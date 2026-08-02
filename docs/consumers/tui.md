@@ -575,10 +575,9 @@ A minimal config:
 
 ```toml
 [defaults]
-shell                 = "/bin/zsh"
+shell                 = "/bin/zsh"         # unset: $SHELL, fallback /bin/sh
 term                  = "xterm-256color"   # TERM advertised to spawned panes
 history-limit         = 50000
-refresh-rate          = 60
 # Sane-default spawn knobs (phux-4li.1):
 cwd-inheritance       = "inherit-focused"
 session-name-template = "default"
@@ -635,6 +634,13 @@ section_header = "yellow"
 **Spawn defaults under `[defaults]`** shape what happens when a new pane
 or session comes into being:
 
+- **`shell`** (string, default unset) is the program server-spawned
+  panes run when nothing names a command: the seed session, attach-time
+  session creation, and a `SPAWN_TERMINAL` whose wire frame carries no
+  `command`; it is also the shell that wraps `spawn-on-attach` and
+  `--seed-command` via `<shell> -c`. The server resolves it once at
+  startup: `defaults.shell` when set, else `$SHELL`, else `/bin/sh`. A
+  wire `command` always wins over this default (phux-i0e8.4.1).
 - **`term`** (string, default `"xterm-256color"`) is the `TERM` the
   server advertises to the inner program of every spawned pane. The
   resolution order for one spawn, lowest to highest: compiled-in
@@ -1128,8 +1134,9 @@ surfaces trigger the same in-place reload of a running client:
 A reload re-runs the full layered loader — `extends` stacks and `-append`
 array merges resolve exactly as at startup — and rebuilds, atomically:
 keybindings (prefix, both tables, plugin-contributed chords, the
-which-key knobs), the theme, the status-bar composition, and the plugin
-action rows in the palette. Failure semantics are all-or-nothing: on any
+which-key knobs), the theme, the status-bar composition (widgets,
+plugin `[[widgets]]` contributions, and `[status] position`), and the
+plugin action rows in the palette. Failure semantics are all-or-nothing: on any
 parse or validation error the client keeps the **previous** config fully
 in effect and surfaces the error as a dismissable toast — never a crash,
 never a half-applied mix of old and new. This is deliberately stricter
@@ -2131,8 +2138,8 @@ array-of-tables (TOML `[[hooks.<name>]]`) of `{ when, action }` pairs.
 
 ```toml
 [[hooks.after-new-pane]]
-when   = { cwd-startswith = "/Users/phall/work" }
-action = { kind = "message", text = "in work tree" }
+when   = { session-startswith = "work" }
+action = { kind = "run", command = "echo pane up >> ~/.cache/phux/hooks.log" }
 
 [[hooks.pane-exit]]
 when   = { exit-code = 0 }
@@ -2151,21 +2158,34 @@ The hook system is intentionally small:
 - **Async by default.** Hook actions fire and the server moves on. Sync
   hooks (where the result blocks the trigger) are reserved for v0.2.
 
-Hook points (initial):
+Hook points (initial). The context keys are what `when` clauses can
+match (and what the hook child receives as `PHUX_*` variables); keys in
+parentheses may be absent on a given firing — `exit-code` for a
+signal-killed child, `session` when none applies, `agent-name` for an
+anonymous agent, `from` on a first sighting. This table mirrors
+`phux_config::vocab::hook_context_keys`, which is itself pinned to the
+server's event constructors by an agreement test.
 
-| Hook                  | Fires after / on                         |
-|-----------------------|------------------------------------------|
-| `after-new-session`   | session creation                         |
-| `after-new-window`    | window creation                          |
-| `after-new-pane`      | pane creation, before exec               |
-| `after-kill-pane`     | pane removed from layout                 |
-| `pane-exit`           | inner process exit                       |
-| `client-attached`     | client attach completed                  |
-| `client-detached`     | client detach (any reason)               |
-| `focus-changed`       | any client changes focus                 |
-| `agent-state-changed` | a pane's derived agent state changed     |
-| `output-silenced`     | configurable silence threshold elapsed   |
-| `output-active`       | first byte after a silence               |
+| Hook                  | Fires after / on                         | Context keys                                              |
+|-----------------------|------------------------------------------|-----------------------------------------------------------|
+| `after-new-session`   | session creation                         | design intent                                             |
+| `after-new-window`    | window creation                          | design intent                                             |
+| `after-new-pane`      | pane creation, before exec               | (`session`), `terminal-id`                                |
+| `after-kill-pane`     | pane removed from layout                 | design intent                                             |
+| `pane-exit`           | inner process exit                       | (`exit-code`), `terminal-id`                              |
+| `client-attached`     | client attach completed                  | `client-id`, `session`                                    |
+| `client-detached`     | client detach (any reason)               | `client-id`, (`session`)                                  |
+| `focus-changed`       | any client changes focus                 | `client-id`, `terminal-id`                                |
+| `agent-state-changed` | a pane's derived agent state changed     | `agent-kind`, (`agent-name`), (`from`), `terminal-id`, `to` |
+| `output-silenced`     | configurable silence threshold elapsed   | design intent                                             |
+| `output-active`       | first byte after a silence               | design intent                                             |
+
+`phux config check` validates this whole surface — an unknown event
+name (including the design-intent rows, which the server does not fire
+yet), a `when` key outside the event's context (the `-startswith`
+suffix strips off before the lookup), or an action that can never
+execute server-side is reported there and warned about again at server
+startup, instead of silently never firing.
 
 Server-side execution semantics (the shipped subset):
 
@@ -2321,16 +2341,15 @@ The shipped defaults, in one place:
 
 | Setting                       | Default                                  |
 |-------------------------------|------------------------------------------|
-| Shell                         | `$SHELL`, fallback `/bin/sh`             |
+| Shell                         | `defaults.shell`; unset → `$SHELL`, fallback `/bin/sh` |
 | `TERM` advertised to panes    | `xterm-256color` (phux-7vx/phux-0o8; set `defaults.term = "ghostty"` to opt in) |
 | History limit per pane        | 50 000 lines                             |
-| Pane refresh rate cap         | 60 Hz                                    |
 | Backpressure threshold        | 32 unacked frames                        |
 | Journal size cap (per pane)   | 10 MiB ring                              |
 | Prefix key                    | `C-a`                                    |
 | Which-key popup               | on, 600 ms hesitation delay              |
 | Pane on PTY exit              | close                                    |
-| Mouse                         | on                                       |
+| Mouse                         | on (`defaults.mouse`; `false` = pass-through only, §7) |
 | New-pane CWD inheritance      | `inherit-focused` (tmux-shaped)          |
 | Spawn-on-attach               | `defaults.shell` (unset = inherit)       |
 | Session name template         | `"default"` (supports `${cwd-basename}`) |
