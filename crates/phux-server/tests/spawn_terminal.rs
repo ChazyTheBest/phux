@@ -190,6 +190,23 @@ const fn enter_key() -> KeyEvent {
     }
 }
 
+/// Let a newly spawned shell proceed only after its spawn reply is observed.
+/// This prevents startup output or exit events from racing the reply and being
+/// consumed by `await_terminal_spawned`.
+async fn release_spawned_child(
+    stream: &mut UnixStream,
+    terminal_id: &phux_protocol::ids::TerminalId,
+) {
+    send_frame(
+        stream,
+        &FrameKind::InputKey {
+            terminal_id: terminal_id.clone(),
+            event: enter_key(),
+        },
+    )
+    .await;
+}
+
 /// Build an `ATTACH { CreateIfMissing(name) }` frame so the test client
 /// gets attached state (and thus an outbound mailbox) before sending
 /// SPAWN_TERMINAL. Without an attached slot the auto-subscribe path in
@@ -199,6 +216,7 @@ const fn enter_key() -> KeyEvent {
 fn attach_create_if_missing(name: &str) -> FrameKind {
     use phux_protocol::wire::frame::{AttachTarget, ViewportInfo};
     FrameKind::Attach {
+        attach_id: 1,
         target: AttachTarget::CreateIfMissing {
             name: name.to_owned(),
             command: None,
@@ -222,7 +240,7 @@ async fn spawn_and_attach(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<(), phux_server::ServerError>>,
 ) {
-    use phux_protocol::wire::frame::{TYPE_ATTACHED, TYPE_TERMINAL_SNAPSHOT};
+    use phux_protocol::wire::frame::{TYPE_ATTACHED, TYPE_BOOTSTRAP_BEGIN};
 
     let socket_path = tmp.path().join("phux.sock");
     let (shutdown_tx, server_handle) = spawn_server(socket_path.clone(), None);
@@ -234,7 +252,7 @@ async fn spawn_and_attach(
     // TERMINAL_SNAPSHOT for the seed pane
     let (type_byte, _snap) = recv_typed(&mut stream).await;
     assert_eq!(
-        type_byte, TYPE_TERMINAL_SNAPSHOT,
+        type_byte, TYPE_BOOTSTRAP_BEGIN,
         "expected TERMINAL_SNAPSHOT",
     );
     (stream, shutdown_tx, server_handle)
@@ -439,7 +457,7 @@ fn failed_actor_build_reaps_atomic_agent_session_provenance() {
 #[test]
 fn explicit_owner_terminal_selects_exact_session_window() {
     run_local(async {
-        use phux_protocol::wire::frame::{TYPE_ATTACHED, TYPE_TERMINAL_SNAPSHOT};
+        use phux_protocol::wire::frame::{TYPE_ATTACHED, TYPE_BOOTSTRAP_BEGIN};
 
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
@@ -453,12 +471,12 @@ fn explicit_owner_terminal_selects_exact_session_window() {
             FrameKind::Attached { snapshot, .. } => snapshot.focused_pane,
             other => panic!("expected Attached, got {other:?}"),
         };
-        assert_eq!(recv_typed(&mut first).await.0, TYPE_TERMINAL_SNAPSHOT);
+        assert_eq!(recv_typed(&mut first).await.0, TYPE_BOOTSTRAP_BEGIN);
 
         let mut second = wait_for_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
         send_frame(&mut second, &attach_create_if_missing("second")).await;
         assert_eq!(recv_typed(&mut second).await.0, TYPE_ATTACHED);
-        assert_eq!(recv_typed(&mut second).await.0, TYPE_TERMINAL_SNAPSHOT);
+        assert_eq!(recv_typed(&mut second).await.0, TYPE_BOOTSTRAP_BEGIN);
 
         let mut headless = wait_for_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
         send_frame(
@@ -624,9 +642,9 @@ fn spawn_terminal_lands_in_attached_session_not_a_new_session() {
 /// server's `defaults.term` baseline. The wire frame is authoritative for
 /// the Terminal it creates.
 ///
-/// The spawned command prints `$TERM` and blocks; the value comes back as
-/// TERMINAL_OUTPUT. The override is a sentinel string distinct from any
-/// real terminfo entry so the assertion can't pass by accident.
+/// After the spawn reply, the test releases the command to print `$TERM`;
+/// this avoids racing an immediate PTY output frame against
+/// `TERMINAL_SPAWNED`.
 #[test]
 fn spawn_terminal_env_term_overrides_default() {
     run_local(async {
@@ -641,9 +659,9 @@ fn spawn_terminal_env_term_overrides_default() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    // `read _` (a builtin) blocks so the pane stays alive
-                    // after printing; `exec read _` would die immediately.
-                    "printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
+                    // Wait until the test has received TERMINAL_SPAWNED so
+                    // the TERM output cannot be consumed while finding it.
+                    "read _; printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: Some(vec![("TERM".to_owned(), "phux-spawn-override".to_owned())]),
@@ -659,6 +677,7 @@ fn spawn_terminal_env_term_overrides_default() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = b"TERMIS=phux-spawn-override";
         let acc = await_output_contains(&mut stream, &new_id, needle).await;
@@ -699,7 +718,7 @@ fn spawn_terminal_default_term_is_xterm_256color() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
+                    "read _; printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -715,6 +734,7 @@ fn spawn_terminal_default_term_is_xterm_256color() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = b"TERMIS=xterm-256color";
         let acc = await_output_contains(&mut stream, &new_id, needle).await;
@@ -754,7 +774,7 @@ fn spawn_terminal_term_field_overrides_default() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
+                    "read _; printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -770,6 +790,7 @@ fn spawn_terminal_term_field_overrides_default() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = b"TERMIS=phux-term-field";
         let acc = await_output_contains(&mut stream, &new_id, needle).await;
@@ -807,7 +828,7 @@ fn spawn_terminal_env_term_beats_term_field() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
+                    "read _; printf 'TERMIS=%s\\n' \"$TERM\"; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: Some(vec![("TERM".to_owned(), "phux-env-wins".to_owned())]),
@@ -823,6 +844,7 @@ fn spawn_terminal_env_term_beats_term_field() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = b"TERMIS=phux-env-wins";
         let acc = await_output_contains(&mut stream, &new_id, needle).await;
@@ -894,8 +916,8 @@ fn spawn_terminal_emits_terminal_closed_on_pty_exit() {
         let tmp = TempDir::new().unwrap();
         let (mut stream, shutdown_tx, server_handle) = spawn_and_attach(&tmp, "default").await;
 
-        // sh -c 'exit 42' is portable (BSD, Linux, macOS) and produces
-        // a deterministic exit code we can assert on the wire.
+        // The child waits until TERMINAL_SPAWNED has arrived, then exits
+        // with a deterministic status portable across BSD, Linux, and macOS.
         send_frame(
             &mut stream,
             &FrameKind::SpawnTerminal {
@@ -904,7 +926,7 @@ fn spawn_terminal_emits_terminal_closed_on_pty_exit() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "exit 42".to_owned(),
+                    "read _; exit 42".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -922,11 +944,10 @@ fn spawn_terminal_emits_terminal_closed_on_pty_exit() {
             SpawnResult::Err(e) => panic!("expected Ok, got Err({e:?})"),
             other => panic!("unexpected SpawnResult variant: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
-        // The child exits almost immediately; the PTY EOF watcher
-        // fires the exit_notify oneshot which drives the
-        // TERMINAL_CLOSED broadcast. WIRE_RECV_TIMEOUT (5s) is the
-        // budget.
+        // Releasing the child drives the PTY EOF watcher, whose exit_notify
+        // oneshot produces TERMINAL_CLOSED.
         let exit_status = await_terminal_closed(&mut stream, &new_id).await;
         assert_eq!(
             exit_status,
@@ -948,7 +969,7 @@ fn spawn_terminal_emits_terminal_closed_on_pty_exit() {
 fn terminal_resize_updates_pane_dims_observable_on_reattach() {
     run_local(async {
         use phux_protocol::wire::frame::{
-            AttachTarget, TYPE_ATTACHED, TYPE_TERMINAL_SNAPSHOT, ViewportInfo,
+            AttachTarget, TYPE_ATTACHED, TYPE_BOOTSTRAP_BEGIN, ViewportInfo,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -961,7 +982,7 @@ fn terminal_resize_updates_pane_dims_observable_on_reattach() {
         let (type_byte, _attached) = recv_typed(&mut stream_a).await;
         assert_eq!(type_byte, TYPE_ATTACHED);
         let (type_byte, _snap) = recv_typed(&mut stream_a).await;
-        assert_eq!(type_byte, TYPE_TERMINAL_SNAPSHOT);
+        assert_eq!(type_byte, TYPE_BOOTSTRAP_BEGIN);
 
         // Use /bin/cat so the actor stays alive for the duration of the
         // resize round-trip. A short-lived command would race with the
@@ -1017,6 +1038,7 @@ fn terminal_resize_updates_pane_dims_observable_on_reattach() {
         send_frame(
             &mut stream_b,
             &FrameKind::Attach {
+                attach_id: 1,
                 target: AttachTarget::ByName("resize-test".to_owned()),
                 viewport: ViewportInfo::new(80, 24),
                 request_scrollback: false,
@@ -1122,11 +1144,11 @@ async fn await_snapshot_or_output_contains(
             FrameKind::TerminalOutput {
                 terminal_id, bytes, ..
             } if &terminal_id == pane => acc.extend_from_slice(&bytes),
-            FrameKind::TerminalSnapshot {
+            FrameKind::BootstrapChunk {
                 terminal_id,
-                vt_replay_bytes,
+                payload,
                 ..
-            } if &terminal_id == pane => acc.extend_from_slice(&vt_replay_bytes),
+            } if &terminal_id == pane => acc.extend_from_slice(&payload),
             _ => continue,
         }
         if acc.windows(needle.len()).any(|w| w == needle) {
@@ -1157,9 +1179,9 @@ fn spawn_terminal_injects_matching_terminal_id_env() {
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
                     // Trailing `.` so `PTID=1.` can't match a prefix of a
-                    // longer id (`PTID=12`). `read _` blocks so the pane
-                    // stays alive after printing.
-                    "printf 'PTID=%s.\\n' \"$PHUX_TERMINAL_ID\"; read _".to_owned(),
+                    // longer id (`PTID=12`). The first read prevents output
+                    // from racing TERMINAL_SPAWNED; the second keeps it alive.
+                    "read _; printf 'PTID=%s.\\n' \"$PHUX_TERMINAL_ID\"; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -1175,6 +1197,7 @@ fn spawn_terminal_injects_matching_terminal_id_env() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
         let local = new_id
             .local_id()
             .expect("a freshly spawned id must be LOCAL");
@@ -1217,6 +1240,7 @@ fn attach_create_seed_pane_injects_matching_terminal_id_env() {
         send_frame(
             &mut stream,
             &FrameKind::Attach {
+                attach_id: 1,
                 target: AttachTarget::CreateIfMissing {
                     name: "seed-id".to_owned(),
                     command: Some(vec![
@@ -1280,7 +1304,7 @@ fn spawn_terminal_injects_server_socket_env() {
         let (mut stream, shutdown_tx, server_handle) = spawn_and_attach(&tmp, "default").await;
 
         let probe = format!(
-            "if [ \"$PHUX_SOCKET\" = '{}' ]; then printf 'SOCKOK.\\n'; \
+            "read _; if [ \"$PHUX_SOCKET\" = '{}' ]; then printf 'SOCKOK.\\n'; \
              else printf 'SOCKBAD=%s.\\n' \"$PHUX_SOCKET\"; fi; read _",
             socket_path.display()
         );
@@ -1304,6 +1328,7 @@ fn spawn_terminal_injects_server_socket_env() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
         let acc = await_output_contains(&mut stream, &new_id, b"SOCK").await;
         let body = String::from_utf8_lossy(&acc);
         assert!(
@@ -1343,6 +1368,7 @@ fn attach_create_seed_pane_injects_server_socket_env() {
         send_frame(
             &mut stream,
             &FrameKind::Attach {
+                attach_id: 1,
                 target: AttachTarget::CreateIfMissing {
                     name: "seed-sock".to_owned(),
                     command: Some(vec!["/bin/sh".to_owned(), "-c".to_owned(), probe]),
@@ -1424,7 +1450,7 @@ fn spawn_terminal_inherits_focused_pane_live_cwd() {
         let (type_byte, _snap) = recv_typed(&mut stream).await;
         assert_eq!(
             type_byte,
-            phux_protocol::wire::frame::TYPE_TERMINAL_SNAPSHOT,
+            phux_protocol::wire::frame::TYPE_BOOTSTRAP_BEGIN,
             "expected TERMINAL_SNAPSHOT",
         );
 
@@ -1444,8 +1470,9 @@ fn spawn_terminal_inherits_focused_pane_live_cwd() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    // `read _` blocks (a builtin); `exec read _` would die.
-                    "pwd; read _".to_owned(),
+                    // The first read prevents output from racing
+                    // TERMINAL_SPAWNED; the second keeps the pane alive.
+                    "read _; pwd; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -1461,6 +1488,7 @@ fn spawn_terminal_inherits_focused_pane_live_cwd() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = cwd_path.to_str().expect("utf8 cwd").as_bytes();
         let acc = await_output_contains(&mut stream, &new_id, needle).await;
@@ -1511,6 +1539,7 @@ fn create_if_missing_seeds_pane_in_wire_cwd() {
         send_frame(
             &mut stream,
             &FrameKind::Attach {
+                attach_id: 1,
                 target: AttachTarget::CreateIfMissing {
                     name: "proj".to_owned(),
                     command: Some(vec![
@@ -1597,7 +1626,7 @@ fn spawn_terminal_session_root_inherits_seed_pane_dir() {
         let (type_byte, _snap) = recv_typed(&mut stream).await;
         assert_eq!(
             type_byte,
-            phux_protocol::wire::frame::TYPE_TERMINAL_SNAPSHOT,
+            phux_protocol::wire::frame::TYPE_BOOTSTRAP_BEGIN,
             "expected TERMINAL_SNAPSHOT",
         );
 
@@ -1615,7 +1644,7 @@ fn spawn_terminal_session_root_inherits_seed_pane_dir() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "pwd; read _".to_owned(),
+                    "read _; pwd; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -1631,6 +1660,7 @@ fn spawn_terminal_session_root_inherits_seed_pane_dir() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = root_path.to_str().expect("utf8 root").as_bytes();
         let acc = await_output_contains(&mut stream, &new_id, needle).await;
@@ -1687,7 +1717,7 @@ fn spawn_terminal_last_cwd_per_window_inherits_active_pane_dir() {
         let (type_byte, _snap) = recv_typed(&mut stream).await;
         assert_eq!(
             type_byte,
-            phux_protocol::wire::frame::TYPE_TERMINAL_SNAPSHOT,
+            phux_protocol::wire::frame::TYPE_BOOTSTRAP_BEGIN,
             "expected TERMINAL_SNAPSHOT",
         );
 
@@ -1702,7 +1732,7 @@ fn spawn_terminal_last_cwd_per_window_inherits_active_pane_dir() {
                 command: Some(vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "pwd; read _".to_owned(),
+                    "read _; pwd; read _".to_owned(),
                 ]),
                 cwd: None,
                 env: None,
@@ -1718,6 +1748,7 @@ fn spawn_terminal_last_cwd_per_window_inherits_active_pane_dir() {
             SpawnResult::Ok(id) => id,
             other => panic!("SPAWN_TERMINAL did not succeed: {other:?}"),
         };
+        release_spawned_child(&mut stream, &new_id).await;
 
         let needle = win_path.to_str().expect("utf8 win").as_bytes();
         let acc = await_output_contains(&mut stream, &new_id, needle).await;

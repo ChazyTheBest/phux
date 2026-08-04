@@ -92,4 +92,45 @@ impl ServerState {
     ) -> Vec<(phux_protocol::ids::SatelliteHost, u32)> {
         self.leases.satellite_held_by(client)
     }
+
+    // -- satellite proxy attach registrations -----------------------------
+
+    /// Whether `client` holds a proxied `ATTACH_TERMINAL` over `terminal` on
+    /// `host`.
+    ///
+    /// The hub relays opaque reply and input frames on a consumer's behalf and
+    /// cannot re-derive entitlement from the frame alone, so every relayed
+    /// frame is gated on an exact registration made here at attach time.
+    #[must_use]
+    pub fn has_satellite_proxy_attach(
+        &self,
+        client: ClientId,
+        host: &phux_protocol::ids::SatelliteHost,
+        terminal: u32,
+    ) -> bool {
+        self.leases
+            .has_satellite_proxy_attach(client, host, terminal)
+    }
+
+    /// Record that `client` now proxies `terminal` on `host`.
+    pub fn register_satellite_proxy_attach(
+        &mut self,
+        client: ClientId,
+        host: phux_protocol::ids::SatelliteHost,
+        terminal: u32,
+    ) {
+        self.leases
+            .register_satellite_proxy_attach(client, host, terminal);
+    }
+
+    /// Drop one proxy registration. Idempotent.
+    pub fn unregister_satellite_proxy_attach(
+        &mut self,
+        client: ClientId,
+        host: &phux_protocol::ids::SatelliteHost,
+        terminal: u32,
+    ) {
+        self.leases
+            .unregister_satellite_proxy_attach(client, host, terminal);
+    }
 }

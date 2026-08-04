@@ -315,7 +315,9 @@ mod tests {
     use super::*;
     use crate::terminal_actor::TerminalHandle;
     use phux_core::ids::TerminalId;
-    use phux_protocol::caps::{ClientCapabilities, ColorSupport, LayerSet};
+    use phux_protocol::caps::{
+        BootstrapLimits, BootstrapProfile, ClientCapabilities, ColorSupport, LayerSet,
+    };
 
     use phux_protocol::wire::frame::{FrameKind, Scope};
 
@@ -358,6 +360,14 @@ mod tests {
             )
             .1,
             snapshot: snapshot_tx,
+            #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+            native_bootstrap: mpsc::channel(8).0,
+            #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+            native_publication: mpsc::channel(8).0,
+            #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+            native_history: mpsc::channel(8).0,
+            #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+            native_release: mpsc::channel(8).0,
             set_default_colors: mpsc::channel(8).0,
             screen: screen_tx,
             upgrade: upgrade_tx,
@@ -556,13 +566,57 @@ mod tests {
     }
 
     #[test]
-    fn second_attach_for_same_client_returns_already_attached() {
+    fn same_client_may_rebootstrap_same_session_but_not_switch_sessions() {
+        // A second ATTACH naming the SAME session is a re-bootstrap, not an
+        // error: the client is renegotiating its profile or recovering. Only
+        // switching sessions on one connection is refused.
+        let mut s = ServerState::new();
+        let (default, window, original) = s.seed_session("default");
+        let _ = s.seed_session("other");
+        let cid = s.new_client_id();
+        s.attach_default_caps(cid, "default", mk_tx()).unwrap();
+        let added = s
+            .registry_mut()
+            .new_terminal(window)
+            .expect("pane added after initial attach");
+        assert_eq!(
+            s.attach_default_caps(cid, "default", mk_tx()).unwrap(),
+            default,
+            "same-connection recovery reuses the live session identity"
+        );
+        assert_eq!(
+            s.subscribers_for_terminal(original),
+            &[cid],
+            "reattach must not duplicate an existing subscription",
+        );
+        assert_eq!(
+            s.subscribers_for_terminal(added),
+            &[cid],
+            "reattach must subscribe panes created after the first attach",
+        );
+        let err = s.attach_default_caps(cid, "other", mk_tx()).unwrap_err();
+        assert_eq!(err, AttachError::AlreadyAttached(cid));
+    }
+
+    #[test]
+    fn attach_stores_hello_selected_bootstrap_contract_unchanged() {
         let mut s = ServerState::new();
         let _ = s.seed_session("default");
         let cid = s.new_client_id();
-        s.attach_default_caps(cid, "default", mk_tx()).unwrap();
-        let err = s.attach_default_caps(cid, "default", mk_tx()).unwrap_err();
-        assert_eq!(err, AttachError::AlreadyAttached(cid));
+        let profile = BootstrapProfile::SynthesizedVtStateSync;
+        let limits = BootstrapLimits::new(64 * 1024, 128 * 1024).unwrap();
+        s.attach(
+            cid,
+            "default",
+            mk_tx(),
+            ClientCapabilities::default(),
+            profile,
+            limits,
+        )
+        .unwrap();
+        let attached = &s.attached()[&cid];
+        assert_eq!(attached.bootstrap_profile, profile);
+        assert_eq!(attached.bootstrap_limits, limits);
     }
 
     #[test]
@@ -872,6 +926,8 @@ mod tests {
             "default",
             mk_tx(),
             ClientCapabilities::new().with_color_support(ColorSupport::Indexed16),
+            BootstrapProfile::SynthesizedVtRaw,
+            BootstrapLimits::default(),
         )
         .unwrap();
         let client = s.attached().get(&cid).unwrap();
@@ -987,7 +1043,9 @@ mod tests {
     fn drain_frames(rx: &mut mpsc::Receiver<Outbound>) -> Vec<FrameKind> {
         let mut out = Vec::new();
         while let Ok(msg) = rx.try_recv() {
-            let Outbound::Frame(f) = msg;
+            let Outbound::Frame(f) = msg else {
+                panic!("unexpected terminal outbound sentinel")
+            };
             out.push(f);
         }
         out

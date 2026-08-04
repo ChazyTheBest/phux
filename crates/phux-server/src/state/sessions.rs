@@ -53,7 +53,7 @@ impl ServerState {
     /// Look up the [`SessionId`] for a name by scanning the registry.
     ///
     /// Uses `Registry::sessions` directly — no side ledger required.
-    pub(super) fn find_session_by_name(&self, name: &str) -> Option<SessionId> {
+    pub(crate) fn find_session_by_name(&self, name: &str) -> Option<SessionId> {
         self.sessions.find_by_name(name)
     }
 

@@ -219,23 +219,26 @@ pub async fn get_state_on(conn: &mut Connection) -> Result<StateView, AttachErro
 /// Send `HELLO` on `conn` and return the protocol version triple the server
 /// selected in `HELLO_OK`.
 ///
-/// The one-shot CLI verbs skip the handshake entirely (the server does not
-/// require it before commands), so the negotiated protocol version is
-/// invisible to them; this probe performs the same `HELLO`/`HELLO_OK`
-/// exchange the attach path does, minus the terminal capability sniffing a
-/// headless caller has no terminal for. Purely client-side: no wire change,
-/// and any server that can attach a client answers it.
-///
-/// Call it first on a fresh connection — `HELLO` is the opening frame of the
-/// handshake, and the same connection can carry commands afterwards (the
-/// attach path's exact sequence).
+/// Production [`Connection`] constructors already complete that exchange.
+/// This helper returns the version they validated without emitting a second
+/// `HELLO`; crate-internal raw connections still perform the exchange here.
 ///
 /// # Errors
 ///
-/// Returns a transport error when the connection fails mid-exchange, a
-/// refusal carrying the server's message when it answers `ERROR` (version
-/// incompatibility), or a protocol error on any other reply.
+/// Returns a transport error when an unnegotiated raw connection fails
+/// mid-exchange, a refusal carrying the server's message when it answers
+/// `ERROR` (version incompatibility), or a protocol error on any other reply.
+///
+/// Callers may use this on either a production-negotiated connection or a
+/// crate-internal raw connection.
 pub async fn probe_hello(conn: &mut Connection) -> Result<(u16, u16, u16), AttachError> {
+    if conn.negotiated_bootstrap().is_some() {
+        return Ok((
+            phux_protocol::PROTOCOL_VERSION.major,
+            phux_protocol::PROTOCOL_VERSION.minor,
+            phux_protocol::PROTOCOL_VERSION.patch,
+        ));
+    }
     conn.send(&FrameKind::Hello {
         client_name: format!("phux-cli/{}", env!("CARGO_PKG_VERSION")),
         protocol_major: phux_protocol::PROTOCOL_VERSION.major,
@@ -406,17 +409,31 @@ mod tests {
         );
         assert_eq!(*view.snapshot(), expected);
         let seen = server.await.unwrap();
+        let Some(FrameKind::Hello {
+            client_name,
+            client_caps,
+            ..
+        }) = seen.first()
+        else {
+            panic!("HELLO must be first, got {seen:?}");
+        };
+        assert!(client_name.starts_with("phux-client/"));
+        assert_eq!(
+            client_caps.layers,
+            phux_protocol::caps::LayerSet::with(&[phux_protocol::caps::Layer::L3]),
+            "control commands advertise the metadata tier used by the shared connection API"
+        );
         assert!(
             matches!(
-                seen.first(),
+                seen.get(1),
                 Some(FrameKind::Command {
                     request_id: 0,
                     command: Command::GetState { .. }
                 })
             ),
-            "GET_STATE is the only frame this path sends, on request id 0; got {:?}",
-            seen.first()
+            "GET_STATE must follow negotiation on request id 0; got {seen:?}",
         );
+        assert_eq!(seen.len(), 2, "exactly one HELLO and one GET_STATE");
     }
 
     #[tokio::test]
@@ -525,6 +542,13 @@ mod tests {
             "the probe's first frame must be HELLO; got {:?}",
             seen.first()
         );
+        assert_eq!(
+            seen.iter()
+                .filter(|frame| matches!(frame, FrameKind::Hello { .. }))
+                .count(),
+            1,
+            "probing an already-negotiated connection must not emit a second HELLO",
+        );
     }
 
     #[tokio::test]
@@ -532,10 +556,13 @@ mod tests {
         // The listener lives in this test process, so the peer credentials
         // of a connection to it name this very pid — on both Linux
         // (SO_PEERCRED) and macOS (LOCAL_PEEREPID), the two platforms phux
-        // ships on. Purely an OS fact: no server code participates.
+        // ships on. The scripted peer only completes the production
+        // constructor's mandatory HELLO negotiation.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("pid.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server =
+            tokio::spawn(async move { ScriptedServer::accept(&listener, ScriptSpec::new()).await });
 
         let conn = Connection::connect(&socket).await.unwrap();
         assert_eq!(
@@ -543,6 +570,8 @@ mod tests {
             Some(i32::try_from(std::process::id()).unwrap()),
             "a UDS connection's peer pid must be the listening process"
         );
+        drop(conn);
+        server.await.unwrap();
     }
 
     #[test]

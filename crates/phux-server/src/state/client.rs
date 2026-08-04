@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use phux_core::ids::{SessionId, TerminalId};
-use phux_protocol::caps::{ClientCapabilities, ColorSupport, LayerSet};
+use phux_protocol::caps::{
+    BootstrapLimits, BootstrapProfile, ClientCapabilities, ColorSupport, LayerSet,
+};
 use phux_protocol::ids::TerminalId as WireTerminalId;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -41,6 +43,10 @@ pub struct AttachedClient {
     /// to [`ClientCapabilities::default`] (most-permissive — never silently
     /// downgrades).
     pub client_caps: ClientCapabilities,
+    /// Immutable bootstrap profile selected for this HELLO.
+    pub bootstrap_profile: BootstrapProfile,
+    /// Immutable payload limits selected for this HELLO.
+    pub bootstrap_limits: BootstrapLimits,
     /// This client's current outer viewport (`phux-nk07`).
     ///
     /// Set from the `ATTACH` viewport and updated on every `VIEWPORT_RESIZE`.
@@ -83,6 +89,9 @@ pub enum AttachError {
     /// The given [`ClientId`] is already attached.
     #[error("client {0:?} is already attached")]
     AlreadyAttached(ClientId),
+    /// The session cannot fit the bounded aggregate attach preflight.
+    #[error("session exceeds aggregate attach resource limits")]
+    ResourceLimit,
 }
 
 impl ServerState {
@@ -144,27 +153,42 @@ impl ServerState {
         session_name: &str,
         tx: mpsc::Sender<Outbound>,
         client_caps: ClientCapabilities,
+        bootstrap_profile: BootstrapProfile,
+        bootstrap_limits: BootstrapLimits,
     ) -> Result<SessionId, AttachError> {
-        if self.clients.attached.contains_key(&client_id) {
-            return Err(AttachError::AlreadyAttached(client_id));
-        }
+        // Resolve the session BEFORE the already-attached check: a second
+        // attach naming the SAME session is a re-bootstrap (the client is
+        // renegotiating its profile, or recovering), not an error. Only a
+        // client trying to switch sessions on one connection is refused. The
+        // check therefore needs the resolved id, so an unknown session name
+        // still reports UnknownSession rather than AlreadyAttached.
         let session_id = self
             .find_session_by_name(session_name)
             .ok_or_else(|| AttachError::UnknownSession(session_name.to_owned()))?;
-
-        self.clients.attached.insert(
-            client_id,
-            AttachedClient {
-                id: client_id,
-                session: session_id,
-                tx,
-                client_caps,
-                viewport: None,
-                viewport_seq: 0,
-            },
-        );
-        // Attaching arms tmux-model last-session self-exit (phux-60s).
-        self.arm_self_exit();
+        if let Some(existing) = self.clients.attached.get(&client_id) {
+            if existing.session != session_id {
+                return Err(AttachError::AlreadyAttached(client_id));
+            }
+            // Same session: keep the live record (and its identity) and fall
+            // through to the subscription sweep below, which is idempotent and
+            // picks up panes created since the first attach.
+        } else {
+            self.clients.attached.insert(
+                client_id,
+                AttachedClient {
+                    id: client_id,
+                    session: session_id,
+                    tx,
+                    client_caps,
+                    bootstrap_profile,
+                    bootstrap_limits,
+                    viewport: None,
+                    viewport_seq: 0,
+                },
+            );
+            // Attaching arms tmux-model last-session self-exit (phux-60s).
+            self.arm_self_exit();
+        }
 
         // Subscribe to EVERY pane in the session, across all its windows —
         // not just the active one (phux-fysb.2). A multi-pane client renders
@@ -200,16 +224,23 @@ impl ServerState {
     }
 
     /// Convenience wrapper around [`Self::attach`] that passes
-    /// [`ColorSupport::default`] for the client tier. Intended for test
-    /// scaffolding and in-tree call sites that don't carry a HELLO-derived
-    /// capability value.
+    /// [`ClientCapabilities::default`] plus the baseline bootstrap contract.
+    /// Intended for test scaffolding and in-tree call sites that do not carry
+    /// a HELLO-derived capability value.
     pub fn attach_default_caps(
         &mut self,
         client_id: ClientId,
         session_name: &str,
         tx: mpsc::Sender<Outbound>,
     ) -> Result<SessionId, AttachError> {
-        self.attach(client_id, session_name, tx, ClientCapabilities::default())
+        self.attach(
+            client_id,
+            session_name,
+            tx,
+            ClientCapabilities::default(),
+            BootstrapProfile::SynthesizedVtRaw,
+            BootstrapLimits::default(),
+        )
     }
 
     /// Update the recorded [`ClientCapabilities`] for an already-attached

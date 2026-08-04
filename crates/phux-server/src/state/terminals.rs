@@ -1,9 +1,10 @@
 use std::future::Future;
 
 use phux_core::ids::TerminalId;
-use phux_protocol::ids::TerminalId as WireTerminalId;
+use phux_protocol::ids::{BootstrapId, TerminalId as WireTerminalId};
 use tokio_util::sync::CancellationToken;
 
+use super::terminal_table::AttachTerminalPumpReplacement;
 use super::{ClientId, ServerState};
 use crate::terminal_actor::TerminalHandle;
 
@@ -117,16 +118,27 @@ impl ServerState {
         self.terminal_table.all_handles()
     }
 
-    /// Register (and return the token for) an `ATTACH_TERMINAL` output
-    /// pump for `(client, terminal)` (phux-v45.7). Returns `None` when a
-    /// pump is already live for the pair — the idempotent re-attach must
-    /// not double-stream.
-    pub fn register_attach_terminal_pump(
+    /// Install a new `ATTACH_TERMINAL` pump generation for `(client,
+    /// terminal)`, displacing any live one.
+    ///
+    /// See `TerminalTable::replace_pump` for what the returned tuple carries
+    /// and why a second attach replaces rather than being refused. (Not a
+    /// rustdoc link: that method is `pub(super)`, and rustdoc does not document
+    /// private items.)
+    pub fn replace_attach_terminal_pump(
         &mut self,
         client: ClientId,
         terminal: TerminalId,
-    ) -> Option<CancellationToken> {
-        self.terminal_table.register_pump(client, terminal)
+        bootstrap_id: BootstrapId,
+    ) -> AttachTerminalPumpReplacement {
+        self.terminal_table
+            .replace_pump(client, terminal, bootstrap_id)
+    }
+
+    /// Allocate the next per-terminal bootstrap id for `client`, or `None`
+    /// once the connection has exhausted its id space.
+    pub fn next_attach_terminal_bootstrap_id(&mut self, client: ClientId) -> Option<BootstrapId> {
+        self.terminal_table.next_bootstrap_id(client)
     }
 
     /// Cancel and forget the `ATTACH_TERMINAL` pump for `(client,

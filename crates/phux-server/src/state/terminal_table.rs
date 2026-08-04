@@ -33,13 +33,57 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use phux_core::ids::TerminalId;
+use phux_protocol::ids::BootstrapId;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::ClientId;
 use crate::terminal_actor::TerminalHandle;
+
+/// Last `PANE_OUTPUT` sequence a pump emitted before it was superseded.
+///
+/// Shared with the pump task so a replacement generation can resume from
+/// where the prior one stopped rather than replaying from zero.
+pub(super) type LastValidAttachSequence = Arc<AtomicU64>;
+
+/// What a superseded pump generation leaves behind: its bootstrap id (to
+/// tombstone), a token that resolves once it has actually exited, and the
+/// sequence it reached.
+pub(super) type PriorAttachTerminalPump = (BootstrapId, CancellationToken, LastValidAttachSequence);
+
+/// The new generation's `(cancel, done, last_valid_seq)` plus whatever it
+/// displaced.
+pub(super) type AttachTerminalPumpReplacement = (
+    CancellationToken,
+    CancellationToken,
+    LastValidAttachSequence,
+    Option<PriorAttachTerminalPump>,
+);
+
+/// One generation of an `ATTACH_TERMINAL` output pump.
+///
+/// `ATTACH_TERMINAL` used to be idempotent-or-nothing: a second attach for a
+/// live `(client, terminal)` was refused so the pane could not double-stream.
+/// Negotiated bootstrap makes re-attach meaningful — a client re-bootstraps to
+/// change profile or recover — so a generation now *replaces* its predecessor:
+/// the prior `cancel` fires, `done` reports when it has drained, and its
+/// bootstrap id is tombstoned so late frames from the dead pump are dropped
+/// rather than attributed to the new one.
+#[derive(Debug)]
+pub(super) struct AttachTerminalGeneration {
+    /// Fires to stop this pump.
+    pub(super) cancel: CancellationToken,
+    /// Resolves once the pump task has actually exited.
+    pub(super) done: CancellationToken,
+    /// Highest sequence this generation emitted.
+    pub(super) last_valid_seq: LastValidAttachSequence,
+    /// Bootstrap id this generation streams under.
+    pub(super) bootstrap_id: BootstrapId,
+}
 
 /// Every pane-keyed table the server owns, plus the client subscriptions
 /// and output pumps that hang off them.
@@ -92,7 +136,10 @@ pub(super) struct TerminalTable {
     /// cancels the pane's entries. Without the token the pump task (which
     /// holds the client's outbound sender) would keep streaming until the
     /// connection died.
-    pumps: HashMap<(ClientId, TerminalId), CancellationToken>,
+    pumps: HashMap<(ClientId, TerminalId), AttachTerminalGeneration>,
+    /// Next connection-global bootstrap id for per-terminal attaches, keyed
+    /// by client. Monotonic, so a tombstoned generation's id is never reused.
+    next_bootstrap: HashMap<ClientId, u64>,
 }
 
 impl Default for TerminalTable {
@@ -111,6 +158,7 @@ impl TerminalTable {
             tasks: JoinSet::new(),
             subscribers: HashMap::new(),
             pumps: HashMap::new(),
+            next_bootstrap: HashMap::new(),
         }
     }
 
@@ -247,45 +295,78 @@ impl TerminalTable {
 
     // -- ATTACH_TERMINAL output pumps ---------------------------------
 
-    /// Register (and return the token for) an `ATTACH_TERMINAL` output
-    /// pump for `(client, terminal)` (phux-v45.7). Returns `None` when a
-    /// pump is already live for the pair — the idempotent re-attach must
-    /// not double-stream.
-    pub(super) fn register_pump(
+    /// Install a new `ATTACH_TERMINAL` pump generation for `(client,
+    /// terminal)`, displacing any live one.
+    ///
+    /// Returns the new generation's `(cancel, done, last_valid_seq)` plus, when
+    /// one was displaced, the prior generation's bootstrap id, its `done` token
+    /// and the sequence it reached. The caller awaits that `done` before
+    /// tombstoning the old bootstrap id, so a late frame from the dying pump is
+    /// never attributed to the new generation.
+    ///
+    /// This replaced a register-or-refuse form that returned `None` for a live
+    /// pair. Under negotiated bootstrap a second `ATTACH_TERMINAL` is a
+    /// meaningful request — re-bootstrap at a different profile, or recover —
+    /// so refusing it would strand the client on the old stream.
+    pub(super) fn replace_pump(
         &mut self,
         client: ClientId,
         terminal: TerminalId,
-    ) -> Option<CancellationToken> {
-        use std::collections::hash_map::Entry;
-        match self.pumps.entry((client, terminal)) {
-            Entry::Occupied(_) => None,
-            Entry::Vacant(slot) => {
-                let token = CancellationToken::new();
-                slot.insert(token.clone());
-                Some(token)
-            }
-        }
+        bootstrap_id: BootstrapId,
+    ) -> AttachTerminalPumpReplacement {
+        let cancel = CancellationToken::new();
+        let done = CancellationToken::new();
+        let last_valid_seq: LastValidAttachSequence = Arc::new(AtomicU64::new(0));
+        let prior = self
+            .pumps
+            .insert(
+                (client, terminal),
+                AttachTerminalGeneration {
+                    cancel: cancel.clone(),
+                    done: done.clone(),
+                    last_valid_seq: Arc::clone(&last_valid_seq),
+                    bootstrap_id,
+                },
+            )
+            .map(|prior| {
+                prior.cancel.cancel();
+                (prior.bootstrap_id, prior.done, prior.last_valid_seq)
+            });
+        (cancel, done, last_valid_seq, prior)
+    }
+
+    /// Allocate the next per-terminal bootstrap id for `client`.
+    ///
+    /// `None` once the per-client counter would overflow — the connection has
+    /// exhausted its id space and must reconnect rather than reuse an id a
+    /// tombstone still refers to.
+    pub(super) fn next_bootstrap_id(&mut self, client: ClientId) -> Option<BootstrapId> {
+        let next = self.next_bootstrap.entry(client).or_insert(1);
+        let raw = *next;
+        *next = raw.checked_add(1)?;
+        BootstrapId::new(raw)
     }
 
     /// Cancel and forget the `ATTACH_TERMINAL` pump for `(client,
     /// terminal)`, if one is live. Idempotent.
     pub(super) fn cancel_pump(&mut self, client: ClientId, terminal: TerminalId) {
-        if let Some(token) = self.pumps.remove(&(client, terminal)) {
-            token.cancel();
+        if let Some(generation) = self.pumps.remove(&(client, terminal)) {
+            generation.cancel.cancel();
         }
     }
 
     /// Cancel every `ATTACH_TERMINAL` output pump `client` owns
     /// (phux-v45.7) so no task keeps streaming into a dead mailbox.
     pub(super) fn cancel_pumps_for_client(&mut self, client: ClientId) {
-        self.pumps.retain(|(owner, _), token| {
+        self.pumps.retain(|(owner, _), generation| {
             if *owner == client {
-                token.cancel();
+                generation.cancel.cancel();
                 false
             } else {
                 true
             }
         });
+        self.next_bootstrap.remove(&client);
     }
 
     // -- teardown -----------------------------------------------------
@@ -308,9 +389,9 @@ impl TerminalTable {
             token.cancel();
         }
         self.subscribers.remove(&terminal);
-        self.pumps.retain(|(_, pane), token| {
+        self.pumps.retain(|(_, pane), generation| {
             if *pane == terminal {
-                token.cancel();
+                generation.cancel.cancel();
                 false
             } else {
                 true

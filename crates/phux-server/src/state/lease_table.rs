@@ -33,7 +33,7 @@
 //! and both maps stay exactly as unreachable from outside `state` as they
 //! were as private fields.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use phux_core::ids::TerminalId;
 use tokio::sync::mpsc;
@@ -91,6 +91,16 @@ pub(super) struct LeaseTable {
     /// satellite cannot, since it sees only the shared link identity. See
     /// L1 §9.1.
     satellite: BTreeMap<(phux_protocol::ids::SatelliteHost, u32), SatelliteLease>,
+    /// Successful satellite `ATTACH_TERMINAL` proxy ownership, mirrored at the
+    /// hub authority boundary.
+    ///
+    /// The hub relays opaque reply and input frames on behalf of a consumer,
+    /// and cannot re-derive from the frame alone whether that consumer is
+    /// entitled to the satellite terminal it names. A frame must match one of
+    /// these exact `(client, host, terminal)` registrations before the hub
+    /// forwards it, so a consumer cannot address a satellite pane it never
+    /// attached to.
+    satellite_proxy_attaches: HashSet<(ClientId, phux_protocol::ids::SatelliteHost, u32)>,
 }
 
 impl Default for LeaseTable {
@@ -106,7 +116,44 @@ impl LeaseTable {
         Self {
             input: HashMap::new(),
             satellite: BTreeMap::new(),
+            satellite_proxy_attaches: HashSet::new(),
         }
+    }
+
+    // -- satellite proxy attach registrations -----------------------------
+
+    /// Whether `client` holds a proxied `ATTACH_TERMINAL` over `terminal` on
+    /// `host`. The gate every relayed reply/input frame passes.
+    pub(super) fn has_satellite_proxy_attach(
+        &self,
+        client: ClientId,
+        host: &phux_protocol::ids::SatelliteHost,
+        terminal: u32,
+    ) -> bool {
+        self.satellite_proxy_attaches
+            .contains(&(client, host.clone(), terminal))
+    }
+
+    /// Record that `client` now proxies `terminal` on `host`.
+    pub(super) fn register_satellite_proxy_attach(
+        &mut self,
+        client: ClientId,
+        host: phux_protocol::ids::SatelliteHost,
+        terminal: u32,
+    ) {
+        self.satellite_proxy_attaches
+            .insert((client, host, terminal));
+    }
+
+    /// Drop one proxy registration. Idempotent.
+    pub(super) fn unregister_satellite_proxy_attach(
+        &mut self,
+        client: ClientId,
+        host: &phux_protocol::ids::SatelliteHost,
+        terminal: u32,
+    ) {
+        self.satellite_proxy_attaches
+            .remove(&(client, host.clone(), terminal));
     }
 
     // -- local pane leases ----------------------------------------------
