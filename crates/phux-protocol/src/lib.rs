@@ -28,7 +28,7 @@
 // The wire codec and its input atoms are libghostty-free (ADR-0024) and so
 // build for any target, including wasm browser consumers. libghostty
 // conversions for the atoms live behind the `server` feature. The policy
-// vocabulary (ALPN constants, peer-identity/audit types) is likewise on the
+// vocabulary (ALPN constants, peer identity, capabilities) is likewise on the
 // ungated shell: it is pure std/serde, and the wire crate must own the ALPN
 // bytes for consumers like `phux-dial` that deliberately stay off the
 // `server` feature.
@@ -103,7 +103,7 @@ pub use wire::frame::{
 /// Older clients and servers remain valid but MUST negotiate the capability
 /// before using the new command.
 ///
-/// Bumped from `0.6.0` to `0.7.0` by ADR-0067: `TERMINAL_SNAPSHOT` (`0x91`)
+/// Bumped from `0.6.0` to `0.7.0` by ADR-0070: `TERMINAL_SNAPSHOT` (`0x91`)
 /// is permanently retired. Explicit native/compatibility profile negotiation,
 /// generation-bound bootstrap/history streams, and READY-fenced attach replace
 /// synthesized snapshot ordering. Protocol 0.6 and 0.7 peers reject each other.

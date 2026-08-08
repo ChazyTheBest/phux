@@ -73,8 +73,8 @@ client logic, not a wire-level lifecycle entity.
 
 A consumer that doesn't want this vocabulary doesn't have to learn it;
 the substrate doesn't carry it. `GroupId` survives only as a
-documented opaque grouping key, not a lifecycle tier — its full removal is
-tracked by bead phux-0bmc.
+documented opaque grouping key, not a lifecycle tier — settled, not a
+remnant awaiting removal (bead phux-0bmc closed as resolved-by-rename).
 
 ---
 
@@ -212,9 +212,8 @@ phux host <add|ls|rm>         # one namespace over both machine registries
                               # satellite the peers a federation hub dials;
                               # aliases: list, remove). Formerly the
                               # separate `phux remote`, `phux satellite`,
-                              # and top-level `phux enroll` verbs, which
-                              # remain hidden deprecated aliases for one
-                              # release cycle (ADR-0066)
+                              # and top-level `phux enroll` verbs, absorbed
+                              # into this one namespace (ADR-0066)
 phux service <install|uninstall|status|logs|prune-logs>
                               # per-user service unit (launchd LaunchAgent on
                               # macOS, systemd user unit on Linux) that keeps
@@ -264,8 +263,7 @@ implicitly spawn. `--split` is the same axis flag `spawn` and `launch` take
 (`h` / `v` are accepted shorthands); omitted, it defaults to horizontal (a
 horizontal divider, so panes are stacked), while `--split vertical` means a
 vertical divider and side-by-side panes. The pre-unification boolean
-`--horizontal` / `--vertical` spellings still parse for one release, hidden
-from help and each printing a one-line deprecation warning. `R` defaults to
+`--horizontal` / `--vertical` spellings have been removed. `R` defaults to
 `0.5`; ratios must be finite and strictly between zero and one, checked at
 parse time. `move-pane SOURCE TARGET` accepts the same user-facing direction
 and ratio flags. A cross-session move preserves the Terminal's process, PTY, scrollback,

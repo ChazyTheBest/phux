@@ -1,7 +1,7 @@
 ---
 audience: contributors, agents
 stability: evolving
-last-reviewed: 2026-08-02
+last-reviewed: 2026-08-07
 ---
 
 # Operations
@@ -235,6 +235,59 @@ cargo nextest run -p phux-server server_idle_exit
 cargo test -p phux --test idle_exit_e2e -- --ignored
 ```
 
+## Service-managed pane environment
+
+`phux service install` (ADR-0055) runs the server under launchd or
+systemd, both of which start their unit with a minimal environment: no
+login shell ever ran, so `PATH` additions a Homebrew or Nix installer
+put in `~/.zprofile` / `~/.profile` never take effect. Left alone, every
+pane the server spawns would inherit that minimal `PATH` — `nvim` and
+`brew` reporting "command not found" even though an ordinary interactive
+shell on the same machine has them. [ADR-0073](../ADR/0073-service-managed-pane-login-shell.md)
+is the decision record; this is the operator-facing summary.
+
+**The fix is conditional, not a blanket default.** `phux service install`
+stamps `PHUX_SERVICE_MANAGED=1` into the unit it generates (both the
+launchd `EnvironmentVariables` dict and the systemd `Environment=`
+lines). `phux server` checks for that marker at its own startup and,
+only when present, spawns every command-less pane's shell in its
+platform **login** mode instead of a plain interactive shell:
+
+| shell        | login flag |
+|--------------|------------|
+| `bash`       | `-l`       |
+| `zsh`        | `-l`       |
+| `fish`       | `--login`  |
+| `sh`         | `-l`       |
+
+A `defaults.shell` naming anything else gets no login flag at all, even
+under a service-managed server — an unrecognized program has unknown
+flag semantics, and a pane that fails to spawn is a worse outcome than
+one whose profile did not run.
+
+**A hand-started server is unaffected.** `phux server` run directly from
+a terminal, or auto-spawned by a bare `phux`/`phux new`, never carries
+the marker and keeps spawning plain, non-login panes exactly as before —
+that environment is already profile-initialized, and re-sourcing it a
+second time is not idempotent for every setup (`nvm`/`rbenv`/`direnv`
+guards misfiring, not just PATH duplication). This is why the marker is
+something the installer writes and the server reads back, rather than a
+guess from environment shape (a short `PATH`, an unfamiliar parent
+process): the same markers that make a profile guard think
+initialization already happened (`NIX_PROFILES` and similar) would make
+a shape-based guess just as unreliable.
+
+**Applying the fix to an already-installed service** requires rerunning
+`phux service install`: the marker is only in units generated after this
+change, and the server reads it once, at its own startup.
+
+`phux service install` also never freezes the installing shell's own
+transient `PATH` into the generated unit — running the installer from
+inside `nix develop` or direnv leaves the unit exactly as portable as
+running it from a plain shell. The init system's own `PATH` reaches the
+server unmodified; login-shell treatment is how a *pane* recovers the
+profile's `PATH`, not a baked-in snapshot of the installer's.
+
 ## Workspace continuity and update survival
 
 phux has two different continuity mechanisms. They are intentionally separate:
@@ -249,6 +302,19 @@ phux has two different continuity mechanisms. They are intentionally separate:
   existing PTYs alive across a server binary re-exec. Its e2e drill is
   `cargo test -p phux --test upgrade_e2e -- --ignored`, which checks that a
   pane child PID and scrollback marker survive the upgrade.
+- **Release update:** `phux update` is the user-facing verb built on that
+  handoff. It resolves the published release, verifies the `.sha256` sidecar
+  before unpacking, replaces the binaries atomically, and then calls the
+  `phux upgrade` path so panes survive. It writes only to installs it
+  maintains — a Homebrew, Cargo, or Nix install gets the exact native command
+  instead, and an unrecognized location is refused rather than overwritten
+  ([ADR-0074](../ADR/0074-self-update-trust-boundary.md), operator guide in
+  [`INSTALL.md`](./INSTALL.md#updating)). The compatibility unit is the
+  release: a server, its local clients, its satellites, and its relays must all
+  run the same one, because a wire `minor` bump refuses mismatched peers at
+  HELLO with no grace window
+  ([ADR-0061](../ADR/0061-capabilities-add-versions-break.md),
+  [ADR-0071](../ADR/0071-what-phux-1-0-commits-to.md)).
 
 The workspace archive stores sessions, windows, pane metadata, cwd, dimensions,
 and split-layout shape where the server reports it. Restore currently recreates
@@ -305,8 +371,7 @@ phux service install --hub
 phux host enroll --role satellite user@devbox
 ```
 
-(Formerly `phux satellite enroll`; the old spelling remains a hidden
-deprecated alias for one release cycle — see
+(Formerly `phux satellite enroll`, a spelling since removed — see
 [ADR-0066](../ADR/0066-host-namespace.md).)
 
 `host enroll --role satellite` verifies the remote binary, installs its service, runs

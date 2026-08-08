@@ -134,7 +134,7 @@ pub const TYPE_PONG: u8 = 0xFF;
 /// bytes and are never capability-rewritten.
 pub const TYPE_TERMINAL_OUTPUT: u8 = 0x90;
 // 0x91 was `TERMINAL_SNAPSHOT` through protocol 0.6. It is permanently
-// retired by ADR-0067 and MUST NOT be decoded or reassigned.
+// retired by ADR-0070 and MUST NOT be decoded or reassigned.
 /// Discriminant for `BOOTSTRAP_BEGIN` (server to client, `docs/spec/L1.md` §4.3).
 pub const TYPE_BOOTSTRAP_BEGIN: u8 = 0x93;
 /// Discriminant for `BOOTSTRAP_CHUNK` (server to client, `docs/spec/L1.md` §4.3).
@@ -268,7 +268,7 @@ pub const TERMINAL_AGENT_KEY: &str = "phux.agent/v1";
 /// Conventional Terminal-scoped provenance for provider-native session resume.
 ///
 /// Value: bounded UTF-8 JSON `{plugin_id, integration_id, native_id}` owned by
-/// ADR-0067. `SPAWN_TERMINAL.agent_session` may install these opaque bytes
+/// ADR-0068. `SPAWN_TERMINAL.agent_session` may install these opaque bytes
 /// atomically with a local spawn; ordinary L3 reads and writes use this key.
 pub const TERMINAL_AGENT_SESSION_KEY: &str = "phux.agent-session/v1";
 /// Maximum encoded `phux.agent-session/v1` record accepted by server mutations.
@@ -744,6 +744,15 @@ pub enum ErrorCode {
     InputLeaseHeld = 204,
     /// Input reached the pane write path, but final PTY delivery is unknown.
     InputDeliveryUnknown = 205,
+    /// phux-mjmc: the pane's line discipline is in canonical mode
+    /// (`ICANON`) and the input batch's encoded PTY bytes contain a line
+    /// longer than the pane's canonical-line limit with no terminator to
+    /// flush it. Writing it would have silently truncated at the kernel's
+    /// canonical queue boundary instead of delivering it — refused before
+    /// any bytes reached the pane. Distinct from [`Self::InputDeliveryUnknown`]:
+    /// that code means delivery could not be *confirmed*; this one means
+    /// delivery is *known* to be unsafe and nothing was written.
+    CanonicalLimitExceeded = 206,
 
     /// Catch-all for unexpected server-side failures. Carries
     /// `u16::MAX = 65535` on the wire.
@@ -781,6 +790,7 @@ impl ErrorCode {
             203 => Self::UnsafePaste,
             204 => Self::InputLeaseHeld,
             205 => Self::InputDeliveryUnknown,
+            206 => Self::CanonicalLimitExceeded,
             65535 => Self::InternalError,
             _ => return None,
         })
@@ -1064,7 +1074,7 @@ pub enum SpawnError {
     /// server cannot route to it: it is not a federation hub, or the host
     /// is absent from its satellite registry (phux-v45.6). The spawn-reply
     /// mirror of `ErrorCode::UnsupportedSatelliteRoute` — a configuration
-    /// refusal, fixed by `phux server --hub` / `phux satellite add`.
+    /// refusal, fixed by `phux server --hub` / `phux host add --role satellite`.
     UnsupportedSatelliteRoute,
     /// The spawn named a satellite this hub dials, but the link is down,
     /// dialing, refused fail-closed, or did not answer within the relay
@@ -1800,7 +1810,7 @@ pub enum AgentEvent {
 /// The phux-6yl.4 scaffold populated `Hello`, `Ping`, and `PaneDiff`. The
 /// phux-4az pass added the message-catalog variants needed for the attach
 /// lifecycle. Protocol 0.7 replaces the retired synthesized snapshot frame with
-/// explicit bootstrap/profile/history frames from ADR-0067. `TerminalOutput`
+/// explicit bootstrap/profile/history frames from ADR-0070. `TerminalOutput`
 /// remains VT bytes, now bound to a non-zero stream and bootstrap generation.
 ///
 /// [ADR-0013]: https://github.com/phall1/phux/blob/main/ADR/0013-libghostty-bytes-on-wire.md

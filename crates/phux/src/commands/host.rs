@@ -280,6 +280,7 @@ struct AddArgs<'a> {
 
 /// One merged view of an entry from either registry, shaped for the table
 /// and the JSON document.
+#[derive(Debug)]
 struct HostRow {
     name: String,
     role: HostRole,
@@ -591,14 +592,34 @@ fn finish_enroll(
     pairing: Option<&enroll::PairReport>,
     session: Option<&str>,
 ) -> Result<HostRow, CliError> {
+    finish_enroll_in(
+        &phux_server::telemetry::state_dir(),
+        role,
+        name,
+        endpoint,
+        pairing,
+        session,
+    )
+}
+
+/// [`finish_enroll`] with the state directory injectable, so a test can
+/// drive the validate-before-write ordering (phux-522) against a tempdir
+/// instead of the operator's real `$XDG_STATE_HOME` — this crate forbids
+/// `unsafe`, so `env::set_var` (unsafe under edition 2024) is not an option
+/// for pointing `phux_server::telemetry::state_dir()` elsewhere.
+fn finish_enroll_in(
+    state_dir: &Path,
+    role: HostRole,
+    name: &str,
+    endpoint: &str,
+    pairing: Option<&enroll::PairReport>,
+    session: Option<&str>,
+) -> Result<HostRow, CliError> {
     // The token is only meaningful for a dialed transport; an ssh:// entry
     // rides ssh trust and must not leave a stray credential on disk.
-    let token_file = (pairing.is_some() && !endpoint.starts_with("ssh://")).then(|| {
-        let state_dir = phux_server::telemetry::state_dir();
-        match role {
-            HostRole::Remote => enroll::token_path(&state_dir, name),
-            HostRole::Satellite => enroll::satellite_token_path(&state_dir, name),
-        }
+    let token_file = (pairing.is_some() && !endpoint.starts_with("ssh://")).then(|| match role {
+        HostRole::Remote => enroll::token_path(state_dir, name),
+        HostRole::Satellite => enroll::satellite_token_path(state_dir, name),
     });
     let cert_fingerprint = pairing.and_then(|report| report.cert_fingerprint.as_deref());
 
@@ -958,201 +979,13 @@ fn run_remove(name: &str, role: Option<HostRole>, json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-// ---------------------------------------------------------------------------
-// Deprecated aliases (ADR-0066, phux-i0e8.12.4): `phux remote`,
-// `phux satellite`, and top-level `phux enroll` are hidden spellings of
-// `phux host` for one release cycle. Each dispatches through `run_host`
-// after printing ONE stderr deprecation line naming the visible
-// replacement — suppressed under `--json`, where stderr is reserved for the
-// one-line error contract and stdout for the document.
-// ---------------------------------------------------------------------------
-
-/// Run a deprecated top-level spelling through its `host` implementation.
-///
-/// `main`'s dispatch routes exactly the three hidden aliases here; anything
-/// else is an internal wiring error, reported rather than panicked on.
-pub(crate) fn run_deprecated_alias(command: super::Command) -> ExitCode {
-    let Some((action, note)) = deprecated_alias(command) else {
-        eprintln!("phux: internal error: verb routed as a deprecated alias has no host mapping");
-        return ExitCode::FAILURE;
-    };
-    if !action_json(&action) {
-        eprintln!("{note}");
-    }
-    run_host(&action)
-}
-
-/// The `--json` bit of a mapped action. The deprecation note is suppressed
-/// under `--json`: stdout must carry only the document, and a failure must
-/// be ONE stderr contract line — a prose note would contaminate both
-/// consumers' parsers.
-const fn action_json(action: &HostAction) -> bool {
-    match action {
-        HostAction::Add { json, .. }
-        | HostAction::Enroll { json, .. }
-        | HostAction::List { json, .. }
-        | HostAction::Remove { json, .. } => json.json,
-    }
-}
-
-/// The one-line stderr warning for a deprecated spelling, naming the exact
-/// visible replacement. Pinned to one line so scripts see a single,
-/// greppable warning (the `--split` precedent).
-fn deprecation_line(old: &str, new: &str) -> String {
-    format!("phux: `{old}` is deprecated and will be removed; use `{new}`")
-}
-
-/// Map a deprecated top-level spelling onto the `host` action it aliases,
-/// plus its deprecation line. The mapping is the ADR-0066 alias table,
-/// row for row. `None` for a command that is not one of the three hidden
-/// aliases. `pub(crate)` so the dispatch tests in `main.rs` can pin the
-/// table against parsed invocations.
-pub(crate) fn deprecated_alias(command: super::Command) -> Option<(HostAction, String)> {
-    use super::Command;
-    match command {
-        Command::Enroll {
-            host,
-            name,
-            endpoint,
-            quic_port,
-            no_service,
-            ssh_only,
-            session,
-        } => Some((
-            HostAction::Enroll {
-                host,
-                role: HostRole::Remote,
-                name,
-                endpoint,
-                quic_port,
-                no_service,
-                ssh_only,
-                session,
-                json: JsonOpt { json: false },
-            },
-            deprecation_line("phux enroll", "phux host enroll"),
-        )),
-        Command::Remote { action } => Some(remote_alias(action)),
-        Command::Satellite { action } => Some(satellite_alias(action)),
-        _ => None,
-    }
-}
-
-/// The `phux remote` rows of the alias table (role `remote`, the default,
-/// so the replacement spellings carry no `--role` flag).
-fn remote_alias(action: super::RemoteAction) -> (HostAction, String) {
-    use super::RemoteAction;
-    match action {
-        RemoteAction::Add {
-            name,
-            endpoint,
-            token_file,
-            cert_fingerprint,
-            session,
-        } => (
-            HostAction::Add {
-                name,
-                endpoint,
-                role: HostRole::Remote,
-                token_file,
-                cert_fingerprint,
-                session,
-                disabled: false,
-                json: JsonOpt { json: false },
-            },
-            deprecation_line("phux remote add", "phux host add"),
-        ),
-        RemoteAction::List { json } => (
-            HostAction::List {
-                role: Some(HostRole::Remote),
-                json: JsonOpt { json },
-            },
-            deprecation_line("phux remote list", "phux host ls"),
-        ),
-        RemoteAction::Remove { name } => (
-            HostAction::Remove {
-                name,
-                role: Some(HostRole::Remote),
-                json: JsonOpt { json: false },
-            },
-            deprecation_line("phux remote remove", "phux host rm"),
-        ),
-    }
-}
-
-/// The `phux satellite` rows of the alias table: every replacement carries
-/// `--role satellite`, and the satellite-only surface (`--disabled`, no
-/// `--session`) maps unchanged.
-fn satellite_alias(action: super::SatelliteAction) -> (HostAction, String) {
-    use super::SatelliteAction;
-    match action {
-        SatelliteAction::List { json } => (
-            HostAction::List {
-                role: Some(HostRole::Satellite),
-                json: JsonOpt { json },
-            },
-            deprecation_line("phux satellite list", "phux host ls --role satellite"),
-        ),
-        SatelliteAction::Enroll {
-            host,
-            name,
-            endpoint,
-            quic_port,
-            no_service,
-            ssh_only,
-            json,
-        } => (
-            HostAction::Enroll {
-                host,
-                role: HostRole::Satellite,
-                name,
-                endpoint,
-                quic_port,
-                no_service,
-                ssh_only,
-                session: None,
-                json: JsonOpt { json },
-            },
-            deprecation_line("phux satellite enroll", "phux host enroll --role satellite"),
-        ),
-        SatelliteAction::Add {
-            name,
-            endpoint,
-            disabled,
-            token_file,
-            cert_fingerprint,
-            json,
-        } => (
-            HostAction::Add {
-                name,
-                endpoint,
-                role: HostRole::Satellite,
-                token_file,
-                cert_fingerprint,
-                session: None,
-                disabled,
-                json: JsonOpt { json },
-            },
-            deprecation_line("phux satellite add", "phux host add --role satellite"),
-        ),
-        SatelliteAction::Remove { name, json } => (
-            HostAction::Remove {
-                name,
-                role: Some(HostRole::Satellite),
-                json: JsonOpt { json },
-            },
-            deprecation_line("phux satellite remove", "phux host rm --role satellite"),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         HostRole, HostRow, auth_display, empty_state, enroll_failure_error, enroll_role_mismatch,
-        render_table, resolve_rm_role, role_flag_mismatch, sort_rows,
+        finish_enroll_in, render_table, resolve_rm_role, role_flag_mismatch, sort_rows,
     };
     use crate::commands::enroll::EnrollFailure;
     use crate::commands::json_err::codes;
@@ -1428,5 +1261,96 @@ mod tests {
 
         let satellites = empty_state(Some(HostRole::Satellite));
         assert!(satellites.contains("--role satellite"));
+    }
+
+    /// phux-522 regression: a name that would escape `<state>/remotes` via
+    /// `token_path`'s naive `join` (e.g. `../../evil`) must be rejected by
+    /// `NewRemote::new` before `finish_enroll` ever calls `write_token` — a
+    /// token written first and rejected second leaves a live bearer
+    /// credential sitting outside the registry's control.
+    ///
+    /// Drives [`finish_enroll_in`] against a tempdir rather than mutating
+    /// `$XDG_STATE_HOME` (this crate forbids `unsafe`, and `env::set_var`
+    /// is unsafe under edition 2024).
+    #[test]
+    fn enroll_rejects_a_traversal_name_before_writing_any_token() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let pairing = super::enroll::PairReport {
+            token: "deadbeef".to_owned(),
+            cert_fingerprint: Some("ab".repeat(32)),
+            overlay_addresses: vec!["100.64.0.2".to_owned()],
+        };
+        let err = finish_enroll_in(
+            state_dir.path(),
+            HostRole::Remote,
+            "../../evil",
+            "quic://mini:8788",
+            Some(&pairing),
+            None,
+        )
+        .expect_err("a traversal name must be refused");
+        assert_eq!(err.code, codes::REGISTRY);
+
+        // Nothing that looks like a bearer token landed anywhere under the
+        // (fake) state dir — not at the intended path, and not at the
+        // traversal target either.
+        let found: Vec<_> = walkdir_tokens(state_dir.path()).collect();
+        assert!(
+            found.is_empty(),
+            "rejection must not leave an orphaned token file: {found:?}"
+        );
+    }
+
+    /// phux-522 regression: a `quic://` endpoint with no `--cert-fingerprint`
+    /// fails `NewRemote::new`'s pin requirement (ADR-0038). That failure must
+    /// happen before `write_token`, or every rejected unpinned enrollment
+    /// leaves a 0600 bearer token on disk that nothing ever points at.
+    #[test]
+    fn enroll_rejects_unpinned_quic_before_writing_any_token() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+
+        let pairing = super::enroll::PairReport {
+            token: "deadbeef".to_owned(),
+            cert_fingerprint: None,
+            overlay_addresses: vec!["100.64.0.2".to_owned()],
+        };
+        let err = finish_enroll_in(
+            state_dir.path(),
+            HostRole::Remote,
+            "mini",
+            "quic://mini:8788",
+            Some(&pairing),
+            None,
+        )
+        .expect_err("an unpinned quic endpoint must be refused");
+        assert!(err.message.contains("--cert-fingerprint"), "got {err:?}");
+
+        let found: Vec<_> = walkdir_tokens(state_dir.path()).collect();
+        assert!(
+            found.is_empty(),
+            "rejection must not leave an orphaned token file: {found:?}"
+        );
+    }
+
+    /// Every `*.token` file under `root`, walked without pulling in a full
+    /// directory-walking crate for two tests.
+    fn walkdir_tokens(root: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+        fn visit(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "token") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, &mut out);
+        out.into_iter()
     }
 }

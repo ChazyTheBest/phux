@@ -19,6 +19,9 @@
 //! (via `#[path]`) to read the same table the binary was compiled with.
 
 /// Which kind of hidden surface carries an old spelling.
+// No variant is constructed while `DEPRECATED` is empty; both stay live for
+// the next row (a hidden verb or a hidden flag) that needs one.
+#[allow(dead_code, reason = "constructed by the next row added to DEPRECATED")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeprecatedSurface {
     /// A hidden top-level verb (ADR-0066): the whole subcommand path is
@@ -93,136 +96,119 @@ impl Deprecation {
     }
 }
 
-/// Every deprecated spelling the binary currently accepts, in page order:
-/// the ADR-0066 machine-registry verbs absorbed into `phux host`, then the
-/// split booleans absorbed into `--split` (phux-i0e8.8.4).
-pub(crate) const DEPRECATED: &[Deprecation] = &[
-    Deprecation {
+/// Every deprecated spelling the binary currently accepts.
+///
+/// Empty: the ADR-0066 machine-registry verbs (`remote`, `satellite`,
+/// top-level `enroll`) and the split booleans (`--horizontal`/`--vertical`,
+/// phux-i0e8.8.4) that once lived here were removed in v0.12.1, once their
+/// `removed_in` release shipped. The table, and every consumer that reads
+/// it (the audit in `tests/deprecated_aliases.rs`, the generated
+/// `docs/reference/deprecations.md`, and the clap-tree pin test in
+/// `main.rs`), stay wired up for the next spelling that needs one release
+/// cycle of warning before it goes.
+pub(crate) const DEPRECATED: &[Deprecation] = &[];
+
+/// One spelling that is gone: what it was, what replaced it, and when it
+/// went.
+///
+/// A removed spelling no longer parses, so clap answers it with a generic
+/// nearest-match — which is actively misleading here, because the nearest
+/// string is rarely the right migration (`phux remote add` resolved to
+/// "a similar subcommand exists: `rename`"). These rows let the parse
+/// error name the actual replacement for a release or two after removal,
+/// after which the row ages out and clap's ordinary message is the honest
+/// answer.
+pub(crate) struct Removal {
+    /// The kind of surface the old spelling was.
+    pub(crate) surface: DeprecatedSurface,
+    /// The old spelling as the user typed it, in the same shape as
+    /// [`Deprecation::old`]: `phux remote add`, or a verb followed by the
+    /// removed long flag.
+    pub(crate) old: &'static str,
+    /// The visible replacement spelling.
+    pub(crate) new: &'static str,
+    /// The release the spelling stopped parsing in.
+    pub(crate) removed_in: &'static str,
+}
+
+impl Removal {
+    /// The first subcommand word of a [`DeprecatedSurface::Verb`] row
+    /// (`"phux remote add"` yields `Some("remote")`); `None` on flag rows.
+    /// This is what clap reports back as the invalid subcommand.
+    pub(crate) fn old_root_verb(&self) -> Option<&'static str> {
+        match self.surface {
+            DeprecatedSurface::Verb => self.old.split_whitespace().nth(1),
+            DeprecatedSurface::Flag => None,
+        }
+    }
+
+    /// The removed long flag of a [`DeprecatedSurface::Flag`] row
+    /// (`Some("--horizontal")`); `None` on verb rows.
+    pub(crate) fn old_flag(&self) -> Option<&'static str> {
+        self.old
+            .split_whitespace()
+            .next_back()
+            .filter(|word| word.starts_with("--"))
+    }
+
+    /// The verb a [`DeprecatedSurface::Flag`] row's flag hung off
+    /// (`"phux insert-pane --horizontal"` yields `Some("insert-pane")`).
+    pub(crate) fn flag_verb(&self) -> Option<&'static str> {
+        match self.surface {
+            DeprecatedSurface::Flag => self.old.split_whitespace().nth(1),
+            DeprecatedSurface::Verb => None,
+        }
+    }
+}
+
+/// Every spelling removed recently enough that naming its replacement in a
+/// parse error still helps someone upgrading.
+///
+/// Rows are dropped once the release that removed them is far enough back
+/// that anyone still typing the old spelling is not mid-upgrade — at which
+/// point clap's generic message is the honest answer and this table should
+/// shrink rather than accumulate.
+pub(crate) const REMOVED: &[Removal] = &[
+    Removal {
         surface: DeprecatedSurface::Verb,
-        old: "phux remote add",
-        new: "phux host add",
-        note: "phux: `phux remote add` is deprecated and will be removed; use `phux host add`",
-        setup_argv: &[],
-        example_argv: &["remote", "add", "mini", "ssh://mini"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
+        old: "phux remote",
+        new: "phux host",
+        removed_in: "v0.12.1",
     },
-    Deprecation {
+    Removal {
         surface: DeprecatedSurface::Verb,
-        old: "phux remote list",
-        new: "phux host ls",
-        note: "phux: `phux remote list` is deprecated and will be removed; use `phux host ls`",
-        setup_argv: &[],
-        example_argv: &["remote", "list"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
+        old: "phux satellite",
+        new: "phux host --role satellite",
+        removed_in: "v0.12.1",
     },
-    Deprecation {
-        surface: DeprecatedSurface::Verb,
-        old: "phux remote remove",
-        new: "phux host rm",
-        note: "phux: `phux remote remove` is deprecated and will be removed; use `phux host rm`",
-        setup_argv: &["host", "add", "mini", "ssh://mini"],
-        example_argv: &["remote", "remove", "mini"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
-    },
-    Deprecation {
-        surface: DeprecatedSurface::Verb,
-        old: "phux satellite add",
-        new: "phux host add --role satellite",
-        note: "phux: `phux satellite add` is deprecated and will be removed; \
-               use `phux host add --role satellite`",
-        setup_argv: &[],
-        example_argv: &["satellite", "add", "edge", "ssh://edge"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
-    },
-    Deprecation {
-        surface: DeprecatedSurface::Verb,
-        old: "phux satellite list",
-        new: "phux host ls --role satellite",
-        note: "phux: `phux satellite list` is deprecated and will be removed; \
-               use `phux host ls --role satellite`",
-        setup_argv: &[],
-        example_argv: &["satellite", "list"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
-    },
-    Deprecation {
-        surface: DeprecatedSurface::Verb,
-        old: "phux satellite enroll",
-        new: "phux host enroll --role satellite",
-        note: "phux: `phux satellite enroll` is deprecated and will be removed; \
-               use `phux host enroll --role satellite`",
-        setup_argv: &[],
-        example_argv: &["satellite", "enroll", "edge", "--ssh-only"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
-    },
-    Deprecation {
-        surface: DeprecatedSurface::Verb,
-        old: "phux satellite remove",
-        new: "phux host rm --role satellite",
-        note: "phux: `phux satellite remove` is deprecated and will be removed; \
-               use `phux host rm --role satellite`",
-        setup_argv: &["host", "add", "edge", "ssh://edge", "--role", "satellite"],
-        example_argv: &["satellite", "remove", "edge"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
-    },
-    Deprecation {
+    Removal {
         surface: DeprecatedSurface::Verb,
         old: "phux enroll",
         new: "phux host enroll",
-        note: "phux: `phux enroll` is deprecated and will be removed; use `phux host enroll`",
-        setup_argv: &[],
-        example_argv: &["enroll", "me@mini", "--ssh-only"],
-        deprecated_in: "v0.10.0",
-        removed_in: "v0.12.0",
+        removed_in: "v0.12.1",
     },
-    Deprecation {
+    Removal {
         surface: DeprecatedSurface::Flag,
         old: "phux insert-pane --horizontal",
         new: "phux insert-pane --split horizontal",
-        note: "phux: --horizontal is deprecated and will be removed; \
-               use `--split horizontal` (or `--split h`)",
-        setup_argv: &[],
-        example_argv: &["insert-pane", "%1", "%2", "--horizontal"],
-        deprecated_in: "v0.9.0",
-        removed_in: "v0.12.0",
+        removed_in: "v0.12.1",
     },
-    Deprecation {
+    Removal {
         surface: DeprecatedSurface::Flag,
         old: "phux insert-pane --vertical",
         new: "phux insert-pane --split vertical",
-        note: "phux: --vertical is deprecated and will be removed; \
-               use `--split vertical` (or `--split v`)",
-        setup_argv: &[],
-        example_argv: &["insert-pane", "%1", "%2", "--vertical"],
-        deprecated_in: "v0.9.0",
-        removed_in: "v0.12.0",
+        removed_in: "v0.12.1",
     },
-    Deprecation {
+    Removal {
         surface: DeprecatedSurface::Flag,
         old: "phux move-pane --horizontal",
         new: "phux move-pane --split horizontal",
-        note: "phux: --horizontal is deprecated and will be removed; \
-               use `--split horizontal` (or `--split h`)",
-        setup_argv: &[],
-        example_argv: &["move-pane", "%1", "%2", "--horizontal"],
-        deprecated_in: "v0.9.0",
-        removed_in: "v0.12.0",
+        removed_in: "v0.12.1",
     },
-    Deprecation {
+    Removal {
         surface: DeprecatedSurface::Flag,
         old: "phux move-pane --vertical",
         new: "phux move-pane --split vertical",
-        note: "phux: --vertical is deprecated and will be removed; \
-               use `--split vertical` (or `--split v`)",
-        setup_argv: &[],
-        example_argv: &["move-pane", "%1", "%2", "--vertical"],
-        deprecated_in: "v0.9.0",
-        removed_in: "v0.12.0",
+        removed_in: "v0.12.1",
     },
 ];

@@ -327,7 +327,7 @@ ServerFeature = bitset (u32) {
     ACKNOWLEDGED_INPUT = 0x00000010, // APPLY_INPUT (L1.md §6.2.1; ADR-0053)
     FILE_UPLOAD        = 0x00000020, // PUT_FILE (L1.md §6.2.2; ADR-0059)
     MOVE_TERMINAL      = 0x00000040, // MOVE_TERMINAL (L1.md §3.1; ADR-0056)
-    TERMINAL_REPLY     = 0x00000080, // INPUT_TERMINAL_REPLY (L1.md §3.4; ADR-0067)
+    TERMINAL_REPLY     = 0x00000080, // INPUT_TERMINAL_REPLY (L1.md §3.4; ADR-0070)
 }
 
 EngineFeatureSet = bitset (u32) {
@@ -720,6 +720,14 @@ ErrorCode = enum {
                                  //   to an existing input-lease holder
     INPUT_DELIVERY_UNKNOWN = 205,// APPLY_INPUT reached PTY handoff but write /
                                  //   flush completion is indeterminate
+    CANONICAL_LIMIT_EXCEEDED = 206, // phux-mjmc: the pane is in canonical
+                                 //   (ICANON) mode and the batch's encoded
+                                 //   bytes contain a line longer than the
+                                 //   pane's canonical-line limit with no
+                                 //   terminator; refused before any bytes
+                                 //   were written, distinct from 205 (that
+                                 //   code means delivery is unconfirmed,
+                                 //   this one means delivery is known unsafe)
 
     INTERNAL_ERROR       = 65535,
 }

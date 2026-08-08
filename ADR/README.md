@@ -60,7 +60,7 @@ amends / extends) are hand-curated from each ADR's body.
 | [0026](./0026-overlays-theme-stack-single-dispatch.md) | Overlays: one theme, a real stack, and a single dispatch path | Accepted (builds on [0020](./0020-layered-render.md)) |
 | [0027](./0027-terminal-references-and-l3-links.md) | Terminals are referenced, not owned: views, links, and L3 tags | Accepted (builds on [0017](./0017-tui-not-protocol-privileged.md), [0015](./0015-protocol-layering.md)) |
 | [0028](./0028-runtime-log-control.md) | Runtime log control | Accepted (forward-compat, builds on [0024](./0024-wire-owns-input-atoms.md)) |
-| [0029](./0029-one-cursor-authority-and-repaint-scheduler.md) | One cursor authority and a repaint scheduler | Accepted (forward-compat, extends [0020](./0020-layered-render.md)) |
+| [0029](./0029-one-cursor-authority-and-repaint-scheduler.md) | One cursor authority and a repaint scheduler | Accepted (extends [0020](./0020-layered-render.md); shipped — `end_of_frame_cursor` and the `RepaintLevel` accumulator both live, see [0046](./0046-server-side-agent-state-detection.md)) |
 | [0030](./0030-engine-delegated-wire-and-projection-consumers.md) | Engine-delegated wire and projection consumers | Accepted (supersedes the L2 tier of [0015](./0015-protocol-layering.md)) |
 | [0031](./0031-remote-consumer-auth-and-encryption.md) | Remote-consumer authentication and encryption (no SSH tunnel) | Proposed |
 | [0032](./0032-graceful-server-upgrade.md) | Graceful server upgrade (sessions survive a binary update) | Accepted |
@@ -99,9 +99,13 @@ amends / extends) are hand-curated from each ADR's body.
 | [0065](./0065-one-cli-grammar.md) | One CLI grammar | Accepted |
 | [0066](./0066-host-namespace.md) | One `phux host` namespace over the split machine registries | Accepted |
 | [0067](./0067-cache-preserving-agent-fleet-context.md) | Cache-preserving agent fleet context | Accepted (projects [0040](./0040-agent-identity-metadata.md)/[0046](./0046-server-side-agent-state-detection.md) into agent-host context without changing the wire) |
-| [0067](./0067-native-engine-state-bootstrap.md) | Native engine-state bootstrap and client-owned history | Accepted (replaces native clients' synthesized-VT bootstrap under [0013](./0013-libghostty-bytes-on-wire.md) with an opaque libghostty READY/history lifecycle; compatibility clients retain synthesized VT, and one PTY retains one authoritative geometry) |
 | [0068](./0068-native-agent-session-restore.md) | Native agent-session restore | Accepted (bridges [0040](./0040-agent-identity-metadata.md), [0042](./0042-launch-executor.md), and workspace archives through bounded L3 provenance; adds no wire under [0061](./0061-capabilities-add-versions-break.md)) |
 | [0069](./0069-generated-reference-docs.md) | Generated reference docs from the compiled binary | Accepted |
+| [0070](./0070-native-engine-state-bootstrap.md) | Native engine-state bootstrap and client-owned history | Accepted (replaces native clients' synthesized-VT bootstrap under [0013](./0013-libghostty-bytes-on-wire.md) with an opaque libghostty READY/history lifecycle; compatibility clients retain synthesized VT, and one PTY retains one authoritative geometry) |
+| [0071](./0071-what-phux-1-0-commits-to.md) | What phux 1.0 commits to | Proposed (freezes the consumer surface under semver while the wire keeps its own `0.x` line per [0061](./0061-capabilities-add-versions-break.md)) |
+| [0072](./0072-prune-policy-vocabulary-keep-the-seam.md) | Prune the policy vocabulary, keep the authorization seam | Proposed (prunes the unreferenced half of the vocabulary [0031](./0031-remote-consumer-auth-and-encryption.md) introduced, and keeps the HELLO seam a post-1.0 paired-workload feature must implement) |
+| [0073](./0073-service-managed-pane-login-shell.md) | Login-shell semantics for service-managed pane spawns | Accepted (closes the environment gap [0055](./0055-always-on-server-and-ssh-bootstrapped-enrollment.md)'s generated unit opened) |
+| [0074](./0074-self-update-trust-boundary.md) | The self-update trust boundary | Accepted (checksum-gated, atomic, never mutates an install another tool owns; delivers the one-command update path [0071](./0071-what-phux-1-0-commits-to.md) puts in 1.0 scope) |
 
 ## When to write an ADR
 
