@@ -160,6 +160,12 @@ pub(super) struct DispatchCtx<'a> {
     /// the per-frame `sidebar` reservation after dispatch so the toggle repaint
     /// reflects the new state. Owned by the driver like `zoomed`.
     pub sidebar_enabled: &'a mut bool,
+    /// The configured sidebar width in columns, whether or not the strip
+    /// is currently shown. `toggle-sidebar` needs it to answer "would
+    /// turning this on actually change anything at this terminal size?"
+    /// before flipping a flag whose effect the driver would then fold
+    /// away — see the `toggle-sidebar` arm of [`run_action`].
+    pub sidebar_width: u16,
     /// phux-foz.9: the window index of each sidebar agents-section row, in
     /// display order — the same list the strip painter rendered from
     /// ([`crate::render::chrome::sidebar::SidebarPainter::agent_windows`]).
@@ -1356,16 +1362,29 @@ fn bar_click_action(
     painter: Option<&crate::render::chrome::status_bar::StatusBarPainter>,
     x: u16,
 ) -> Option<phux_config::keybind::ResolvedAction> {
-    let index = painter?.window_hit_at(x)?;
-    let mut args = std::collections::BTreeMap::new();
-    args.insert(
-        "index".to_owned(),
-        toml::Value::Integer(i64::try_from(index).ok()?),
-    );
-    Some(phux_config::keybind::ResolvedAction {
-        action: "select-window".to_owned(),
-        args,
-    })
+    match painter?.hit_at(x)? {
+        phux_config::widget::CellHit::Window(index) => {
+            let mut args = std::collections::BTreeMap::new();
+            args.insert(
+                "index".to_owned(),
+                toml::Value::Integer(i64::try_from(index).ok()?),
+            );
+            Some(phux_config::keybind::ResolvedAction {
+                action: "select-window".to_owned(),
+                args,
+            })
+        }
+        // The `switch` chip opens the fleet dashboard — the same overlay
+        // `prefix A` opens, through the same dispatch path. It is the
+        // right target for a pointer because it is the *only* switcher
+        // that answers all three questions at once (which sessions, which
+        // windows, which agent needs me), and on the narrow terminal
+        // where the chip is shown that is the whole point.
+        phux_config::widget::CellHit::Switch => Some(phux_config::keybind::ResolvedAction {
+            action: "agent-fleet".to_owned(),
+            args: std::collections::BTreeMap::new(),
+        }),
+    }
 }
 
 /// phux-wrnm: push `spec` as a context menu anchored at the viewport cell
@@ -2605,11 +2624,27 @@ fn run_action(
             }
         }
         "toggle-sidebar" => {
-            // phux-4h5a: show/hide the window sidebar. Unconditional (unlike
-            // zoom, which needs >1 pane) — the strip lists windows and is
-            // meaningful even single-pane. The driver owns `sidebar_enabled`;
-            // we signal intent + a repaint so the panes reflow into/out of the
-            // reserved columns.
+            // The strip costs its width off every pane. On a terminal too
+            // narrow to afford it and still leave a usable pane area, the
+            // driver's reservation folds to `None` — so turning it "on"
+            // would change nothing on screen and the keypress would read
+            // as broken. Refuse with the bell instead, the same way zoom
+            // refuses on a single-pane window: a refusal you can hear
+            // beats a toggle that silently does nothing.
+            //
+            // Turning it *off* is always allowed: that direction never
+            // needs room, and a user shrinking their terminal must be
+            // able to reclaim the columns.
+            let width = ctx.sidebar_width;
+            if !*ctx.sidebar_enabled
+                && ctx.viewport.0 < width.saturating_add(crate::attach::paint::MIN_PANE_COLS)
+            {
+                effects.bell = true;
+                return effects;
+            }
+            // phux-4h5a: show/hide the window sidebar. The driver owns
+            // `sidebar_enabled`; we signal intent + a repaint so the panes
+            // reflow into/out of the reserved columns.
             // phux-4h5a P4 follow-up: a `focus-window`-by-index action (the
             // keyboard companion to clicking a strip row) is deferred; the
             // existing `select-window` jumps by tab position, but a strip-row
@@ -3326,6 +3361,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -3828,6 +3864,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -3897,6 +3934,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -4001,6 +4039,7 @@ mod tests {
                 zoomed: &mut zoomed,
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
+                sidebar_width: 20,
                 sidebar_agents: &[],
                 bar: None,
                 status_bar: None,
@@ -4168,6 +4207,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -4599,6 +4639,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5084,6 +5125,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5174,6 +5216,7 @@ mod tests {
                 zoomed: &mut zoomed,
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
+                sidebar_width: 20,
                 sidebar_agents: &[],
                 bar: None,
                 status_bar: None,
@@ -5352,6 +5395,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5468,6 +5512,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5633,6 +5678,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5836,6 +5882,7 @@ mod tests {
                 width: 20,
             }),
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: Some(crate::render::chrome::status_bar::Position::Bottom),
             status_bar: None,
@@ -6054,6 +6101,7 @@ mod tests {
                 zoomed: &mut zoomed,
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
+                sidebar_width: 20,
                 sidebar_agents: &[],
                 bar: Some(position),
                 status_bar: with_painter.then_some(&painter),
@@ -6376,6 +6424,7 @@ mod tests {
                 zoomed: &mut zoomed,
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
+                sidebar_width: 20,
                 sidebar_agents: &[],
                 bar: None,
                 status_bar: None,
@@ -6859,6 +6908,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -7093,6 +7143,7 @@ mod tests {
             zoomed: &mut zoomed,
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
+            sidebar_width: 20,
             sidebar_agents: &[],
             bar: None,
             status_bar: None,

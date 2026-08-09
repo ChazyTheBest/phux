@@ -63,7 +63,7 @@ use super::input_dispatch::{
 };
 use super::paint::{
     SidebarEdge, SidebarReservation, content_rect, paint_bar_after_pane, paint_chrome_in_place,
-    paint_full_frame,
+    paint_full_frame, sidebar_reservation,
 };
 use super::plugin_actions::{self, PluginActionEntry, PluginRunResult};
 use super::plugin_panes;
@@ -1233,16 +1233,17 @@ pub async fn run_headless_rendered(
     // `None`, keeping the rendered frame byte-identical to the pre-sidebar one.
     let headless_cfg = phux_config::loader::load().ok();
     let sidebar_cfg = headless_cfg.as_ref().map(|c| c.sidebar.clone());
-    let sidebar = sidebar_cfg
-        .as_ref()
-        .filter(|c| c.enabled)
-        .map(|c| SidebarReservation {
-            edge: match c.position {
+    let sidebar = sidebar_cfg.as_ref().and_then(|c| {
+        sidebar_reservation(
+            viewport_dims.0,
+            c.enabled,
+            c.width,
+            match c.position {
                 SidebarPosition::Right => SidebarEdge::Right,
                 SidebarPosition::Left => SidebarEdge::Left,
             },
-            width: c.width,
-        });
+        )
+    });
     let sidebar_theme = headless_cfg
         .as_ref()
         .map_or_else(crate::render::Theme::default, |c| {
@@ -2278,10 +2279,12 @@ async fn main_loop<W: super::RenderSink>(
     // `handle_server_frame` runs exactly once, in one place. The sidebar
     // reservation for this bootstrap frame (recomputed per-iteration in the
     // loop below to track `toggle-sidebar`).
-    let sidebar = sidebar_enabled.then_some(SidebarReservation {
-        edge: sidebar_edge,
-        width: sidebar_width,
-    });
+    let sidebar = sidebar_reservation(
+        viewport_dims.0,
+        sidebar_enabled,
+        sidebar_width,
+        sidebar_edge,
+    );
     let outcome = handle_server_frame(
         &mut engine_kernel,
         &mut kernel_effects,
@@ -2447,10 +2450,12 @@ async fn main_loop<W: super::RenderSink>(
         // the next iteration. `None` (the default) keeps `content_rect` the
         // full pane viewport, so the whole path is byte-identical when the
         // sidebar is off.
-        let sidebar = sidebar_enabled.then_some(SidebarReservation {
-            edge: sidebar_edge,
-            width: sidebar_width,
-        });
+        let sidebar = sidebar_reservation(
+            viewport_dims.0,
+            sidebar_enabled,
+            sidebar_width,
+            sidebar_edge,
+        );
         // phux-npb3: capture follows focus. Re-derive the outer-terminal
         // mouse-tracking DECSET from the focused pane's opt-out state every
         // iteration — one call site covers every way focus or the set can
@@ -2683,6 +2688,7 @@ async fn main_loop<W: super::RenderSink>(
                     zoomed: &mut zoomed,
                     sidebar,
                     sidebar_enabled: &mut sidebar_enabled,
+                    sidebar_width,
                     sidebar_agents: &sidebar_agent_rows,
                     bar: status_bar.as_ref().map(StatusBarPainter::position),
                     status_bar: status_bar.as_ref(),
@@ -2713,10 +2719,7 @@ async fn main_loop<W: super::RenderSink>(
                 // `sidebar_enabled`. Re-fold it into the reservation so the
                 // reflow + repaint below tile into the NEW content rect this
                 // iteration rather than waiting a frame.
-                let sidebar = sidebar_enabled.then_some(SidebarReservation {
-                    edge: sidebar_edge,
-                    width: sidebar_width,
-                });
+                let sidebar = sidebar_reservation(viewport_dims.0, sidebar_enabled, sidebar_width, sidebar_edge);
                 // phux-eb0: a committed `switch-session` ends this loop so
                 // the outer driver re-attaches. Return BEFORE any repaint
                 // — the new session's ATTACHED + snapshot will repaint.
@@ -3591,6 +3594,7 @@ async fn main_loop<W: super::RenderSink>(
                     zoomed: &mut zoomed,
                     sidebar,
                     sidebar_enabled: &mut sidebar_enabled,
+                    sidebar_width,
                     sidebar_agents: &sidebar_agent_rows,
                     bar: status_bar.as_ref().map(StatusBarPainter::position),
                     status_bar: status_bar.as_ref(),
@@ -3620,10 +3624,7 @@ async fn main_loop<W: super::RenderSink>(
                 // phux-4h5a: re-fold a `toggle-sidebar` flip into the
                 // reservation, same as the stdin arm, so the same-iteration
                 // repaint tiles into the new content rect.
-                let sidebar = sidebar_enabled.then_some(SidebarReservation {
-                    edge: sidebar_edge,
-                    width: sidebar_width,
-                });
+                let sidebar = sidebar_reservation(viewport_dims.0, sidebar_enabled, sidebar_width, sidebar_edge);
                 // phux-eb0: same switch-on-commit check as the stdin arm.
                 // A bare-ESC flush can carry the final chord of a
                 // `<leader> a` selection committed via Enter.
@@ -7070,6 +7071,141 @@ mod tests {
     /// Content written into the pane mirror, to prove the base frame
     /// repainted around the floating modal.
     const PROBE_PANE_TEXT: &str = "PANE-BASE";
+
+    /// A composited frame — panes, dividers and the **shipped** status bar
+    /// — at an arbitrary viewport, replayed through the PTY-probe oracle.
+    ///
+    /// This is the closest the repo gets to "what is on the user's glass":
+    /// it runs the real `paint_full_frame` path with the bar built from
+    /// `default.toml`, so the shipped `[status]` lineup, the responsive
+    /// slot policy, and the widget-level shrink ladders are all exercised
+    /// together rather than one layer at a time.
+    fn shipped_frame_rows(view: (u16, u16), windows: &[WindowInfo]) -> Vec<String> {
+        let (cols, rows) = view;
+        let id = TerminalId::local(1);
+        let workspace = Workspace::single(id.clone());
+
+        let cfg = phux_config::parse_with_defaults("", std::path::Path::new("/nonexistent/c.toml"))
+            .expect("shipped defaults parse");
+        let mut status_bar = crate::attach::reload::compose_status_bar(&cfg, &[])
+            .expect("the shipped status lineup must build")
+            .expect("the shipped lineup is non-empty");
+        status_bar.set_windows(windows.to_vec());
+
+        // One row of the viewport belongs to the bar.
+        let pane_rows = rows.saturating_sub(1);
+        let mut panes: HashMap<TerminalId, PaneSlot> = HashMap::new();
+        panes.insert(
+            id.clone(),
+            PaneSlot::new_with_size(cols, pane_rows).expect("pane slot"),
+        );
+        let engine_kernel = published_test_kernel(&id, cols, pane_rows, PROBE_PANE_TEXT.as_bytes());
+
+        let mut out: Vec<u8> = Vec::new();
+        paint_full_frame(
+            &mut out,
+            &workspace.render_window(None).expect("layout"),
+            &mut panes,
+            &engine_kernel,
+            Some(&id),
+            view,
+            Some(&mut status_bar),
+            None,
+            None,
+            "phux",
+        );
+
+        let mut probe = PaneSlot::new_with_size(cols, rows).expect("probe slot");
+        probe.terminal.vt_write(&out);
+        let mut frame = phux_core::screen::RenderedFrame::blank(cols, rows);
+        probe
+            .renderer
+            .render_at_cells(&probe.terminal, &mut frame, (0, 0), (cols, rows))
+            .expect("project probe cells");
+        (0..rows)
+            .map(|r| {
+                let base = usize::from(r) * usize::from(cols);
+                frame.cells[base..base + usize::from(cols)]
+                    .iter()
+                    .map(|c| c.grapheme.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn probe_window(name: &str, active: bool) -> WindowInfo {
+        WindowInfo {
+            name: name.to_owned(),
+            active,
+            zoomed: false,
+            attention: false,
+            branch: None,
+        }
+    }
+
+    /// The whole composited frame at a roomy viewport: padded tab strip,
+    /// hints, session name and clock, all on one bar row.
+    #[test]
+    fn shipped_frame_at_a_roomy_viewport() {
+        let windows = [
+            probe_window("zsh", false),
+            probe_window("nvim", true),
+            probe_window("server", false),
+        ];
+        let rows = shipped_frame_rows((100, 12), &windows);
+        let bar = rows.last().expect("a bar row");
+        assert!(bar.contains(" 1:nvim "), "{bar:?}");
+        assert!(bar.contains("Space palette"), "{bar:?}");
+        assert!(bar.contains("phux"), "{bar:?}");
+        assert!(!bar.contains("switch"), "{bar:?}");
+        assert!(rows.join("\n").contains(PROBE_PANE_TEXT), "{rows:?}");
+    }
+
+    /// The same frame on a phone-sized grid. This is the shape the
+    /// responsive work exists for: the hints and the clock are gone and a
+    /// `switch` chip has taken their place, while every tab that is shown
+    /// is shown whole.
+    #[test]
+    fn shipped_frame_at_a_phone_sized_viewport() {
+        let windows = [
+            probe_window("zsh", false),
+            probe_window("nvim", true),
+            probe_window("server", false),
+            probe_window("logs", false),
+        ];
+        let rows = shipped_frame_rows((46, 12), &windows);
+        let bar = rows.last().expect("a bar row");
+        assert!(bar.contains(" 1:nvim "), "active tab whole: {bar:?}");
+        assert!(bar.contains("switch"), "{bar:?}");
+        assert!(!bar.contains("Space palette"), "hints yield: {bar:?}");
+        assert!(bar.chars().count() <= 46, "row overran: {bar:?}");
+        assert!(rows.join("\n").contains(PROBE_PANE_TEXT), "{rows:?}");
+        insta::assert_snapshot!("shipped_frame_phone_sized", rows.join("\n"));
+    }
+
+    /// Narrower still, where the tab strip itself has to give: it keeps
+    /// the active tab and its neighbours whole and stands in for the rest
+    /// with a `›`, rather than clipping a label into a window name that
+    /// does not exist.
+    #[test]
+    fn shipped_frame_when_the_tab_strip_must_collapse() {
+        let windows = [
+            probe_window("zsh", false),
+            probe_window("nvim", true),
+            probe_window("server", false),
+            probe_window("logs", false),
+        ];
+        let rows = shipped_frame_rows((36, 10), &windows);
+        let bar = rows.last().expect("a bar row");
+        assert!(bar.contains(" 1:nvim "), "active tab whole: {bar:?}");
+        assert!(bar.contains('\u{203a}'), "hidden tabs are marked: {bar:?}");
+        assert!(!bar.contains("3:logs"), "the far tab is dropped: {bar:?}");
+        assert!(bar.contains("switch"), "affordance survives: {bar:?}");
+        assert!(bar.chars().count() <= 36, "row overran: {bar:?}");
+        insta::assert_snapshot!("shipped_frame_collapsed_tabs", rows.join("\n"));
+    }
 
     /// Replay `bytes` (a full frame of VT output) into a fresh libghostty
     /// terminal — the house PTY-probe oracle — and project the resulting
