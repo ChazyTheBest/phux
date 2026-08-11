@@ -169,10 +169,45 @@ else
 fi
 
 tmp_dir="$(mktemp -d)"
+publish_dir=""
+lock_dir=""
+lock_acquired=0
+publish_started=0
+publish_complete=0
+published_phux=0
+published_phux_mcp=0
+
+rollback_publish() {
+  [ "$publish_started" -eq 1 ] || return 0
+  [ "$publish_complete" -eq 0 ] || return 0
+
+  if [ "$published_phux" -eq 1 ]; then
+    rm -f "${install_dir}/phux"
+  fi
+  if [ "$published_phux_mcp" -eq 1 ]; then
+    rm -f "${install_dir}/phux-mcp"
+  fi
+  if [ -e "${publish_dir}/backup/phux" ] || [ -L "${publish_dir}/backup/phux" ]; then
+    mv -f "${publish_dir}/backup/phux" "${install_dir}/phux"
+  fi
+  if [ -e "${publish_dir}/backup/phux-mcp" ] || [ -L "${publish_dir}/backup/phux-mcp" ]; then
+    mv -f "${publish_dir}/backup/phux-mcp" "${install_dir}/phux-mcp"
+  fi
+}
+
 cleanup() {
+  rollback_publish
+  if [ -n "$publish_dir" ]; then
+    rm -rf "$publish_dir"
+  fi
+  if [ "$lock_acquired" -eq 1 ]; then
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
   rm -rf "$tmp_dir"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 archive_path="${tmp_dir}/${artifact}"
 sha_path="${archive_path}.sha256"
@@ -272,9 +307,60 @@ validate_extracted_tree
 [ -f "${stage_dir}/phux-mcp" ] && [ ! -L "${stage_dir}/phux-mcp" ] || die "archive did not contain a regular phux-mcp binary"
 
 mkdir -p "$install_dir"
-cp -f "${stage_dir}/phux" "${install_dir}/phux"
-cp -f "${stage_dir}/phux-mcp" "${install_dir}/phux-mcp"
-chmod 755 "${install_dir}/phux" "${install_dir}/phux-mcp"
+lock_dir="${install_dir}/.phux-install.lock"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+  die "another phux install is already publishing to ${install_dir}"
+fi
+lock_acquired=1
+
+# Stage and back up on the destination filesystem so every publish/restore is
+# a rename. The trap restores the complete previous pair after any partial
+# publication, including interruption between the two renames.
+publish_dir="$(mktemp -d "${install_dir}/.phux-install.XXXXXX")"
+mkdir "${publish_dir}/backup"
+cp "${stage_dir}/phux" "${publish_dir}/phux"
+cp "${stage_dir}/phux-mcp" "${publish_dir}/phux-mcp"
+chmod 755 "${publish_dir}/phux" "${publish_dir}/phux-mcp"
+
+for installed_name in phux phux-mcp; do
+  installed_path="${install_dir}/${installed_name}"
+  if [ -e "$installed_path" ] && [ ! -f "$installed_path" ] && [ ! -L "$installed_path" ]; then
+    die "refusing to replace non-file install destination: ${installed_path}"
+  fi
+done
+
+publish_started=1
+if [ -e "${install_dir}/phux" ] || [ -L "${install_dir}/phux" ]; then
+  mv "${install_dir}/phux" "${publish_dir}/backup/phux"
+fi
+if [ -e "${install_dir}/phux-mcp" ] || [ -L "${install_dir}/phux-mcp" ]; then
+  mv "${install_dir}/phux-mcp" "${publish_dir}/backup/phux-mcp"
+fi
+# Mark each destination before its rename so an INT/TERM delivered between
+# the rename and the next shell statement still rolls the partial pair back.
+published_phux=1
+mv "${publish_dir}/phux" "${install_dir}/phux"
+published_phux_mcp=1
+mv "${publish_dir}/phux-mcp" "${install_dir}/phux-mcp"
+publish_complete=1
 
 echo "installed phux ${version} for ${target} to ${install_dir}"
-echo "path hint: add ${install_dir} to PATH if phux is not found"
+installed_dir="$(cd "$install_dir" && pwd -P)"
+installed_command="${installed_dir}/phux"
+found_command="$(command -v phux 2>/dev/null || true)"
+found_canonical=""
+if [ -n "$found_command" ] && [ "${found_command#*/}" != "$found_command" ]; then
+  found_dir="$(dirname "$found_command")"
+  if found_dir="$(cd "$found_dir" 2>/dev/null && pwd -P)"; then
+    found_canonical="${found_dir}/$(basename "$found_command")"
+  fi
+fi
+
+if [ "$found_canonical" = "$installed_command" ]; then
+  echo "next: phux"
+else
+  printf 'next: %q\n' "$installed_command"
+  # The printed remedy must defer expansion until the user runs it.
+  # shellcheck disable=SC2016
+  printf 'PATH remedy: export PATH=%q:"$PATH"\n' "$installed_dir"
+fi

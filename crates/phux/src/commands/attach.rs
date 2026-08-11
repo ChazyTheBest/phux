@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -24,6 +25,16 @@ use crate::commands::{DEFAULT_SESSION_NAME, print_attach_error, server::ensure_s
 /// driver's render sink for the duration of one attach, and a graceful-upgrade
 /// reconnect (ADR-0032) starts a *second* attach against the *same* recording.
 type RecorderHandle = Rc<RefCell<SessionRecorder>>;
+
+/// Refuse interactive entry points before they can start a server, connect,
+/// or let the driver write terminal-control sequences.
+pub(crate) fn interactive_tty_preflight() -> Result<(), ExitCode> {
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return Ok(());
+    }
+    eprintln!("phux: interactive use requires both stdin and stdout to be terminals");
+    Err(ExitCode::FAILURE)
+}
 
 /// phux-i0e8.2.2: explain how a successful attach ended, once the TUI is
 /// down and stdout/stderr are the user's cooked terminal again.
@@ -84,6 +95,10 @@ pub(crate) fn run_naked(socket: Option<PathBuf>, rec: Option<&RecordSpec>) -> Ex
     // human can read it. The banner stays on the long-running foreground
     // entry points (`phux server`, `phux relay run`), whose stderr
     // remains visible.
+
+    if let Err(code) = interactive_tty_preflight() {
+        return code;
+    }
 
     let socket_path = socket.unwrap_or_else(default_socket_path);
     // phux-iwuc: a socket path over the platform's sockaddr_un limit can
@@ -518,25 +533,16 @@ async fn wait_with_countdown(dial: &Dial, deadline: Duration) -> ReconnectOutcom
 
 /// Flush the residual UTF-8 tail, backfill `duration`, and close the cast.
 ///
-/// Every clone handed to an attach attempt has been dropped by the time this
-/// runs, so `try_unwrap` reclaims the recorder. A clone that somehow outlived
-/// the loop is logged and the file left as-is: the prefix on disk is a valid,
-/// playable asciicast, and abandoning it would be strictly worse than a
-/// missing `duration` key. Diagnostics go through `tracing` (file-only on the
-/// client) and never to stderr, which the TUI has only just released.
+/// Idempotent because the production clean-detach path finalizes immediately
+/// before `process::exit`; this remains the fallback for returning error paths.
+/// Diagnostics go through `tracing` (file-only on the client) and never to
+/// stderr, which the TUI has only just released.
 fn close_recorder(recorder: Option<RecorderHandle>) {
     let Some(handle) = recorder else {
         return;
     };
-    match Rc::try_unwrap(handle) {
-        Ok(cell) => {
-            if let Err(err) = cell.into_inner().finish() {
-                tracing::warn!(error = %err, "closing the session recording failed");
-            }
-        }
-        Err(_) => {
-            tracing::warn!("session recorder still referenced at shutdown; cast left unfinalized");
-        }
+    if let Err(err) = handle.borrow_mut().finish_in_place() {
+        tracing::warn!(error = %err, "closing the session recording failed");
     }
 }
 
@@ -687,6 +693,10 @@ pub(crate) fn run_attach_rec(
     socket: Option<PathBuf>,
     rec: Option<&RecordSpec>,
 ) -> ExitCode {
+    if let Err(code) = interactive_tty_preflight() {
+        return code;
+    }
+
     // A name in the registry is a deliberate operator statement — they ran
     // `phux host enroll` or `phux host add` for it — so it wins over the
     // local-session reading of the same word. `--socket` is an explicit

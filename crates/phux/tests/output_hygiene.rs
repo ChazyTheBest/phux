@@ -33,6 +33,103 @@ fn dead_socket() -> String {
     format!("/tmp/phux-no-such-server-{}.sock", std::process::id())
 }
 
+#[test]
+fn redirected_interactive_invocations_do_not_spawn_or_emit_terminal_bytes() {
+    for args in [&[][..], &["attach"][..], &["new", "redirected"][..]] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("phux.sock");
+        let state = dir.path().join("state");
+        let out = Command::new(PHUX)
+            .args(args)
+            .args(["--socket"])
+            .arg(&socket)
+            .env("XDG_STATE_HOME", &state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run redirected interactive invocation");
+
+        assert!(!out.status.success(), "redirected {args:?} must fail");
+        assert_eq!(out.stdout, b"", "redirected {args:?} emitted stdout bytes");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("interactive use requires both stdin and stdout to be terminals"),
+            "redirected {args:?} did not explain the TTY requirement: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !socket.exists(),
+            "redirected {args:?} created a server socket at {}",
+            socket.display()
+        );
+        assert!(
+            !state.exists(),
+            "redirected {args:?} created client state before refusing the TTY"
+        );
+    }
+}
+
+#[test]
+fn redirected_worktree_attach_refuses_before_git_mutation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = dir.path().join("created-worktree");
+    let out = Command::new(PHUX)
+        .args(["worktree", "new", "review", "--repo"])
+        .arg(dir.path())
+        .args(["--path"])
+        .arg(&worktree)
+        .arg("--attach")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run redirected worktree attach");
+
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("interactive use requires both stdin and stdout to be terminals")
+    );
+    assert!(!worktree.exists(), "TTY refusal came after git mutation");
+}
+
+#[test]
+fn redirected_remote_attaches_refuse_before_dialing() {
+    for args in [
+        ["attach", "--ws", "ws://127.0.0.1:9"].as_slice(),
+        ["attach", "--quic", "127.0.0.1:9"].as_slice(),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let out = Command::new(PHUX)
+            .args(args)
+            .env("XDG_STATE_HOME", &state)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run redirected remote attach");
+        assert!(!out.status.success());
+        assert_eq!(out.stdout, b"");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "phux: interactive use requires both stdin and stdout to be terminals\n"
+        );
+        assert!(!state.exists(), "remote attach initialized client state");
+    }
+}
+
+#[test]
+fn telemetry_failure_does_not_contaminate_json_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(PHUX)
+        .args(["ls", "--json", "--socket", &dead_socket()])
+        .env("PHUX_LOG", dir.path())
+        .output()
+        .expect("run JSON command with invalid log destination");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "JSON stderr was contaminated: {stderr:?}");
+    serde_json::from_str::<serde_json::Value>(lines[0]).expect("stderr is one JSON document");
+}
+
 /// Run `phux <args...>` and return `(exit_code, stdout, stderr)`.
 fn run(args: &[&str]) -> (i32, String, String) {
     let out = Command::new(PHUX)
@@ -110,6 +207,21 @@ fn help_does_not_print_banner() {
         !stdout.contains(BANNER_FRAGMENT) && !stderr.contains(BANNER_FRAGMENT),
         "--help must not print the build banner; stdout={stdout:?} stderr={stderr:?}"
     );
+}
+
+#[test]
+fn short_and_long_help_progressively_disclose_the_root() {
+    let (short_code, short, short_err) = run(&["-h"]);
+    let (long_code, long, long_err) = run(&["--help"]);
+    assert_eq!(short_code, 0, "short help failed: {short_err}");
+    assert_eq!(long_code, 0, "long help failed: {long_err}");
+    assert!(short.contains("Start here:"), "short help:\n{short}");
+    assert!(short.contains("phux                     Attach"));
+    assert!(!short.contains("ATTACH / SERVE"), "short help:\n{short}");
+    assert!(long.contains("ATTACH / SERVE"), "long help:\n{long}");
+    assert!(long.contains("  spawn      Create a pane"));
+    assert!(long.contains("  launch     Start a configured agent"));
+    assert!(!long.contains("\nCommands:\n"), "long help:\n{long}");
 }
 
 #[test]

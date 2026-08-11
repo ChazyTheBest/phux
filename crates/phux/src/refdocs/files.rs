@@ -19,6 +19,10 @@
 use super::Page;
 
 /// Render `docs/reference/files.md`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the file reference is one generated page; splitting it would obscure its source order"
+)]
 pub(crate) fn page() -> Page {
     let body = String::from(
         "phux splits its files across the three XDG base directories: \
@@ -71,6 +75,8 @@ pub(crate) fn page() -> Page {
          ├── server.log.1        # the previous generation, after rotation\n\
          ├── server-starts.log   # one line per server start (crash-loop check)\n\
          ├── client-<pid>.log    # per-pid interactive-client log\n\
+         ├── onboarding.json     # versioned first-use journey progress\n\
+         ├── onboarding.lock     # serializes first-use moment delivery\n\
          ├── remote-cert.pem     # auto-provisioned remote-consumer certificate\n\
          ├── remote-key.pem      # its private key (owner-only, 0600)\n\
          └── remote-tokens       # pairing-token store (owner-only, 0600)\n\
@@ -92,6 +98,11 @@ pub(crate) fn page() -> Page {
            trace — the TUI owns the alt screen, so the client never \
            logs to stderr. `PHUX_LOG` redirects it. Log files are \
            created mode `0600`.\n\
+         - `onboarding.json` records only the versioned first-use journey \
+           stage. `onboarding.lock` serializes delivery within that profile. \
+           State is best-effort: missing state starts the guidance, while \
+           unreadable, unknown, or unwritable state stays quiet and never \
+           prevents attach.\n\
          - `remote-cert.pem` / `remote-key.pem` are the self-signed \
            TLS pair auto-provisioned for remote consumers (ADR-0031); \
            `PHUX_WS_TLS_CERT` / `PHUX_WS_TLS_KEY` substitute an \
@@ -202,6 +213,8 @@ mod tests {
         for entry in [
             "server.log",
             "client-<pid>.log",
+            "onboarding.json",
+            "onboarding.lock",
             "remote-cert.pem",
             "remote-key.pem",
             "remote-tokens",

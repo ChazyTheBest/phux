@@ -59,8 +59,8 @@ use super::input_dispatch::{
 };
 use super::outcome::{AttachEnd, AttachError};
 use super::paint::{
-    SidebarEdge, SidebarReservation, content_rect, paint_bar_after_pane, paint_chrome_in_place,
-    paint_full_frame, sidebar_reservation,
+    SidebarEdge, SidebarReservation, StatusBarPaint, content_rect, paint_bar_after_pane,
+    paint_chrome_in_place, paint_full_frame, sidebar_reservation,
 };
 use super::pane_state::{
     AttachKernel, AttentionNavigation, PaneSlot, VcsIndex, reanchor_predict_to_pane,
@@ -299,21 +299,21 @@ fn paint_active_overlay<W: super::RenderSink>(
     sidebar_painter: Option<&mut crate::render::chrome::sidebar::SidebarPainter>,
     session_name: &str,
     theme: &crate::render::Theme,
-) {
+) -> StatusBarPaint {
     // phux-foz.14: floating modals center inside the pane content rect (the
     // viewport minus the sidebar strip and status-bar row), NOT the raw
     // viewport, so a centered box never lands on the sidebar columns and
     // occludes the chrome the base-frame repaint (phux-foz.10) preserves. The
     // borrow of `status_bar` ends here (position is `Copy`), so it stays
     // available to move into `paint_full_frame` below.
+    let bar_pos = status_bar.as_deref().map(StatusBarPainter::position);
     let overlay_content = {
-        let bar_pos = status_bar.as_deref().map(StatusBarPainter::position);
         let cr = content_rect(viewport_dims, bar_pos, sidebar);
         ratatui::layout::Rect::new(cr.x, cr.y, cr.w, cr.h)
     };
     if let Some(sel) = overlays.copy_selection() {
         let (Some(ls), Some(fid)) = (workspace.active_window(), focused) else {
-            return;
+            return StatusBarPaint::NotPublished;
         };
         // Set the selection on the focused renderer for this one paint, repaint
         // the (zoom-honoring) base frame — the renderer inverts the selected
@@ -325,24 +325,34 @@ fn paint_active_overlay<W: super::RenderSink>(
         if let Some(slot) = panes.get_mut(fid) {
             slot.renderer.set_selection(Some(sel));
         }
-        if let Some(base) = base.as_deref() {
-            paint_full_frame(
-                out,
-                base,
-                panes,
-                engine_kernel,
-                focused,
-                viewport_dims,
-                status_bar,
-                sidebar,
-                sidebar_painter,
-                session_name,
-            );
-        }
+        let painted = base
+            .as_deref()
+            .map_or(StatusBarPaint::NotPublished, |base| {
+                paint_full_frame(
+                    out,
+                    base,
+                    panes,
+                    engine_kernel,
+                    focused,
+                    viewport_dims,
+                    status_bar,
+                    sidebar,
+                    sidebar_painter,
+                    session_name,
+                )
+            });
         if let Some(slot) = panes.get_mut(fid) {
             slot.renderer.set_selection(None);
         }
         let _ = paint_copy_mode_status(out, sel, viewport_dims, theme);
+        if matches!(
+            bar_pos,
+            Some(crate::render::chrome::status_bar::Position::Bottom)
+        ) {
+            StatusBarPaint::NotPublished
+        } else {
+            painted
+        }
     } else if let Some(clip) = overlays.active_bounds(overlay_content) {
         // Floating modal (help / prompt / command palette / pickers): keep
         // the live panes visible by repainting the base frame, then emit
@@ -351,25 +361,31 @@ fn paint_active_overlay<W: super::RenderSink>(
         // The base frame includes the sidebar strip (phux-foz.10): the
         // repaint's own ED2 cleared it, and chrome must persist under a
         // floating overlay.
-        if let Some(ls) = workspace.render_window(zoomed).as_deref() {
-            paint_full_frame(
-                out,
-                ls,
-                panes,
-                engine_kernel,
-                focused,
-                viewport_dims,
-                status_bar,
-                sidebar,
-                sidebar_painter,
-                session_name,
-            );
-        }
+        let painted =
+            workspace
+                .render_window(zoomed)
+                .as_deref()
+                .map_or(StatusBarPaint::NotPublished, |ls| {
+                    paint_full_frame(
+                        out,
+                        ls,
+                        panes,
+                        engine_kernel,
+                        focused,
+                        viewport_dims,
+                        status_bar,
+                        sidebar,
+                        sidebar_painter,
+                        session_name,
+                    )
+                });
         let _ = overlays.paint_clipped(out, viewport_dims, overlay_content, clip, theme.shadow);
+        painted
     } else {
         // Full-screen overlay (no bounded region): clear + paint.
         let _ = out.write_all(b"\x1b[2J\x1b[H");
         let _ = overlays.paint(out, viewport_dims);
+        StatusBarPaint::NotPublished
     }
 }
 
@@ -448,7 +464,7 @@ async fn run_buffered(
     if let Some(rec) = rec {
         let mut tee = TeeSink {
             inner: &mut sink,
-            rec,
+            rec: Rc::clone(&rec),
         };
         attach_session(
             dial,
@@ -459,6 +475,7 @@ async fn run_buffered(
             Some(writer),
             true,
             initial_notice,
+            Some(rec),
         )
         .await
     } else {
@@ -471,6 +488,7 @@ async fn run_buffered(
             Some(writer),
             true,
             initial_notice,
+            None,
         )
         .await
     }
@@ -596,6 +614,7 @@ pub async fn run_with_stdout_predict<W: super::RenderSink>(
         None,
         None,
         false,
+        None,
         None,
     )
     .await
@@ -998,6 +1017,7 @@ async fn attach_session<W: super::RenderSink>(
     // entry only (an in-invocation session switch must not re-show it) —
     // the reconnect loop's "re-attached after server restart".
     initial_notice: Option<Notice>,
+    recorder: Option<Rc<RefCell<SessionRecorder>>>,
 ) -> Result<AttachEnd, AttachError> {
     // STAGE 1 — pre-handshake, on the cooked outer terminal.
     //
@@ -1095,13 +1115,11 @@ async fn attach_session<W: super::RenderSink>(
     // never left in a bad state. On `Detached` the loop exits via
     // `exit_after_detach` (which never returns — see its doc comment).
     let mut attached = attached;
-    // phux-foz.6: first-run onboarding hint, decided ONCE per attach
-    // invocation by a single existence check at the canonical config path
-    // (see `super::onboarding` for the trigger rule). `mem::take` hands the
-    // flag to the first `main_loop` entry only, so an in-invocation session
-    // switch (which re-enters `main_loop` with fresh session state) does
-    // not re-show a hint the user already dismissed.
-    let mut show_onboarding = super::onboarding::should_show(&phux_config::loader::config_path());
+    // First-use guidance is profile-scoped, versioned, and best-effort. The
+    // moment is decided once per process attach and consumed by the first loop
+    // entry, so in-process session switches never repeat it.
+    let onboarding_path = super::onboarding::state_path();
+    let mut onboarding_claim = super::onboarding::begin_attach(&onboarding_path);
     // phux-foz.8: window index to select after a one-step cross-session
     // window pick (`switch-session { name, window }`) re-attaches. `None`
     // on the first attach and after plain switches; set per-iteration by
@@ -1115,7 +1133,7 @@ async fn attach_session<W: super::RenderSink>(
     // session switch re-enters `main_loop` but is not a reconnect.
     let mut initial_notice = initial_notice;
     loop {
-        let show_onboarding_hint = std::mem::take(&mut show_onboarding);
+        let claim = onboarding_claim.take();
         let exit = match main_loop(
             &mut conn,
             attached,
@@ -1123,7 +1141,7 @@ async fn attach_session<W: super::RenderSink>(
             out,
             resync,
             wants_state_sync,
-            show_onboarding_hint,
+            claim,
             initial_notice.take(),
             pending_window.take(),
             pending_pane.take(),
@@ -1141,7 +1159,10 @@ async fn attach_session<W: super::RenderSink>(
             }
         };
         match exit {
-            LoopExit::Detached(end) => {
+            LoopExit::Detached {
+                end,
+                locally_requested,
+            } => {
                 // Lifecycle transition (info): the attach loop is exiting.
                 tracing::info!(?end, "attach loop: DETACHED; exiting");
                 // The session ended (user detach, server `DETACHED`, or a
@@ -1157,7 +1178,7 @@ async fn attach_session<W: super::RenderSink>(
                 if let Some(writer) = writer.take() {
                     writer.shutdown_and_join();
                 }
-                exit_after_detach(end);
+                exit_after_detach(end, locally_requested, &onboarding_path, recorder.as_ref());
             }
             LoopExit::SwitchTo(target) => {
                 // Lifecycle transition (info): switching sessions on the
@@ -1424,10 +1445,43 @@ enum LoopExit {
     /// The session ended (detach / server DETACHED / last pane closed).
     /// Carries WHY (phux-i0e8.2.2) so the teardown path can explain a
     /// last-pane death on the cooked terminal. The process exits.
-    Detached(AttachEnd),
+    Detached {
+        end: AttachEnd,
+        locally_requested: bool,
+    },
     /// Re-attach on the same connection — to an existing session or a
     /// newly-created one.
     SwitchTo(ReattachTarget),
+}
+
+/// Classify a detach independently from the wire frame that completed it.
+/// A server `DETACHED` is local only when this client had already requested
+/// detach; pane death remains its own ending even if the events race.
+const fn is_local_detach(end: AttachEnd, local_intent: bool) -> bool {
+    local_intent && matches!(end, AttachEnd::Detached)
+}
+
+const fn detached_loop_exit(end: AttachEnd, local_intent: bool) -> LoopExit {
+    LoopExit::Detached {
+        end,
+        locally_requested: is_local_detach(end, local_intent),
+    }
+}
+
+fn finish_onboarding_claim(claim: Option<super::onboarding::AttachClaim>, delivery_accepted: bool) {
+    if delivery_accepted && let Some(claim) = claim {
+        let _ = claim.commit();
+    }
+}
+
+fn finish_return_onboarding_after_paint(
+    claim: &mut Option<super::onboarding::AttachClaim>,
+    status_bar: Option<&StatusBarPainter>,
+    paint: StatusBarPaint,
+) {
+    if paint.delivered(status_bar, super::onboarding::RETURN_NOTICE) {
+        finish_onboarding_claim(claim.take(), true);
+    }
 }
 
 /// Drive the `tokio::select!` loop until detach or a session switch.
@@ -1473,12 +1527,9 @@ async fn main_loop<W: super::RenderSink>(
     // per-frame `FRAME_ACK`: only a state-sync consumer's acks are tracked
     // server-side, so a raw consumer skips them (see `should_emit_frame_ack`).
     wants_state_sync: bool,
-    // phux-foz.6: show the first-run onboarding hint after the bootstrap
-    // paint. The caller decides this once per attach invocation (config-path
-    // existence check in `attach_session`'s outer loop) and passes `true`
-    // only on the first `main_loop` entry, so a session switch never
-    // re-shows a hint the user already dismissed.
-    show_onboarding: bool,
+    // First-use moment consumed by this loop entry. Session switches receive
+    // `None`, so they never repeat attach guidance.
+    mut onboarding_claim: Option<super::onboarding::AttachClaim>,
     // phux-i0e8.2.3: transient status-bar notice to seed at attach time —
     // the reconnect loop's "re-attached after server restart". Applied to
     // the painter right after the bootstrap chrome refresh, so the first
@@ -1501,6 +1552,11 @@ async fn main_loop<W: super::RenderSink>(
     // degrades to a logged no-op if out of range.
     initial_pane: Option<usize>,
 ) -> Result<LoopExit, AttachError> {
+    let onboarding_moment = onboarding_claim
+        .as_ref()
+        .map_or(super::onboarding::AttachMoment::None, |claim| {
+            claim.moment()
+        });
     // phux-4li.4: hold N client-side Terminals keyed by `TerminalId`,
     // not the single Terminal of the wave-A driver. Each pane's metadata slot
     // is allocated lazily from authoritative bootstrap geometry.
@@ -1847,9 +1903,8 @@ async fn main_loop<W: super::RenderSink>(
         false,
     )?;
     if outcome.exit {
-        return Ok(LoopExit::Detached(
-            outcome.exit_reason.unwrap_or(AttachEnd::Detached),
-        ));
+        let end = outcome.exit_reason.unwrap_or(AttachEnd::Detached);
+        return Ok(detached_loop_exit(end, false));
     }
     vcs.apply_snapshot(outcome.pane_cwds);
     if let Some((list, focused)) = outcome.sessions {
@@ -1946,21 +2001,25 @@ async fn main_loop<W: super::RenderSink>(
     // up, and the ordinary 1 s status_tick expires it, so "re-attached
     // after server restart" is visible inside the live TUI instead of on
     // the cooked terminal the alt screen replaced.
-    apply_initial_notice(status_bar.as_mut(), initial_notice);
+    let return_notice_available =
+        initial_notice.is_none() && onboarding_moment == super::onboarding::AttachMoment::Return;
+    let initial_notice = initial_notice.or_else(|| {
+        return_notice_available.then(|| Notice::info(super::onboarding::RETURN_NOTICE))
+    });
+    let notice_accepted = apply_initial_notice(status_bar.as_mut(), initial_notice);
+    if onboarding_moment == super::onboarding::AttachMoment::Return
+        && (!return_notice_available || !notice_accepted)
+    {
+        onboarding_claim.take();
+    }
 
-    // phux-foz.6: first-run onboarding hint. The caller already applied the
-    // trigger rule (nothing exists at the canonical config path; once per
-    // attach invocation — see `super::onboarding`); here we push the notice
-    // onto the ordinary overlay stack AFTER the bootstrap frame painted, so
-    // it floats over the live pane like any other modal. It reuses
-    // `ToastOverlay`, so any key dismisses it and triggers the standard
-    // dismiss-repaint; while it is up, frames keep applying to the pane
-    // mirrors with the outbound flush paused (ADR-0020 invariant 5), exactly
-    // as for every other overlay.
-    if show_onboarding {
-        overlays.push(Box::new(crate::render::overlay::ToastOverlay::new(
+    // The introduction floats over the live pane after bootstrap. It is a
+    // passthrough notice: the first key dismisses it and continues through the
+    // normal resolver/pane route, so guidance never taxes the user's intent.
+    if onboarding_moment == super::onboarding::AttachMoment::Intro {
+        overlays.push(Box::new(crate::render::overlay::ToastOverlay::passthrough(
             super::onboarding::ONBOARDING_TITLE,
-            super::onboarding::hint_lines(&phux_config::loader::config_path()),
+            super::onboarding::hint_lines(keybindings_snapshot.as_ref()),
             &theme,
         )));
         paint_active_overlay(
@@ -1978,6 +2037,8 @@ async fn main_loop<W: super::RenderSink>(
             &session_name,
             &theme,
         );
+        let paint_accepted = out.flush().is_ok();
+        finish_onboarding_claim(onboarding_claim.take(), paint_accepted);
     }
 
     loop {
@@ -2041,7 +2102,7 @@ async fn main_loop<W: super::RenderSink>(
                 && !overlays.is_active()
                 && let Some(ls) = workspace.render_window(zoomed.as_ref()).as_deref()
             {
-                paint_chrome_in_place(
+                let painted = paint_chrome_in_place(
                     out,
                     ls,
                     &panes,
@@ -2051,6 +2112,11 @@ async fn main_loop<W: super::RenderSink>(
                     sidebar,
                     Some(&mut sidebar_painter),
                     &session_name,
+                );
+                finish_return_onboarding_after_paint(
+                    &mut onboarding_claim,
+                    status_bar.as_ref(),
+                    painted,
                 );
             }
         }
@@ -2070,7 +2136,7 @@ async fn main_loop<W: super::RenderSink>(
         // serviced promptly.
         if needs_resync.is_some_and(|flag| flag.swap(false, Ordering::AcqRel)) {
             if overlays.is_active() {
-                paint_active_overlay(
+                let painted = paint_active_overlay(
                     out,
                     &overlays,
                     &workspace,
@@ -2085,8 +2151,13 @@ async fn main_loop<W: super::RenderSink>(
                     &session_name,
                     &theme,
                 );
+                finish_return_onboarding_after_paint(
+                    &mut onboarding_claim,
+                    status_bar.as_ref(),
+                    painted,
+                );
             } else if let Some(ls) = workspace.render_window(zoomed.as_ref()).as_deref() {
-                paint_full_frame(
+                let painted = paint_full_frame(
                     out,
                     ls,
                     &mut panes,
@@ -2097,6 +2168,11 @@ async fn main_loop<W: super::RenderSink>(
                     sidebar,
                     Some(&mut sidebar_painter),
                     &session_name,
+                );
+                finish_return_onboarding_after_paint(
+                    &mut onboarding_claim,
+                    status_bar.as_ref(),
+                    painted,
                 );
             }
         }
@@ -2310,7 +2386,7 @@ async fn main_loop<W: super::RenderSink>(
                     if !overlays.is_active()
                         && let Some(ls) = workspace.render_window(zoomed.as_ref()).as_deref()
                     {
-                        paint_full_frame(
+                        let painted = paint_full_frame(
                             out,
                             ls,
                             &mut panes,
@@ -2322,10 +2398,15 @@ async fn main_loop<W: super::RenderSink>(
                             Some(&mut sidebar_painter),
                             &session_name,
                         );
+                        finish_return_onboarding_after_paint(
+                            &mut onboarding_claim,
+                            status_bar.as_ref(),
+                            painted,
+                        );
                     }
                 }
                 if overlays.is_active() {
-                    paint_active_overlay(
+                    let painted = paint_active_overlay(
                         out,
                         &overlays,
                         &workspace,
@@ -2340,13 +2421,18 @@ async fn main_loop<W: super::RenderSink>(
                         &session_name,
                         &theme,
                     );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
+                    );
                 }
                 // phux-foz.5: a `reload-config` committed in this batch
                 // (palette row or bound chord). Runs LAST in the arm so
                 // its repaint reflects the new theme/bar.
                 if reload_request {
                     reload_request = false;
-                    handle_config_reload(
+                    let painted = handle_config_reload(
                         out,
                         &mut keybindings_snapshot,
                         &mut resolver,
@@ -2369,6 +2455,11 @@ async fn main_loop<W: super::RenderSink>(
                         viewport_dims,
                         sidebar,
                         &session_name,
+                    );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
                     );
                 }
             }
@@ -2562,9 +2653,8 @@ async fn main_loop<W: super::RenderSink>(
                         focus_history.observe(focused_before_frame, focused_pane.as_ref());
                         focus_history.repair(focused_pane.as_ref(), &workspace);
                         if outcome.exit {
-                            return Ok(LoopExit::Detached(
-                                outcome.exit_reason.unwrap_or(AttachEnd::Detached),
-                            ));
+                            let end = outcome.exit_reason.unwrap_or(AttachEnd::Detached);
+                            return Ok(detached_loop_exit(end, detach_pending));
                         }
                         if outcome.resync_required {
                             if session_name.is_empty() {
@@ -2608,6 +2698,11 @@ async fn main_loop<W: super::RenderSink>(
                             || outcome.layout_replaced
                             || outcome.reflow_panes
                             || outcome.sessions.is_some();
+                        finish_return_onboarding_after_paint(
+                            &mut onboarding_claim,
+                            status_bar.as_ref(),
+                            outcome.status_bar_painted,
+                        );
                         // ADR-0040: the frame may have added panes
                         // (TerminalSpawned, a peer's layout broadcast) or
                         // removed them (TerminalClosed). Re-sweep so every
@@ -2928,7 +3023,7 @@ async fn main_loop<W: super::RenderSink>(
                         // as the `reload-config` action; failures keep the
                         // previous config and toast.
                         if outcome.config_reload {
-                            handle_config_reload(
+                            let painted = handle_config_reload(
                                 out,
                                 &mut keybindings_snapshot,
                                 &mut resolver,
@@ -2951,6 +3046,11 @@ async fn main_loop<W: super::RenderSink>(
                                 viewport_dims,
                                 sidebar,
                                 &session_name,
+                            );
+                            finish_return_onboarding_after_paint(
+                                &mut onboarding_claim,
+                                status_bar.as_ref(),
+                                painted,
                             );
                         }
                         // phux-foz.7: the agent-fleet dashboard is a live
@@ -2985,7 +3085,7 @@ async fn main_loop<W: super::RenderSink>(
                         // live fleet list is actually in the overlay stack, so
                         // the raise costs nothing when the dashboard is closed.
                         if drained.fleet_dirty {
-                            refresh_fleet_if_open(
+                            let painted = refresh_fleet_if_open(
                                 out,
                                 &mut overlays,
                                 &workspace,
@@ -3006,12 +3106,17 @@ async fn main_loop<W: super::RenderSink>(
                                 &foreign_layouts,
                                 &foreign_agents,
                             );
+                            finish_return_onboarding_after_paint(
+                                &mut onboarding_claim,
+                                status_bar.as_ref(),
+                                painted,
+                            );
                         }
                         if !overlays.is_active()
                             && let Some(ls) = workspace.render_window(zoomed.as_ref()).as_deref()
                         {
-                            match drained.level {
-                                RepaintLevel::None => {}
+                            let status_bar_painted = match drained.level {
+                                RepaintLevel::None => StatusBarPaint::NotPublished,
                                 RepaintLevel::Chrome => paint_chrome_in_place(
                                     out,
                                     ls,
@@ -3035,7 +3140,12 @@ async fn main_loop<W: super::RenderSink>(
                                     Some(&mut sidebar_painter),
                                     &session_name,
                                 ),
-                            }
+                            };
+                            finish_return_onboarding_after_paint(
+                                &mut onboarding_claim,
+                                status_bar.as_ref(),
+                                status_bar_painted,
+                            );
                         }
                     }
                     Err(AttachError::Disconnected) if detach_pending => {
@@ -3043,7 +3153,7 @@ async fn main_loop<W: super::RenderSink>(
                         // frame — treat it as a clean shutdown because
                         // the user requested detach. Otherwise the loop
                         // bubbles the disconnect up unchanged.
-                        return Ok(LoopExit::Detached(AttachEnd::Detached));
+                        return Ok(detached_loop_exit(AttachEnd::Detached, true));
                     }
                     Err(err) => return Err(err),
                 }
@@ -3070,7 +3180,7 @@ async fn main_loop<W: super::RenderSink>(
                     && !overlays.is_active()
                     && let Some(ls) = workspace.render_window(zoomed.as_ref()).as_deref()
                 {
-                    paint_full_frame(
+                    let painted = paint_full_frame(
                         out,
                         ls,
                         &mut panes,
@@ -3081,6 +3191,11 @@ async fn main_loop<W: super::RenderSink>(
                         sidebar,
                         Some(&mut sidebar_painter),
                         &session_name,
+                    );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
                     );
                 }
             }
@@ -3208,7 +3323,7 @@ async fn main_loop<W: super::RenderSink>(
                     && !overlays.is_active()
                     && let Some(ls) = workspace.render_window(zoomed.as_ref()).as_deref()
                 {
-                    paint_full_frame(
+                    let painted = paint_full_frame(
                         out,
                         ls,
                         &mut panes,
@@ -3220,9 +3335,14 @@ async fn main_loop<W: super::RenderSink>(
                         Some(&mut sidebar_painter),
                         &session_name,
                     );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
+                    );
                 }
                 if overlays.is_active() {
-                    paint_active_overlay(
+                    let painted = paint_active_overlay(
                         out,
                         &overlays,
                         &workspace,
@@ -3237,13 +3357,18 @@ async fn main_loop<W: super::RenderSink>(
                         &session_name,
                         &theme,
                     );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
+                    );
                 }
                 // phux-foz.5: same reload-on-commit check as the stdin
                 // arm — a bare-ESC flush can carry the final chord of a
                 // palette selection committing `reload-config`.
                 if reload_request {
                     reload_request = false;
-                    handle_config_reload(
+                    let painted = handle_config_reload(
                         out,
                         &mut keybindings_snapshot,
                         &mut resolver,
@@ -3267,6 +3392,11 @@ async fn main_loop<W: super::RenderSink>(
                         sidebar,
                         &session_name,
                     );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
+                    );
                 }
             }
 
@@ -3285,7 +3415,7 @@ async fn main_loop<W: super::RenderSink>(
                     keybindings_snapshot.as_ref(),
                     &theme,
                 ) {
-                    paint_active_overlay(
+                    let painted = paint_active_overlay(
                         out,
                         &overlays,
                         &workspace,
@@ -3299,6 +3429,11 @@ async fn main_loop<W: super::RenderSink>(
                         Some(&mut sidebar_painter),
                         &session_name,
                         &theme,
+                    );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
                     );
                 }
             }
@@ -3404,7 +3539,7 @@ async fn main_loop<W: super::RenderSink>(
                         status_bar.as_ref().map(StatusBarPainter::position),
                         sidebar,
                     );
-                    paint_active_overlay(
+                    let painted = paint_active_overlay(
                         out,
                         &overlays,
                         &workspace,
@@ -3418,6 +3553,11 @@ async fn main_loop<W: super::RenderSink>(
                         Some(&mut sidebar_painter),
                         &session_name,
                         &theme,
+                    );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
                     );
                 } else {
                     let _ = out.flush();
@@ -3475,7 +3615,7 @@ async fn main_loop<W: super::RenderSink>(
                         has_cursor = focused_cursor.is_some(),
                         "status_tick: repaint bar"
                     );
-                    paint_bar_after_pane(
+                    let painted = paint_bar_after_pane(
                         status_bar.as_mut(),
                         out,
                         viewport_dims,
@@ -3487,6 +3627,11 @@ async fn main_loop<W: super::RenderSink>(
                         // painter's content cache repaints only when a
                         // widget (e.g. the clock) actually changed.
                         false,
+                    );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
                     );
                 }
             }
@@ -3508,7 +3653,7 @@ async fn main_loop<W: super::RenderSink>(
                     overlays.push(Box::new(crate::render::overlay::ToastOverlay::new(
                         title, lines, &theme,
                     )));
-                    paint_active_overlay(
+                    let painted = paint_active_overlay(
                         out,
                         &overlays,
                         &workspace,
@@ -3522,6 +3667,11 @@ async fn main_loop<W: super::RenderSink>(
                         Some(&mut sidebar_painter),
                         &session_name,
                         &theme,
+                    );
+                    finish_return_onboarding_after_paint(
+                        &mut onboarding_claim,
+                        status_bar.as_ref(),
+                        painted,
                     );
                 }
             }
@@ -3728,9 +3878,9 @@ fn refresh_fleet_if_open<W: super::RenderSink>(
     vcs: &mut VcsIndex,
     foreign_layouts: &HashMap<phux_protocol::ids::SessionId, Workspace>,
     foreign_agents: &HashMap<TerminalId, AgentRecord>,
-) {
+) -> StatusBarPaint {
     if !overlays.is_active() {
-        return;
+        return StatusBarPaint::NotPublished;
     }
     let meta = super::fleet::collect_pane_meta(panes, vcs);
     let items = super::fleet::fleet_items(
@@ -3757,7 +3907,9 @@ fn refresh_fleet_if_open<W: super::RenderSink>(
             Some(sidebar_painter),
             session_name,
             theme,
-        );
+        )
+    } else {
+        StatusBarPaint::NotPublished
     }
 }
 
@@ -4195,7 +4347,8 @@ fn handle_config_reload<W: super::RenderSink>(
     viewport_dims: (u16, u16),
     sidebar: Option<SidebarReservation>,
     session_name: &str,
-) {
+) -> StatusBarPaint {
+    let mut painted = StatusBarPaint::NotPublished;
     match super::reload::reload_in_place(
         &phux_config::loader::config_path(),
         keybindings_snapshot,
@@ -4230,7 +4383,7 @@ fn handle_config_reload<W: super::RenderSink>(
             if !overlays.is_active()
                 && let Some(ls) = workspace.render_window(zoomed).as_deref()
             {
-                paint_full_frame(
+                painted = paint_full_frame(
                     out,
                     ls,
                     panes,
@@ -4262,7 +4415,7 @@ fn handle_config_reload<W: super::RenderSink>(
         }
     }
     if overlays.is_active() {
-        paint_active_overlay(
+        painted = paint_active_overlay(
             out,
             overlays,
             workspace,
@@ -4278,6 +4431,7 @@ fn handle_config_reload<W: super::RenderSink>(
             theme,
         );
     }
+    painted
 }
 
 /// phux-i0e8.2.3: set a caller-supplied attach-time notice (the reconnect
@@ -4754,11 +4908,10 @@ pub fn write_terminal_reset<W: Write>(out: &mut W) -> io::Result<()> {
     Ok(())
 }
 
-/// Best-effort terminal reset from inside a signal handler arm. This
-/// is the SIGINT/SIGTERM/SIGHUP path: termios goes back to the saved
-/// state (recovered from [`SAVED_TERMIOS`] when populated; otherwise a
-/// re-cook fall-back), and the alt-screen sequence is left if we
-/// entered one. Errors are swallowed — the process is on its way out.
+/// Best-effort termios restore shared by signal and clean-detach exits.
+/// Termios goes back to the saved state (recovered from [`SAVED_TERMIOS`]
+/// when populated; otherwise a re-cook fall-back). Errors are swallowed: the
+/// process is on its way out.
 ///
 /// Behaviour change for phux-2r7 (was best-effort re-cook only,
 /// committed in 63dc6ff): when [`RawModeGuard`] has parked a snapshot,
@@ -4767,7 +4920,7 @@ pub fn write_terminal_reset<W: Write>(out: &mut W) -> io::Result<()> {
 /// would clobber. The manual SIGINT-during-attach repro that motivated
 /// the original fix still passes; verifying the precise-restore
 /// behaviour requires a live PTY and is not unit-testable from here.
-fn terminal_reset_on_signal() {
+fn restore_terminal_termios() {
     let stdin = io::stdin();
     let fd = stdin.as_fd();
     if let Some(saved) = take_termios_snapshot() {
@@ -4799,8 +4952,33 @@ fn terminal_reset_on_signal() {
             .insert(rustix::termios::OutputModes::OPOST);
         let _ = rustix::termios::tcsetattr(fd, OptionalActions::Now, &termios);
     }
+}
+
+/// Restore termios and leave the alt screen from a signal handler arm.
+fn terminal_reset_on_signal() {
+    restore_terminal_termios();
     let mut out = io::stdout().lock();
     let _ = write_terminal_reset(&mut out);
+}
+
+fn write_terminal_reset_and_finalize<W: Write>(
+    out: &mut W,
+    recorder: Option<&Rc<RefCell<SessionRecorder>>>,
+) {
+    if let Some(recorder) = recorder {
+        {
+            let mut tee = TeeSink {
+                inner: out,
+                rec: Rc::clone(recorder),
+            };
+            let _ = write_terminal_reset(&mut tee);
+        }
+        if let Err(err) = recorder.borrow_mut().finish_in_place() {
+            tracing::warn!(error = %err, "closing the session recording failed");
+        }
+    } else {
+        let _ = write_terminal_reset(out);
+    }
 }
 
 /// Clean client exit after a server-acknowledged DETACH (or a
@@ -4832,9 +5010,20 @@ fn terminal_reset_on_signal() {
     clippy::print_stderr,
     reason = "phux-i0e8.2.2: the terminal is cooked again and the process exits before the CLI could print; this is the only window for the last-pane explanation"
 )]
-fn exit_after_detach(end: AttachEnd) -> ! {
-    terminal_reset_on_signal();
+fn exit_after_detach(
+    end: AttachEnd,
+    locally_requested: bool,
+    onboarding_path: &std::path::Path,
+    recorder: Option<&Rc<RefCell<SessionRecorder>>>,
+) -> ! {
+    restore_terminal_termios();
+    let mut stdout = io::stdout().lock();
+    write_terminal_reset_and_finalize(&mut stdout, recorder);
+    drop(stdout);
     if let Some(line) = end.explanation() {
+        eprintln!("{line}");
+    } else if locally_requested && let Some(line) = super::onboarding::after_detach(onboarding_path)
+    {
         eprintln!("{line}");
     }
     std::process::exit(0);
@@ -4911,6 +5100,18 @@ mod tests {
 
     static TERMINAL_RESET_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn detach_classification_requires_local_intent_and_plain_detach() {
+        assert!(is_local_detach(AttachEnd::Detached, true));
+        assert!(!is_local_detach(AttachEnd::Detached, false));
+        assert!(!is_local_detach(
+            AttachEnd::LastPaneClosed {
+                exit_status: Some(0),
+            },
+            true,
+        ));
+    }
+
     /// phux-0db: a session created from inside the TUI (picker "new
     /// session") seeds its pane in the client's cwd, not `None` (= the
     /// daemon's CWD).
@@ -4976,6 +5177,158 @@ mod tests {
         ));
         // No notice: a first attach is a no-op even with a painter.
         assert!(!apply_initial_notice(Some(&mut painter), None));
+    }
+
+    fn returning_onboarding_claim(path: &std::path::Path) -> super::super::onboarding::AttachClaim {
+        let intro = super::super::onboarding::begin_attach(path).expect("intro claim");
+        assert!(intro.commit());
+        assert_eq!(
+            super::super::onboarding::after_detach(path),
+            Some(super::super::onboarding::DETACH_NOTICE)
+        );
+        super::super::onboarding::begin_attach(path).expect("return claim")
+    }
+
+    #[test]
+    fn accepted_return_notice_is_retryable_when_attach_exits_before_paint() {
+        use phux_config::widget::WidgetRegistry;
+        use phux_config::{StatusCfg, Widget};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("onboarding.json");
+        let claim = returning_onboarding_claim(&path);
+        let cfg = StatusCfg {
+            left: vec![Widget::Bare("session-name".into())],
+            ..StatusCfg::default()
+        };
+        let bar = phux_config::widget::StatusBar::build(&cfg, &WidgetRegistry::with_builtins())
+            .expect("bar");
+        let mut painter =
+            StatusBarPainter::new(bar, crate::render::chrome::status_bar::Position::Bottom);
+
+        assert!(apply_initial_notice(
+            Some(&mut painter),
+            Some(Notice::info(super::super::onboarding::RETURN_NOTICE)),
+        ));
+        drop(claim);
+
+        assert_eq!(
+            super::super::onboarding::begin_attach(&path)
+                .expect("return remains retryable")
+                .moment(),
+            super::super::onboarding::AttachMoment::Return
+        );
+    }
+
+    #[test]
+    fn delivered_return_notice_commits_onboarding_claim() {
+        use phux_config::widget::WidgetRegistry;
+        use phux_config::{StatusCfg, Widget};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("onboarding.json");
+        let claim = returning_onboarding_claim(&path);
+        let cfg = StatusCfg {
+            left: vec![Widget::Bare("session-name".into())],
+            ..StatusCfg::default()
+        };
+        let bar = phux_config::widget::StatusBar::build(&cfg, &WidgetRegistry::with_builtins())
+            .expect("bar");
+        let mut painter =
+            StatusBarPainter::new(bar, crate::render::chrome::status_bar::Position::Bottom);
+        assert!(apply_initial_notice(
+            Some(&mut painter),
+            Some(Notice::info(super::super::onboarding::RETURN_NOTICE)),
+        ));
+
+        let mut out = Vec::new();
+        let delivered = paint_bar_after_pane(
+            Some(&mut painter),
+            &mut out,
+            (80, 24),
+            None,
+            "demo",
+            None,
+            None,
+            false,
+        );
+        assert!(matches!(delivered, StatusBarPaint::Published { .. }));
+        let mut escaped = false;
+        let plain: String = String::from_utf8_lossy(&out)
+            .chars()
+            .filter(|ch| {
+                if escaped {
+                    if ch.is_ascii_alphabetic() {
+                        escaped = false;
+                    }
+                    false
+                } else if *ch == '\x1b' {
+                    escaped = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        assert!(
+            plain.contains(super::super::onboarding::RETURN_NOTICE),
+            "painted text: {plain:?}"
+        );
+        let mut claim = Some(claim);
+        finish_return_onboarding_after_paint(&mut claim, Some(&painter), delivered);
+
+        assert!(super::super::onboarding::begin_attach(&path).is_none());
+    }
+
+    #[test]
+    fn truncated_return_notice_retries_until_the_full_notice_is_published() {
+        use phux_config::widget::WidgetRegistry;
+        use phux_config::{StatusCfg, Widget};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("onboarding.json");
+        let mut claim = Some(returning_onboarding_claim(&path));
+        let cfg = StatusCfg {
+            left: vec![Widget::Bare("session-name".into())],
+            ..StatusCfg::default()
+        };
+        let bar = phux_config::widget::StatusBar::build(&cfg, &WidgetRegistry::with_builtins())
+            .expect("bar");
+        let mut painter =
+            StatusBarPainter::new(bar, crate::render::chrome::status_bar::Position::Bottom);
+        assert!(apply_initial_notice(
+            Some(&mut painter),
+            Some(Notice::info(super::super::onboarding::RETURN_NOTICE)),
+        ));
+
+        let mut out = Vec::new();
+        let truncated = paint_bar_after_pane(
+            Some(&mut painter),
+            &mut out,
+            (20, 24),
+            None,
+            "demo",
+            None,
+            None,
+            false,
+        );
+        finish_return_onboarding_after_paint(&mut claim, Some(&painter), truncated);
+        assert!(claim.is_some(), "a truncated notice must remain retryable");
+
+        let delivered = paint_bar_after_pane(
+            Some(&mut painter),
+            &mut out,
+            (80, 24),
+            None,
+            "demo",
+            None,
+            None,
+            false,
+        );
+        finish_return_onboarding_after_paint(&mut claim, Some(&painter), delivered);
+
+        assert!(claim.is_none());
+        assert!(super::super::onboarding::begin_attach(&path).is_none());
     }
 
     #[test]
@@ -6367,6 +6720,45 @@ mod tests {
         assert!(
             pos_1006l < pos_1049l && pos_1002l < pos_1049l,
             "mouse-disable must precede the alt-screen leave: {reset:?}"
+        );
+    }
+
+    #[test]
+    fn clean_detach_records_the_complete_reset_before_finalizing() {
+        let _guard = TERMINAL_RESET_TEST_LOCK
+            .lock()
+            .expect("terminal reset test lock");
+        HOVER_TRACKING_ACTIVE.store(true, Ordering::SeqCst);
+        MOUSE_CAPTURE_ACTIVE.store(true, Ordering::SeqCst);
+        ALT_SCREEN_ACTIVE.store(true, Ordering::SeqCst);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("detach.cast");
+        let recorder = Rc::new(RefCell::new(
+            SessionRecorder::create(&path, None, phux_record::cast::CastVersion::V2)
+                .expect("recorder"),
+        ));
+        let mut reset = Vec::new();
+        write_terminal_reset_and_finalize(&mut reset, Some(&recorder));
+
+        let cast = std::fs::read(&path).expect("read cast");
+        let text = String::from_utf8(cast.clone()).expect("cast utf-8");
+        assert!(
+            text.lines()
+                .next()
+                .is_some_and(|line| line.contains("\"duration\":")),
+            "clean detach must backfill duration"
+        );
+        let (_, events) = phux_record::cast::read_cast(cast.as_slice()).expect("parse cast");
+        let recorded_reset: String = events
+            .iter()
+            .filter(|event| event.code == phux_record::cast::EventCode::Output)
+            .map(|event| event.data.as_str())
+            .collect();
+        assert_eq!(
+            recorded_reset.as_bytes(),
+            reset,
+            "the recorder must capture every reset byte before it is finalized"
         );
     }
 
