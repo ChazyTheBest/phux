@@ -517,11 +517,15 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   `claude --version` bypass phux.
 
   **The lifecycle hooks declare identity only — `--name claude --kind claude`,
-  never a `--state`.** They announce *who* occupies the pane and leave *what
-  it is doing* to the server's derivation, which is the whole point: a hook
-  that declared a `state` would stand the ADR-0046 detector down on that pane
-  for the record's lifetime, and `claude.toml` is the deepest manifest phux
-  ships. Blocked notifications still emit `phux ask`, so phone and TUI fleet
+  never a `--state` — and only the session-start hook writes the record at
+  all.** They announce *who* occupies the pane and leave *what it is doing* to
+  the server's derivation, which is the whole point: a hook that declared a
+  `state` would stand the ADR-0046 detector down on that pane for the record's
+  lifetime, and `claude.toml` is the deepest manifest phux ships. The
+  per-turn hooks write nothing to the record because an identity write also
+  replaces the derived `state` (§3.7 records are replaced wholesale, not
+  merged), which a repeated write turns into a false departure edge.
+  Blocked notifications still emit `phux ask`, so phone and TUI fleet
   views see attention without screen inference; that path is unchanged and
   keeps the hook's exact timing. What the shim no longer writes is `done` —
   the Stop hook was phux's only `done` producer, and `agent wait --until done`
