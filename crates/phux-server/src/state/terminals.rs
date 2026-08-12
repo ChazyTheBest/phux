@@ -2,10 +2,12 @@ use std::future::Future;
 
 use phux_core::ids::TerminalId;
 use phux_protocol::ids::{BootstrapId, TerminalId as WireTerminalId};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::terminal_table::AttachTerminalPumpReplacement;
 use super::{ClientId, ServerState};
+use crate::mailbox::Outbound;
 use crate::terminal_actor::TerminalHandle;
 
 impl ServerState {
@@ -22,8 +24,44 @@ impl ServerState {
     /// The `ATTACH_TERMINAL` / `SPAWN_TERMINAL` counterpart of
     /// [`Self::unsubscribe_terminal`]; whole-session subscription happens
     /// inside [`Self::attach`].
-    pub fn subscribe_terminal(&mut self, client: ClientId, terminal: TerminalId) {
+    ///
+    /// `mailbox` is the subscriber's outbound channel. Pass `Some` from any
+    /// path that can subscribe a client with no session-scoped `ATTACH`
+    /// behind it (`ATTACH_TERMINAL`), so terminal-scoped fanout
+    /// ([`Self::terminal_fanout_targets`]) can reach it; `None` is correct
+    /// only where the caller has just verified the client is in
+    /// [`Self::attached`], which already carries the same sender.
+    pub fn subscribe_terminal(
+        &mut self,
+        client: ClientId,
+        terminal: TerminalId,
+        mailbox: Option<mpsc::Sender<Outbound>>,
+    ) {
+        if let Some(tx) = mailbox {
+            self.clients.remember_terminal_mailbox(client, tx);
+        }
         self.terminal_table.subscribe(client, terminal);
+    }
+
+    /// Outbound mailboxes of every client subscribed to `terminal`, for the
+    /// server's out-of-band terminal-scoped fanout (`TERMINAL_CLOSED`).
+    ///
+    /// Each subscriber is resolved to exactly one mailbox —
+    /// [`Self::attached`] first, then the `ATTACH_TERMINAL` subscription
+    /// mailbox — so a session-attached client receives one frame and an
+    /// `ATTACH_TERMINAL`-only consumer receives one frame, per L1 §3.1's
+    /// "every client subscribed to the Terminal". Resolving through
+    /// [`Self::attached`] alone silently dropped the second kind
+    /// (phux-w7z2.56).
+    ///
+    /// A subscriber whose mailbox has already gone (connection tearing
+    /// down) is skipped; the fanout is best-effort by construction.
+    #[must_use]
+    pub fn terminal_fanout_targets(&self, terminal: TerminalId) -> Vec<mpsc::Sender<Outbound>> {
+        self.subscribers_for_terminal(terminal)
+            .iter()
+            .filter_map(|client| self.clients.terminal_fanout_mailbox(*client).cloned())
+            .collect()
     }
 
     /// Clone the [`TerminalHandle`] of every pane `client_id` currently

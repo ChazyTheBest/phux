@@ -489,6 +489,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_fanout_reaches_attach_terminal_only_subscribers_exactly_once() {
+        // phux-w7z2.56: L1 §3.1 requires TERMINAL_CLOSED for "every client
+        // subscribed to the Terminal", and L1 §5.1 says ATTACH_TERMINAL
+        // needs no session-scoped ATTACH. The fanout used to resolve
+        // mailboxes through `attached()` alone, so a consumer that only
+        // sent ATTACH_TERMINAL was in the subscriber list and filtered out
+        // of the fanout — it stopped receiving output and never learned
+        // why. Both kinds must resolve, and each to exactly one mailbox.
+        let mut s = ServerState::new();
+        let (_sid, _wid, pid) = s.seed_session("default");
+
+        let attached = s.new_client_id();
+        let (attached_tx, _attached_rx) = mpsc::channel::<Outbound>(DEFAULT_CLIENT_MAILBOX);
+        s.attach_default_caps(attached, "default", attached_tx)
+            .expect("attach the session-scoped client");
+
+        let watcher = s.new_client_id();
+        let (watcher_tx, _watcher_rx) = mpsc::channel::<Outbound>(DEFAULT_CLIENT_MAILBOX);
+        s.subscribe_terminal(watcher, pid, Some(watcher_tx));
+
+        assert_eq!(
+            s.terminal_fanout_targets(pid).len(),
+            2,
+            "both the session-attached client and the ATTACH_TERMINAL-only \
+             watcher must resolve to a mailbox",
+        );
+
+        // The session-attached client is ALSO reachable per-Terminal on the
+        // upgrade path (it re-issues ATTACH_TERMINAL on a pane it already
+        // observes). It must still resolve to one mailbox, not two.
+        let (upgrade_tx, _upgrade_rx) = mpsc::channel::<Outbound>(DEFAULT_CLIENT_MAILBOX);
+        s.subscribe_terminal(attached, pid, Some(upgrade_tx));
+        assert_eq!(
+            s.terminal_fanout_targets(pid).len(),
+            2,
+            "a client subscribed both ways must be delivered exactly one frame",
+        );
+
+        // Disconnect drops the per-Terminal mailbox with the subscription.
+        s.detach(watcher);
+        assert_eq!(
+            s.terminal_fanout_targets(pid).len(),
+            1,
+            "a detached watcher must leave neither a subscription nor a mailbox",
+        );
+    }
+
     // ADR-0033 input-lease state machine (the gate's backing store).
 
     #[test]

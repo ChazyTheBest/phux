@@ -1406,7 +1406,10 @@ pub(crate) async fn handle_spawn_terminal(
         // wire-wise (the frame doesn't require ATTACH first) but the
         // subscription would have no `attached` slot to live in.
         if s.attached().contains_key(&client_id) {
-            s.subscribe_terminal(client_id, core_terminal_id);
+            // `None` mailbox: the `attached` entry just checked already
+            // carries this client's sender, so terminal-scoped fanout
+            // resolves it without a second copy (phux-w7z2.56).
+            s.subscribe_terminal(client_id, core_terminal_id, None);
         }
         s.terminal_handle(core_terminal_id)
             .cloned()

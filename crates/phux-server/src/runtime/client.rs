@@ -516,11 +516,16 @@ pub(crate) fn spawn_terminal_exit_watcher(
             served,
         } = state.with_mut(|s| {
             let wire_terminal_id = s.intern_terminal_wire(pane);
-            let targets: Vec<tokio::sync::mpsc::Sender<Outbound>> = s
-                .subscribers_for_terminal(pane)
-                .iter()
-                .filter_map(|cid| s.attached().get(cid).map(|c| c.tx.clone()))
-                .collect();
+            // phux-w7z2.56: resolve every subscriber's mailbox, not just
+            // the session-attached ones. This used to filter through
+            // `attached()`, which an `ATTACH_TERMINAL`-only consumer never
+            // enters (L1 §5.1: "a session-scoped `ATTACH` is not
+            // required"), so an agent watching a single pane — and a
+            // federation hub's proxy subscription, which is exactly that
+            // shape — was silently dropped from the fanout L1 §3.1
+            // requires. It kept streaming nothing, indistinguishable from
+            // an idle pane, and the hub retained dead proxy state.
+            let targets: Vec<tokio::sync::mpsc::Sender<Outbound>> = s.terminal_fanout_targets(pane);
             // phux-60s: reap the dead pane, cascading to its window and
             // session when they empty. Done here (inside the same lock
             // that gathered subscribers) so no ATTACH can interleave

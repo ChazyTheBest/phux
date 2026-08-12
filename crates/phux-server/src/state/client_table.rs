@@ -109,6 +109,29 @@ pub(super) struct ClientTable {
     /// back here, so there is exactly one delivery per client either way.
     /// Cleared on detach alongside the subscription triples.
     pub(super) metadata_mailboxes: HashMap<ClientId, mpsc::Sender<Outbound>>,
+    /// Outbound mailbox of every client holding an `ATTACH_TERMINAL`
+    /// subscription, for exactly the same reason
+    /// [`Self::event_subscriptions`] and [`Self::metadata_mailboxes`] carry
+    /// one: `ATTACH_TERMINAL` is a per-Terminal subscription that does
+    /// **not** require a session-scoped `ATTACH` (L1 §5.1, "a session-scoped
+    /// `ATTACH` is not required"), so such a consumer has no
+    /// [`Self::attached`] entry and cannot be reached through it.
+    ///
+    /// Terminal *content* still reaches it — the per-`(client, terminal)`
+    /// output pump owns its own clone of the mailbox — but the server's
+    /// out-of-band terminal-scoped fanout (`TERMINAL_CLOSED`, L1 §3.1: "the
+    /// server MUST emit it to every client subscribed to the Terminal")
+    /// resolves mailboxes from the subscriber list, and every subscriber
+    /// that only ever sent `ATTACH_TERMINAL` was silently filtered out.
+    /// An agent watching one pane then never learned the pane died; it just
+    /// stopped receiving output, which is indistinguishable from an idle
+    /// pane (phux-w7z2.56).
+    ///
+    /// An attached subscriber has the same sender in both maps.
+    /// [`Self::terminal_fanout_mailbox`] prefers `attached` and falls back
+    /// here, so a client is resolved to exactly one mailbox either way.
+    /// Cleared on detach alongside the subscriptions themselves.
+    pub(super) terminal_mailboxes: HashMap<ClientId, mpsc::Sender<Outbound>>,
     /// Per-client peer identities, keyed by server-assigned client id.
     pub(super) peer_identities: HashMap<ClientId, phux_protocol::policy::PeerIdentity>,
     /// Nonce-bearing session-create result keys owned by each connection.
@@ -136,6 +159,7 @@ impl ClientTable {
             layers: HashMap::new(),
             event_subscriptions: HashMap::new(),
             metadata_mailboxes: HashMap::new(),
+            terminal_mailboxes: HashMap::new(),
             peer_identities: HashMap::new(),
             session_create_results: HashMap::new(),
         }
@@ -219,6 +243,42 @@ impl ClientTable {
             .filter(|client| client.session == session)
             .map(|client| (client.id, client.tx.clone()))
             .collect()
+    }
+
+    // -- per-Terminal subscription mailboxes ---------------------------
+
+    /// Remember `client`'s outbound mailbox for terminal-scoped fanout.
+    ///
+    /// Called from the `ATTACH_TERMINAL` handler, in the same critical
+    /// section that appends `client` to the Terminal's subscriber list, so
+    /// the mailbox is never missing for a client the list already names.
+    /// Re-attaching overwrites with the same sender (a connection's tx is
+    /// stable), so this is idempotent in practice.
+    pub(super) fn remember_terminal_mailbox(
+        &mut self,
+        client: ClientId,
+        tx: mpsc::Sender<Outbound>,
+    ) {
+        self.terminal_mailboxes.insert(client, tx);
+    }
+
+    /// Resolve `client`'s outbound mailbox for terminal-scoped fanout:
+    /// [`Self::attached`] first, then [`Self::terminal_mailboxes`].
+    ///
+    /// One mailbox per client, whichever way it subscribed — the
+    /// "exactly once" half of the [`Self::terminal_mailboxes`] contract.
+    /// `None` for a client that is neither attached nor per-Terminal
+    /// subscribed, which for a name taken from a live subscriber list means
+    /// the connection is already tearing down.
+    #[must_use]
+    pub(super) fn terminal_fanout_mailbox(
+        &self,
+        client: ClientId,
+    ) -> Option<&mpsc::Sender<Outbound>> {
+        self.attached
+            .get(&client)
+            .map(|attached| &attached.tx)
+            .or_else(|| self.terminal_mailboxes.get(&client))
     }
 
     // -- agent-event subscriptions -------------------------------------

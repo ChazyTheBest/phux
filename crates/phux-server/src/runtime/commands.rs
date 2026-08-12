@@ -908,10 +908,17 @@ async fn handle_attach_terminal(
     // Resolve and register the subscription in one critical section. Codec
     // selection is connection-scoped and comes directly from HELLO; it is
     // never re-probed or replaced with compatibility defaults here.
+    //
+    // The caller's mailbox is captured with the subscription (phux-w7z2.56):
+    // `ATTACH_TERMINAL` does not require a session-scoped `ATTACH` (L1 §5.1),
+    // so this consumer may have no `attached` entry, and the server's
+    // out-of-band terminal-scoped fanout — `TERMINAL_CLOSED`, which L1 §3.1
+    // requires for "every client subscribed to the Terminal" — has no other
+    // way to reach it. Content rides the pump below; lifecycle does not.
     let resolved = state.with_mut(|s| {
         let core = s.terminal_from_wire(terminal_id)?;
         let handle = s.terminal_handle(core).cloned()?;
-        s.subscribe_terminal(client_id, core);
+        s.subscribe_terminal(client_id, core, Some(out_tx.clone()));
         Some((core, handle))
     });
     let Some((core, handle)) = resolved else {

@@ -296,6 +296,11 @@ impl ServerState {
         // negotiation. Keeps the maps bounded across attach churn.
         self.metadata.drop_client(client_id);
         self.clients.metadata_mailboxes.remove(&client_id);
+        // The per-Terminal subscription mailbox goes with the subscriptions
+        // `drop_client_subscriptions` just cleared (phux-w7z2.56): they are
+        // the two halves of one `ATTACH_TERMINAL` registration, and leaving
+        // the mailbox would keep a dead connection's sender alive in the map.
+        self.clients.terminal_mailboxes.remove(&client_id);
         if let Some(keys) = self.clients.session_create_results.remove(&client_id) {
             for key in keys {
                 let _ = self.metadata_delete(&phux_protocol::wire::frame::Scope::Global, &key);
