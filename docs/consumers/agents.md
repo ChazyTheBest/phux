@@ -1836,9 +1836,15 @@ and **stderr carries one line of JSON** (ADR-0065 §4):
   (exit 2 — a key argument would not translate to the key you clearly meant,
   refused before the connection is opened so the batch stays all-or-nothing).
   Acknowledged input adds `input_busy` (nothing written; retry is safe),
-  `delivery_unknown` (indeterminate; never resend), `input_too_large`,
-  `input_lease_held`, `canonical_limit_exceeded`, `unsafe_paste`,
-  `invalid_input_batch`, and `permission_denied`. Ask validation adds
+  `input_not_written` (exit 1 — nothing was written, **proven** at some point
+  other than lane contention: no PTY, a writer-side queue full or closed, or
+  the pane's own actor gone before handoff; retry is safe, under the same
+  operation id or a fresh one, because nothing already written could be
+  duplicated), `delivery_unknown` (exit 1 — indeterminate; never resend
+  under any id — do not confuse the two: `input_not_written` is the case
+  the server can rule out delivery for, `delivery_unknown` is the case it
+  cannot), `input_too_large`, `input_lease_held`, `canonical_limit_exceeded`,
+  `unsafe_paste`, `invalid_input_batch`, and `permission_denied`. Ask validation adds
   `no_active_ask`, `ask_unidentified`, `ask_stale`, `answer_choice_out_of_range`,
   and `answer_not_suggested`. Start adds `invalid_agent_name`,
   `unsupported_agent_kind`, `agent_detection_unavailable`,

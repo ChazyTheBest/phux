@@ -289,10 +289,11 @@ impl std::fmt::Display for Refusal {
 
 /// The one reading an `APPLY_INPUT` reply has.
 ///
-/// Deliberately four cases and not more: every server error code collapses
-/// into "written", "nothing written and retryable", "nothing written and
-/// not retryable", or "indeterminate". A caller that has to guess which of
-/// those a code means is a caller that will guess wrong under load.
+/// Deliberately five cases and not more: every server error code collapses
+/// into "written", "nothing written and known retryable", "nothing written
+/// for some other proven reason", "nothing written and not retryable", or
+/// "indeterminate". A caller that has to guess which of those a code means is
+/// a caller that will guess wrong under load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyVerdict {
     /// Every byte was accepted into the tty input queue and flushed.
@@ -301,6 +302,14 @@ pub enum ApplyVerdict {
     /// Nothing was written; resubmitting the identical batch under the same
     /// operation id is honest and is what this module does.
     Busy(String),
+    /// phux-w7z2.60: nothing was written, proven at a point other than lane
+    /// contention — the pane had no PTY, a writer-side queue was full or its
+    /// channel closed, or the pane's own actor was gone before handoff. Unlike
+    /// [`Self::Busy`] this module does not auto-retry it (the cause may not
+    /// clear on its own), but unlike [`Self::Unknown`] a caller MAY resubmit
+    /// safely, under the same operation id or a fresh one — there is nothing
+    /// already written for a fresh id to duplicate.
+    NotWritten(String),
     /// Nothing was written and the identical batch cannot succeed.
     Refused(Refusal),
     /// The Terminal is gone or was never here.
@@ -312,13 +321,18 @@ pub enum ApplyVerdict {
 
 /// Map one `APPLY_INPUT` reply onto its single reading.
 ///
-/// `INTERNAL_ERROR` is pessimized to [`ApplyVerdict::Unknown`] on purpose:
-/// the server raises it both pre-handoff ("pane actor unavailable") and
-/// post-handoff ("input lane stopped before `APPLY_INPUT` completed"), and the
-/// code alone does not separate them, so the caller must assume the worse of
-/// the two. Any code this build does not know is pessimized the same way —
-/// `ErrorCode` is `#[non_exhaustive]`, and inventing an optimistic default
-/// for a future code is how a duplicate gets written.
+/// `INTERNAL_ERROR` is pessimized to [`ApplyVerdict::Unknown`] on purpose: the
+/// server still raises it for at least one post-handoff case — "input lane
+/// stopped before `APPLY_INPUT` completed", raised when the whole lane is torn
+/// down with the operation's answer still outstanding, which may have already
+/// been resolved by a writer the caller never heard from — and the code alone
+/// does not distinguish that from a future, differently-caused `INTERNAL_ERROR`.
+/// Every pre-handoff cause this module can currently name instead carries its
+/// own code: [`ErrorCode::ResourceExhausted`] ([`ApplyVerdict::Busy`]) and
+/// [`ErrorCode::InputNotWritten`] ([`ApplyVerdict::NotWritten`]). Any code this
+/// build does not know at all is pessimized the same way as `INTERNAL_ERROR` —
+/// `ErrorCode` is `#[non_exhaustive]`, and inventing an optimistic default for
+/// a future code is how a duplicate gets written.
 #[must_use]
 pub fn classify(result: &CommandResult) -> ApplyVerdict {
     let (code, message) = match result {
@@ -335,6 +349,7 @@ pub fn classify(result: &CommandResult) -> ApplyVerdict {
     };
     match code {
         ErrorCode::ResourceExhausted => ApplyVerdict::Busy(message),
+        ErrorCode::InputNotWritten => ApplyVerdict::NotWritten(message),
         ErrorCode::InputLeaseHeld => ApplyVerdict::Refused(Refusal::InputLeaseHeld(message)),
         ErrorCode::CanonicalLimitExceeded => {
             ApplyVerdict::Refused(Refusal::CanonicalLimitExceeded(message))
@@ -649,6 +664,20 @@ pub enum PromptError {
         /// The operation id, in hex.
         operation_id: String,
     },
+    /// phux-w7z2.60: nothing was written, proven at some point other than
+    /// lane contention (no PTY, a writer-side queue full or closed, or the
+    /// pane's own actor gone before handoff). Unlike [`Self::LaneBusy`] this
+    /// is not auto-retried — the cause may not clear on its own — but unlike
+    /// [`Self::DeliveryUnknown`] a caller MAY resubmit, under the same
+    /// operation id or a fresh one: there is nothing already written for a
+    /// fresh id to duplicate. Exit 1.
+    #[error("nothing was written (operation {operation_id}): {message}")]
+    NotWritten {
+        /// The operation id, in hex.
+        operation_id: String,
+        /// The server's diagnostic.
+        message: String,
+    },
     /// The Terminal is gone. Exit 1.
     #[error("terminal not found: {0}")]
     NotFound(String),
@@ -872,6 +901,12 @@ pub async fn deliver_acknowledged(
                 budget_ms,
                 message,
                 operation_id: hex,
+            });
+        }
+        ApplyVerdict::NotWritten(message) => {
+            return Err(PromptError::NotWritten {
+                operation_id: hex,
+                message,
             });
         }
         ApplyVerdict::Refused(refusal) => return Err(PromptError::Refused(refusal)),
@@ -1279,11 +1314,11 @@ mod tests {
         assert!(!matches!(verdict, ApplyVerdict::Busy(_)));
     }
 
-    /// `INTERNAL_ERROR` is raised both pre- and post-handoff and the code
-    /// does not separate them, so it is pessimized to unknown. So is any code
-    /// a newer server may add — `ErrorCode` is `#[non_exhaustive]`, and an
-    /// optimistic default for an unknown code is how a duplicate gets
-    /// written.
+    /// `INTERNAL_ERROR` still carries at least one genuinely post-handoff
+    /// reading (the lane torn down with an operation's answer outstanding),
+    /// so it stays pessimized to unknown. So is any code a newer server may
+    /// add — `ErrorCode` is `#[non_exhaustive]`, and an optimistic default
+    /// for an unknown code is how a duplicate gets written.
     #[test]
     fn internal_error_and_unknown_codes_pessimize_to_unknown() {
         assert!(matches!(
@@ -1294,6 +1329,22 @@ mod tests {
             classify(&error(ErrorCode::NotAttached)),
             ApplyVerdict::Unknown(_)
         ));
+    }
+
+    /// phux-w7z2.60: `INPUT_NOT_WRITTEN` is its own reading — nothing was
+    /// written, proven at some point other than the server-wide lane — and it
+    /// must not collapse into either neighbour: not `Busy` (this module does
+    /// not auto-retry it) and not `Unknown` (a caller MAY resubmit safely,
+    /// because nothing already written could be duplicated).
+    #[test]
+    fn input_not_written_is_its_own_reading_distinct_from_busy_and_unknown() {
+        let verdict = classify(&error(ErrorCode::InputNotWritten));
+        assert!(
+            matches!(verdict, ApplyVerdict::NotWritten(_)),
+            "{verdict:?}"
+        );
+        assert!(!matches!(verdict, ApplyVerdict::Busy(_)));
+        assert!(!matches!(verdict, ApplyVerdict::Unknown(_)));
     }
 
     /// `RESOURCE_EXHAUSTED` is pre-handoff: nothing was written, and the

@@ -238,11 +238,11 @@ impl InputLaneHandle {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 return acknowledged_resource_exhausted("input lane queue is full");
             }
+            // The lane thread itself is gone: this operation was never even
+            // enqueued, let alone handed to a pane actor or a PTY writer.
+            // Provably nothing was written (phux-w7z2.60).
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                return CommandResult::Error {
-                    code: ErrorCode::InternalError,
-                    message: "input lane unavailable for APPLY_INPUT".to_owned(),
-                };
+                return acknowledged_not_written("input lane unavailable for APPLY_INPUT");
             }
         }
         result.await.unwrap_or_else(|_| CommandResult::Error {
@@ -292,10 +292,9 @@ impl InputLaneHandle {
             mpsc::error::TrySendError::Full(_) => {
                 acknowledged_resource_exhausted("input lane queue is full")
             }
-            mpsc::error::TrySendError::Closed(_) => CommandResult::Error {
-                code: ErrorCode::InternalError,
-                message: "input lane unavailable for APPLY_INPUT".to_owned(),
-            },
+            mpsc::error::TrySendError::Closed(_) => {
+                acknowledged_not_written("input lane unavailable for APPLY_INPUT")
+            }
         })?;
         Ok(result)
     }
@@ -595,9 +594,18 @@ fn acknowledged_resource_exhausted(message: &str) -> CommandResult {
     }
 }
 
-fn internal_error(message: &str) -> CommandResult {
+/// phux-w7z2.60: an `APPLY_INPUT` operation refused, or abandoned, at a point
+/// this module can prove never reached a pane actor's own mailbox, let alone a
+/// PTY writer. Every call site below is pre-handoff — the batch is never
+/// `try_send`d onto `TerminalHandle::encoded_input` on this path — so nothing
+/// was written and resubmitting under any operation id cannot type it twice.
+/// The sibling proof for a request that DID reach the pane actor but was
+/// dropped before reaching the PTY writer lives in
+/// [`crate::terminal_actor::WriteCompletion::NotWritten`], mapped in
+/// `acknowledged::completion_result`.
+fn acknowledged_not_written(message: &str) -> CommandResult {
     CommandResult::Error {
-        code: ErrorCode::InternalError,
+        code: ErrorCode::InputNotWritten,
         message: message.to_owned(),
     }
 }
@@ -746,7 +754,9 @@ fn process_apply_input(
         reservation,
         reply,
     )) {
-        pending.resolve_without_writer(internal_error(
+        // Registration itself is pre-handoff: the batch was never `try_send`d
+        // onto the pane actor's mailbox, so nothing was written (phux-w7z2.60).
+        pending.resolve_without_writer(acknowledged_not_written(
             "acknowledged completion waiter unavailable for APPLY_INPUT",
         ));
         return;
@@ -764,7 +774,10 @@ fn process_apply_input(
             .input_snapshot
             .same_channel(&current.handle.input_snapshot)
         {
-            return Err(internal_error(
+            // The Terminal's actor was replaced between admission and
+            // handoff (a respawn), so this batch is never sent to *any*
+            // actor's mailbox on this path. Provably nothing was written.
+            return Err(acknowledged_not_written(
                 "pane actor changed before APPLY_INPUT handoff",
             ));
         }
@@ -777,8 +790,11 @@ fn process_apply_input(
                 drop(request);
                 Err(refusal)
             }
+            // The pane actor's own inbound mailbox is closed: the actor is
+            // gone, so this request is never dequeued by it, let alone
+            // forwarded to a PTY writer. Provably nothing was written.
             Err(mpsc::error::TrySendError::Closed(request)) => {
-                let refusal = internal_error("pane actor unavailable for APPLY_INPUT");
+                let refusal = acknowledged_not_written("pane actor unavailable for APPLY_INPUT");
                 waiter.abandon(ticket, refusal.clone());
                 drop(request);
                 Err(refusal)
@@ -1437,8 +1453,89 @@ mod tests {
         ));
     }
 
+    /// phux-w7z2.60: a Terminal registered with no PTY at all (the actor's
+    /// `pty_tx` is `None`, `TerminalActor::new`'s no-PTY test variant) can
+    /// never hand a batch to a writer, so this is provably nothing-written —
+    /// `InputNotWritten`, not `InputDeliveryUnknown`.
     #[tokio::test(flavor = "current_thread")]
-    async fn apply_input_full_writer_queue_is_bounded_and_returns_delivery_unknown() {
+    async fn apply_input_reports_not_written_when_pane_has_no_pty() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bundle = TerminalActor::new(80, 24).expect("actor");
+                let handle = bundle.handle.clone();
+                let token = bundle.token.clone();
+                let actor = bundle.actor;
+                let state = SharedState::new();
+                let (wire, client) = state.with_mut(|s| {
+                    let pane = s.seed_session("s").2;
+                    let wire = s.register_terminal_handle(pane, handle, token.clone());
+                    (wire, s.new_client_id())
+                });
+                tokio::task::spawn_local(actor.run());
+                let lane = spawn_input_lane(state).expect("spawn lane");
+                let result = tokio::time::timeout(
+                    LANE_DELIVERY_DEADLINE,
+                    lane.handle().apply_input(
+                        client,
+                        operation_id(21),
+                        wire,
+                        vec![InputEvent::Paste(paste_event(b"x"))],
+                    ),
+                )
+                .await
+                .expect("no-PTY reply must not hang");
+                assert!(matches!(
+                    result,
+                    CommandResult::Error {
+                        code: ErrorCode::InputNotWritten,
+                        ..
+                    }
+                ));
+                token.cancel();
+            })
+            .await;
+    }
+
+    /// phux-w7z2.60: the pane actor's own inbound mailbox closed (the actor
+    /// is gone) *before* handoff, so the batch is never even dequeued by an
+    /// actor, let alone forwarded to a writer. Provably nothing was written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_input_reports_not_written_when_pane_actor_is_gone_before_handoff() {
+        let bundle = TerminalActor::new(80, 24).expect("actor");
+        let handle = bundle.handle.clone();
+        let token = bundle.token.clone();
+        // The actor (and the `encoded_input` mailbox's receiver half) is
+        // dropped without ever running: the registered handle's sender half
+        // now finds the channel closed on the very first send.
+        drop(bundle);
+        let state = SharedState::new();
+        let (wire, client) = state.with_mut(|s| {
+            let pane = s.seed_session("s").2;
+            let wire = s.register_terminal_handle(pane, handle, token);
+            (wire, s.new_client_id())
+        });
+        let lane = spawn_input_lane(state).expect("spawn lane");
+        let result = lane
+            .handle()
+            .apply_input(
+                client,
+                operation_id(22),
+                wire,
+                vec![InputEvent::Paste(paste_event(b"x"))],
+            )
+            .await;
+        assert!(matches!(
+            result,
+            CommandResult::Error {
+                code: ErrorCode::InputNotWritten,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_input_full_writer_queue_is_bounded_and_returns_not_written() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1465,13 +1562,16 @@ mod tests {
                 // The ONLY deadline in this module that is itself the
                 // assertion, so it cannot join `LANE_DELIVERY_DEADLINE`: a
                 // full writer queue must short-circuit to
-                // `InputDeliveryUnknown` rather than wait out the product's
+                // `InputNotWritten` rather than wait out the product's
                 // `ACKNOWLEDGED_COMPLETION_TIMEOUT`, and both paths end in
                 // the same `CommandResult`. Strictly-under is the whole
                 // claim, so the bound is derived from the product constant
                 // instead of hand-picked — half of it is 5x the 500ms this
                 // used to be (headroom against a loaded runner) while still
-                // failing if the slow path were ever taken.
+                // failing if the slow path were ever taken. phux-w7z2.60: a
+                // full writer queue is provably nothing-written (the writer
+                // thread never received it), so this is `InputNotWritten`
+                // rather than the `InputDeliveryUnknown` it used to report.
                 let fast_path_bound = ACKNOWLEDGED_COMPLETION_TIMEOUT / 2;
                 for (id, payload) in [(18, b"first".as_slice()), (19, b"second".as_slice())] {
                     let result = tokio::time::timeout(
@@ -1488,7 +1588,7 @@ mod tests {
                     assert!(matches!(
                         result,
                         CommandResult::Error {
-                            code: ErrorCode::InputDeliveryUnknown,
+                            code: ErrorCode::InputNotWritten,
                             ..
                         }
                     ));
@@ -1620,8 +1720,12 @@ mod tests {
             .await;
     }
 
+    /// phux-w7z2.60: a writer channel closed before handoff even reaches it
+    /// (the writer thread is gone) is provably nothing-written — the pane
+    /// actor never calls `write(2)` for it — so this reports `InputNotWritten`
+    /// rather than the `InputDeliveryUnknown` it used to.
     #[tokio::test(flavor = "current_thread")]
-    async fn apply_input_waiter_finishes_if_writer_channel_is_closed() {
+    async fn apply_input_reports_not_written_if_writer_channel_is_closed() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -1642,7 +1746,7 @@ mod tests {
                 assert!(matches!(
                     result,
                     CommandResult::Error {
-                        code: ErrorCode::InputDeliveryUnknown,
+                        code: ErrorCode::InputNotWritten,
                         ..
                     }
                 ));

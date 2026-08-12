@@ -339,8 +339,12 @@ fn numbered(suggestions: &[String]) -> String {
 /// add, because assuming the optimistic reading of a code you cannot name is
 /// how a duplicate submission gets written. So it is exit 3 ("phux cannot
 /// answer that") and explicitly not retryable: a fresh operation id would be
-/// the double submission, and the same id replays the cached unknown. The other
-/// three arms wrote nothing.
+/// the double submission, and the same id replays the cached unknown. Every
+/// other arm wrote nothing, `NotWritten` included — it shares
+/// `ANSWER_REFUSED`'s code with `Busy`/`NotFound`/`Refused` (this verb
+/// discriminates by message and exit code, not by a fourth code for every
+/// nothing-written reason), and it is safe to resubmit precisely because
+/// nothing already reached the pane for a resubmission to duplicate.
 fn refusal_for_verdict(verdict: ApplyVerdict, label: &str) -> Refusal {
     match verdict {
         // Handled by the caller; folded in so the mapping stays total.
@@ -362,6 +366,13 @@ fn refusal_for_verdict(verdict: ApplyVerdict, label: &str) -> Refusal {
             format!("{label}: the server-wide acknowledged input lane is busy ({message})"),
             "nothing was typed — this refusal happens before the write. Back off and run \
              the same command again",
+            crate::exit_codes::EXIT_FAILURE,
+        ),
+        ApplyVerdict::NotWritten(message) => Refusal::new(
+            codes::ANSWER_REFUSED,
+            format!("{label}: nothing was typed ({message})"),
+            "nothing reached the pane, so re-running this command — even with a fresh \
+             operation id — cannot type the answer twice",
             crate::exit_codes::EXIT_FAILURE,
         ),
         ApplyVerdict::NotFound(message) => Refusal::new(
@@ -749,6 +760,7 @@ mod tests {
                 ErrorCode::ResourceExhausted,
                 crate::exit_codes::EXIT_FAILURE,
             ),
+            (ErrorCode::InputNotWritten, crate::exit_codes::EXIT_FAILURE),
             (ErrorCode::TerminalNotFound, crate::exit_codes::EXIT_FAILURE),
             (ErrorCode::InvalidCommand, crate::exit_codes::EXIT_USAGE),
             (ErrorCode::InputLeaseHeld, crate::exit_codes::EXIT_USAGE),
@@ -776,5 +788,24 @@ mod tests {
             "{}",
             unknown.remedy
         );
+    }
+
+    /// phux-w7z2.60: `NotWritten` is provably nothing-written, so — unlike
+    /// `Unknown` right above — its remedy must not tell the caller to hold
+    /// off. It shares `Busy`/`NotFound`/`Refused`'s `ANSWER_REFUSED` code
+    /// (this verb discriminates by message, not by a code per reason) but its
+    /// own exit and its own "resubmitting is safe" wording.
+    #[test]
+    fn not_written_says_resubmitting_is_safe_unlike_unknown() {
+        let not_written =
+            super::refusal_for_verdict(super::ApplyVerdict::NotWritten("no PTY".to_owned()), "@7");
+        assert_eq!(not_written.code, super::codes::ANSWER_REFUSED);
+        assert_eq!(not_written.exit, crate::exit_codes::EXIT_FAILURE);
+        assert!(
+            !not_written.remedy.contains("do NOT retry"),
+            "{}",
+            not_written.remedy
+        );
+        assert!(not_written.message.contains("@7"));
     }
 }

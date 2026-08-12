@@ -780,6 +780,15 @@ ErrorCode = enum {
                                  //   were written, distinct from 205 (that
                                  //   code means delivery is unconfirmed,
                                  //   this one means delivery is known unsafe)
+    INPUT_NOT_WRITTEN    = 207, // phux-w7z2.60: APPLY_INPUT was refused, or
+                                 //   its pending write abandoned, at a point
+                                 //   provably before any live PTY writer saw
+                                 //   it (no PTY, a writer-side queue full or
+                                 //   closed, or the pane's actor gone before
+                                 //   handoff); distinct from 205 the same way
+                                 //   206 is: 205 means delivery could not be
+                                 //   confirmed, this one means delivery is
+                                 //   known never to have been attempted
 
     INTERNAL_ERROR       = 65535,
 }

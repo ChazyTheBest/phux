@@ -374,6 +374,39 @@ async fn input_delivery_unknown_is_reported_once_and_never_retried() {
     );
 }
 
+/// **`INPUT_DELIVERY_UNKNOWN`'s honest opposite** (phux-w7z2.60).
+/// `INPUT_NOT_WRITTEN` is proven nothing-written, not merely unconfirmed, so
+/// it must land on its own `PromptError` variant rather than collapsing into
+/// `DeliveryUnknown` — and it must not be auto-retried like `Busy` either,
+/// since the module makes no claim the cause will clear on its own.
+#[tokio::test]
+async fn input_not_written_is_reported_distinctly_and_not_auto_retried() {
+    let script =
+        Script::new(Some(record("working"))).apply(vec![refused(ErrorCode::InputNotWritten)]);
+    let (_dir, socket, seen) = serve(script);
+    let outcome = prompt_agent(
+        &socket,
+        &TerminalId::local(7),
+        "ship it",
+        op_id(0x46),
+        &always_ok,
+        None,
+    )
+    .await;
+
+    match outcome {
+        Err(PromptError::NotWritten { operation_id, .. }) => {
+            assert_eq!(operation_id.len(), 32);
+        }
+        other => panic!("a proven not-written batch must be reported as such: {other:?}"),
+    }
+    assert_eq!(
+        seen.lock().expect("ids").len(),
+        1,
+        "this module does not auto-retry INPUT_NOT_WRITTEN — that choice is the caller's"
+    );
+}
+
 /// A pane that refuses the batch before writing anything (canonical-mode
 /// limit) is a refusal the caller can act on, and it is NOT retried: the
 /// identical payload cannot succeed.

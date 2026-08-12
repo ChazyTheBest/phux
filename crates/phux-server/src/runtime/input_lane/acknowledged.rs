@@ -447,6 +447,7 @@ fn completion_result(outcome: WriteCompletion) -> CommandResult {
             ),
         },
         WriteCompletion::Failed => delivery_unknown(),
+        WriteCompletion::NotWritten => not_written(),
     }
 }
 
@@ -454,6 +455,18 @@ fn delivery_unknown() -> CommandResult {
     CommandResult::Error {
         code: ErrorCode::InputDeliveryUnknown,
         message: "PTY input delivery could not be confirmed".to_owned(),
+    }
+}
+
+/// phux-w7z2.60: the request never reached a live PTY writer, so `write(2)`
+/// was never invoked for it — proven at the point [`WriteCompletion::NotWritten`]
+/// was raised, not inferred here. Distinct from [`delivery_unknown`]: that
+/// reading forbids a retry under any id, this one does not, because there is
+/// nothing already written for a retry to duplicate.
+fn not_written() -> CommandResult {
+    CommandResult::Error {
+        code: ErrorCode::InputNotWritten,
+        message: "PTY input was not written; the pane's writer never received it".to_owned(),
     }
 }
 
@@ -560,6 +573,43 @@ mod tests {
         let mut bytes = [0; 16];
         bytes[8..].copy_from_slice(&value.to_be_bytes());
         InputOperationId::new(bytes).expect("non-zero operation id")
+    }
+
+    /// phux-w7z2.60: `NotWritten` and `Failed` both mean the batch did not
+    /// land, but they are not the same reading. `Failed` — a real write was
+    /// attempted and something went wrong partway through — stays
+    /// `InputDeliveryUnknown`: a same-id retry replays it, a fresh-id retry
+    /// risks a duplicate. `NotWritten` — the request never reached a writer at
+    /// all — is a distinct, honest code, and this is the one place the two
+    /// map to `CommandResult`, so pin the split here rather than only at the
+    /// call sites that raise each `WriteCompletion` variant.
+    #[test]
+    fn not_written_and_failed_map_to_distinct_error_codes() {
+        assert_eq!(
+            completion_result(WriteCompletion::NotWritten),
+            CommandResult::Error {
+                code: ErrorCode::InputNotWritten,
+                message: not_written_message(),
+            }
+        );
+        assert_eq!(
+            completion_result(WriteCompletion::Failed),
+            CommandResult::Error {
+                code: ErrorCode::InputDeliveryUnknown,
+                message: "PTY input delivery could not be confirmed".to_owned(),
+            }
+        );
+        assert_ne!(
+            completion_result(WriteCompletion::NotWritten),
+            completion_result(WriteCompletion::Failed),
+        );
+    }
+
+    fn not_written_message() -> String {
+        let CommandResult::Error { message, .. } = not_written() else {
+            unreachable!("not_written always returns Error");
+        };
+        message
     }
 
     /// Two Terminals admit independently; one Terminal excludes itself until

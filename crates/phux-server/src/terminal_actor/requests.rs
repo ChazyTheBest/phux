@@ -245,6 +245,16 @@ pub(crate) enum WriteCompletion {
     /// would have completed the truncated line). `limit` is the pane's real
     /// canonical-line byte limit as queried at refusal time.
     CanonicalLimitExceeded { limit: usize },
+    /// phux-w7z2.60: the request never reached a live writer thread at all,
+    /// so `write(2)` was never invoked — proven, not inferred. Reported
+    /// explicitly (never via [`WriteCompletionSink`]'s `Drop` fallback) at
+    /// each site that can make that proof synchronously: the pane has no
+    /// PTY, the writer's queue is full, or the writer's channel is already
+    /// closed. Distinct from [`Self::Failed`], whose bytes may have already
+    /// left `write_all` before the error: a caller may resubmit this batch,
+    /// under the same operation id or a fresh one, with no risk of typing it
+    /// twice.
+    NotWritten,
 }
 
 /// One-shot report path for an acknowledged write's [`WriteCompletion`].
@@ -256,10 +266,17 @@ pub(crate) enum WriteCompletion {
 /// single completion queue, so the sink carries the callback that tags this
 /// operation's outcome with its queue ticket instead of a bare sender.
 ///
-/// Dropping an unfired sink reports [`WriteCompletion::Failed`], preserving the
-/// old "dropped sender means indeterminate delivery" contract for every path
-/// that discards a request without writing it (a full or closed pane mailbox, a
-/// pane with no PTY, an actor destroyed with the request still queued).
+/// Dropping an unfired sink reports [`WriteCompletion::Failed`] — the
+/// pessimistic default for any path that discards a request without an
+/// explicit verdict, including an actor torn down with the request still
+/// sitting in its own inbound queue (never dequeued, so `service_encoded_input`
+/// never even sees it, but that is not provable from here without walking the
+/// queue at teardown, which nothing does today).
+/// phux-w7z2.60 split off the three sibling cases that a call site CAN prove
+/// synchronously — a full or closed writer-thread queue, or no PTY at all —
+/// which now call [`WriteCompletionSink::complete`] with
+/// [`WriteCompletion::NotWritten`] explicitly instead of falling through to
+/// this default.
 pub(crate) struct WriteCompletionSink {
     notify: Option<Box<dyn FnOnce(WriteCompletion) + Send>>,
 }

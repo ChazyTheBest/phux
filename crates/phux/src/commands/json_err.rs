@@ -167,6 +167,11 @@ pub(crate) mod codes {
     pub(crate) const PERMISSION_DENIED: &str = "permission_denied";
     /// PTY delivery is indeterminate; retrying under a new id risks a duplicate.
     pub(crate) const DELIVERY_UNKNOWN: &str = "delivery_unknown";
+    /// PTY input definitely was not written (proven at a point other than
+    /// lane contention — no PTY, a writer-side queue full or closed, or the
+    /// pane's actor gone before handoff). Unlike `delivery_unknown`, retrying
+    /// — under the same operation id or a fresh one — cannot type it twice.
+    pub(crate) const INPUT_NOT_WRITTEN: &str = "input_not_written";
     /// The server-wide acknowledged input lane did not become available.
     pub(crate) const INPUT_BUSY: &str = "input_busy";
     /// The pane's occupant changed while acknowledged input was in flight.
@@ -406,5 +411,9 @@ mod tests {
         // phux-w7z2.42, added after ADR-0071 point 6 was written: it needs
         // carving into that enumeration in the PR that ships it.
         assert_eq!(codes::UNSATISFIABLE_WAIT, "unsatisfiable_wait");
+        // phux-w7z2.60, added after ADR-0071 point 6 was written: it too
+        // needs carving into that enumeration in the PR that ships it.
+        assert_eq!(codes::INPUT_NOT_WRITTEN, "input_not_written");
+        assert_eq!(codes::DELIVERY_UNKNOWN, "delivery_unknown");
     }
 }

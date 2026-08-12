@@ -2517,33 +2517,50 @@ impl TerminalActor {
     }
 
     /// Forward bytes encoded by the dedicated input lane to the PTY writer.
+    ///
+    /// Every branch that discards `request` here does so **before** it ever
+    /// reaches a live writer thread — `write(2)` is provably never invoked —
+    /// so an acknowledged request's completion is reported explicitly as
+    /// [`WriteCompletion::NotWritten`] (phux-w7z2.60) rather than left to
+    /// [`WriteCompletionSink`]'s pessimistic `Drop` fallback. A fire-and-forget
+    /// request (`request.completion` is `None`) has nothing to report either
+    /// way.
     fn service_encoded_input(&self, request: EncodedInputRequest) {
         if request.bytes.is_empty() && request.completion.is_none() {
             return;
         }
-        if let Some(tx) = self.pty_tx.as_ref() {
-            let len = request.bytes.len();
-            match tx.try_send(request) {
-                Ok(()) => debug!(len, "input queued to PTY writer"),
-                // Dropping input is fire-and-forget per SPEC L1 §9, but it
-                // is not a debug-level event: the bytes are gone, nothing
-                // downstream reports it, and the caller is still acked `Ok`.
-                // At `debug!` this was invisible by default, which is how a
-                // payload split across several events could lose an
-                // interior one and corrupt mid-stream with no trace
-                // (phux-oxd7).
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(len, "PTY writer queue full; dropping input");
-                }
-                // The writer thread is gone. Every subsequent byte for this
-                // pane goes nowhere while output, snapshots, and acks all
-                // keep working — the pane looks alive and is not.
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    error!(len, "PTY writer channel closed; pane input is dead");
+        let len = request.bytes.len();
+        let Some(tx) = self.pty_tx.as_ref() else {
+            debug!("no PTY; encoded input discarded");
+            if let Some(completion) = request.completion {
+                completion.complete(WriteCompletion::NotWritten);
+            }
+            return;
+        };
+        match tx.try_send(request) {
+            Ok(()) => debug!(len, "input queued to PTY writer"),
+            // Dropping input is fire-and-forget per SPEC L1 §9, but it
+            // is not a debug-level event: the bytes are gone, nothing
+            // downstream reports it, and the caller is still acked `Ok`.
+            // At `debug!` this was invisible by default, which is how a
+            // payload split across several events could lose an
+            // interior one and corrupt mid-stream with no trace
+            // (phux-oxd7).
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                warn!(len, "PTY writer queue full; dropping input");
+                if let Some(completion) = request.completion {
+                    completion.complete(WriteCompletion::NotWritten);
                 }
             }
-        } else {
-            debug!("no PTY; encoded input discarded");
+            // The writer thread is gone. Every subsequent byte for this
+            // pane goes nowhere while output, snapshots, and acks all
+            // keep working — the pane looks alive and is not.
+            Err(mpsc::error::TrySendError::Closed(request)) => {
+                error!(len, "PTY writer channel closed; pane input is dead");
+                if let Some(completion) = request.completion {
+                    completion.complete(WriteCompletion::NotWritten);
+                }
+            }
         }
     }
 

@@ -423,6 +423,20 @@ fn report_failure(
             ),
             crate::exit_codes::EXIT_FAILURE,
         ),
+        PromptError::NotWritten {
+            operation_id,
+            message,
+        } => json_err::emit(
+            json,
+            &json_err::CliError::new(
+                codes::INPUT_NOT_WRITTEN,
+                format!("{label}: nothing was written (operation {operation_id}): {message}"),
+                "nothing reached the pane — this was proven, not assumed — so resending is \
+                 safe. A fresh invocation mints a fresh operation id and cannot type these \
+                 keys twice, because nothing was typed the first time",
+            ),
+            crate::exit_codes::EXIT_FAILURE,
+        ),
         PromptError::OccupantChanged {
             detail,
             operation_id,

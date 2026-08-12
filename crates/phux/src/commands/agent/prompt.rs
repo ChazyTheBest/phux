@@ -13,17 +13,24 @@
 //! server-cached result turns that ambiguity into a typed, reportable outcome,
 //! and it costs nothing new on the wire.
 //!
-//! # The three rules a caller must not get wrong
+//! # The four rules a caller must not get wrong
 //!
 //! 1. **`INPUT_DELIVERY_UNKNOWN` is terminal.** Exit 1, with the operation id
 //!    printed. Not exit 3: `docs/consumers/agents.md` §5.2 publishes 3 as
 //!    *retry is correct*, which is the exact opposite of the rule here. The
 //!    CLI never retries it, under this id or any other, and the honest
 //!    recovery is to **read the pane**.
-//! 2. **A retry never mints a new operation id.** The id is generated once,
+//! 2. **`INPUT_NOT_WRITTEN` (phux-w7z2.60) is its honest opposite.** Also
+//!    exit 1, but the server can *prove* this batch never reached the pane —
+//!    no PTY, a writer-side queue full or closed, or the pane's own actor
+//!    gone before handoff — so resubmitting, under the same operation id or a
+//!    fresh one, cannot deliver a duplicate turn. Do not fold this into rule
+//!    1's "never resend": that would strand every provably-failed send behind
+//!    the same read-the-pane recovery a genuinely ambiguous one needs.
+//! 3. **A retry never mints a new operation id.** The id is generated once,
 //!    here, per process invocation. Re-running the command in a shell is a new
 //!    id, and that is the caller's explicit choice.
-//! 3. **The acknowledged path is required, not preferred.** An older server,
+//! 4. **The acknowledged path is required, not preferred.** An older server,
 //!    or a satellite target, is refused (exit 2). Falling back to `ROUTE_INPUT`
 //!    would make the verb's own success code mean "every byte is in the kernel
 //!    queue" on one host and "accepted, possibly dropped" on another.
@@ -397,6 +404,21 @@ fn report_failure(
             ),
             crate::exit_codes::EXIT_FAILURE,
         ),
+        PromptError::NotWritten {
+            operation_id,
+            message,
+        } => json_err::emit(
+            json,
+            &json_err::CliError::new(
+                codes::INPUT_NOT_WRITTEN,
+                format!("{label}: nothing was written (operation {operation_id}): {message}"),
+                "nothing reached the pane — this was proven, not assumed — so re-running \
+                 this command is safe. A fresh invocation mints a fresh operation id and \
+                 cannot deliver a duplicate turn, because no turn was delivered the first \
+                 time",
+            ),
+            crate::exit_codes::EXIT_FAILURE,
+        ),
         PromptError::OccupantChanged {
             detail,
             operation_id,
@@ -617,6 +639,40 @@ mod tests {
         let remedy = doc["remedy"].as_str().unwrap_or_default();
         assert!(remedy.contains("DO NOT RESEND"), "{remedy}");
         assert!(remedy.contains("phux agent explain"), "{remedy}");
+    }
+
+    /// `INPUT_NOT_WRITTEN`'s remedy is `DeliveryUnknown`'s honest opposite
+    /// (phux-w7z2.60): it must say resubmitting is safe rather than forbid
+    /// it, and it must not collapse onto `delivery_unknown`'s code — the
+    /// whole point of splitting it out is that a caller can tell the two
+    /// apart without reading prose.
+    #[test]
+    fn the_not_written_remedy_permits_resending_unlike_delivery_unknown() {
+        let err = PromptError::NotWritten {
+            operation_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            message: "no PTY".to_owned(),
+        };
+        let PromptError::NotWritten { .. } = err else {
+            unreachable!()
+        };
+        let doc = json_err::error_document(
+            &json_err::CliError::new(
+                codes::INPUT_NOT_WRITTEN,
+                "nothing was written",
+                "nothing reached the pane — this was proven, not assumed — so re-running \
+                 this command is safe",
+            ),
+            crate::exit_codes::EXIT_FAILURE,
+        );
+        assert_eq!(doc["error"]["code"], "input_not_written");
+        assert_ne!(
+            doc["error"]["code"], "delivery_unknown",
+            "the two readings must not share a code"
+        );
+        assert_eq!(doc["exit_code"], 1);
+        let remedy = doc["remedy"].as_str().unwrap_or_default();
+        assert!(!remedy.contains("DO NOT RESEND"), "{remedy}");
+        assert!(remedy.contains("safe"), "{remedy}");
     }
 
     /// `--until` shares the client-side vocabulary, and `unknown` is not in

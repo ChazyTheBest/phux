@@ -757,6 +757,17 @@ pub enum ErrorCode {
     /// that code means delivery could not be *confirmed*; this one means
     /// delivery is *known* to be unsafe and nothing was written.
     CanonicalLimitExceeded = 206,
+    /// phux-w7z2.60: `APPLY_INPUT` was refused, or its pending write was
+    /// abandoned, at a point the server can **prove** never reached a live
+    /// PTY writer — the pane has no PTY, the writer's queue was full, the
+    /// writer's channel was already closed, or the pane's own actor had
+    /// already gone before handoff. Distinct from
+    /// [`Self::InputDeliveryUnknown`] the same way
+    /// [`Self::CanonicalLimitExceeded`] is: that code means delivery could
+    /// not be *confirmed*; this one means delivery is *known* never to have
+    /// been attempted, so resubmitting the batch — under the same operation
+    /// id or a fresh one — cannot type it twice.
+    InputNotWritten = 207,
 
     /// Catch-all for unexpected server-side failures. Carries
     /// `u16::MAX = 65535` on the wire.
@@ -824,7 +835,8 @@ impl ErrorCode {
             | Self::UnsafePaste
             | Self::InputLeaseHeld
             | Self::InputDeliveryUnknown
-            | Self::CanonicalLimitExceeded => ErrorScope::Request,
+            | Self::CanonicalLimitExceeded
+            | Self::InputNotWritten => ErrorScope::Request,
             Self::TerminalNotFound
             | Self::UnsupportedSatelliteRoute
             | Self::SatelliteUnreachable
@@ -861,6 +873,7 @@ impl ErrorCode {
             204 => Self::InputLeaseHeld,
             205 => Self::InputDeliveryUnknown,
             206 => Self::CanonicalLimitExceeded,
+            207 => Self::InputNotWritten,
             65535 => Self::InternalError,
             _ => return None,
         })
@@ -5133,6 +5146,7 @@ mod tests {
         ErrorCode::InputLeaseHeld,
         ErrorCode::InputDeliveryUnknown,
         ErrorCode::CanonicalLimitExceeded,
+        ErrorCode::InputNotWritten,
         ErrorCode::InternalError,
     ];
 
