@@ -2,29 +2,72 @@
 //! ADR-0022 'events', `phux-y2t`).
 //!
 //! The push half of the agent surface: a client SUBSCRIBES to events and
-//! the server PUSHES `EVENT` frames as a pane bells, retitles, and
-//! ultimately closes. This test pins the server half of the contract from
-//! the wire's point of view:
+//! the server PUSHES `EVENT` frames as a pane retitles, bells, runs an
+//! OSC-133-marked command, changes directory, and ultimately closes. These
+//! tests pin the server half of the contract from the wire's point of view:
 //!
-//! 1. Pre-seed a PTY-backed pane with a shell that, after a short delay
-//!    (so the client wins the race to subscribe), emits an OSC 2 title
-//!    change and a BEL, then exits.
+//! 1. Pre-seed a PTY-backed pane with a shell that blocks on a *release
+//!    file* before emitting anything observable.
 //! 2. Attach a client and `SUBSCRIBE_EVENTS { terminal: None }`
-//!    (server-wide).
-//! 3. Assert `title_changed`, `bell`, and `pane_closed` events arrive.
+//!    (server-wide), then wait for a barrier reply proving the server has
+//!    processed the subscribe.
+//! 3. Release the seed and assert the events arrive.
 //!
-//! The delay is the same race-avoidance trick `eof_detach.rs` uses — the
-//! event stream is a best-effort accelerator, so events emitted before the
-//! subscription lands are legitimately dropped; the seed defers its
-//! observable output until the client has subscribed.
+//! ## Why the seeds are file-gated and not `sleep`-gated
+//!
+//! Every seed here used to defer its output with a fixed `sleep 0.25`,
+//! betting that the client could connect, ATTACH and SUBSCRIBE inside that
+//! window. Event fanout resolves subscribers *at emit time*, so an event
+//! emitted before the subscription lands is legitimately dropped — losing
+//! the bet does not produce a flaky assertion, it produces a permanently
+//! failing one.
+//!
+//! That bet loses **deterministically on any machine with the `tailscale`
+//! CLI on `$PATH`**. `ServerRuntime::run_async` pre-seeds the pane (which
+//! starts the seed shell's clock) and only *then* computes its optional
+//! WebSocket and QUIC listen addresses. Each of those calls
+//! `phux_config::overlay::detect()`, which shells out to `tailscale ip -4`
+//! — roughly 150ms per call, twice, synchronously, on the server's
+//! current-thread runtime, before the accept loop ever runs. The client
+//! cannot be served for ~300-400ms, by which time the seed has already
+//! spoken. CI has no `tailscale` binary, so `detect()` degrades to a fast
+//! UDP route probe, no stall occurs, and the same code passes there. A
+//! test whose outcome turns on whether a VPN client happens to be
+//! installed is a test nobody can trust.
+//!
+//! These tests are made **independent** of that dependency rather than
+//! skipped when it is present. Nothing here is about overlay networking or
+//! server startup latency — the ambient dependency only ever showed up as
+//! stolen wall-clock, and a test that does not race the wall clock cannot
+//! be robbed of it. Skipping would also hide the assertion on precisely
+//! the machines developers use.
+//!
+//! The replacement is the two-part barrier from `agent_asked.rs`:
+//!
+//! * the seed spins on `until [ -f <release> ]` and emits nothing until the
+//!   test writes that file, so no amount of server-startup latency can let
+//!   the pane speak first; and
+//! * the test writes the release file only after a `GET_STATE` reply
+//!   proves the server has already installed the subscription —
+//!   `SUBSCRIBE_EVENTS` carries no request id and is answered with no
+//!   frame, so `send_frame` returning proves only that the bytes left this
+//!   end. The per-connection frame loop handles frames in order, so a
+//!   `CommandResult` for a request sent *after* the subscribe is proof the
+//!   subscribe ahead of it already ran.
+//!
+//! No sleep was lengthened to fix this, and no deadline is load-bearing on
+//! the happy path: each collector stops the moment its events arrive.
 
 #![allow(clippy::expect_used, reason = "tests")]
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+use std::path::Path;
 use std::time::Duration;
 
-use phux_protocol::wire::frame::{AgentEvent, FrameKind, TYPE_ATTACHED};
+use phux_protocol::wire::frame::{
+    AgentEvent, Command, CommandResult, FrameKind, StateScope, TYPE_ATTACHED,
+};
 use portable_pty::CommandBuilder;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -32,22 +75,75 @@ use tokio::time::timeout;
 
 use phux_server_testkit::tracing_capture::TracingCapture;
 use phux_server_testkit::{
-    SOCKET_CONNECT_DEADLINE, attach_by_name, recv_typed, run_local, send_frame,
+    SOCKET_CONNECT_DEADLINE, WIRE_RECV_TIMEOUT, attach_by_name, recv_typed, run_local, send_frame,
     spawn_server_with_seed_cmd, wait_for_socket,
 };
 
-/// A shell that defers its observable output so the test client wins the
-/// race to `SUBSCRIBE_EVENTS` before any event fires. After ~250ms it sets
-/// the terminal title via OSC 2 (`ESC ] 2 ; phux-watch BEL`) →
-/// `title_changed`, rings the bell (`printf '\a'`) → `bell`, then exits 0 →
-/// PTY EOF → `pane_closed`.
-fn seed_with_title_bell_then_exit() -> CommandBuilder {
+/// A `/bin/sh -c` seed that blocks until `release` exists and then runs
+/// `script`.
+///
+/// The gate is the whole point: the pane produces no observable output —
+/// no title, no BEL, no OSC-133 mark, no EOF — until the test says so, so
+/// the client's subscription is always installed first no matter how long
+/// the server took to reach its accept loop. `until`/`[ -f ]`/`sleep` are
+/// POSIX; the 10ms poll is the seed's own idle cost, not a test deadline.
+fn gated_seed(release: &Path, script: &str) -> CommandBuilder {
     let mut cmd = CommandBuilder::new("/bin/sh");
     cmd.arg("-c");
-    // `printf` is POSIX. `\033]2;...\007` is OSC 2 set-title; `\007` alone
-    // is the BEL. The leading sleep lets the client subscribe first.
-    cmd.arg("sleep 0.25; printf '\\033]2;phux-watch\\007'; printf '\\007'; sleep 0.1; exit 0");
+    cmd.arg(format!(
+        "until [ -f '{}' ]; do sleep 0.01; done; {script}",
+        release.display(),
+    ));
     cmd
+}
+
+/// Drain frames until the `COMMAND_RESULT` for `request_id` arrives.
+async fn recv_command_result(stream: &mut UnixStream, request_id: u32) -> CommandResult {
+    loop {
+        let (_type_byte, frame) = recv_typed(stream).await;
+        if let FrameKind::CommandResult {
+            request_id: got,
+            result,
+        } = frame
+            && got == request_id
+        {
+            return result;
+        }
+    }
+}
+
+/// `SUBSCRIBE_EVENTS { terminal: None }` plus the barrier that proves the
+/// server processed it, then release the seed.
+///
+/// `GET_STATE { scope: Server }` is the barrier command: read-only, so
+/// waiting on it changes nothing else, and it needs neither an ATTACH nor a
+/// terminal id — so the attached and unattached tests can share one
+/// barrier. Its `CommandResult` cannot be produced before the frame loop
+/// has run `handle_subscribe_events`, which registers the subscription
+/// synchronously in `ServerState`.
+///
+/// Returns only once the pane has been released, so everything the seed
+/// emits from here on is guaranteed to have an observer.
+async fn subscribe_then_release(stream: &mut UnixStream, request_id: u32, release: &Path) {
+    send_frame(stream, &FrameKind::SubscribeEvents { terminal: None }).await;
+    send_frame(
+        stream,
+        &FrameKind::Command {
+            request_id,
+            command: Command::GetState {
+                scope: StateScope::Server,
+            },
+        },
+    )
+    .await;
+    let barrier = timeout(WIRE_RECV_TIMEOUT, recv_command_result(stream, request_id))
+        .await
+        .expect("the server must answer GET_STATE before the collection window");
+    assert!(
+        !matches!(barrier, CommandResult::Error { .. }),
+        "the subscribe barrier must succeed, got {barrier:?}",
+    );
+    std::fs::write(release, b"go").expect("release the seed pane");
 }
 
 /// Drain `EVENT` frames until `complete(&seen)` says every event the caller
@@ -84,6 +180,10 @@ async fn collect_events(
 
 /// A subscribed client receives `title_changed`, `bell`, and `pane_closed`
 /// agent events as the seed pane retitles, bells, and exits (SPEC §7.5).
+///
+/// Environment-independent by construction: the seed emits nothing until
+/// the subscribe barrier releases it (see the module docs — a `tailscale`
+/// binary on `$PATH` used to eat the fixed head start this test relied on).
 #[test]
 fn subscribed_client_receives_title_bell_and_pane_closed_events() {
     run_local(async {
@@ -94,8 +194,14 @@ fn subscribed_client_receives_title_bell_and_pane_closed_events() {
         let _cap = TracingCapture::install("agent_events");
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
+        let release = tmp.path().join("release");
 
-        let cmd = seed_with_title_bell_then_exit();
+        // `printf` is POSIX. `\033]2;...\007` is OSC 2 set-title; `\007`
+        // alone is the BEL. Then exit 0 -> PTY EOF -> pane_closed.
+        let cmd = gated_seed(
+            &release,
+            "printf '\\033]2;phux-watch\\007'; printf '\\007'; exit 0",
+        );
         let (shutdown_tx, server_handle) =
             spawn_server_with_seed_cmd(socket_path.clone(), "demo", cmd);
 
@@ -110,12 +216,11 @@ fn subscribed_client_receives_title_bell_and_pane_closed_events() {
             "first server-to-client frame must be ATTACHED",
         );
 
-        // ---- SUBSCRIBE_EVENTS (server-wide) ---- before the seed's
-        // ~250ms deferred output fires.
-        send_frame(&mut stream, &FrameKind::SubscribeEvents { terminal: None }).await;
+        // ---- SUBSCRIBE_EVENTS (server-wide), barrier, release ----
+        subscribe_then_release(&mut stream, 1, &release).await;
 
         // ---- collect EVENT frames ----
-        let events = collect_events(&mut stream, Duration::from_secs(3), |seen| {
+        let events = collect_events(&mut stream, WIRE_RECV_TIMEOUT, |seen| {
             seen.iter()
                 .any(|e| matches!(e, AgentEvent::TitleChanged { .. }))
                 && seen.iter().any(|e| matches!(e, AgentEvent::Bell))
@@ -159,29 +264,31 @@ fn subscribed_client_receives_title_bell_and_pane_closed_events() {
 /// from the `attached` map (the regression the mailbox-in-subscription fix
 /// closed). Here the unattached watcher subscribes server-wide and must
 /// observe the seed pane's `pane_closed` when it exits.
+///
+/// Environment-independent by construction: same release-file gate as its
+/// siblings, and the `GET_STATE` barrier deliberately needs no ATTACH.
 #[test]
 fn unattached_subscriber_receives_events() {
     run_local(async {
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
+        let release = tmp.path().join("release");
 
-        // A seed shell that lives long enough for the watcher to subscribe,
-        // then exits → PTY EOF → pane_closed.
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg("sleep 0.3; exit 0");
+        // A seed that stays silent until released, then exits -> PTY EOF ->
+        // pane_closed.
+        let cmd = gated_seed(&release, "exit 0");
         let (shutdown_tx, server_handle) =
             spawn_server_with_seed_cmd(socket_path.clone(), "demo", cmd);
 
         let mut stream = wait_for_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
 
-        // NO ATTACH. Subscribe server-wide straight away.
-        send_frame(&mut stream, &FrameKind::SubscribeEvents { terminal: None }).await;
+        // NO ATTACH. Subscribe server-wide straight away, barrier, release.
+        subscribe_then_release(&mut stream, 1, &release).await;
 
         // `pane_closed` is the ONLY event this seed produces, so it is also
         // the stop condition — the collector returns the moment it lands
         // instead of sitting out the full deadline.
-        let events = collect_events(&mut stream, Duration::from_secs(3), |seen| {
+        let events = collect_events(&mut stream, WIRE_RECV_TIMEOUT, |seen| {
             seen.iter()
                 .any(|e| matches!(e, AgentEvent::PaneClosed { .. }))
         })
@@ -209,25 +316,35 @@ fn unattached_subscriber_receives_events() {
 /// command after a `cd`. Pins the raw-PTY-stream OSC-133 scan (the grid
 /// projection cannot yield the exit code) and the prompt-boundary kernel
 /// cwd re-query.
+///
+/// This test does NOT depend on the ambient login shell having OSC-133
+/// shell integration: the seed writes the `C` and `D` marks itself with
+/// `printf` over a fixed `/bin/sh`. What it *did* depend on was winning a
+/// 250ms race against server startup, which a machine with `tailscale`
+/// installed loses every time — see the module docs. The release-file gate
+/// plus the subscribe barrier removes the race entirely.
 #[test]
 fn subscribed_client_receives_command_and_cwd_events() {
     run_local(async {
         let _cap = TracingCapture::install("agent_events_cmd_cwd");
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
+        let release = tmp.path().join("release");
 
-        // Deferred like the title/bell seed so the client wins the race to
-        // subscribe. The shell: cd to / (a directory that cannot equal the
-        // spawn cwd of a tempdir-homed test server), then emit an OSC-133
-        // C mark (command executing), fake output, and a D mark carrying
-        // exit code 7. It lingers briefly so the prompt-boundary kernel
-        // cwd query still finds a live child.
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg(
-            "sleep 0.25; cd /; \
-             printf '\\033]133;C\\007out\\r\\n\\033]133;D;7\\007'; \
-             sleep 0.3; exit 0",
+        // Once released: cd to / (a directory that cannot equal the spawn
+        // cwd of the test server), then emit an OSC-133 C mark (command
+        // executing), fake output, and a D mark carrying exit code 7.
+        //
+        // The trailing sleep only has to outlive the collection window, so
+        // it comfortably does: the kernel cwd re-query at the D mark needs
+        // a live child, and a pane that exits mid-window would reap the
+        // last session, self-exit the server, and fail this test with
+        // "early eof" rather than with anything about OSC-133. The
+        // collector stops the moment its three events land, so the sleep
+        // costs nothing on the happy path.
+        let cmd = gated_seed(
+            &release,
+            "cd /; printf '\\033]133;C\\007out\\r\\n\\033]133;D;7\\007'; sleep 60",
         );
         let (shutdown_tx, server_handle) =
             spawn_server_with_seed_cmd(socket_path.clone(), "demo", cmd);
@@ -238,13 +355,13 @@ fn subscribed_client_receives_command_and_cwd_events() {
         let (type_byte, _attached) = recv_typed(&mut stream).await;
         assert_eq!(type_byte, TYPE_ATTACHED);
 
-        send_frame(&mut stream, &FrameKind::SubscribeEvents { terminal: None }).await;
+        subscribe_then_release(&mut stream, 1, &release).await;
 
         // Drain EVENT frames until all three targets are seen, or the
         // pane closes (no further events can follow, and reading on would
         // run into the server's post-exit socket teardown), or the
         // deadline elapses.
-        let events = collect_events(&mut stream, Duration::from_secs(4), |seen| {
+        let events = collect_events(&mut stream, WIRE_RECV_TIMEOUT, |seen| {
             let saw_all = seen.iter().any(|e| matches!(e, AgentEvent::CommandStarted))
                 && seen
                     .iter()
