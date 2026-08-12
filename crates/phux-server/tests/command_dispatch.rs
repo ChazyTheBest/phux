@@ -899,7 +899,17 @@ fn headless_session_create_forwards_env_and_arms_last_session_exit() {
             "command": [
                 "/bin/sh",
                 "-c",
-                "printf %s \"$GC_PHUX_TEST_VALUE\" > \"$1\"; sleep 60",
+                // Write beside the marker and rename into place. `>` creates
+                // and truncates before `printf` writes a byte, so the poll
+                // below — which breaks as soon as the path is *readable* —
+                // could observe a legitimately empty file and assert `""`
+                // against `"forwarded"` (measured: 1 failure in 50 runs on a
+                // loaded box). A same-directory `mv` is atomic on POSIX, so
+                // the poll now sees either no file or the whole value, and
+                // the assertion stays a real assertion about env forwarding
+                // rather than a second, weaker "is it non-empty yet" poll.
+                "printf %s \"$GC_PHUX_TEST_VALUE\" > \"$1.partial\"; \
+                 mv \"$1.partial\" \"$1\"; sleep 60",
                 "sh",
                 marker_path,
             ],

@@ -80,6 +80,47 @@ threads-required = 'num-cpus'
 filter = 'package(phux-server) & binary(agent_detect)'
 threads-required = 'num-cpus'
 
+# The `hub::link` ssh-transport tests need it too, and this one is contention,
+# not a race — the measurement says so plainly.
+#
+# These are LIB tests, so `kind(test)` above does not reach them, and each of
+# them spawns a real child process: a `/bin/sh` stub standing in for `ssh` via
+# the `$PHUX_SSH` seam. Their assertions poll `wait_for_real_status`, whose
+# deadline is 10s.
+#
+# Measured across full-suite `cargo nextest run -p phux-server` runs on a
+# 14-core box under a 70-120 load average (many concurrent cargo builds):
+#
+#   ssh_transport_holds_a_live_child_as_connected              0.56s -> 5.65s
+#   ssh_transport_drains_stderr_past_the_pipe_buffer...        0.31s -> 6.32s
+#   ssh_transport_spawns_the_planned_argv_and_treats_exit...   0.38s -> 6.44s
+#   ssh_transport_missing_program_is_a_failed_attempt...       0.30s -> 0.12s
+#
+# The three that spawn a stub degraded 15-20x together, to within a third of
+# the 10s deadline; the fourth — which deliberately spawns NOTHING, pointing
+# `ssh_program` at a nonexistent path — was unaffected. That split is the
+# whole diagnosis: the cost is child-process startup under an oversubscribed
+# pool, not anything in the link supervisor. Nothing here races. The one
+# ordering hazard the code could have had (the argv-recording stub being
+# re-spawned by a redial and truncating `argv.txt` under the reader) cannot
+# occur: the supervisor task and the polling test share one current-thread
+# runtime, and there is no await between observing `Backoff` and reading the
+# file, so the supervisor cannot run in that gap.
+#
+# `threads-required` and not `pty-serial`, for the reason the two blocks above
+# already establish: a `max-threads = 1` group only serialises members against
+# EACH OTHER, and the load starving these tests comes from the whole pool.
+# Lengthening the 10s deadline is the other obvious move and is the wrong one
+# — it does not stop the starvation, it just waits longer for it, and the
+# margin it would need is unbounded in the load.
+#
+# The prefix filter takes all four rather than naming the three, so a future
+# ssh-transport test is covered without maintenance; including the
+# non-spawning one costs ~0.1s of exclusive machine time.
+[[profile.default.overrides]]
+filter = 'package(phux-server) & test(ssh_transport_)'
+threads-required = 'num-cpus'
+
 # The `ci` profile is behavior-identical to `default` — nextest consults the
 # selected profile's settings first and falls back to profile.default, so the
 # retry policy and the pty-serial override above still apply. It exists only
