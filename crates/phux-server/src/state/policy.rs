@@ -32,7 +32,10 @@ impl ServerState {
         self.clients.peer_identity(client_id)
     }
 
-    /// Remove a peer identity when a client disconnects.
+    /// Remove a peer identity when a client *disconnects* — not when it
+    /// detaches. Peer identity is stamped by the accepting transport and
+    /// cannot be re-established on a live connection, so
+    /// [`Self::forget_connection`] is its only caller.
     pub fn remove_peer_identity(&mut self, client_id: ClientId) {
         self.clients.remove_peer_identity(client_id);
     }

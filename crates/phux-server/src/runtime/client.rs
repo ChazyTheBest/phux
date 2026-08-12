@@ -664,6 +664,13 @@ pub(crate) async fn broadcast_terminal_closed(
 /// `RenderState` cache the actor allocated at attach is dropped rather
 /// than leaked until pane teardown.
 ///
+/// **Attachment teardown only.** Most call sites — the `DETACH` arm, the
+/// `DETACH_CLIENTS` force-detach, the session-reaped fanout — run against a
+/// connection that stays open, so this must not disturb anything HELLO
+/// negotiated for the connection. [`release_connection_state`] is the
+/// transport-close superset, and the accept loop runs it exactly once per
+/// connection no matter which path ended the client task.
+///
 /// Handles are gathered under-lock (`subscribed_terminal_handles`); the
 /// `consumer_detach` sends happen off-lock to avoid awaiting inside
 /// `with_mut`. `try_send` is non-blocking and best-effort: a full or
@@ -685,7 +692,6 @@ pub(crate) fn detach_and_release_consumer_state(state: &SharedState, client_id: 
                 .map(|session| session.name.clone())
         })
     });
-    state.with_mut(|s| s.remove_peer_identity(client_id));
     let wire_client_id =
         phux_protocol::ids::ClientId::new(u32::try_from(client_id.0).unwrap_or(u32::MAX));
     let handles = state.with(|s| s.subscribed_terminal_handles(client_id));
@@ -767,6 +773,28 @@ pub(crate) fn detach_and_release_consumer_state(state: &SharedState, client_id: 
             crate::hooks::HookEvent::client_detached(client_id, session_name.as_deref()),
         );
     }
+}
+
+/// Transport-close teardown: [`detach_and_release_consumer_state`] plus the
+/// connection-scoped state HELLO negotiated (phux-w7z2.55).
+///
+/// The distinction this draws is the whole point. `DETACH` (proto.md §7.2)
+/// ends an *attachment*; the reference server answers `DETACHED` and keeps
+/// reading, because the same connection may serve a later `ATTACH`. The peer
+/// on the far side is still the peer the transport authenticated, and it is
+/// still speaking the layer set it advertised — neither can be renegotiated,
+/// since a second HELLO is a protocol error (proto.md §6.1). Dropping either
+/// at `DETACH` therefore changed what a live connection could do with no
+/// handshake in between: `client_layers` fell back to the permissive
+/// `LayerSet::all` (an L1-only peer began passing the §11.5 L3 gate) and the
+/// `SHUTDOWN` local-transport check lost the identity it keys on.
+///
+/// Called from the accept loop, which is the one place every connection on
+/// every transport funnels through on its way out — the in-loop teardown
+/// sites all `return` into it.
+pub(crate) fn release_connection_state(state: &SharedState, client_id: ClientId) {
+    detach_and_release_consumer_state(state, client_id);
+    state.with_mut(|s| s.forget_connection(client_id));
 }
 
 /// Prepare and validate the parent directory of `socket_path`.
@@ -1051,11 +1079,13 @@ pub(crate) async fn accept_loop<L: Incoming>(
                             if let Err(err) = handle_client(reader, writer, task_state.clone(), client_id, client_token, task_root_token, task_input_lane).await {
                                 warn!(error = %err, "client task ended with error");
                             }
-                            // Implicit detach on EOF / error path — matches
-                            // the explicit `DETACH` semantics for the wire
-                            // path that will land alongside the protocol
-                            // variants.
-                            detach_and_release_consumer_state(&task_state, client_id);
+                            // Implicit detach on EOF / error path, plus the
+                            // connection-scoped HELLO state (phux-w7z2.55).
+                            // Every transport and every in-loop teardown path
+                            // funnels through here, so this is the one site
+                            // that may forget the negotiated layers and the
+                            // transport-authenticated peer identity.
+                            release_connection_state(&task_state, client_id);
                             // phux-n6rv: re-arm the idle clock if this was the
                             // last connection. Runs after the detach above so
                             // "unattended" and "detached" become true in the

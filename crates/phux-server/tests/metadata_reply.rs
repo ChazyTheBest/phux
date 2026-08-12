@@ -18,12 +18,13 @@
 //! (one of the phux-4li epic's success criteria) and `phux-4li.5`'s
 //! reconcile-on-attach use case.
 //!
-//! The connection here does not ATTACH and does not send HELLO: the L3
-//! dispatch arms operate on the connection's `client_id`, not on its
-//! attached session, and `ServerState::client_layers` defaults to
-//! `LayerSet::all()` for an un-HELLO'd client (so L3 is permitted by
-//! default — the SPEC §16.4 gate fires only against an explicitly
-//! L3-less HELLO, which is its own test in `phux-protocol`).
+//! The connection here does not ATTACH: the L3 dispatch arms operate on the
+//! connection's `client_id`, not on its attached session. It *does* HELLO —
+//! `wait_for_socket` completes the mandatory protocol-0.7 handshake
+//! advertising `LayerSet::all()`, so the SPEC §11.5 tier gate is passed by a
+//! real negotiation rather than by the permissive no-record default. That the
+//! gate holds for an explicitly L3-less HELLO, and keeps holding across a
+//! mid-connection `DETACH`, is `tests/hello_survives_detach.rs`.
 
 #![allow(clippy::expect_used, reason = "tests")]
 #![allow(clippy::unwrap_used, reason = "tests")]

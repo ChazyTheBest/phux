@@ -4,12 +4,26 @@
 //! Six fields that were flat on [`super::ServerState`] live here because
 //! they share one lifetime — a client's connection. An entry appears when
 //! the client identifies itself (HELLO, ATTACH, `SUBSCRIBE_EVENTS`, a
-//! session-create submission) and every one of them disappears in
-//! `ServerState::detach`. Keeping them together is what makes "forget
-//! everything about this client" one place to look instead of five map
-//! removals scattered across `state::client`, `state::events`,
+//! session-create submission) and every one of them disappears by the time
+//! `ServerState::forget_connection` returns. Keeping them together is what
+//! makes "forget everything about this client" one place to look instead of
+//! five map removals scattered across `state::client`, `state::events`,
 //! `state::policy`, and `state::metadata`, which is where they drifted out
 //! of step before.
+//!
+//! # Two lifetimes, not one
+//!
+//! The maps split on *which* edge clears them, and conflating the two is
+//! how phux-w7z2.55 happened:
+//!
+//! * **Attachment-scoped** — [`Self::attached`], the subscription maps, and
+//!   the session-create result keys. `ServerState::detach` clears these on
+//!   a mid-connection `DETACH` as well as on transport close.
+//! * **Connection-scoped** — [`Self::layers`] and [`Self::peer_identities`],
+//!   both established once at HELLO and unrepeatable on a live connection
+//!   (a second HELLO is a protocol error). Only
+//!   `ServerState::forget_connection` clears these, and only when the
+//!   transport is going away.
 //!
 //! # Ownership boundary
 //!
@@ -81,6 +95,11 @@ pub(super) struct ClientTable {
     /// §16.4). Default for a client that never sent HELLO (test
     /// scaffolding) is [`LayerSet::all`] — the most-permissive default
     /// keeps test setups simple; production clients always advertise.
+    ///
+    /// Connection-scoped: survives `DETACH` and is cleared only by
+    /// `ServerState::forget_connection`. Because the default is
+    /// permissive, clearing it early is a fail-open tier escalation, not
+    /// a lost restriction.
     pub(super) layers: HashMap<ClientId, LayerSet>,
     /// Per-client agent-event subscriptions (SPEC §7.5, phux-y2t). Each
     /// subscribed client maps to its outbound mailbox plus the set of
@@ -133,6 +152,11 @@ pub(super) struct ClientTable {
     /// Cleared on detach alongside the subscriptions themselves.
     pub(super) terminal_mailboxes: HashMap<ClientId, mpsc::Sender<Outbound>>,
     /// Per-client peer identities, keyed by server-assigned client id.
+    ///
+    /// Connection-scoped, and stamped by the accepting transport before the
+    /// client task is spawned — nothing on a live connection can restore it,
+    /// so it survives `DETACH` and is cleared only by
+    /// `ServerState::forget_connection`.
     pub(super) peer_identities: HashMap<ClientId, phux_protocol::policy::PeerIdentity>,
     /// Nonce-bearing session-create result keys owned by each connection.
     ///

@@ -275,6 +275,16 @@ impl ServerState {
     ///
     /// Silent no-op if the client is not currently attached — detach must be
     /// idempotent for the EOF cleanup path in `handle_client`.
+    ///
+    /// **Attachment teardown, not connection teardown.** A mid-connection
+    /// `DETACH` (proto.md §7.2) ends one attachment while the transport stays
+    /// up and may serve a later `ATTACH`, so anything negotiated *for the
+    /// connection* — the HELLO layer set, the transport-authenticated peer
+    /// identity — survives this call and is dropped by
+    /// [`Self::forget_connection`] instead. What this clears is exactly what
+    /// the spec scopes to the attachment: L3 metadata subscriptions and
+    /// agent-event subscriptions, which `docs/spec/L3.md` §1.2 says are
+    /// "dropped automatically on `DETACH` and on transport close".
     pub fn detach(&mut self, client_id: ClientId) {
         self.clients.attached.remove(&client_id);
         // Release any input leases this client held (ADR-0033) so a
@@ -291,9 +301,11 @@ impl ServerState {
         // map doesn't grow unboundedly across attach/detach churn).
         self.terminal_table.cancel_pumps_for_client(client_id);
         self.terminal_table.drop_client_subscriptions(client_id);
-        // Drop any L3 metadata subscriptions this client owned (SPEC §7.4
-        // says subscriptions are connection-scoped) plus its cached layer
-        // negotiation. Keeps the maps bounded across attach churn.
+        // Drop any L3 metadata subscriptions this client owned. L3.md §1.2
+        // scopes them to the attachment ("dropped automatically on DETACH
+        // and on transport close"), so this is the correct place. The
+        // *layer negotiation* is NOT dropped here — that is a property of
+        // the connection, cleared in `forget_connection`.
         self.metadata.drop_client(client_id);
         self.clients.metadata_mailboxes.remove(&client_id);
         // The per-Terminal subscription mailbox goes with the subscriptions
@@ -306,11 +318,36 @@ impl ServerState {
                 let _ = self.metadata_delete(&phux_protocol::wire::frame::Scope::Global, &key);
             }
         }
-        self.clients.layers.remove(&client_id);
-        // Agent-event subscriptions are connection-scoped (SPEC §7.5),
-        // same as L3 metadata subscriptions above. Drop them so the map
+        // Agent-event subscriptions follow the same lifecycle as the L3
+        // metadata subscriptions above (SPEC §7.5). Drop them so the map
         // stays bounded across attach churn.
         self.clients.event_subscriptions.remove(&client_id);
+    }
+
+    /// Forget everything the server knows about `client_id`'s *connection*,
+    /// after running the attachment teardown in [`Self::detach`].
+    ///
+    /// Call this **only** when the transport is going away. The two pieces
+    /// it clears are established once, at HELLO, and cannot be re-established
+    /// on a live connection — a second HELLO is a protocol error
+    /// (proto.md §6.1), and the peer identity is stamped by the accepting
+    /// transport before the client task starts. Clearing them on a
+    /// mid-connection `DETACH` therefore silently changed what the still-open
+    /// connection was entitled to do:
+    ///
+    /// * [`Self::client_layers`] falls back to [`LayerSet::all`] for an
+    ///   unknown client, so an L1-only peer that attached and detached
+    ///   started passing the §11.5 L3 gate — a fail-open tier escalation.
+    /// * [`Self::peer_identity`] is what the `SHUTDOWN` local-transport gate
+    ///   keys on, so a local peer that detached could no longer stop its own
+    ///   server — the same loss, failing closed.
+    ///
+    /// Idempotent, like [`Self::detach`]: the accept loop runs it once per
+    /// connection regardless of which path ended the client task.
+    pub fn forget_connection(&mut self, client_id: ClientId) {
+        self.detach(client_id);
+        self.clients.layers.remove(&client_id);
+        self.remove_peer_identity(client_id);
     }
 
     /// Collect the `(client, outbound mailbox)` pairs to force-detach for the

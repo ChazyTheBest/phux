@@ -1357,6 +1357,84 @@ mod tests {
         assert!(drain_frames(&mut rx).is_empty());
     }
 
+    /// phux-w7z2.55: `detach` is attachment teardown. The negotiated layer
+    /// set and the transport-authenticated peer identity are properties of
+    /// the *connection*, which a mid-connection `DETACH` does not end, and
+    /// neither can be re-established afterwards (a second HELLO is a
+    /// protocol error). Note the direction of the layer failure: because
+    /// `client_layers` defaults to `LayerSet::all`, forgetting the record
+    /// promoted an L1-only peer instead of restricting it.
+    #[test]
+    fn detach_keeps_negotiated_layers_and_peer_identity() {
+        let mut s = ServerState::new();
+        let (cid, _tx, _rx) = attach_l3_client(&mut s);
+        let (l1_cid, _l1_tx, _l1_rx) = attach_l1_only_client(&mut s);
+        for client in [cid, l1_cid] {
+            s.set_peer_identity(
+                client,
+                phux_protocol::policy::PeerIdentity {
+                    uid: 501,
+                    pid: Some(4242),
+                    exe_path: None,
+                    mcp_host_key: None,
+                    transport: phux_protocol::policy::TransportType::UnixSocket,
+                    source_addr: None,
+                },
+            );
+        }
+
+        s.detach(cid);
+        s.detach(l1_cid);
+
+        assert!(
+            !s.client_speaks_l3(l1_cid),
+            "an L1-only peer must not be promoted to L3 by detaching",
+        );
+        assert_eq!(s.client_layers(cid), LayerSet::all());
+        assert_eq!(
+            s.peer_identity(l1_cid).map(|peer| peer.transport),
+            Some(phux_protocol::policy::TransportType::UnixSocket),
+            "the SHUTDOWN local-transport gate keys on this",
+        );
+    }
+
+    /// The transport-close superset does forget both, so neither map grows
+    /// across connection churn.
+    #[test]
+    fn forget_connection_drops_negotiated_layers_and_peer_identity() {
+        let mut s = ServerState::new();
+        let (cid, _tx, _rx) = attach_l1_only_client_seeded(&mut s);
+        s.set_peer_identity(
+            cid,
+            phux_protocol::policy::PeerIdentity {
+                uid: 501,
+                pid: None,
+                exe_path: None,
+                mcp_host_key: None,
+                transport: phux_protocol::policy::TransportType::UnixSocket,
+                source_addr: None,
+            },
+        );
+
+        s.forget_connection(cid);
+
+        assert!(s.peer_identity(cid).is_none());
+        // Back to the permissive no-record default, which is what makes
+        // clearing it early unsafe on a live connection.
+        assert_eq!(s.client_layers(cid), LayerSet::all());
+        assert!(!s.attached().contains_key(&cid));
+        // Idempotent, like `detach` — the accept loop runs it unconditionally.
+        s.forget_connection(cid);
+    }
+
+    /// [`attach_l1_only_client`] assumes a caller already seeded `default`.
+    fn attach_l1_only_client_seeded(
+        s: &mut ServerState,
+    ) -> (ClientId, mpsc::Sender<Outbound>, mpsc::Receiver<Outbound>) {
+        let _ = s.seed_session("default");
+        attach_l1_only_client(s)
+    }
+
     #[test]
     fn metadata_list_returns_keys_sorted_and_scope_isolated() {
         let mut s = ServerState::new();
