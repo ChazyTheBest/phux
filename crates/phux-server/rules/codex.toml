@@ -111,17 +111,38 @@ match = { all = [
   { line-regex = '^\s*(›\s*)?\d+\.\s+\S' },
 ] }
 
+# A screen-side `working` backstop, for a terminal that suppresses the OSC
+# title (the title rule above then never fires). Priority is lower than the
+# approval-dialog rule so a genuinely blocked screen still wins if both ever
+# matched at once.
+#
+# VERIFIED against Codex 0.145.0 (captured screen:
+# `fixtures/codex/working.txt` line 19): "• Working (0s • esc to interrupt)".
+# This is the exact footer string the header comment above already recorded
+# as captured but deliberately unused, because the title proves `working`
+# roughly 4s earlier. It is worth a rule now as the backstop for when the
+# title is not available at all, not as a replacement for it. `bottom-lines`
+# keeps the match off scrolled-back transcript, and requiring both the
+# elapsed-seconds parenthetical and the interrupt affordance (an `all`, not
+# either alone) guards against either phrase appearing in printed prose.
+[[rules]]
+id = "screen-working-footer-backstop"
+state = "working"
+priority = 60
+region = "bottom-lines"
+match = { all = [
+  { regex = 'Working \(\d+s' },
+  { contains = "esc to interrupt" },
+] }
+
 # --- Rules deliberately NOT written ------------------------------------------
 #
-# No `working` rule keyed on the on-screen "• Working (Ns • esc to interrupt)"
-# footer, even though it was captured (`fixtures/codex/working.txt` line 19)
-# and is a real string. The title already proves `working` from the first
-# frame, and it does so ~4s earlier than the footer is worth polling for.
-# A second rule asserting the same state buys nothing and doubles the surface
-# that rots when Codex restyles its footer. It is recorded here rather than
-# written so that a future maintainer who needs a screen-side `working`
-# backstop — for a terminal that suppresses OSC titles — knows the string
-# exists and has been seen, instead of inventing one.
+# `screen-working-footer-backstop` above used to be filed here rather than
+# written, on the reasoning that the title already proves `working` ~4s
+# earlier and a second rule for the same state buys nothing during ordinary
+# use. It is now shipped anyway, specifically for the terminal-suppresses-
+# OSC-title case the title rule cannot cover at all — see that rule's
+# comment.
 #
 # No `idle` rule. Codex's composer placeholder ("Find and fix a bug in
 # @filename") is present in the idle capture, but it is also present *behind*

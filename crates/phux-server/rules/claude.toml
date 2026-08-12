@@ -47,6 +47,32 @@ match = { line-regex = "^[⠂⠐]" }
 
 # --- Screen rules -----------------------------------------------------------
 
+# A screen-side `working` backstop, for installs that set
+# `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` and therefore never write the busy
+# title above. Priority is lower than the permission-dialog rule so a
+# genuinely blocked screen still wins if both ever matched at once (they
+# should not: the dialog replaces this status line).
+#
+# VERIFIED against Claude Code 2.1.207 (captured screen:
+# `fixtures/claude/working.txt` line 18):
+#
+#     ✻ Kneading… (1s · thinking with high effort)
+#
+# The CLI cycles both the leading glyph and the status verb ("Kneading",
+# "Pondering", …) on a rotation that was not fully captured — only this one
+# frame was. The rule therefore matches by STRUCTURE, not by the literal
+# glyph or verb: any token ending in an ellipsis immediately followed by an
+# elapsed-seconds parenthetical, e.g. "…(1s". That shape is not one ordinary
+# transcript prose produces, and `bottom-lines` (the same default window the
+# transcript-viewer rule below already relies on) keeps it off scrolled-back
+# text.
+[[rules]]
+id = "screen-status-elapsed-backstop"
+state = "working"
+priority = 60
+region = "bottom-lines"
+match = { line-regex = '^\S+\s+\S*…\s+\(\d+s' }
+
 # A permission prompt: the question stem plus a numbered option list, with a
 # U+276F caret on the selected row.
 #
@@ -124,6 +150,15 @@ match = { contains = "showing detailed transcript" }
 #
 # Their absence costs nothing: `idle` is the detector's fail-safe default
 # (ADR-0046 §D), so it needs no rule to be reached, and `working` is proven
-# by the title above. What is missing is a screen-side `working` backstop for
-# installs that set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`; that wants a
-# verified string, and is filed rather than guessed.
+# by the title above. The screen-side `working` backstop this section used to
+# say was missing (for `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` installs) is
+# now `screen-status-elapsed-backstop` above, once the elapsed-status line
+# was captured.
+#
+# Still not written: a positive `idle` rule (phux-w7z2.28, RULED AGAINST) and
+# any of the 16 kinds phux-w7z2.21 lists with no manifest at all. Neither has
+# a captured screen to verify a rule against in this environment — no CLI for
+# any of them is installed or authenticated here, and phux-7p8 already
+# tracks gemini specifically as the smallest slice of that capture work. A
+# rule matching a screen nobody has captured is a guess, and ADR-0046's
+# Tradeoffs already record what that costs.

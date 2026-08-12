@@ -1658,19 +1658,44 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         assert!(!got.freeze);
     }
 
-    /// The working screen's input box is EMPTY — structurally identical to the
-    /// idle one. Only the title separates them, which is the whole reason the
-    /// title rule carries the working signal.
+    /// The working screen's PROMPT BOX is EMPTY — structurally identical to
+    /// the idle one's. The title is the primary discriminator; the elapsed-
+    /// status line is the screen-side backstop for when the title is not
+    /// available (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`).
     #[test]
-    fn claude_working_screen_is_working_only_by_its_title() {
+    fn claude_working_screen_is_working_by_title_or_by_the_screen_backstop() {
         let by_title = claude_eval(CLAUDE_TITLE_BUSY_A, &claude_working_screen());
         assert_eq!(by_title.state, Some(DetectedState::Working));
         assert_eq!(by_title.matched.as_deref(), Some("title-busy-spinner"));
 
+        // Without a title, `screen-status-elapsed-backstop` still catches the
+        // captured "✻ Kneading… (1s · ...)" status line.
         let titleless = claude_eval("", &claude_working_screen());
         assert_eq!(
-            titleless.state, None,
-            "the working screen is indistinguishable from idle without the title",
+            titleless.state,
+            Some(DetectedState::Working),
+            "the elapsed-status backstop must prove working even with no title at all",
+        );
+        assert_eq!(
+            titleless.matched.as_deref(),
+            Some("screen-status-elapsed-backstop"),
+        );
+    }
+
+    /// NEGATIVE case for the new backstop: neither the idle screen nor the
+    /// live permission dialog carries the elapsed-status shape, so the rule
+    /// must stay silent on both — a positive-idle or a masked-dialog result
+    /// would be exactly the failure ADR-0046 §D forbids.
+    #[test]
+    fn claude_screen_backstop_does_not_fire_on_idle_or_blocked_screens() {
+        let idle = claude_eval(CLAUDE_TITLE_QUIET, &claude_idle_screen());
+        assert_ne!(idle.state, Some(DetectedState::Working));
+
+        let blocked = claude_eval(CLAUDE_TITLE_QUIET, &claude_blocked_screen());
+        assert_eq!(
+            blocked.state,
+            Some(DetectedState::Blocked),
+            "the backstop must not outrank the live permission dialog",
         );
     }
 
@@ -1915,6 +1940,40 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
     fn codex_approval_prompt_is_blocked() {
         let got = codex_eval(CODEX_TITLE_QUIET, &codex_blocked_screen());
         assert_eq!(got.state, Some(DetectedState::Blocked));
+    }
+
+    /// The screen-side backstop: with the bare (non-spinner) title — the
+    /// only title a terminal that suppresses OSC titles would ever show —
+    /// the captured "• Working (0s • esc to interrupt)" footer alone must
+    /// still prove `working`.
+    #[test]
+    fn codex_screen_backstop_catches_working_without_a_spinner_title() {
+        let got = codex_eval(CODEX_TITLE_QUIET, &codex_working_screen());
+        assert_eq!(
+            got.state,
+            Some(DetectedState::Working),
+            "the elapsed-status footer must prove working even without the spinner title",
+        );
+        assert_eq!(
+            got.matched.as_deref(),
+            Some("screen-working-footer-backstop"),
+        );
+    }
+
+    /// NEGATIVE case: neither the idle composer nor the live approval dialog
+    /// carries the footer's elapsed-seconds-plus-interrupt shape, so the
+    /// backstop must stay silent on both.
+    #[test]
+    fn codex_screen_backstop_does_not_fire_on_idle_or_blocked_screens() {
+        let idle = codex_eval(CODEX_TITLE_QUIET, &codex_idle_screen());
+        assert_ne!(idle.state, Some(DetectedState::Working));
+
+        let blocked = codex_eval(CODEX_TITLE_QUIET, &codex_blocked_screen());
+        assert_eq!(
+            blocked.state,
+            Some(DetectedState::Blocked),
+            "the backstop must not outrank the live approval dialog",
+        );
     }
 
     /// The guard that matters: prose alone must not trip `blocked`. The
