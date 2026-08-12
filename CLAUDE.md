@@ -43,6 +43,32 @@ gate-by-gate map.
 Note `commitlint` is a required check and lints **every commit in the PR**,
 not just the title — one malformed message fails the branch.
 
+## How work reaches `main`
+
+**A maintainer may push straight to `main`.** `main` carries two rulesets:
+
+| Ruleset | Rules | Bypass |
+|---|---|---|
+| `main safety rails` | `deletion`, `non_fast_forward` | **none** |
+| `main merge gate` | required checks `check` / `test` / `commitlint` | admin, always |
+
+So a direct push is allowed, and `main` still cannot be force-pushed or
+deleted **by anyone, including an admin** — those two live in a separate
+ruleset with an empty bypass list precisely so that loosening the merge gate
+never loosens the safety rails.
+
+The gate that replaces the PR is therefore **local**: run `just ci-full`
+before pushing. Nothing else will catch you. A PR is still the right shape for
+anything you want reviewed, for anything from outside the maintainer set, and
+for release-please's own branch — pushing straight to `main` is a convenience
+for work you have already validated, not a licence to skip validating it.
+
+The reason this is set up this way rather than routing everything through PR
+CI: a PR run costs several minutes of Actions time per branch, and for a
+maintainer who has already run the identical gates locally that is pure
+duplication. The release lanes still run the full suite, so the artifact that
+reaches users is never gated on a local run alone.
+
 ## Architecture Overview
 
 phux is a **libghostty-backed terminal control plane**. The wire is
