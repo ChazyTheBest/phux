@@ -296,6 +296,27 @@ pub(crate) struct AgentDetector {
     /// recycled small integer, so the pair is what actually distinguishes two
     /// processes (see [`identify::Occupant`]).
     identified_occupant: Option<identify::Occupant>,
+    /// The last foreground pgid ANY successful occupancy resolution reported
+    /// — agent or vacant, unlike [`Self::identified_occupant`], which is only
+    /// ever set while an agent is identified.
+    ///
+    /// The seam phux-w7z2.50 added: reading a pgid (`tcgetpgrp`) is one
+    /// ioctl; reading and parsing its argv (`process_argv`) is a `/proc` read
+    /// or two `sysctl`s, and argv only changes when the pgid does. Between
+    /// full identity rechecks, [`Self::tick`] compares a CHEAP pgid-only
+    /// probe against this field and pays for the expensive argv read only
+    /// when the two disagree — which is also exactly the condition under
+    /// which the answer could possibly have changed. A `None` reading (the
+    /// probe failed, or there is no PTY) is never compared against and never
+    /// stored: not an observation, same rule as [`identify::Occupancy`].
+    ///
+    /// This does NOT touch the pid-reuse pairing phux-w7z2.43 established: a
+    /// pgid the OS recycles to a new process wears the SAME integer, so the
+    /// cheap probe cannot see that swap and does not try to. It falls
+    /// through to the periodic full recheck exactly as it always did, which
+    /// is where [`identify::Occupant::same`]'s `(pgid, started)` comparison
+    /// lives, untouched.
+    last_pgid: Option<i32>,
     /// Consecutive *confirmed vacant* observations since the last time an
     /// agent was seen. Never incremented by an unanswerable query.
     ///
@@ -352,6 +373,7 @@ impl std::fmt::Debug for AgentDetector {
         f.debug_struct("AgentDetector")
             .field("identified", &self.identified)
             .field("identified_occupant", &self.identified_occupant)
+            .field("last_pgid", &self.last_pgid)
             .field("vacant_streak", &self.vacant_streak)
             .field("published", &self.published)
             .field("current", &self.current)
@@ -369,6 +391,7 @@ impl AgentDetector {
             rules,
             identified: None,
             identified_occupant: None,
+            last_pgid: None,
             vacant_streak: 0,
             next_identify: now,
             started: now,
@@ -457,9 +480,7 @@ impl AgentDetector {
         screen: Option<&[String]>,
     ) -> DetectOutcome {
         // 1. Identity.
-        if now >= self.next_identify
-            && let Some(outcome) = self.reidentify(now, master_fd)
-        {
+        if let Some(outcome) = self.maybe_identify(now, master_fd) {
             return outcome;
         }
         let Some(kind) = self.identified.clone() else {
@@ -561,9 +582,37 @@ impl AgentDetector {
         DetectOutcome::Publish(report)
     }
 
-    /// Re-derive identity from the kernel. Returns `Some(outcome)` when the
-    /// tick is fully resolved by the identity step alone (the agent went away,
-    /// or none has appeared yet).
+    /// Identity, split cheap-first (phux-w7z2.50).
+    ///
+    /// The periodic full recheck ([`identify_recheck`] / [`IDENTIFY_ACQUIRE_POLL`])
+    /// runs exactly as it always has — [`Self::reidentify`], unconditionally,
+    /// argv and all. Between those, this pays for one `tcgetpgrp` ioctl every
+    /// ordinary tick and compares it against [`Self::last_pgid`]; only a
+    /// DISAGREEMENT is worth the argv read, because argv cannot have changed
+    /// without the pgid changing too. A same-pgid pid recycle — the hole
+    /// phux-w7z2.43 closed — is invisible to this cheap probe by construction
+    /// (it is the same integer) and is caught by the full recheck exactly as
+    /// before; this only ever shortens the wait for the case the probe CAN
+    /// see.
+    fn maybe_identify(&mut self, now: Instant, master_fd: Option<RawFd>) -> Option<DetectOutcome> {
+        if now >= self.next_identify {
+            return self.reidentify(now, master_fd);
+        }
+        let probed = self.resolve_pgid(master_fd);
+        if let Some(pgid) = probed
+            && Some(pgid) != self.last_pgid
+        {
+            // The cheap answer disagrees with what we last resolved in full.
+            // Pay for the expensive path now instead of waiting out the rest
+            // of the recheck interval.
+            return self.reidentify(now, master_fd);
+        }
+        None
+    }
+
+    /// Re-derive identity from the kernel, in full (pgid AND argv). Returns
+    /// `Some(outcome)` when the tick is fully resolved by the identity step
+    /// alone (the agent went away, or none has appeared yet).
     fn reidentify(&mut self, now: Instant, master_fd: Option<RawFd>) -> Option<DetectOutcome> {
         let found = self.resolve_identity(master_fd);
         self.apply_identity(now, found)
@@ -581,6 +630,28 @@ impl AgentDetector {
         match &self.identity_source {
             IdentitySource::Kernel => identify::foreground_occupancy(master_fd, &self.rules),
             IdentitySource::Forced(occupancy) => occupancy.clone(),
+        }
+    }
+
+    /// The cheap half: ask the kernel for the foreground pgid ONLY. See
+    /// [`Self::maybe_identify`].
+    #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the #[cfg(test)] sibling reads self.identity_source; matching signatures keep the call site uniform across both"
+    )]
+    fn resolve_pgid(&self, master_fd: Option<RawFd>) -> Option<i32> {
+        identify::foreground_pgid(master_fd)
+    }
+
+    /// As above, honouring the [`IdentitySource`] test seam: a forced
+    /// occupancy answers its own pgid without a live kernel, exactly as
+    /// [`Self::resolve_identity`] does for the full path.
+    #[cfg(test)]
+    fn resolve_pgid(&self, master_fd: Option<RawFd>) -> Option<i32> {
+        match &self.identity_source {
+            IdentitySource::Kernel => identify::foreground_pgid(master_fd),
+            IdentitySource::Forced(occupancy) => occupancy.pgid(),
         }
     }
 
@@ -620,6 +691,14 @@ impl AgentDetector {
         occupancy: identify::Occupancy,
     ) -> Option<DetectOutcome> {
         use identify::Occupancy;
+
+        // Record the pgid this FULL resolution found, whatever it was, so
+        // the next cheap probe (phux-w7z2.50) has something to compare
+        // against. `Unresolved` carries none: an unanswered query is not an
+        // observation and must not be remembered as one.
+        if let Some(pgid) = occupancy.pgid() {
+            self.last_pgid = Some(pgid);
+        }
 
         let acquiring = !matches!(occupancy, Occupancy::Agent { .. })
             && now < self.started + IDENTIFY_ACQUIRE_WINDOW;
@@ -1568,6 +1647,93 @@ match = { contains = "WORKING" }
             },
             "the remembered start time survived the failed queries",
         );
+    }
+
+    // --- the cheap pgid probe (phux-w7z2.50) --------------------------------
+
+    /// THE perf fix, proven positive: a genuine occupant change — a
+    /// different pgid — is caught on the very next ORDINARY tick, not held
+    /// until the full recheck five seconds later. `h.tick` here is the plain
+    /// cadence helper, not `identity_tick`'s forced full poll.
+    #[test]
+    fn a_pgid_change_is_caught_by_the_ordinary_cadence_not_just_the_recheck() {
+        let mut h = occupied("t", 100);
+
+        // A restart lands on a different pgid. The full recheck is not due
+        // for several more seconds (`occupied` leaves well under one
+        // `IDENTIFY_RECHECK` on the clock), so if this is caught at all here,
+        // it was the cheap probe that caught it.
+        h.occupy(agent("u", 200));
+        assert_eq!(
+            h.tick("WORKING"),
+            DetectOutcome::Reidentified {
+                kind: "u".to_owned(),
+                name: "u-agent".to_owned(),
+            },
+            "the cheap pgid-only probe must not wait out the full recheck \
+             for a change it can see for the price of one ioctl",
+        );
+    }
+
+    /// THE regression guard: the cheap probe must not let a pid-reused pgid
+    /// slip past the pairing phux-w7z2.43 established. Same integer, so the
+    /// probe cannot see the swap by construction — it must fall through to
+    /// the full recheck, exactly as before this change, rather than either
+    /// (a) manufacturing a correction it has no evidence for, or (b) somehow
+    /// suppressing the correction the full recheck is still owed.
+    #[test]
+    fn a_recycled_pgid_is_invisible_to_the_cheap_probe_but_still_caught_on_recheck() {
+        let mut h = occupied("t", 100);
+
+        // Same pgid, different start time: the id was recycled under the
+        // agent's nose.
+        h.occupy(agent_started("t", 100, Some(999_999)));
+
+        // Several ordinary-cadence ticks: the cheap probe reads the SAME
+        // pgid every time, so it has nothing to act on and must stay quiet.
+        for i in 0..5 {
+            assert_eq!(
+                h.tick("WORKING"),
+                DetectOutcome::Quiet,
+                "tick {i}: the cheap probe cannot afford to notice a same-pgid \
+                 recycle, and must not guess",
+            );
+            assert_eq!(
+                h.detector.identified_occupant,
+                Some(Occupant::new(100, Some(700))),
+                "tick {i}: still believed to be the ORIGINAL process",
+            );
+        }
+
+        // The full recheck is what actually pays for the start-time
+        // comparison, and it must still catch the recycle — the cheap probe
+        // must not have suppressed or pre-empted it.
+        assert_eq!(
+            h.identity_tick(),
+            DetectOutcome::Reidentified {
+                kind: "t".to_owned(),
+                name: "t-agent".to_owned(),
+            },
+            "the full recheck still closes the .43 hole the cheap probe cannot",
+        );
+    }
+
+    /// The cheap probe reads no argv at all: an unresolvable pgid (no PTY, a
+    /// pane mid-teardown) must be held exactly like an unresolved FULL query
+    /// — never treated as a change, never advancing anything.
+    #[test]
+    fn an_unresolvable_cheap_probe_holds_rather_than_guessing() {
+        let mut h = occupied("t", 100);
+        h.occupy(Occupancy::Unresolved);
+        for _ in 0..5 {
+            assert_eq!(h.tick("WORKING"), DetectOutcome::Quiet);
+        }
+        assert_eq!(
+            h.detector.identified.as_deref(),
+            Some("t"),
+            "still believed present"
+        );
+        assert_eq!(h.state(), Some(DetectedState::Working), "badge untouched");
     }
 
     /// The new occupant gets its OWN startup grace. Re-anchoring is what stops

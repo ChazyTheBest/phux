@@ -135,6 +135,44 @@ pub(crate) enum Occupancy {
     },
 }
 
+impl Occupancy {
+    /// The process group this occupancy is ABOUT, if the question was
+    /// answered. [`Self::Unresolved`] carries none — unresolved is not
+    /// evidence of anything, including a pgid.
+    ///
+    /// This is what [`AgentDetector`](super::AgentDetector)'s cheap
+    /// pgid-only probe (phux-w7z2.50) compares against the last full
+    /// resolution to decide whether the expensive argv read is even worth
+    /// paying for on a given tick.
+    pub(crate) const fn pgid(&self) -> Option<i32> {
+        match self {
+            Self::Unresolved => None,
+            Self::Vacant { pgid } => Some(*pgid),
+            Self::Agent { occupant, .. } => Some(occupant.pgid),
+        }
+    }
+}
+
+/// The cheap half of [`foreground_occupancy`]: the foreground process group
+/// only, with no argv read.
+///
+/// `tcgetpgrp` is one ioctl; `process_argv` is a `/proc` read on Linux and two
+/// `sysctl`s on macOS, and argv only changes when the pgid does. Polling this
+/// on every ordinary detector tick and reserving [`foreground_occupancy`] for
+/// when the pgid actually moved (or the periodic recheck is due) is the
+/// phux-w7z2.50 fix: acquisition of an agent typed at an existing pane's
+/// shell drops from up to one full [`super::IDENTIFY_RECHECK`] to the
+/// ordinary tick cadence, for the cost of one extra ioctl on the ticks where
+/// nothing changed.
+///
+/// Deliberately does NOT read the start time: that is only ever compared
+/// once an [`Occupancy::Agent`] is already in hand (see the module docs), and
+/// this function exists precisely to avoid paying for anything past the
+/// pgid when nothing downstream needs it yet.
+pub(crate) fn foreground_pgid(master_fd: Option<i32>) -> Option<i32> {
+    proc_query::foreground_pgid(master_fd?)
+}
+
 /// Who occupies the foreground of this PTY.
 ///
 /// 1. Ask the kernel which process group owns the tty.
