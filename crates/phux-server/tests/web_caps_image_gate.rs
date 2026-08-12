@@ -54,22 +54,37 @@ const fn web_profile_caps() -> ClientCapabilities {
     ClientCapabilities::new().with_image_protocols(ImageProtocolSet::new())
 }
 
-/// A deterministic seed command: sleep long enough for both clients to
-/// attach (so the burst arrives as live `TERMINAL_OUTPUT`, not snapshot
-/// replay), then print the three image-protocol escapes bracketed by text
-/// markers, then idle so the pane stays alive through teardown.
-fn image_burst_command() -> CommandBuilder {
-    // Attach completes in well under 100 ms; the 0.5 s lead keeps margin
-    // for a loaded 2-core CI runner without stalling every run a full second.
-    let script = "sleep 0.5; \
+/// A deterministic seed command: block on `release` until both clients have
+/// finished attaching (so the burst arrives as live `TERMINAL_OUTPUT`, not
+/// snapshot replay), then print the three image-protocol escapes bracketed
+/// by text markers, then idle so the pane stays alive through teardown.
+///
+/// The gate used to be `sleep 0.5`, chosen because "attach completes in well
+/// under 100 ms". That is a bet, and under parallel test load it loses: two
+/// full HELLO/ATTACH/bootstrap handshakes can take longer than half a
+/// second, the burst then lands before a client is attached, and its bytes
+/// are folded into that client's opening snapshot instead of arriving as
+/// `TERMINAL_OUTPUT`. `drain_output_until` only accumulates
+/// `TERMINAL_OUTPUT`, so the end marker never appears and the test dies on
+/// `WIRE_RECV_TIMEOUT` — 15 seconds of nothing, reported as a timeout rather
+/// than as anything about image capabilities.
+///
+/// The release file removes the bet: the burst cannot happen until the test
+/// says so, and the test does not say so until both clients have read
+/// `BOOTSTRAP_READY`.
+fn image_burst_command(release: &std::path::Path) -> CommandBuilder {
+    let script = format!(
+        "until [ -f '{}' ]; do sleep 0.01; done; \
          printf 'IMG_BEGIN\\r\\n'; \
          printf '\\033_Ga=T,f=100,s=1,v=1;QUJDRA==\\033\\\\'; \
          printf '\\033Pq#0;2;0;0;0#0~~@@~~$\\033\\\\'; \
          printf '\\033]1337;File=inline=1:QUJDRA==\\007'; \
          printf 'IMG_END\\r\\n'; \
-         sleep 30";
+         sleep 600",
+        release.display(),
+    );
     let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.args(["-c", script]);
+    cmd.args(["-c", &script]);
     cmd
 }
 
@@ -79,7 +94,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Full opening sequence with an explicit HELLO capability set:
-/// `HELLO` -> `HELLO_OK` -> `ATTACH` -> `ATTACHED` -> `TERMINAL_SNAPSHOT`.
+/// `HELLO` -> `HELLO_OK` -> `ATTACH` -> `ATTACHED` -> `BOOTSTRAP_BEGIN` ->
+/// ... -> `BOOTSTRAP_READY`.
+///
+/// It drains all the way to `BOOTSTRAP_READY`, not just to the opening
+/// `BOOTSTRAP_BEGIN`, because that milestone is what the release file below
+/// is gating on. Stopping at `BOOTSTRAP_BEGIN` would let the burst fire
+/// while the snapshot was still streaming, which is precisely the "is this
+/// live output or replayed snapshot?" ambiguity the test is built to avoid.
 async fn attach_with_caps(
     socket_path: &std::path::Path,
     session: &str,
@@ -108,6 +130,12 @@ async fn attach_with_caps(
     assert_eq!(tb, TYPE_ATTACHED, "expected ATTACHED after ATTACH");
     let (tb, _) = recv_typed(&mut stream).await;
     assert_eq!(tb, TYPE_BOOTSTRAP_BEGIN, "expected opening snapshot");
+    loop {
+        let (_, frame) = recv_typed(&mut stream).await;
+        if matches!(frame, FrameKind::BootstrapReady { .. }) {
+            break;
+        }
+    }
     stream
 }
 
@@ -130,11 +158,16 @@ fn no_image_escapes_forwarded_to_client_advertising_none() {
     run_local(async {
         let tmp = TempDir::new().expect("tempdir");
         let socket_path = tmp.path().join("phux.sock");
-        let (shutdown_tx, server_handle) =
-            spawn_server_with_seed_cmd(socket_path.clone(), "default", image_burst_command());
+        let release = tmp.path().join("release");
+        let (shutdown_tx, server_handle) = spawn_server_with_seed_cmd(
+            socket_path.clone(),
+            "default",
+            image_burst_command(&release),
+        );
 
-        // Both clients attach during the seed script's initial sleep, so
-        // the escape burst reaches them as live TERMINAL_OUTPUT.
+        // Both clients attach before the burst is released, so the escapes
+        // reach them as live TERMINAL_OUTPUT rather than as replayed
+        // snapshot bytes.
         let mut web = attach_with_caps(
             &socket_path,
             "default",
@@ -149,6 +182,9 @@ fn no_image_escapes_forwarded_to_client_advertising_none() {
             ClientCapabilities::new().with_image_protocols(ImageProtocolSet::all()),
         )
         .await;
+
+        // Both bootstraps are READY; nothing has been emitted yet. Fire.
+        std::fs::write(&release, b"go").expect("release the image burst");
 
         let web_bytes = drain_output_until(&mut web, END_MARKER).await;
         let control_bytes = drain_output_until(&mut control, END_MARKER).await;

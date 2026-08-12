@@ -108,6 +108,23 @@ fn seed_with_ask_title(release: &std::path::Path) -> CommandBuilder {
     cmd
 }
 
+/// A pane that stays alive until the test's own shutdown signal reaps it.
+///
+/// Tests whose subject is a *command* (`REPORT_ASKED`) still need a live
+/// terminal to name, but they assert nothing about the pane. A seed that
+/// exits on its own schedule turns that scaffolding into a race: when the
+/// last pane dies the session is reaped and the server self-exits, dropping
+/// every client connection, and the next `recv_typed` panics with "early
+/// eof" — a failure that says nothing about the feature under test. The
+/// park is long enough that no bounded wait in this file can outlast it,
+/// and short enough to be reaped by the harness if a test ever leaks one.
+fn park_until_shutdown() -> CommandBuilder {
+    let mut cmd = CommandBuilder::new("/bin/sh");
+    cmd.arg("-c");
+    cmd.arg("sleep 600");
+    cmd
+}
+
 /// Drain `EVENT` frames until an `Asked` event is seen, or `deadline`
 /// elapses. Non-`EVENT` frames (`ATTACHED`, `TERMINAL_SNAPSHOT`,
 /// `TERMINAL_OUTPUT`, etc.) are skipped — we assert on the event stream.
@@ -288,11 +305,16 @@ fn report_asked_command_emits_asked_event() {
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
 
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg("sleep 2");
+        // The pane exists only to give REPORT_ASKED a live terminal to name;
+        // nothing here asserts on its death. It must nevertheless outlive
+        // the collection window below, which is bounded by
+        // `WIRE_RECV_TIMEOUT` (15s). This was `sleep 2` — a pane that could
+        // exit mid-window, reaping the session, self-exiting the server, and
+        // failing the test with "early eof" rather than with anything about
+        // asks. `park_until_shutdown` is not a longer bet; it removes the
+        // bet, exactly as the ask-title seed above already does.
         let (shutdown_tx, server_handle) =
-            spawn_server_with_seed_cmd(socket_path.clone(), "demo", cmd);
+            spawn_server_with_seed_cmd(socket_path.clone(), "demo", park_until_shutdown());
 
         let mut stream = wait_for_raw_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
         negotiate(&mut stream).await;
@@ -350,11 +372,12 @@ fn report_asked_rejects_empty_question() {
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
 
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg("sleep 2");
+        // Same reasoning as `report_asked_command_emits_asked_event`: the
+        // pane is scaffolding, and `recv_command_result` here is not even
+        // deadline-bounded, so a pane that outlives nothing in particular is
+        // the only safe shape.
         let (shutdown_tx, server_handle) =
-            spawn_server_with_seed_cmd(socket_path.clone(), "demo", cmd);
+            spawn_server_with_seed_cmd(socket_path.clone(), "demo", park_until_shutdown());
 
         let mut stream = wait_for_raw_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
         negotiate(&mut stream).await;
