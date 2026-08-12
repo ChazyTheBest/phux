@@ -327,6 +327,40 @@ fn server_health_checks(
 /// generator actually writes are. A unit missing them entirely predates
 /// phux-zomb.4 (or was hand-edited into the same unthrottled shape), and
 /// either way deserves the same warning.
+///
+/// ## Why this stays a second predicate next to `service::reconcile_unit` (phux-x2k8)
+///
+/// `service::Reconcile::Current` ([`crate::commands::service::reconcile_unit`])
+/// answers a byte-exact question: would patching this file with today's
+/// [`crate::commands::service::launchd_policy_lines`] /
+/// [`crate::commands::service::systemd_policy_lines`] change anything? That is
+/// the right question for the reconciler — it has to be a fixed point
+/// (`reconcile(reconcile(x)) == reconcile(x)`) and its whole job is
+/// converging a unit onto this build's exact canonical bytes.
+///
+/// A diagnostic needs a looser question: is this unit's restart behavior
+/// dangerous — unthrottled, or restarting on a clean exit — regardless of
+/// which build wrote it? Keying the warning to byte-exact match would make it
+/// fire on a plain constant retune (say, a future release changing the
+/// throttle interval) even though the installed unit is still perfectly
+/// safe: throttled, failure-only, just pinned to an older number. A `Warn`
+/// that starts firing on every such release trains people to ignore it,
+/// which is the failure mode `server-health` staying a trustworthy exit-0
+/// warning (phux-nvi2) exists to avoid. So this predicate checks value shape
+/// (failure-only, throttle greater than zero) rather than byte identity, and
+/// is deliberately allowed to disagree with `reconcile_unit` on that one
+/// case.
+///
+/// They are required to agree on every case that has actually occurred in
+/// practice — a freshly generated unit, the pre-zomb.4 shape, and dsg1's two
+/// false-pass fixtures — which
+/// `supervisor_unit_is_legacy_and_reconcile_unit_agree_on_known_cases` (below)
+/// pins directly against both functions. The one case they must NOT agree on
+/// is pinned by
+/// `a_retuned_but_positive_throttle_is_not_legacy_though_reconcile_would_still_rewrite_it`.
+/// Both predicates independently stay cross-checked against the real
+/// renderers, so neither can silently drift from what `phux service install`
+/// actually writes.
 fn supervisor_unit_is_legacy(unit: &std::path::Path) -> bool {
     let Ok(body) = std::fs::read_to_string(unit) else {
         return false;
@@ -1240,6 +1274,125 @@ mod tests {
     fn an_unreadable_unit_is_not_flagged_legacy() {
         let path = std::path::Path::new("/nonexistent/phux-doctor-test/unit-file");
         assert!(!supervisor_unit_is_legacy(path));
+    }
+
+    // -----------------------------------------------------------------
+    // supervisor_unit_is_legacy vs service::reconcile_unit (phux-x2k8)
+    // -----------------------------------------------------------------
+    //
+    // Two predicates now answer a related question about the same unit
+    // files (doctor's "should I warn" and service's "would reconciling
+    // change anything"). The design decision — keep both, because they
+    // answer genuinely different questions — is documented on
+    // `supervisor_unit_is_legacy` above. These two tests are what makes that
+    // decision durable instead of just prose: one pins where they must
+    // agree, the other pins the one place they are allowed not to.
+
+    /// Every case that has actually mattered in practice — a freshly
+    /// generated unit for both managers, the real pre-zomb.4 shape, and
+    /// dsg1's two specific false-pass fixtures (a zero throttle, and
+    /// `Restart=always` beside a stray `SuccessfulExit` mention) — must get
+    /// the same legacy verdict from `supervisor_unit_is_legacy` as from
+    /// `reconcile_unit`'s `Current`/not-`Current` split. If a future change
+    /// made these disagree on any of these cases, that is a real
+    /// regression, not the accepted divergence the next test pins.
+    #[test]
+    #[allow(clippy::unwrap_used, reason = "test code")]
+    fn supervisor_unit_is_legacy_and_reconcile_unit_agree_on_known_cases() {
+        use crate::commands::service::{Manager, Reconcile, reconcile_unit};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, Manager, String); 5] = [
+            (
+                "fresh-launchd",
+                Manager::Launchd,
+                crate::commands::service::render_launchd_plist(&service_plan_fixture()),
+            ),
+            (
+                "fresh-systemd",
+                Manager::Systemd,
+                crate::commands::service::render_systemd_unit(&service_plan_fixture()),
+            ),
+            (
+                "pre-zomb4-launchd",
+                Manager::Launchd,
+                "<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n  \
+                 <key>Label</key>\n  <string>com.phux.server</string>\n  \
+                 <key>KeepAlive</key>\n  <true/>\n</dict>\n</plist>\n"
+                    .to_owned(),
+            ),
+            (
+                "zero-throttle-launchd",
+                Manager::Launchd,
+                "<plist version=\"1.0\">\n<dict>\n  <key>SuccessfulExit</key>\n    <false/>\n  \
+                 <key>ThrottleInterval</key>\n  <integer>0</integer>\n</dict>\n</plist>\n"
+                    .to_owned(),
+            ),
+            (
+                "restart-always-systemd",
+                Manager::Systemd,
+                "[Service]\n# SuccessfulExit is launchd's spelling, not used here\n\
+                 Restart=always\nRestartSec=30s\n"
+                    .to_owned(),
+            ),
+        ];
+
+        for (name, manager, body) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &body).unwrap();
+
+            let legacy = supervisor_unit_is_legacy(&path);
+            let would_change = !matches!(reconcile_unit(manager, &body), Reconcile::Current);
+            assert_eq!(
+                legacy,
+                would_change,
+                "{name}: supervisor_unit_is_legacy={legacy} but reconcile_unit \
+                 {}Current",
+                if would_change { "!= " } else { "== " }
+            );
+        }
+    }
+
+    /// The accepted divergence: a throttle that is a real, positive number
+    /// but not *today's exact* number is not dangerous, so doctor does not
+    /// warn about it — while `reconcile_unit` still wants to rewrite it,
+    /// because its job is convergence onto the current canonical bytes, not
+    /// a judgment about safety. If `RESTART_THROTTLE_SECS` is ever retuned,
+    /// a unit installed by the previous release must not start producing a
+    /// doctor warning it did not produce before the upgrade — that is the
+    /// concrete reason the two predicates are not one.
+    #[test]
+    #[allow(clippy::unwrap_used, reason = "test code")]
+    fn a_retuned_but_positive_throttle_is_not_legacy_though_reconcile_would_still_rewrite_it() {
+        use crate::commands::service::{Manager, Reconcile, reconcile_unit};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("com.phux.server.plist");
+        let body = crate::commands::service::render_launchd_plist(&service_plan_fixture());
+        let current = body
+            .split_once("<key>ThrottleInterval</key>")
+            .and_then(|(_, rest)| plist_integer(rest))
+            .expect("today's renderer always emits a positive ThrottleInterval");
+        let retuned = body.replacen(
+            &format!("<integer>{current}</integer>"),
+            &format!("<integer>{}</integer>", current + 1),
+            1,
+        );
+        assert_ne!(
+            retuned, body,
+            "the substitution must actually change something"
+        );
+        std::fs::write(&path, &retuned).unwrap();
+
+        assert!(
+            !supervisor_unit_is_legacy(&path),
+            "a positive throttle is safe regardless of its exact number"
+        );
+        assert_ne!(
+            reconcile_unit(Manager::Launchd, &retuned),
+            Reconcile::Current,
+            "reconcile still wants to converge on the exact current throttle value"
+        );
     }
 
     // -----------------------------------------------------------------
