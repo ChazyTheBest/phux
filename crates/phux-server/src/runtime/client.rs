@@ -2378,8 +2378,29 @@ pub(crate) fn handle_subscribe_metadata(
             debug!(?client_id, ?scope, %key, "SUBSCRIBE_METADATA refused (non-L3)");
             return;
         }
-        debug!(?client_id, ?scope, %key, "SUBSCRIBE_METADATA");
-        s.metadata_subscribe(client_id, scope, key, out_tx.clone());
+        // Cloned only for the post-call log line below; `scope` and `key`
+        // themselves are moved into `metadata_subscribe`, the real owner of
+        // this data on acceptance.
+        let log_scope = scope.clone();
+        let log_key = key.clone();
+        if s.metadata_subscribe(client_id, scope, key, out_tx.clone()) {
+            debug!(?client_id, ?log_scope, %log_key, "SUBSCRIBE_METADATA");
+        } else {
+            // Per-connection cap (phux-w7z2.59, state::metadata::MAX_SUBSCRIPTIONS_PER_CLIENT).
+            // SUBSCRIBE_METADATA has no reply frame on the wire (SPEC L3.md
+            // §1.2), so — exactly like the non-L3 arm above — a log line is
+            // the only signal available. Refuse rather than evict an
+            // existing subscription: eviction would silently break a
+            // subscription that was working fine just to make room for one
+            // that was never established, which is a worse failure than
+            // declining the new one.
+            warn!(
+                ?client_id,
+                ?log_scope,
+                %log_key,
+                "SUBSCRIBE_METADATA refused: per-connection subscription cap reached"
+            );
+        }
     });
 }
 

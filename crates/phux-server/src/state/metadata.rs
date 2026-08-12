@@ -8,6 +8,25 @@ use super::ServerState;
 use super::client::ClientId;
 use crate::mailbox::Outbound;
 
+/// Most metadata subscriptions one connection may hold at once (phux-w7z2.59).
+///
+/// `SUBSCRIBE_METADATA` has no reply frame (SPEC L3.md §1.2) and no
+/// `UNSUBSCRIBE_METADATA` verb, so an unbounded remote caller can grow this
+/// set for the life of the connection — on a `phux service install` server
+/// that is now weeks, not a session. The cap is sized well above any
+/// realistic caller, adopting the "generous multiple of shipped usage"
+/// convention `agent_detect::rules` set for its own bounds
+/// (phux-w7z2.14): the reference TUI subscribes a handful of Global/Group
+/// keys (`phux.session.name/v1`, `phux.tui.layout/v1`,
+/// `phux.tui.window_order/v1`, `phux.tui.focus/v1`) plus up to three
+/// per-Terminal keys (`phux.agent/v1`, `phux.tags/v1`, `phux.link/v1`) per
+/// pane it has ever attached to, so even a heavy fleet of ~150 panes stays
+/// under 500 subscriptions. 512 gives headroom over that while keeping the
+/// worst case trivial: each subscription is one `(ClientId, Scope, String)`
+/// tuple, so a maxed-out connection costs on the order of tens of
+/// kilobytes, not a resource an attacker gains anything by exhausting.
+const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 512;
+
 /// Per-scope K/V store for L3 metadata (SPEC §7.4 / §11.L3) plus the
 /// matching subscription registry.
 ///
@@ -139,20 +158,58 @@ impl MetadataStore {
         keys
     }
 
-    /// Drop every key scoped to `terminal`. Called when the Terminal
-    /// closes (the L1 lifecycle that owns the per-Terminal scope — see
-    /// the `terminal` field doc). Subscriptions targeting the dead
-    /// Terminal are connection-scoped and are reaped on detach, so they
-    /// are left untouched here.
+    /// Drop every key scoped to `terminal`, AND every subscription that
+    /// names it. Called when the Terminal closes (the L1 lifecycle that
+    /// owns the per-Terminal scope — see the `terminal` field doc).
+    ///
+    /// A subscription's *connection* dying is handled separately —
+    /// [`Self::drop_client`] runs on detach and clears every subscription
+    /// that connection holds, whatever scope it names. This method covers
+    /// the other half (phux-w7z2.59): the connection stays alive but the
+    /// Terminal it subscribed to does not. Without this, a long-lived
+    /// watcher that has ever subscribed to a pane's `phux.agent/v1` (or any
+    /// other per-Terminal key) accumulates one dead subscription per closed
+    /// pane for as long as the connection is open — on a `phux service
+    /// install` server, unboundedly.
     pub fn forget_terminal(&mut self, terminal: &WireTerminalId) {
         self.terminal.remove(terminal);
+        self.subscriptions
+            .retain(|(_, scope, _)| !matches!(scope, Scope::Terminal(tid) if tid == terminal));
     }
 
-    /// Register `(client, scope, key)` as an active subscription. The
-    /// underlying set is idempotent: re-subscribing the same triple is
-    /// a noop.
-    pub fn subscribe(&mut self, client: ClientId, scope: Scope, key: String) {
-        self.subscriptions.insert((client, scope, key));
+    /// Register `(client, scope, key)` as an active subscription, subject
+    /// to `MAX_SUBSCRIPTIONS_PER_CLIENT`. Returns `true` if the
+    /// subscription is now active (either newly inserted or already
+    /// present — re-subscribing the same triple is idempotent and never
+    /// counts against the cap twice), `false` if `client` is already at
+    /// the cap and this would have been a new entry.
+    ///
+    /// The caller (`handle_subscribe_metadata`) is expected to drop a
+    /// refusal silently but for a log line: `SUBSCRIBE_METADATA` has no
+    /// reply frame to carry an error on (SPEC L3.md §1.2), matching the
+    /// existing non-L3-consumer refusal one arm up the same dispatch.
+    pub fn subscribe(&mut self, client: ClientId, scope: Scope, key: String) -> bool {
+        let triple = (client, scope, key);
+        if self.subscriptions.contains(&triple) {
+            return true;
+        }
+        // SUBSCRIBE_METADATA is a rare, connection-setup-time event, not a
+        // hot path — this scan (bounded by the cap on any one client, but
+        // linear in the server's *total* subscription count across every
+        // client) is the same trade the module doc already makes for
+        // `subscribers_for`'s dispatch-path scan, and phux is a one-user-
+        // per-server process (ADR-0003) with a correspondingly small
+        // connection count.
+        let held_by_client = self
+            .subscriptions
+            .iter()
+            .filter(|(c, _, _)| *c == client)
+            .count();
+        if held_by_client >= MAX_SUBSCRIPTIONS_PER_CLIENT {
+            return false;
+        }
+        self.subscriptions.insert(triple);
+        true
     }
 
     /// Drop every subscription owned by `client`. Called on detach.
@@ -281,14 +338,173 @@ impl ServerState {
     /// subscribes WITHOUT attaching, so `METADATA_CHANGED` fanout cannot be
     /// resolved through `attached` alone. Both maps are cleared together on
     /// detach.
+    ///
+    /// Returns `false` when `client_id` is already at
+    /// [`MetadataStore`]'s per-connection subscription cap and this would
+    /// have added a new entry — see [`MetadataStore::subscribe`]. The
+    /// mailbox is remembered only when the subscription is actually
+    /// accepted, so a client that is refused every subscription from a
+    /// fresh connection never gains an entry in the mailbox map either.
     pub fn metadata_subscribe(
         &mut self,
         client_id: ClientId,
         scope: Scope,
         key: String,
         tx: mpsc::Sender<Outbound>,
-    ) {
-        self.clients.remember_metadata_mailbox(client_id, tx);
-        self.metadata.subscribe(client_id, scope, key);
+    ) -> bool {
+        let accepted = self.metadata.subscribe(client_id, scope, key);
+        if accepted {
+            self.clients.remember_metadata_mailbox(client_id, tx);
+        }
+        accepted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: usize) -> String {
+        format!("phux.test.key/{n}/v1")
+    }
+
+    /// Filling a client to the cap succeeds on every distinct key; the
+    /// `MAX_SUBSCRIPTIONS_PER_CLIENT + 1`th distinct key is refused, and the
+    /// refusal does not mutate the store — the count stays pinned at the
+    /// cap rather than creeping past it.
+    #[test]
+    fn subscribe_enforces_the_per_client_cap() {
+        let mut store = MetadataStore::default();
+        let client = ClientId(1);
+
+        for n in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+            assert!(
+                store.subscribe(client, Scope::Global, key(n)),
+                "subscription {n} is under the cap and must be accepted",
+            );
+        }
+        assert_eq!(
+            store
+                .subscriptions
+                .iter()
+                .filter(|(c, _, _)| *c == client)
+                .count(),
+            MAX_SUBSCRIPTIONS_PER_CLIENT,
+        );
+
+        let refused = store.subscribe(client, Scope::Global, key(MAX_SUBSCRIPTIONS_PER_CLIENT));
+        assert!(!refused, "the cap+1'th distinct key must be refused");
+        assert_eq!(
+            store
+                .subscriptions
+                .iter()
+                .filter(|(c, _, _)| *c == client)
+                .count(),
+            MAX_SUBSCRIPTIONS_PER_CLIENT,
+            "a refused subscribe must not grow the client's held count past the cap",
+        );
+        // Refuse, not evict (phux-w7z2.59 design choice): the refusal must
+        // not have made room for itself by dropping an earlier subscription.
+        // An eviction policy here would silently break a subscription that
+        // was working fine to admit one that was never established — worse
+        // than just declining the new one.
+        assert_eq!(
+            store.subscribers_for(&Scope::Global, &key(0)),
+            vec![client],
+            "a refused subscribe must not evict any existing subscription",
+        );
+    }
+
+    /// Re-subscribing an already-held triple is a no-op on the count, so it
+    /// never itself trips the cap — a client cannot be starved of its own
+    /// re-subscribes by having previously reached the limit.
+    #[test]
+    fn resubscribing_an_existing_triple_at_the_cap_stays_accepted() {
+        let mut store = MetadataStore::default();
+        let client = ClientId(1);
+        for n in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+            assert!(store.subscribe(client, Scope::Global, key(n)));
+        }
+
+        assert!(
+            store.subscribe(client, Scope::Global, key(0)),
+            "re-subscribing an existing triple must succeed even while at the cap",
+        );
+    }
+
+    /// The cap is per-client: one client hitting its limit must not affect
+    /// another client's ability to subscribe.
+    #[test]
+    fn the_cap_is_per_client_not_global() {
+        let mut store = MetadataStore::default();
+        let hog = ClientId(1);
+        let other = ClientId(2);
+        for n in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+            assert!(store.subscribe(hog, Scope::Global, key(n)));
+        }
+        assert!(!store.subscribe(hog, Scope::Global, key(MAX_SUBSCRIPTIONS_PER_CLIENT)));
+
+        assert!(
+            store.subscribe(other, Scope::Global, key(0)),
+            "a different client must still be able to subscribe to the same key",
+        );
+    }
+
+    /// `forget_terminal` clears the Terminal's K/V bucket (existing
+    /// behavior) AND now reaps any subscription naming that Terminal,
+    /// while leaving subscriptions for other scopes/terminals untouched.
+    /// This is the "reap" half of phux-w7z2.59: a subscription's
+    /// connection can outlive the Terminal it named.
+    #[test]
+    fn forget_terminal_reaps_only_subscriptions_naming_that_terminal() {
+        let mut store = MetadataStore::default();
+        let client = ClientId(1);
+        let dead = WireTerminalId::local(1);
+        let alive = WireTerminalId::local(2);
+
+        assert!(store.subscribe(client, Scope::Terminal(dead.clone()), "k".to_owned()));
+        assert!(store.subscribe(client, Scope::Terminal(alive.clone()), "k".to_owned()));
+        assert!(store.subscribe(client, Scope::Global, "k".to_owned()));
+
+        store.forget_terminal(&dead);
+
+        assert!(
+            store
+                .subscribers_for(&Scope::Terminal(dead.clone()), "k")
+                .is_empty(),
+            "the dead Terminal's subscription must be reaped",
+        );
+        assert_eq!(
+            store.subscribers_for(&Scope::Terminal(alive), "k"),
+            vec![client],
+            "a different Terminal's subscription must survive",
+        );
+        assert_eq!(
+            store.subscribers_for(&Scope::Global, "k"),
+            vec![client],
+            "a Global subscription must survive",
+        );
+    }
+
+    /// Reaping a dead Terminal's subscription frees a cap slot: a
+    /// connection that churns through many short-lived Terminals must not
+    /// have every one of them permanently occupy its subscription budget.
+    #[test]
+    fn forget_terminal_frees_a_cap_slot_for_reuse() {
+        let mut store = MetadataStore::default();
+        let client = ClientId(1);
+        let terminal = WireTerminalId::local(1);
+
+        for n in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+            assert!(store.subscribe(client, Scope::Terminal(terminal.clone()), key(n)));
+        }
+        assert!(!store.subscribe(client, Scope::Global, "overflow".to_owned()));
+
+        store.forget_terminal(&terminal);
+
+        assert!(
+            store.subscribe(client, Scope::Global, "overflow".to_owned()),
+            "reaping the dead Terminal's subscriptions must free room under the cap",
+        );
     }
 }
