@@ -832,6 +832,11 @@ impl RelaySession {
                     satellite: None,
                     owner_terminal: None,
                     agent_session: None,
+                    // Local-only, like the two fields above: the hub has no
+                    // model of the satellite's layout, so the pane takes the
+                    // satellite's default grid and is sized by whichever
+                    // client attaches to it (phux-a5xj).
+                    initial_size: None,
                 }))
             }
             RelayRequest::Subscribe {

@@ -1366,6 +1366,7 @@ proptest! {
         satellite in proptest::option::of(".{0,16}"),
         owner_terminal in proptest::option::of(any::<u32>()),
         agent_session in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..64)),
+        initial_size in proptest::option::of((any::<u16>(), any::<u16>())),
     ) {
         assert_round_trip(&FrameKind::SpawnTerminal {
             request_id,
@@ -1377,6 +1378,7 @@ proptest! {
             satellite: satellite.map(phux_protocol::ids::SatelliteHost::new),
             owner_terminal: owner_terminal.map(TerminalId::local),
             agent_session,
+            initial_size,
         });
     }
 

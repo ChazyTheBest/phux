@@ -329,6 +329,7 @@ ServerFeature = bitset (u32) {
     MOVE_TERMINAL      = 0x00000040, // MOVE_TERMINAL (L1.md §3.1; ADR-0056)
     TERMINAL_REPLY     = 0x00000080, // INPUT_TERMINAL_REPLY (L1.md §3.4; ADR-0070)
     SHUTDOWN           = 0x00000100, // SHUTDOWN (L1.md §5.1)
+    SPAWN_INITIAL_SIZE = 0x00000200, // SPAWN_TERMINAL.initial_size (L1.md §3.1)
 }
 
 EngineFeatureSet = bitset (u32) {
@@ -395,6 +396,14 @@ ignored. A client MUST use the corresponding frame only when its feature is
 advertised. In particular, the absence of `TERMINAL_REPLY` in an otherwise
 valid 0.7 `HELLO_OK` is authoritative: that server does not accept
 `INPUT_TERMINAL_REPLY`.
+
+`SPAWN_INITIAL_SIZE = 0x200` is the one bit that gates a field rather than a
+frame, and its unadvertised case is degrading rather than dangerous: a server
+without it skips the unknown field id by length and spawns at its default,
+which is what happened before the field existed. A client SHOULD still
+require the bit, because it is what distinguishes "the pane already has the
+geometry I asked for" from "the pane is at some default and my follow-up
+`TERMINAL_RESIZE` is load-bearing."
 
 Color/image/keyboard/hyperlink rewriting applies only to synthesized
 compatibility profiles. For `NativeState`, `BOOTSTRAP_CHUNK`,

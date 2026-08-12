@@ -74,6 +74,14 @@ pub(super) struct DispatchCtx<'a> {
     /// the layout `SET_METADATA`, which doesn't need a reply), but we
     /// reserve the counter for future `SPAWN`/kill wiring.
     pub next_request_id: &'a mut u32,
+    /// phux-a5xj: did the server advertise
+    /// [`ServerFeature::SpawnInitialSize`](phux_protocol::caps::ServerFeature::SpawnInitialSize)?
+    /// When set, a spawn carries the tile the new leaf will occupy so the
+    /// pane bootstraps at its real geometry instead of at the server default
+    /// and then being reflowed. Unset against an older server, where the
+    /// field would be skipped by length anyway — omitting it keeps the
+    /// frame byte-identical to what that server has always decoded.
+    pub spawn_initial_size_supported: bool,
     /// phux-4li.12: parked split actions awaiting their
     /// `TERMINAL_SPAWNED` reply. `run_action` inserts;
     /// `handle_server_frame` removes.
@@ -1194,6 +1202,45 @@ fn focused_pane_rect(
     )
 }
 
+/// Resolve `SPAWN_TERMINAL.initial_size` for a spawn this client is about to
+/// issue (phux-a5xj), by asking `predict` for the tile the new leaf will
+/// occupy in the current content rect.
+///
+/// `None` — and therefore an absent wire field — whenever the server did not
+/// advertise the capability, the content rect is degenerate, or `predict`
+/// cannot answer. Every one of those falls back to the pre-field behavior:
+/// the server spawns at its default and the reflow resize sizes the pane.
+fn spawn_initial_size(
+    ctx: &DispatchCtx<'_>,
+    predict: impl FnOnce(crate::layout::Rect) -> Option<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    if !ctx.spawn_initial_size_supported {
+        return None;
+    }
+    let content = content_rect(ctx.viewport, ctx.bar, ctx.sidebar);
+    // A zero axis means there is nothing to render into; the server reads a
+    // zero as "unknown" anyway, so do not spend a field on it.
+    predict(content).filter(|&(cols, rows)| cols > 0 && rows > 0)
+}
+
+/// [`spawn_initial_size`] for a `split-pane`: tile the split this client is
+/// about to ask for and read the new leaf's rect out of it.
+fn predicted_split_size(ctx: &DispatchCtx<'_>, pending: &PendingSplit) -> Option<(u16, u16)> {
+    let active = ctx.workspace.active_window()?.clone();
+    spawn_initial_size(ctx, |content| {
+        actions::predicted_spawn_dims(&active, pending, content)
+    })
+}
+
+/// Stamp `size` onto an already-built `SPAWN_TERMINAL` frame — the plugin-pane
+/// path builds the frame from its manifest entry before it knows which
+/// placement (and therefore which tile) it is about to park.
+const fn set_spawn_initial_size(frame: &mut FrameKind, size: Option<(u16, u16)>) {
+    if let FrameKind::SpawnTerminal { initial_size, .. } = frame {
+        *initial_size = size;
+    }
+}
+
 pub(super) fn focused_pane_rect_for(
     workspace: &Workspace,
     zoomed: Option<&TerminalId>,
@@ -1891,6 +1938,11 @@ fn run_action(
             };
             let request_id = *ctx.next_request_id;
             *ctx.next_request_id = ctx.next_request_id.wrapping_add(1);
+            let pending = PendingSplit {
+                focused_at_request: focused_id,
+                dir,
+                zoom_on_spawn: false,
+            };
             // CWD inheritance is phux-4li.1; until then we let the
             // server pick (typically $HOME). `command = None` invokes
             // the server's default shell; `env = None` inherits the
@@ -1905,16 +1957,9 @@ fn run_action(
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: predicted_split_size(ctx, &pending),
             };
-            effects.spawn_terminal = Some((
-                request_id,
-                PendingSplit {
-                    focused_at_request: focused_id,
-                    dir,
-                    zoom_on_spawn: false,
-                },
-                frame,
-            ));
+            effects.spawn_terminal = Some((request_id, pending, frame));
         }
         "kill-pane" => {
             // phux-4li.12: soft-kill — write `exit\n` as a sequence of
@@ -2065,6 +2110,10 @@ fn run_action(
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                // phux-a5xj: the new window holds one leaf, so the pane
+                // fills the whole content rect. Predicting that here spares
+                // the pane a bootstrap-then-reflow round trip.
+                initial_size: spawn_initial_size(ctx, |content| Some((content.w, content.h))),
             };
             effects.spawn_window = Some((request_id, PendingWindow { name }, frame));
         }
@@ -2534,7 +2583,7 @@ fn run_action(
             };
             let request_id = *ctx.next_request_id;
             *ctx.next_request_id = ctx.next_request_id.wrapping_add(1);
-            let frame = entry.spawn_frame(request_id);
+            let mut frame = entry.spawn_frame(request_id);
             match entry.placement {
                 HostedPlacement::Split | HostedPlacement::Zoomed => {
                     let Some(focused_id) = focused.cloned() else {
@@ -2546,19 +2595,21 @@ fn run_action(
                         effects.bell = true;
                         return effects;
                     };
-                    effects.spawn_terminal = Some((
-                        request_id,
-                        PendingSplit {
-                            focused_at_request: focused_id,
-                            // Side-by-side, matching the palette's
-                            // `split-pane` default (vertical divider).
-                            dir: SplitDir::Horizontal,
-                            zoom_on_spawn: entry.placement == HostedPlacement::Zoomed,
-                        },
-                        frame,
-                    ));
+                    let pending = PendingSplit {
+                        focused_at_request: focused_id,
+                        // Side-by-side, matching the palette's
+                        // `split-pane` default (vertical divider).
+                        dir: SplitDir::Horizontal,
+                        zoom_on_spawn: entry.placement == HostedPlacement::Zoomed,
+                    };
+                    set_spawn_initial_size(&mut frame, predicted_split_size(ctx, &pending));
+                    effects.spawn_terminal = Some((request_id, pending, frame));
                 }
                 HostedPlacement::Tab => {
+                    set_spawn_initial_size(
+                        &mut frame,
+                        spawn_initial_size(ctx, |content| Some((content.w, content.h))),
+                    );
                     effects.spawn_window = Some((
                         request_id,
                         PendingWindow {
@@ -3327,10 +3378,28 @@ mod tests {
         run_with_last(action, workspace, None)
     }
 
+    /// [`run`] against a server that did NOT advertise
+    /// `ServerFeature::SpawnInitialSize` (phux-a5xj).
+    fn run_without_spawn_size_support(
+        action: &phux_config::keybind::ResolvedAction,
+        workspace: &mut Workspace,
+    ) -> ActionEffects {
+        run_with_last_and_spawn_size(action, workspace, None, false)
+    }
+
     fn run_with_last(
         action: &phux_config::keybind::ResolvedAction,
         workspace: &mut Workspace,
         last_focused: Option<TerminalId>,
+    ) -> ActionEffects {
+        run_with_last_and_spawn_size(action, workspace, last_focused, true)
+    }
+
+    fn run_with_last_and_spawn_size(
+        action: &phux_config::keybind::ResolvedAction,
+        workspace: &mut Workspace,
+        last_focused: Option<TerminalId>,
+        spawn_initial_size_supported: bool,
     ) -> ActionEffects {
         let mut next_request_id = 100;
         let mut pending_splits = HashMap::new();
@@ -3357,6 +3426,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -3509,6 +3579,70 @@ mod tests {
         );
         assert_eq!(focused, Some(tid(1)));
         assert_eq!(history.previous(), Some(&tid(2)));
+    }
+
+    // ---------------------------------------------------------------------
+    // phux-a5xj — the dispatcher stamps the tile onto the spawn
+    // ---------------------------------------------------------------------
+
+    fn spawn_initial_size_of(frame: &FrameKind) -> Option<(u16, u16)> {
+        let FrameKind::SpawnTerminal { initial_size, .. } = frame else {
+            panic!("expected SpawnTerminal, got {frame:?}");
+        };
+        *initial_size
+    }
+
+    /// A `split-pane` must name the tile the new leaf is about to occupy, so
+    /// the server bootstraps the pane there instead of at 80x24 and then
+    /// being told the truth by a resize that throws the checkpoint away.
+    ///
+    /// The 80x24 viewport with no chrome tiles to a full 80x24 content rect;
+    /// a horizontal split spends one divider column, leaving 79 to share
+    /// 40/39 — so the new (right-hand) leaf is 39x24. Asserting the exact
+    /// number, not merely "some size", is what makes this a regression guard
+    /// rather than a smoke test.
+    #[test]
+    fn split_pane_spawn_carries_the_new_leafs_tile() {
+        let mut workspace = Workspace::single(tid(1));
+        let mut action = bare_action("split-pane");
+        action.args.insert(
+            "direction".to_owned(),
+            toml::Value::String("vertical".into()),
+        );
+        let effects = run(&action, &mut workspace);
+        let (_req, _pending, frame) = effects.spawn_terminal.expect("split parks a SPAWN");
+        assert_eq!(spawn_initial_size_of(&frame), Some((39, 24)));
+    }
+
+    /// A `new-window` seeds a window holding one leaf, so the pane fills the
+    /// whole content rect.
+    #[test]
+    fn new_window_spawn_carries_the_full_content_rect() {
+        let mut workspace = Workspace::single(tid(1));
+        let effects = run(&bare_action("new-window"), &mut workspace);
+        let (_req, _pending, frame) = effects.spawn_window.expect("new-window parks a SPAWN");
+        assert_eq!(spawn_initial_size_of(&frame), Some((80, 24)));
+    }
+
+    /// Against a server that never advertised the capability the field stays
+    /// absent, so the frame is byte-identical to what that server has always
+    /// decoded (ADR-0061: a client MUST NOT depend on unadvertised surface).
+    #[test]
+    fn spawn_omits_initial_size_when_the_server_did_not_advertise_it() {
+        let mut workspace = Workspace::single(tid(1));
+        let mut action = bare_action("split-pane");
+        action.args.insert(
+            "direction".to_owned(),
+            toml::Value::String("vertical".into()),
+        );
+        let effects = run_without_spawn_size_support(&action, &mut workspace);
+        let (_req, _pending, frame) = effects.spawn_terminal.expect("split parks a SPAWN");
+        assert_eq!(spawn_initial_size_of(&frame), None);
+
+        let mut workspace = Workspace::single(tid(1));
+        let effects = run_without_spawn_size_support(&bare_action("new-window"), &mut workspace);
+        let (_req, _pending, frame) = effects.spawn_window.expect("new-window parks a SPAWN");
+        assert_eq!(spawn_initial_size_of(&frame), None);
     }
 
     #[test]
@@ -3860,6 +3994,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -3930,6 +4065,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -4035,6 +4171,7 @@ mod tests {
                 viewport: (80, 24),
                 cell_px: (1, 1),
                 next_request_id: &mut next_request_id,
+                spawn_initial_size_supported: true,
                 pending_splits: &mut pending_splits,
                 pending_windows: &mut pending_windows,
                 expected_closes: &mut HashSet::new(),
@@ -4203,6 +4340,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -4648,6 +4786,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -5134,6 +5273,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -5225,6 +5365,7 @@ mod tests {
                 viewport: (80, 24),
                 cell_px: (1, 1),
                 next_request_id: &mut next_request_id,
+                spawn_initial_size_supported: true,
                 pending_splits: &mut pending_splits,
                 pending_windows: &mut pending_windows,
                 expected_closes: &mut HashSet::new(),
@@ -5404,6 +5545,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -5533,6 +5675,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -5717,6 +5860,7 @@ mod tests {
             viewport: (8, 4),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -5918,6 +6062,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -6140,6 +6285,7 @@ mod tests {
                 viewport: (80, 24),
                 cell_px: (1, 1),
                 next_request_id: &mut next_request_id,
+                spawn_initial_size_supported: true,
                 pending_splits: &mut pending_splits,
                 pending_windows: &mut pending_windows,
                 expected_closes: &mut HashSet::new(),
@@ -6463,6 +6609,7 @@ mod tests {
                 viewport: (80, 24),
                 cell_px,
                 next_request_id: &mut next_request_id,
+                spawn_initial_size_supported: true,
                 pending_splits: &mut pending_splits,
                 pending_windows: &mut pending_windows,
                 expected_closes: &mut HashSet::new(),
@@ -6947,6 +7094,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),
@@ -7182,6 +7330,7 @@ mod tests {
             viewport: (80, 24),
             cell_px: (1, 1),
             next_request_id: &mut next_request_id,
+            spawn_initial_size_supported: true,
             pending_splits: &mut pending_splits,
             pending_windows: &mut pending_windows,
             expected_closes: &mut HashSet::new(),

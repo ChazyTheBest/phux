@@ -206,6 +206,7 @@ async fn split_pane(stream: &mut UnixStream, request_id: u32) -> SpawnedGenerati
             satellite: None,
             owner_terminal: None,
             agent_session: None,
+            initial_size: None,
         },
     )
     .await;

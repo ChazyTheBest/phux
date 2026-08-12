@@ -192,6 +192,7 @@ async fn spawn_victim_pane(owner: &mut UnixStream) -> TerminalId {
             satellite: None,
             owner_terminal: None,
             agent_session: None,
+            initial_size: None,
         },
     )
     .await;

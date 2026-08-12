@@ -2576,6 +2576,23 @@ pub enum FrameKind {
         /// Additive optional field id 9; old servers ignore it, after which a
         /// new launcher still performs its ordinary SET/GET confirmation.
         agent_session: Option<Vec<u8>>,
+        /// `(cols, rows)` the new Terminal's grid and PTY are created at,
+        /// or `None` to take the server's default (80x24 in the reference
+        /// server). A layout-owning consumer knows the tile the new leaf
+        /// will occupy before it has an id for it, and passing that here
+        /// is strictly better than letting the pane bootstrap at a default
+        /// and then reflowing it: the post-spawn `TERMINAL_RESIZE` becomes
+        /// a no-op instead of invalidating the bootstrap generation the
+        /// server just built (bead phux-a5xj).
+        ///
+        /// Additive optional field id 10, gated on
+        /// [`ServerFeature::SpawnInitialSize`](crate::caps::ServerFeature::SpawnInitialSize):
+        /// a server that predates the field ignores it and spawns at its
+        /// default, which is exactly the pre-field behavior, so sending it
+        /// unadvertised is degrading rather than dangerous — but the bit is
+        /// what lets a client know whether the resize it sends next is
+        /// redundant. A zero on either axis is ignored by the receiver.
+        initial_size: Option<(u16, u16)>,
     },
 
     /// `TERMINAL_SPAWNED` — server reply to a prior `SpawnTerminal`
@@ -3358,6 +3375,7 @@ impl FrameKind {
                 satellite,
                 owner_terminal,
                 agent_session,
+                initial_size,
             } => {
                 enc.write_field_with(field::spawn_terminal::REQUEST_ID, |e| {
                     e.write_u32_be(*request_id);
@@ -3392,6 +3410,12 @@ impl FrameKind {
                 }
                 if let Some(value) = agent_session {
                     enc.write_field(field::spawn_terminal::AGENT_SESSION, value);
+                }
+                if let Some((cols, rows)) = initial_size {
+                    enc.write_field_with(field::spawn_terminal::INITIAL_SIZE, |e| {
+                        e.write_u16_be(*cols);
+                        e.write_u16_be(*rows);
+                    });
                 }
             }
             Self::TerminalSpawned { request_id, result } => {

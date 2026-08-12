@@ -22,6 +22,18 @@ use crate::terminal_actor::{
     TerminalActor, TerminalHandle,
 };
 
+/// The grid a pane is built at when nothing better is known: the classic
+/// VT100 default, and the same dims `phux_core::Registry::new_terminal`
+/// stamps on a fresh descriptor.
+///
+/// Every path that reaches this constant is one where the eventual geometry
+/// arrives later — a seed pane whose attaching client applies its viewport
+/// through `apply_attach_viewport` before any bootstrap exists, or a spawn
+/// from a caller that did not supply `SPAWN_TERMINAL.initial_size`. A
+/// layout-owning consumer that DOES know the tile should send it (phux-a5xj)
+/// rather than let the pane bootstrap here and be reflowed afterwards.
+pub(crate) const DEFAULT_SPAWN_DIMS: (u16, u16) = (80, 24);
+
 pub(crate) fn seed_session_with_actor(
     state: &SharedState,
     name: &str,
@@ -51,12 +63,13 @@ fn seed_session_with_actor_and_metadata(
         }
         terminal
     });
-    // Default 80x24 — same as `phux_core::Pane::new`'s default dims.
-    // Real resize wiring lands with VIEWPORT_RESIZE (phux-4hp).
+    // No-PTY actor: nothing to size against, so the default stands until a
+    // client's viewport arrives (phux-4hp's VIEWPORT_RESIZE wiring).
     let terminal_token = root_token.child_token();
+    let (cols, rows) = DEFAULT_SPAWN_DIMS;
     let bundle = match TerminalActor::build_with_token(
-        80,
-        24,
+        cols,
+        rows,
         None,
         history_limit,
         terminal_token.clone(),
@@ -164,9 +177,10 @@ fn seed_session_with_pty_and_colors_and_metadata(
         terminal
     });
     let terminal_token = root_token.child_token();
+    let (cols, rows) = DEFAULT_SPAWN_DIMS;
     let bundle = match TerminalActor::build_with_token_and_colors(
-        80,
-        24,
+        cols,
+        rows,
         Some(cmd),
         history_limit,
         terminal_token.clone(),
@@ -238,6 +252,7 @@ pub fn spawn_pane_with_pty(
         root_token,
         None,
         None,
+        None,
     )
 }
 
@@ -252,6 +267,18 @@ pub(crate) enum SpawnOwnership {
 
 /// Palette-seeded split variant. The spawning client's advertised defaults
 /// are installed before the child PTY is parsed.
+///
+/// `initial_size` is the `(cols, rows)` the caller already knows the new
+/// leaf will occupy (phux-a5xj, `SPAWN_TERMINAL.initial_size`). It sizes the
+/// libghostty grid, the PTY winsize, and the registry `dims` in the same
+/// transaction that creates the pane, so the bootstrap generation the server
+/// then captures is already the client's real geometry and the reflow
+/// `TERMINAL_RESIZE` that follows is a no-op instead of a tombstone. `None`
+/// keeps [`DEFAULT_SPAWN_DIMS`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one pane-creation transaction: ownership, argv, history bound, cancellation, palette, resume provenance, and geometry all have to be in hand before the actor is built, because every one of them must be true of the pane before it becomes visible to another client. A parameter struct would name the same set once instead of at each of the three call sites."
+)]
 pub(crate) fn spawn_pane_with_pty_and_colors(
     state: &SharedState,
     ownership: &SpawnOwnership,
@@ -260,8 +287,15 @@ pub(crate) fn spawn_pane_with_pty_and_colors(
     root_token: &CancellationToken,
     default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
     agent_session: Option<Vec<u8>>,
+    initial_size: Option<(u16, u16)>,
 ) -> Result<Option<phux_core::ids::TerminalId>, crate::terminal_actor::TerminalActorError> {
     use phux_core::ids::TerminalId;
+    // Clamp exactly as `TerminalActor::handle_resize` does: libghostty has no
+    // zero-dimension grid. Callers upstream already drop an all-zero hint, so
+    // this is belt-and-braces for the in-process call sites.
+    let (cols, rows) = initial_size.map_or(DEFAULT_SPAWN_DIMS, |(cols, rows)| {
+        (cols.max(1), rows.max(1))
+    });
     // phux-p4vp: same spawn-time cwd capture as `seed_session_with_pty`.
     let spawn_cwd = spawn_cwd_of(&cmd);
     let Some(terminal): Option<TerminalId> = state.with_mut(|s| {
@@ -270,6 +304,13 @@ pub(crate) fn spawn_pane_with_pty_and_colors(
             SpawnOwnership::Terminal(owner) => s.add_pane_to_terminal_owner(owner)?,
         };
         stamp_spawn_cwd(s, terminal, spawn_cwd);
+        // Keep the registry's recorded dims in step with the grid the actor
+        // is about to be built at, so `GET_STATE` and the ATTACHED snapshot
+        // report the pane's real geometry from its first instant rather than
+        // the `Registry::new_terminal` 80x24 placeholder.
+        if let Some(pane) = s.registry_mut().terminal_mut(terminal) {
+            pane.dims = (cols, rows);
+        }
         let wire_terminal = s.intern_terminal_wire(terminal);
         crate::terminal_actor::apply_terminal_id(&mut cmd, &wire_terminal);
         crate::terminal_actor::apply_server_socket(&mut cmd, s.server_socket_path());
@@ -286,8 +327,8 @@ pub(crate) fn spawn_pane_with_pty_and_colors(
     };
     let terminal_token = root_token.child_token();
     let bundle = match TerminalActor::build_with_token_and_colors(
-        80,
-        24,
+        cols,
+        rows,
         Some(cmd),
         history_limit,
         terminal_token.clone(),

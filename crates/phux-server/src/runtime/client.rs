@@ -52,6 +52,7 @@ const fn runtime_server_features() -> ServerFeatureSet {
         ServerFeature::MoveTerminal,
         ServerFeature::TerminalReply,
         ServerFeature::Shutdown,
+        ServerFeature::SpawnInitialSize,
     ])
 }
 
@@ -1788,6 +1789,7 @@ where
                 satellite,
                 owner_terminal,
                 agent_session,
+                initial_size,
             } => {
                 let Some(selection) = negotiated.as_ref() else {
                     continue;
@@ -1805,6 +1807,7 @@ where
                         satellite,
                         owner_terminal,
                         agent_session,
+                        initial_size,
                     },
                     &out_tx,
                     selection.profile,

@@ -678,6 +678,16 @@ or session comes into being:
   ghostty SGR extensions) once the apps you run are known to round-trip
   it; apps that opt into kitty mode at runtime get it under either
   default.
+- **Spawn geometry is not configurable, and deliberately so.** A new pane
+  is created at the tile the TUI has already computed for it: the split (or
+  new window) is applied to a provisional copy of the layout before the
+  request goes out, and the resulting rect rides along as
+  `SPAWN_TERMINAL.initial_size` (spec L1 §3.1, gated on the server's
+  `SPAWN_INITIAL_SIZE` capability). Against a server without that
+  capability the pane starts at 80x24 and the reflow `TERMINAL_RESIZE`
+  that follows every spawn sizes it — visually identical, but it costs the
+  pane the engine checkpoint the server had just captured, which is why
+  the field exists (phux-a5xj).
 - **`cwd-inheritance`** (string enum, default `"inherit-focused"`)
   controls how a freshly-spawned pane picks its working directory when a
   `SPAWN_TERMINAL` leaves `cwd` unset (an explicit `cwd` always wins).

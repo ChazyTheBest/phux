@@ -2549,7 +2549,13 @@ impl TerminalActor {
 
     /// Apply a resize to both the libghostty `Terminal` and the PTY
     /// kernel-side winsize. Idempotent; logs and continues on errors.
-    fn handle_resize(&mut self, cols: u16, rows: u16, cell_px: Option<(u16, u16)>) {
+    ///
+    /// Returns whether anything actually moved. A request that repeats the
+    /// settled geometry changes no byte of grid, PTY winsize, or cell size,
+    /// so the caller must not follow it with a resync broadcast either — a
+    /// resync rotates the bootstrap generation, and rotating it for a resize
+    /// that did not happen is exactly the wasted capture phux-a5xj is about.
+    fn handle_resize(&mut self, cols: u16, rows: u16, cell_px: Option<(u16, u16)>) -> bool {
         // libghostty has no concept of a zero-dimension grid: a 0-col or
         // 0-row resize fails with `InvalidValue` and leaves the grid at its
         // prior size. SPEC §10.5 already treats a zero-dimension viewport as
@@ -2564,7 +2570,7 @@ impl TerminalActor {
         // the current winner again.
         if cols == self.cols && rows == self.rows && cell_px.is_none_or(|cell| cell == self.cell_px)
         {
-            return;
+            return false;
         }
         // Sticky cell size: see the `ResizeRequest::cell_px` doc.
         if let Some(cell) = cell_px {
@@ -2633,6 +2639,7 @@ impl TerminalActor {
                 );
             }
         }
+        true
     }
 
     /// Broadcast a full synthesized snapshot of the canonical `Terminal`'s
@@ -4232,9 +4239,11 @@ impl TerminalActor {
                     // A `resync_only` request (from a lagged output pump)
                     // carries no geometry — skip the resize and only schedule
                     // the resync broadcast below.
-                    if !req.resync_only {
-                        self.handle_resize(req.cols, req.rows, req.cell_px);
-                    }
+                    let reflowed = if req.resync_only {
+                        false
+                    } else {
+                        self.handle_resize(req.cols, req.rows, req.cell_px)
+                    };
                     // phux-8v1: re-broadcast a full snapshot for live
                     // resizes so client mirrors reconverge after their
                     // independent reflow. Suppressed for the ATTACH-time
@@ -4242,7 +4251,14 @@ impl TerminalActor {
                     // (RESIZE_RESYNC_DEBOUNCE) so a drag storm — or a burst of
                     // lag-resync requests — coalesces into a single snapshot
                     // rather than flooding the client.
-                    if req.resync_clients {
+                    //
+                    // phux-a5xj: also suppressed when the geometry did not
+                    // move. There is no independent reflow to reconverge from
+                    // if nothing reflowed, and the resync is what rotates the
+                    // bootstrap generation — so a client confirming the size
+                    // it already asked for at spawn must not cost the pane the
+                    // checkpoint it just published.
+                    if req.resync_clients && (req.resync_only || reflowed) {
                         resync_pending = true;
                         resync_reason = if req.resync_only {
                             ResyncReason::OutboundGap
@@ -7686,6 +7702,114 @@ mod tests {
                     contains_subslice(&acc, b"phux8v1-marker"),
                     "resize broadcast did not re-send pre-resize grid content; got {:?}",
                     String::from_utf8_lossy(&acc),
+                );
+
+                token.cancel();
+                tokio::time::timeout(ACTOR_EXIT_DEADLINE, join)
+                    .await
+                    .expect("actor did not exit after cancel")
+                    .expect("actor task panicked");
+            })
+            .await;
+    }
+
+    /// Advance virtual time comfortably past the resize-resync debounce and
+    /// give the actor task enough polls to have acted on it.
+    ///
+    /// Deterministic: the runtime is `start_paused`, so this is a timer the
+    /// test drives rather than a wall-clock wait racing the actor. The yield
+    /// loop before the advance is what guarantees the actor has already
+    /// consumed the resize and (if it means to) armed the debounce, so the
+    /// advance cannot step over an un-armed timer.
+    async fn settle_past_resync_debounce() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(RESIZE_RESYNC_DEBOUNCE * 4).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Drain every `PaneOutput::Resync` currently queued on `out`, returning
+    /// the grid each one carried. Live output and lag drops are not resyncs.
+    fn drain_resync_dims(
+        out: &mut tokio::sync::broadcast::Receiver<PaneOutput>,
+    ) -> Vec<(u16, u16)> {
+        let mut dims = Vec::new();
+        loop {
+            match out.try_recv() {
+                Ok(PaneOutput::Resync { cols, rows, .. }) => dims.push((cols, rows)),
+                Ok(PaneOutput::Live { .. } | PaneOutput::Control { .. })
+                | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        dims
+    }
+
+    /// phux-a5xj: a resize that repeats the settled geometry must publish NO
+    /// resync — while a real one still must (phux-8v1 is not weakened).
+    ///
+    /// `handle_resize` already skipped the grid work and the native-cursor
+    /// invalidation for a no-op, but the resync broadcast was scheduled
+    /// unconditionally, and a resync is what rotates the bootstrap
+    /// generation. That is the second half of the wasted-capture bug: once a
+    /// spawn honors `SPAWN_TERMINAL.initial_size`, the client's reflow
+    /// `TERMINAL_RESIZE` names the size the pane already has — and would
+    /// still have tombstoned the checkpoint the server had just built. There
+    /// is nothing to reconverge from when nothing reflowed.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_no_op_resize_publishes_no_resync_for_phux_a5xj() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bundle = TerminalActor::new_with_seed(80, 24, b"a5xj-marker").expect("seed");
+                let handle = bundle.handle.clone();
+                let token = bundle.token;
+                // Subscribe before the actor runs so no broadcast is missed.
+                let mut out = handle.output.subscribe();
+                let join = tokio::task::spawn_local(bundle.actor.run());
+
+                // Exactly what the reflow emits for a pane the spawn already
+                // sized: the geometry it is already at.
+                handle
+                    .resize
+                    .send(ResizeRequest {
+                        cols: 80,
+                        rows: 24,
+                        cell_px: None,
+                        resync_clients: true,
+                        resync_only: false,
+                    })
+                    .await
+                    .expect("send no-op resize");
+                settle_past_resync_debounce().await;
+                assert_eq!(
+                    drain_resync_dims(&mut out),
+                    Vec::new(),
+                    "a resize to the settled geometry must not rotate the generation",
+                );
+
+                // The suppression is specific to the no-op: a real reflow
+                // still resyncs, carrying the post-reflow dims (phux-8v1 /
+                // phux-3ns5).
+                handle
+                    .resize
+                    .send(ResizeRequest {
+                        cols: 40,
+                        rows: 10,
+                        cell_px: None,
+                        resync_clients: true,
+                        resync_only: false,
+                    })
+                    .await
+                    .expect("send real resize");
+                settle_past_resync_debounce().await;
+                assert_eq!(
+                    drain_resync_dims(&mut out),
+                    vec![(40, 10)],
+                    "a resize that actually reflowed must still resync exactly once",
                 );
 
                 token.cancel();

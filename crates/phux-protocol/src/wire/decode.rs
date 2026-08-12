@@ -1408,6 +1408,7 @@ impl<'a> Decoder<'a> {
                 let mut satellite: Option<crate::ids::SatelliteHost> = None;
                 let mut owner_terminal: Option<crate::ids::TerminalId> = None;
                 let mut agent_session: Option<Vec<u8>> = None;
+                let mut initial_size: Option<(u16, u16)> = None;
                 while let Some((id, value)) = self.read_field()? {
                     match id {
                         field::spawn_terminal::REQUEST_ID => {
@@ -1447,6 +1448,13 @@ impl<'a> Decoder<'a> {
                         field::spawn_terminal::AGENT_SESSION => {
                             agent_session = Some(value.to_vec());
                         }
+                        field::spawn_terminal::INITIAL_SIZE => {
+                            initial_size = Some(sub!(value, |d: &mut Decoder<'_>| {
+                                let cols = d.read_u16_be()?;
+                                let rows = d.read_u16_be()?;
+                                Ok((cols, rows))
+                            }));
+                        }
                         _ => {}
                     }
                 }
@@ -1460,6 +1468,7 @@ impl<'a> Decoder<'a> {
                     satellite,
                     owner_terminal,
                     agent_session,
+                    initial_size,
                 }
             }
             TYPE_TERMINAL_SPAWNED => {

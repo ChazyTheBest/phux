@@ -122,6 +122,7 @@ fn spawn_resolved(
         satellite: None,
         owner_terminal: None,
         agent_session,
+        initial_size: None,
     };
     let result = match target {
         Some(target) => dispatch_spawn_placed(

@@ -417,6 +417,10 @@ pub mod spawn_terminal {
     /// Optional opaque `phux.agent-session/v1` record installed atomically on
     /// the new local Terminal.
     pub const AGENT_SESSION: u32 = 9;
+    /// Optional initial grid the new Terminal is created at: `cols: u16`
+    /// followed by `rows: u16`, both big-endian. Absent (or zero on either
+    /// axis) leaves the server's default grid in force.
+    pub const INITIAL_SIZE: u32 = 10;
 }
 
 /// `TERMINAL_SPAWNED` body fields (`docs/spec/L1.md` §10.1).

@@ -804,6 +804,8 @@ pub const MOVE_TERMINAL: u32 = 0x0000_0040;
 pub const TERMINAL_REPLY: u32 = 0x0000_0080;
 /// Wire bit advertising the `SHUTDOWN` command (phux-pimp).
 pub const SHUTDOWN: u32 = 0x0000_0100;
+/// Wire bit advertising `SPAWN_TERMINAL.initial_size` (phux-a5xj).
+pub const SPAWN_INITIAL_SIZE: u32 = 0x0000_0200;
 
 /// An additive server-owned protocol feature.
 #[repr(u32)]
@@ -825,6 +827,15 @@ pub enum ServerFeature {
     /// sending the command; an older server would silently drop the unknown
     /// tag, which is indistinguishable from a stop that did not happen.
     Shutdown = SHUTDOWN,
+    /// The server honors `SPAWN_TERMINAL.initial_size` (phux-a5xj) — it
+    /// creates the pane's grid and PTY at the requested size instead of at
+    /// its own default. Unlike the frame-gating bits above, sending the
+    /// field unadvertised is safe: an older server skips the unknown field
+    /// id by length and spawns at its default, which is what happened
+    /// before the field existed. The bit exists so a layout-owning client
+    /// can tell whether the geometry it just asked for was honored, and
+    /// therefore whether its follow-up `TERMINAL_RESIZE` is redundant.
+    SpawnInitialSize = SPAWN_INITIAL_SIZE,
 }
 
 /// Bit-field of additive server-owned protocol features.
@@ -836,7 +847,8 @@ impl ServerFeatureSet {
         | (ServerFeature::FileUpload as u32)
         | (ServerFeature::MoveTerminal as u32)
         | (ServerFeature::TerminalReply as u32)
-        | (ServerFeature::Shutdown as u32);
+        | (ServerFeature::Shutdown as u32)
+        | (ServerFeature::SpawnInitialSize as u32);
 
     /// Empty set for servers that advertise no additive features.
     #[must_use]
@@ -1483,6 +1495,10 @@ mod tests {
         assert_eq!(FILE_UPLOAD, 0x0000_0020);
         assert_eq!(MOVE_TERMINAL, 0x0000_0040);
         assert_eq!(TERMINAL_REPLY, 0x0000_0080);
+        assert_eq!(SHUTDOWN, 0x0000_0100);
+        assert_eq!(SPAWN_INITIAL_SIZE, 0x0000_0200);
+        assert_eq!(ServerFeature::Shutdown as u32, SHUTDOWN);
+        assert_eq!(ServerFeature::SpawnInitialSize as u32, SPAWN_INITIAL_SIZE);
         assert_eq!(ServerFeature::AcknowledgedInput as u32, ACKNOWLEDGED_INPUT);
         assert_eq!(ServerFeature::FileUpload as u32, FILE_UPLOAD);
         assert_eq!(ServerFeature::MoveTerminal as u32, MOVE_TERMINAL);
@@ -1498,6 +1514,15 @@ mod tests {
         assert!(set.contains(ServerFeature::MoveTerminal));
         assert!(set.contains(ServerFeature::TerminalReply));
         assert_eq!(set.as_wire(), 0x0000_00F0);
+        let full = ServerFeatureSet::with(&[
+            ServerFeature::AcknowledgedInput,
+            ServerFeature::FileUpload,
+            ServerFeature::MoveTerminal,
+            ServerFeature::TerminalReply,
+            ServerFeature::Shutdown,
+            ServerFeature::SpawnInitialSize,
+        ]);
+        assert_eq!(full.as_wire(), 0x0000_03F0);
         let future = 1_u32 << 31;
         assert!(ServerFeatureSet::from_wire(future).is_empty());
         assert_eq!(ServerFeatureSet::from_wire(set.as_wire() | future), set);

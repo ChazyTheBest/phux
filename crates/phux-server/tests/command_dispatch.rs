@@ -509,6 +509,7 @@ fn kill_terminals_tears_down_a_multi_terminal_group_atomically() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;

@@ -182,6 +182,7 @@ fn run_launcher(args: &PlayArgs<'_>) -> ExitCode {
         satellite: None,
         owner_terminal: None,
         agent_session: None,
+        initial_size: None,
     };
 
     // An omitted TARGET means `.`, the focused pane — so a human running

@@ -324,6 +324,7 @@ fn frame_fixtures() -> Vec<(&'static str, FrameKind)> {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         ),
         (
@@ -345,6 +346,7 @@ fn frame_fixtures() -> Vec<(&'static str, FrameKind)> {
                 agent_session: Some(
                     br#"{"plugin_id":"com.phux.agents","native_id":"session-42"}"#.to_vec(),
                 ),
+                initial_size: Some((132, 43)),
             },
         ),
         (
@@ -362,6 +364,7 @@ fn frame_fixtures() -> Vec<(&'static str, FrameKind)> {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         ),
         (

@@ -586,6 +586,63 @@ pub(super) fn apply_spawned_ok(
     apply_split(&anchored, new_id, pending.dir)
 }
 
+/// A local `TerminalId` that is not a leaf of `state` — a stand-in for the
+/// id the server has not allocated yet.
+///
+/// Geometry does not depend on which id a leaf carries, only on the shape of
+/// the tree, so tiling a provisional split against a placeholder yields the
+/// rect the real leaf will get. The id only has to be distinct from every
+/// live leaf, or `split_at` would attach the new node to the wrong place.
+fn unused_leaf_id(state: &LayoutState) -> TerminalId {
+    let leaves = state
+        .tree
+        .as_ref()
+        .map(crate::layout::leaves)
+        .unwrap_or_default();
+    // A window with u32::MAX distinct panes cannot be tiled into a u16
+    // viewport, so this loop terminates long before it exhausts the space.
+    let mut candidate = u32::MAX;
+    loop {
+        let id = TerminalId::local(candidate);
+        if !leaves.contains(&id) {
+            return id;
+        }
+        candidate = candidate.wrapping_sub(1);
+    }
+}
+
+/// The `(cols, rows)` the pane a parked [`PendingSplit`] is waiting on will
+/// occupy once its reply lands (phux-a5xj).
+///
+/// This is the same computation the post-reply reflow performs — the split
+/// applied by [`apply_spawned_ok`], tiled by
+/// [`crate::multi_pane::pane_rects_in`] into the same `content` rect — run
+/// one round trip early, against a placeholder id. Sending the answer as
+/// `SPAWN_TERMINAL.initial_size` means the server builds the pane's grid,
+/// PTY, and bootstrap generation at the client's real geometry, and the
+/// `TERMINAL_RESIZE` the reflow emits next is a no-op rather than a
+/// tombstone over a checkpoint that was just captured.
+///
+/// `None` when the split cannot be predicted — an empty tree, an anchor that
+/// is not in the layout — in which case the caller omits the field and the
+/// server's default plus the follow-up resize behave exactly as before.
+pub(super) fn predicted_spawn_dims(
+    state: &LayoutState,
+    pending: &PendingSplit,
+    content: Rect,
+) -> Option<(u16, u16)> {
+    // phux-r82.7: a `zoom_on_spawn` split zooms the new pane the instant it
+    // lands, and `Workspace::render_window` tiles a zoomed pane as a lone
+    // full-content leaf — so the split's own geometry never reaches the PTY.
+    if pending.zoom_on_spawn {
+        return Some((content.w, content.h));
+    }
+    let placeholder = unused_leaf_id(state);
+    let next = apply_spawned_ok(state, placeholder.clone(), pending).ok()?;
+    let rects = crate::multi_pane::pane_rects_in(next.tree.as_ref()?, content);
+    rects.get(&placeholder).map(|rect| (rect.w, rect.h))
+}
+
 /// Pure seam for the `TerminalClosed` handler (phux-4li.12).
 ///
 /// Folds `dying` out of `state`, using [`apply_kill`] under
@@ -1025,6 +1082,128 @@ mod tests {
     // park intent) and is covered indirectly by the round-trip integ
     // tests in phux-server.
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // phux-a5xj — spawn-time geometry prediction
+    // ---------------------------------------------------------------------
+
+    /// The property the whole fix rests on: what the client predicts at
+    /// SPAWN time is byte-for-byte what its own post-reply reflow computes.
+    ///
+    /// If these ever diverge, the server builds the pane at one size, the
+    /// reflow immediately resizes it to another, and the bootstrap-then-
+    /// tombstone waste the bead is about comes straight back — silently.
+    /// Exercised across several tree shapes, both split axes, and a
+    /// sidebar/status-bar inset content rect.
+    #[test]
+    fn predicted_spawn_dims_match_the_post_reply_reflow() {
+        let content = Rect {
+            x: 3,
+            y: 1,
+            w: 117,
+            h: 39,
+        };
+        for state in [
+            LayoutState::single(t(1)),
+            two_pane_h(),
+            two_pane_v(),
+            three_pane_mixed(),
+        ] {
+            for dir in [SplitDir::Horizontal, SplitDir::Vertical] {
+                let pending = PendingSplit {
+                    focused_at_request: state.focus.clone().expect("focus"),
+                    dir,
+                    zoom_on_spawn: false,
+                };
+                let predicted =
+                    predicted_spawn_dims(&state, &pending, content).expect("split is predictable");
+                // What actually happens one round trip later: the server
+                // allocates an id, `apply_spawned_ok` folds it in, and the
+                // driver tiles the result into the same content rect.
+                let landed = apply_spawned_ok(&state, t(77), &pending).expect("split applies");
+                let actual =
+                    crate::multi_pane::pane_rects_in(landed.tree.as_ref().expect("tree"), content)
+                        [&t(77)];
+                assert_eq!(
+                    predicted,
+                    (actual.w, actual.h),
+                    "prediction diverged from the reflow for {dir:?} on {:?}",
+                    crate::layout::leaves(state.tree.as_ref().expect("tree")),
+                );
+            }
+        }
+    }
+
+    /// A `zoom_on_spawn` split (ADR-0019 `placement = "zoomed"` plugin
+    /// panes) is zoomed the instant it lands, and a zoomed pane renders as a
+    /// lone full-content leaf — so the split's own tile never reaches the
+    /// PTY and the prediction is the content rect itself.
+    #[test]
+    fn predicted_spawn_dims_for_a_zoomed_spawn_are_the_whole_content_rect() {
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 30,
+        };
+        let state = three_pane_mixed();
+        let pending = PendingSplit {
+            focused_at_request: state.focus.clone().expect("focus"),
+            dir: SplitDir::Horizontal,
+            zoom_on_spawn: true,
+        };
+        assert_eq!(
+            predicted_spawn_dims(&state, &pending, content),
+            Some((100, 30)),
+        );
+    }
+
+    /// An empty workspace has no leaf to split against, so there is nothing
+    /// to predict. The caller must then omit the wire field rather than
+    /// invent a size — the server's default plus the follow-up resize is the
+    /// correct degradation.
+    #[test]
+    fn predicted_spawn_dims_are_none_without_a_tree_to_split() {
+        let pending = PendingSplit {
+            focused_at_request: t(1),
+            dir: SplitDir::Horizontal,
+            zoom_on_spawn: false,
+        };
+        assert_eq!(
+            predicted_spawn_dims(
+                &LayoutState::default(),
+                &pending,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 80,
+                    h: 24,
+                },
+            ),
+            None,
+        );
+    }
+
+    /// The placeholder must never collide with a live leaf, or the split
+    /// would attach to the wrong node and the prediction would be a lie.
+    #[test]
+    fn unused_leaf_id_avoids_live_leaves() {
+        let state = LayoutState {
+            tree: Some(
+                split_at(
+                    &LayoutNode::Leaf(t(u32::MAX)),
+                    &t(u32::MAX),
+                    &t(u32::MAX - 1),
+                    SplitDir::Horizontal,
+                    0.5,
+                )
+                .expect("split"),
+            ),
+            focus: Some(t(u32::MAX)),
+        };
+        let id = unused_leaf_id(&state);
+        assert!(!crate::layout::leaves(state.tree.as_ref().expect("tree")).contains(&id));
+    }
 
     #[test]
     fn apply_spawned_ok_splits_anchored_to_focused_at_request() {

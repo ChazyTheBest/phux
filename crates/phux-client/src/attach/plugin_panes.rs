@@ -148,6 +148,10 @@ impl PluginPaneEntry {
             satellite: None,
             owner_terminal: None,
             agent_session: None,
+            // phux-a5xj: geometry depends on the placement the caller
+            // chooses, which this entry does not decide. `run_action` fills
+            // it in from the tile it is about to park.
+            initial_size: None,
         }
     }
 }
@@ -298,11 +302,16 @@ mod tests {
             satellite,
             owner_terminal,
             agent_session,
+            initial_size,
         } = entry.spawn_frame(7)
         else {
             panic!("expected SpawnTerminal");
         };
         assert_eq!(request_id, 7);
+        assert_eq!(
+            initial_size, None,
+            "the manifest entry does not know its placement, so run_action fills the tile in",
+        );
         assert_eq!(satellite, None, "plugin panes spawn locally");
         assert_eq!(owner_terminal, None, "plugin panes use attached ownership");
         assert_eq!(

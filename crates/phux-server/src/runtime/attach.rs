@@ -942,6 +942,9 @@ pub(crate) struct SpawnRequest {
     pub(crate) owner_terminal: Option<phux_protocol::ids::TerminalId>,
     /// Opaque native agent-session provenance to install before publication.
     pub(crate) agent_session: Option<Vec<u8>>,
+    /// `(cols, rows)` to build the pane's grid and PTY at (phux-a5xj),
+    /// `None` for the server's default.
+    pub(crate) initial_size: Option<(u16, u16)>,
 }
 
 /// Relay one satellite-addressed spawn over the owning hub link
@@ -1180,7 +1183,12 @@ pub(crate) async fn handle_spawn_terminal(
         satellite,
         owner_terminal,
         agent_session,
+        initial_size,
     } = request;
+    // phux-a5xj: a zero on either axis is "I do not know my geometry", not a
+    // zero-cell grid — libghostty has no such thing. Drop it and take the
+    // server default, matching SPEC §10.5's zero-viewport no-op rule.
+    let initial_size = initial_size.filter(|&(cols, rows)| cols > 0 && rows > 0);
     debug!(
         ?client_id,
         request_id,
@@ -1190,6 +1198,7 @@ pub(crate) async fn handle_spawn_terminal(
         env_count = env.as_ref().map_or(0, Vec::len),
         satellite = ?satellite,
         owner_terminal = ?owner_terminal,
+        initial_size = ?initial_size,
         "SPAWN_TERMINAL",
     );
 
@@ -1347,6 +1356,7 @@ pub(crate) async fn handle_spawn_terminal(
         root_token,
         default_colors,
         agent_session,
+        initial_size,
     ) {
         Ok(Some(id)) => id,
         Ok(None) => {

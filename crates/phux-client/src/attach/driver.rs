@@ -1569,6 +1569,12 @@ async fn main_loop<W: super::RenderSink>(
     let terminal_reply_supported = negotiated
         .server_features
         .contains(ServerFeature::TerminalReply);
+    // phux-a5xj: does this server build a spawned pane at the geometry we
+    // name, rather than at its own default? Fixed for the life of the
+    // connection, like the reply bit above.
+    let spawn_initial_size_supported = negotiated
+        .server_features
+        .contains(ServerFeature::SpawnInitialSize);
     let history_config = HistoryCacheConfig {
         request_max_bytes: negotiated.limits.max_history_page_bytes(),
         ..HistoryCacheConfig::default()
@@ -2291,6 +2297,7 @@ async fn main_loop<W: super::RenderSink>(
                     viewport: viewport_dims,
                     cell_px: cell_px_dims,
                     next_request_id: &mut next_request_id,
+                    spawn_initial_size_supported,
                     pending_splits: &mut pending_splits,
                     pending_windows: &mut pending_windows,
                     expected_closes: &mut expected_closes,
@@ -3240,6 +3247,7 @@ async fn main_loop<W: super::RenderSink>(
                     viewport: viewport_dims,
                     cell_px: cell_px_dims,
                     next_request_id: &mut next_request_id,
+                    spawn_initial_size_supported,
                     pending_splits: &mut pending_splits,
                     pending_windows: &mut pending_windows,
                     expected_closes: &mut expected_closes,

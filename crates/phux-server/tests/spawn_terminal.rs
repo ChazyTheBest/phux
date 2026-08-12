@@ -42,8 +42,8 @@ use phux_protocol::ids::GroupId;
 use phux_protocol::input::key::{KeyAction, KeyEvent, ModSet, PhysicalKey};
 use phux_protocol::wire::frame::{
     Command, CommandResult, CommandValue, FrameKind, Scope, SpawnError, SpawnResult, StateScope,
-    TERMINAL_AGENT_SESSION_KEY, TYPE_COMMAND_RESULT, TYPE_METADATA_VALUE, TYPE_TERMINAL_CLOSED,
-    TYPE_TERMINAL_OUTPUT, TYPE_TERMINAL_SPAWNED,
+    TERMINAL_AGENT_SESSION_KEY, TYPE_BOOTSTRAP_BEGIN, TYPE_COMMAND_RESULT, TYPE_METADATA_VALUE,
+    TYPE_TERMINAL_CLOSED, TYPE_TERMINAL_OUTPUT, TYPE_TERMINAL_SPAWNED,
 };
 use phux_server::DEFAULT_GROUP_ID;
 use portable_pty::CommandBuilder;
@@ -282,6 +282,7 @@ fn spawn_terminal_in_default_group_round_trips_input() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: Some(agent_session.clone()),
+                initial_size: None,
             },
         )
         .await;
@@ -371,6 +372,7 @@ fn spawn_terminal_rejects_invalid_agent_session_provenance() {
                     satellite: None,
                     owner_terminal: None,
                     agent_session: Some(agent_session),
+                    initial_size: None,
                 },
             )
             .await;
@@ -413,6 +415,7 @@ fn failed_actor_build_reaps_atomic_agent_session_provenance() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: Some(br#"{"native_id":"never-live"}"#.to_vec()),
+                initial_size: None,
             },
         )
         .await;
@@ -491,6 +494,7 @@ fn explicit_owner_terminal_selects_exact_session_window() {
                 satellite: None,
                 owner_terminal: Some(owner.clone()),
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -585,6 +589,7 @@ fn spawn_terminal_lands_in_attached_session_not_a_new_session() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -669,6 +674,7 @@ fn spawn_terminal_env_term_overrides_default() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -726,6 +732,7 @@ fn spawn_terminal_default_term_is_xterm_256color() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -782,6 +789,7 @@ fn spawn_terminal_term_field_overrides_default() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -836,6 +844,7 @@ fn spawn_terminal_env_term_beats_term_field() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -885,6 +894,7 @@ fn spawn_terminal_unknown_group_returns_group_not_found() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -934,6 +944,7 @@ fn spawn_terminal_emits_terminal_closed_on_pty_exit() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -1000,6 +1011,7 @@ fn terminal_resize_updates_pane_dims_observable_on_reattach() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -1082,6 +1094,194 @@ fn terminal_resize_updates_pane_dims_observable_on_reattach() {
 
         drop(stream_a);
         drop(stream_b);
+        shutdown_tx.send(()).ok();
+        timeout(phux_server_testkit::SERVER_JOIN_DEADLINE, server_handle)
+            .await
+            .expect("server did not shut down after the shutdown signal")
+            .expect("server join")
+            .expect("server run_async ok");
+    });
+}
+
+/// Drain frames until the `BOOTSTRAP_BEGIN` that opens `pane`'s first
+/// replica generation arrives, and return the grid it was captured at.
+///
+/// `BOOTSTRAP_BEGIN` is unconditional — the server emits one for every pane
+/// it starts streaming, so this is a positive barrier with no timing
+/// assumption behind it (ADR-0070's cut sequence guarantees it precedes every
+/// chunk and any live byte for that generation).
+async fn await_bootstrap_dims(
+    stream: &mut UnixStream,
+    pane: &phux_protocol::ids::TerminalId,
+) -> (u16, u16) {
+    let deadline = tokio::time::Instant::now() + WIRE_RECV_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let Ok((type_byte, frame)) = timeout(remaining, recv_typed(stream)).await else {
+            break;
+        };
+        if type_byte != TYPE_BOOTSTRAP_BEGIN {
+            continue;
+        }
+        if let FrameKind::BootstrapBegin {
+            terminal_id,
+            cols,
+            rows,
+            ..
+        } = frame
+            && &terminal_id == pane
+        {
+            return (cols, rows);
+        }
+    }
+    panic!("timed out waiting for BOOTSTRAP_BEGIN for pane {pane:?}");
+}
+
+/// The `(cols, rows)` a server-scope `GET_STATE` reports for `pane`.
+///
+/// `GET_STATE` is correlated, so awaiting its `COMMAND_RESULT` doubles as the
+/// in-order barrier for everything the test sent before it on this
+/// connection — the server processes one connection's frames in arrival
+/// order (`docs/spec/proto.md`; ADR-0062 relies on the same property for
+/// `phux resize`'s read-back).
+async fn await_pane_dims(
+    stream: &mut UnixStream,
+    request_id: u32,
+    pane: &phux_protocol::ids::TerminalId,
+) -> (u16, u16) {
+    send_frame(
+        stream,
+        &FrameKind::Command {
+            request_id,
+            command: Command::GetState {
+                scope: StateScope::Server,
+            },
+        },
+    )
+    .await;
+    match await_command_result(stream, request_id).await {
+        CommandResult::OkWith(CommandValue::State(snapshot)) => {
+            let info = snapshot
+                .panes
+                .iter()
+                .find(|p| &p.id == pane)
+                .unwrap_or_else(|| panic!("pane {pane:?} missing from GET_STATE snapshot"));
+            (info.cols, info.rows)
+        }
+        other => panic!("expected Ok_With(State(..)), got {other:?}"),
+    }
+}
+
+/// phux-a5xj: a `SPAWN_TERMINAL` carrying `initial_size` must build the
+/// pane's grid, PTY, and FIRST bootstrap generation at that geometry.
+///
+/// Before this, every spawn bootstrapped at the server's 80x24 default and
+/// the attaching client's real tile arrived afterwards as a
+/// `TERMINAL_RESIZE`, which invalidated the generation that had just been
+/// captured — a full capture computed, published, and immediately thrown
+/// away on every single pane creation.
+///
+/// The assertion is on `BOOTSTRAP_BEGIN.cols/rows` because that is the grid
+/// the client's replica is actually built from; the `GET_STATE` read-back
+/// pins the registry half (what `phux ls` and the ATTACHED snapshot report).
+/// Both are positive, correlated frames — nothing here waits on a clock.
+#[test]
+fn spawn_initial_size_builds_the_first_bootstrap_at_the_requested_grid() {
+    run_local(async {
+        let tmp = TempDir::new().unwrap();
+        let (mut stream, shutdown_tx, server_handle) = spawn_and_attach(&tmp, "a5xj-honored").await;
+
+        // /bin/cat keeps the pane alive for the whole collection window: a
+        // short-lived command could exit, reap the session, and self-exit the
+        // server before the assertions run.
+        send_frame(
+            &mut stream,
+            &FrameKind::SpawnTerminal {
+                request_id: 11,
+                group: DEFAULT_GROUP_ID,
+                command: Some(vec!["/bin/cat".to_owned()]),
+                cwd: None,
+                env: None,
+                term: None,
+                satellite: None,
+                owner_terminal: None,
+                agent_session: None,
+                // Deliberately unlike the 80x24 default AND unlike the
+                // attached client's 80x24 viewport, so neither fallback can
+                // produce this answer by accident.
+                initial_size: Some((132, 43)),
+            },
+        )
+        .await;
+        let new_id = match await_terminal_spawned(&mut stream, 11).await {
+            SpawnResult::Ok(id) => id,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        assert_eq!(
+            await_bootstrap_dims(&mut stream, &new_id).await,
+            (132, 43),
+            "the spawned pane's first bootstrap generation must be captured at \
+             the geometry the spawn named, not at the server's default",
+        );
+        assert_eq!(
+            await_pane_dims(&mut stream, 12, &new_id).await,
+            (132, 43),
+            "the registry dims must match the grid the actor was built at",
+        );
+
+        drop(stream);
+        shutdown_tx.send(()).ok();
+        timeout(phux_server_testkit::SERVER_JOIN_DEADLINE, server_handle)
+            .await
+            .expect("server did not shut down after the shutdown signal")
+            .expect("server join")
+            .expect("server run_async ok");
+    });
+}
+
+/// phux-a5xj negative control: without `initial_size` the pane still
+/// bootstraps at the server's 80x24 default, and a zero on either axis is
+/// read as "I do not know my geometry" rather than as a zero-cell grid
+/// (libghostty has no such thing — SPEC §10.5's zero-viewport no-op rule).
+///
+/// Without this the honored-geometry test above could pass against a server
+/// that ignored the field entirely, if 132x43 ever became the default.
+#[test]
+fn spawn_without_initial_size_and_with_a_zero_axis_keep_the_default_grid() {
+    run_local(async {
+        let tmp = TempDir::new().unwrap();
+        let (mut stream, shutdown_tx, server_handle) = spawn_and_attach(&tmp, "a5xj-default").await;
+
+        for (request_id, initial_size) in [(21u32, None), (23, Some((0u16, 43u16)))] {
+            send_frame(
+                &mut stream,
+                &FrameKind::SpawnTerminal {
+                    request_id,
+                    group: DEFAULT_GROUP_ID,
+                    command: Some(vec!["/bin/cat".to_owned()]),
+                    cwd: None,
+                    env: None,
+                    term: None,
+                    satellite: None,
+                    owner_terminal: None,
+                    agent_session: None,
+                    initial_size,
+                },
+            )
+            .await;
+            let new_id = match await_terminal_spawned(&mut stream, request_id).await {
+                SpawnResult::Ok(id) => id,
+                other => panic!("expected Ok, got {other:?}"),
+            };
+            assert_eq!(
+                await_bootstrap_dims(&mut stream, &new_id).await,
+                (80, 24),
+                "initial_size = {initial_size:?} must leave the server default in force",
+            );
+        }
+
+        drop(stream);
         shutdown_tx.send(()).ok();
         timeout(phux_server_testkit::SERVER_JOIN_DEADLINE, server_handle)
             .await
@@ -1189,6 +1389,7 @@ fn spawn_terminal_injects_matching_terminal_id_env() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -1320,6 +1521,7 @@ fn spawn_terminal_injects_server_socket_env() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -1480,6 +1682,7 @@ fn spawn_terminal_inherits_focused_pane_live_cwd() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -1652,6 +1855,7 @@ fn spawn_terminal_session_root_inherits_seed_pane_dir() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;
@@ -1740,6 +1944,7 @@ fn spawn_terminal_last_cwd_per_window_inherits_active_pane_dir() {
                 satellite: None,
                 owner_terminal: None,
                 agent_session: None,
+                initial_size: None,
             },
         )
         .await;

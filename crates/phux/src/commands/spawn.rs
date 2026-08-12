@@ -60,6 +60,10 @@ pub(crate) fn run_spawn(
         satellite: satellite.map(SatelliteHost::new),
         owner_terminal: None,
         agent_session: None,
+        // phux-a5xj: a headless `phux spawn` has no viewport and owns no
+        // layout, so it has nothing honest to name here. The pane takes the
+        // server default and is sized by whichever client attaches.
+        initial_size: None,
     };
     let result = match target {
         Some(target) => dispatch_spawn_placed(
@@ -633,6 +637,7 @@ mod tests {
             satellite: None,
             owner_terminal: None,
             agent_session: None,
+            initial_size: None,
         }
     }
 
