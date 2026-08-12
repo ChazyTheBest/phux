@@ -541,9 +541,7 @@ impl AgentDetector {
                 trace!(
                     %kind,
                     matched = evaluation.matched.as_deref().unwrap_or("<none>"),
-                    visible_blocker = evaluation.visible_blocker,
                     visible_idle = evaluation.visible_idle,
-                    visible_working = evaluation.visible_working,
                     "agent-detect: derived",
                 );
                 // FAIL SAFE: no state-bearing rule matched => Idle. Never
@@ -891,7 +889,6 @@ id = "working"
 state = "working"
 priority = 50
 region = "viewport"
-visible-working = true
 match = { contains = "WORKING" }
 
 [[rules]]
@@ -899,7 +896,6 @@ id = "blocked"
 state = "blocked"
 priority = 80
 region = "viewport"
-visible-blocker = true
 match = { contains = "BLOCKED" }
 
 [[rules]]
@@ -939,7 +935,6 @@ id = "working"
 state = "working"
 priority = 50
 region = "viewport"
-visible-working = true
 match = { contains = "WORKING" }
 "#;
 

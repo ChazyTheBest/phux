@@ -18,7 +18,6 @@ id = "bottom-working-status"
 state = "working"
 priority = 60
 region = "bottom-lines"
-visible-working = true
 match = { line-regex = '^\s*[⠀-⣿]\s+Working\.\.\.\s*$' }
 
 # VERIFIED: before an untrusted project starts, Pi replaces the editor with a
@@ -29,7 +28,6 @@ id = "project-trust-dialog"
 state = "blocked"
 priority = 80
 region = "bottom-lines"
-visible-blocker = true
 match = { all = [
   { contains = "do not trust (this session only)" },
   { contains = "escape/ctrl+c cancel" },

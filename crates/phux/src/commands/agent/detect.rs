@@ -248,14 +248,8 @@ fn collect_matched(node: &PredicateEvidence, out: &mut Vec<String>) {
 
 fn positive_flags(explained: &Explanation) -> Vec<&'static str> {
     let mut flags = Vec::new();
-    if explained.visible_blocker {
-        flags.push("visible-blocker");
-    }
     if explained.visible_idle {
         flags.push("visible-idle");
-    }
-    if explained.visible_working {
-        flags.push("visible-working");
     }
     if explained.freeze {
         flags.push("skip-state-update");

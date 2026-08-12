@@ -43,7 +43,6 @@ id = "title-busy-spinner"
 state = "working"
 priority = 100
 region = "title"
-visible-working = true
 match = { line-regex = "^[⠂⠐]" }
 
 # --- Screen rules -----------------------------------------------------------
@@ -81,7 +80,6 @@ id = "prompt-permission-dialog"
 state = "blocked"
 priority = 80
 region = "after-last-rule"
-visible-blocker = true
 match = { all = [
   { any = [
     { contains = "do you want to " },

@@ -408,14 +408,8 @@ fn print_rule(rule: &EvaluatedRule) {
     let mark = if rule.matched { "[match]" } else { "[ miss]" };
     let state = rule.state.as_deref().unwrap_or("-");
     let mut flags = Vec::new();
-    if rule.visible_blocker {
-        flags.push("visible-blocker");
-    }
     if rule.visible_idle {
         flags.push("visible-idle");
-    }
-    if rule.visible_working {
-        flags.push("visible-working");
     }
     if rule.skip_state_update {
         flags.push("skip-state-update");
@@ -448,14 +442,8 @@ fn print_evidence(node: &PredicateEvidence, indent: usize) {
 
 fn positive_flags(explanation: &Explanation) -> Vec<&'static str> {
     let mut flags = Vec::new();
-    if explanation.visible_blocker {
-        flags.push("visible-blocker");
-    }
     if explanation.visible_idle {
         flags.push("visible-idle");
-    }
-    if explanation.visible_working {
-        flags.push("visible-working");
     }
     if explanation.freeze {
         flags.push("skip-state-update");

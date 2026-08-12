@@ -163,42 +163,27 @@ pub(crate) struct RuleSpec {
     /// The predicate tree.
     #[serde(rename = "match")]
     pub(crate) predicate: PredicateSpec,
-    /// The screen POSITIVELY shows the agent is blocked.
+    /// The screen POSITIVELY shows the agent is idle. The only `visible-*`
+    /// flag the schema carries: it bypasses the working -> idle hold
+    /// (ADR-0046 point 6).
     ///
-    /// **Reported, not acted on.** Nothing in the detector's control flow
-    /// reads this; it reaches `trace!` and `phux agent explain` and stops
-    /// there. Every shipped manifest sets it on — and only on — a rule that
-    /// already declares `state = "blocked"`, so it currently restates `state`
-    /// and carries no information of its own. Pinned by
-    /// `no_shipped_manifest_uses_a_visible_flag_to_say_more_than_state_does`,
-    /// which is the tripwire for that stopping being true. See phux-w7z2.18:
-    /// the flag is slated for removal, and giving it teeth instead would mean
-    /// letting fresh screen evidence override a declared state, which
-    /// contradicts ADR-0046 point 8 and needs the ADR amended first.
-    #[serde(default)]
-    pub(crate) visible_blocker: bool,
-    /// The screen POSITIVELY shows the agent is idle. The only one of the
-    /// three `visible-*` flags that changes control flow: it bypasses the
-    /// working -> idle hold (ADR-0046 point 6).
-    ///
-    /// It is the odd one out for a reason worth keeping straight. `idle` is
+    /// `visible-blocker` and `visible-working` existed alongside this one and
+    /// were removed by phux-w7z2.18: across every shipped manifest each sat
+    /// on a rule that already declared the matching `state`, so they restated
+    /// `state` and reached no control flow of their own — parsed,
+    /// documented, and inert. `idle` is different in kind, not degree: it is
     /// the detector's fail-safe (point 5), reached by *nothing matching*, so
-    /// a rule that positively asserts idleness is making a claim `state`
-    /// alone cannot express. `blocked` and `working` are only ever reached by
-    /// a rule asserting them, so for those two the flag has nothing left to
-    /// add.
+    /// a rule that positively asserts idleness makes a claim `state` alone
+    /// cannot express. Giving the removed pair real teeth would mean letting
+    /// fresh screen evidence override a declared state, which contradicts
+    /// ADR-0046 point 8 and needs the ADR amended first — a bigger change
+    /// than this schema cleanup.
     ///
-    /// No shipped manifest sets it, which means the fast path it unlocks is
-    /// dead code for every built-in agent today: every idle transition pays
-    /// the full three-confirmation / ~700 ms hold.
+    /// No shipped manifest sets `visible-idle` either, which means the fast
+    /// path it unlocks is dead code for every built-in agent today (relevant
+    /// to phux-w7z2.28: no manifest asserts idle positively at all).
     #[serde(default)]
     pub(crate) visible_idle: bool,
-    /// The screen POSITIVELY shows the agent is working.
-    ///
-    /// **Reported, not acted on** — see [`Self::visible_blocker`], which this
-    /// shares a fate with.
-    #[serde(default)]
-    pub(crate) visible_working: bool,
     /// The screen is a transcript viewer / model picker / pager and
     /// therefore carries NO information about agent state. Freeze the last
     /// derivation; do not guess.
@@ -433,12 +418,8 @@ pub(crate) struct RuleTrace {
     pub(crate) region: Region,
     /// Whether its predicate matched.
     pub(crate) matched: bool,
-    /// See [`RuleSpec::visible_blocker`].
-    pub(crate) visible_blocker: bool,
     /// See [`RuleSpec::visible_idle`].
     pub(crate) visible_idle: bool,
-    /// See [`RuleSpec::visible_working`].
-    pub(crate) visible_working: bool,
     /// See [`RuleSpec::skip_state_update`].
     pub(crate) skip_state_update: bool,
     /// The predicate tree, annotated with what each node saw.
@@ -497,12 +478,8 @@ pub(crate) struct Rule {
     pub(crate) region: Region,
     /// The compiled predicate tree.
     pub(crate) predicate: Predicate,
-    /// See [`RuleSpec::visible_blocker`].
-    pub(crate) visible_blocker: bool,
     /// See [`RuleSpec::visible_idle`].
     pub(crate) visible_idle: bool,
-    /// See [`RuleSpec::visible_working`].
-    pub(crate) visible_working: bool,
     /// See [`RuleSpec::skip_state_update`].
     pub(crate) skip_state_update: bool,
 }
@@ -530,15 +507,10 @@ pub(crate) struct Evaluation {
     /// The winning state, or `None` when no state-bearing rule matched
     /// (the caller's fail-safe turns that into `idle`, never `blocked`).
     pub(crate) state: Option<DetectedState>,
-    /// A matching rule asserts the screen positively shows a blocker.
-    /// Reported only; see [`RuleSpec::visible_blocker`].
-    pub(crate) visible_blocker: bool,
     /// A matching rule asserts the screen positively shows idleness. The one
-    /// flag the caller acts on: it bypasses the working -> idle hold.
+    /// `visible-*` flag the caller acts on: it bypasses the working -> idle
+    /// hold.
     pub(crate) visible_idle: bool,
-    /// A matching rule asserts the screen positively shows work. Reported
-    /// only; see [`RuleSpec::visible_blocker`].
-    pub(crate) visible_working: bool,
     /// A matching rule says this screen carries no state information at
     /// all. The caller MUST freeze rather than derive.
     pub(crate) freeze: bool,
@@ -620,9 +592,7 @@ impl CompiledManifest {
                     priority: rule.priority,
                     region: rule.region,
                     matched,
-                    visible_blocker: rule.visible_blocker,
                     visible_idle: rule.visible_idle,
-                    visible_working: rule.visible_working,
                     skip_state_update: rule.skip_state_update,
                     predicate: rule.predicate.trace(text),
                 });
@@ -630,9 +600,7 @@ impl CompiledManifest {
             if !matched {
                 continue;
             }
-            out.visible_blocker |= rule.visible_blocker;
             out.visible_idle |= rule.visible_idle;
-            out.visible_working |= rule.visible_working;
             out.freeze |= rule.skip_state_update;
             let Some(state) = rule.state else { continue };
             let key = (rule.region == Region::Title, rule.priority, idx);
@@ -723,9 +691,7 @@ impl RuleSet {
                 priority: rule.priority,
                 region: rule.region,
                 predicate,
-                visible_blocker: rule.visible_blocker,
                 visible_idle: rule.visible_idle,
-                visible_working: rule.visible_working,
                 skip_state_update: rule.skip_state_update,
             });
         }
@@ -903,7 +869,6 @@ id = "title-working"
 state = "working"
 priority = 10
 region = "title"
-visible-working = true
 match = { line-regex = "^W " }
 
 [[rules]]
@@ -911,7 +876,6 @@ id = "screen-blocked"
 state = "blocked"
 priority = 90
 region = "bottom-lines"
-visible-blocker = true
 match = { all = [ { contains = "do you want" }, { line-regex = "^\\s*\\d+\\." } ] }
 
 [[rules]]
@@ -951,9 +915,6 @@ match = { contains = "-- pager --" }
         });
         assert_eq!(got.state, Some(DetectedState::Working));
         assert_eq!(got.matched.as_deref(), Some("title-working"));
-        // Flags from EVERY matching rule are still collected.
-        assert!(got.visible_working);
-        assert!(got.visible_blocker);
     }
 
     #[test]
@@ -980,7 +941,6 @@ match = { contains = "-- pager --" }
             lines: &buf,
         });
         assert_eq!(got.state, None);
-        assert!(!got.visible_blocker);
     }
 
     #[test]
@@ -1065,17 +1025,44 @@ id = "r"
 state = "idle"
 region = "title"
 visible-idle = true
-visible-blocker = true
-visible-working = true
 skip-state-update = true
 match = { contains = "x" }
 "#,
         );
         let rule = &set.manifest("k").expect("manifest").rules[0];
         assert!(rule.visible_idle, "visible-idle must bind");
-        assert!(rule.visible_blocker, "visible-blocker must bind");
-        assert!(rule.visible_working, "visible-working must bind");
         assert!(rule.skip_state_update, "skip-state-update must bind");
+    }
+
+    /// REGRESSION for phux-w7z2.18. `visible-blocker` and `visible-working`
+    /// were removed from the schema: they were parsed and reported but
+    /// reached no control flow, and across all five shipped manifests every
+    /// `visible-working` sat on a rule that already declared `state =
+    /// "working"` (same for `visible-blocker` / `"blocked"`), so they were
+    /// pure restatements. `deny_unknown_fields` on `RuleSpec` (see the doc
+    /// comment above) means a manifest that still writes either key now fails
+    /// to load — loud, not silently ignored — which is the right failure for
+    /// an accepted key that stops being accepted. Config-surface removal
+    /// before ADR-0071 point 1 freezes the manifest schema at 1.0 is cheap;
+    /// after that freeze it needs a deprecation cycle instead.
+    #[test]
+    fn removed_visible_flags_are_now_unknown_fields() {
+        for key in ["visible-blocker", "visible-working"] {
+            let toml_text = format!(
+                r#"
+kind = "k"
+binaries = ["k"]
+[[rules]]
+id = "r"
+state = "idle"
+region = "title"
+{key} = true
+match = {{ contains = "x" }}
+"#
+            );
+            let parsed: Result<ManifestSpec, _> = toml::from_str(&toml_text);
+            assert!(parsed.is_err(), "`{key}` must be rejected, not ignored");
+        }
     }
 
     #[test]
@@ -1095,55 +1082,22 @@ match = { contains = "x" }
         assert!(parsed.is_err(), "a mis-spelled flag must not pass silently");
     }
 
-    /// THE EVIDENCE BEHIND phux-w7z2.18, kept executable so the decision can
-    /// be re-checked rather than re-argued.
-    ///
-    /// `visible-blocker` and `visible-working` are parsed and reported but
-    /// reach no control flow. The question the bead asks is whether to wire
-    /// them or delete them, and the answer turns on whether they say anything
-    /// `state` does not. Today they do not: across all five shipped manifests,
-    /// every `visible-working` sits on a rule that already declares
-    /// `state = "working"` and every `visible-blocker` on one that already
-    /// declares `state = "blocked"`. They are restatements, so deleting them
-    /// loses nothing — which is why deletion is the recommendation.
-    ///
-    /// `visible-idle` is deliberately exempt. It is not redundant with
-    /// `state`, because `idle` is the fail-safe reached by nothing matching
-    /// (ADR-0046 point 5), so asserting it positively is a real and distinct
-    /// claim — and it is the one flag the detector consumes. The test also
-    /// records that no shipped manifest sets it, which makes the working ->
-    /// idle fast path dead code for every built-in agent today.
-    ///
-    /// If this test ever fails, a manifest has started using a `visible-*`
-    /// flag to say something new and the delete recommendation must be
-    /// revisited before it is carried out.
+    /// `visible-idle` is not redundant with `state` the way the removed
+    /// `visible-blocker` / `visible-working` were: `idle` is the fail-safe
+    /// reached by nothing matching (ADR-0046 point 5), so asserting it
+    /// positively is a real and distinct claim, and it is the one flag the
+    /// detector's control flow consumes (bypassing the working -> idle
+    /// hold). No shipped manifest sets it today, which makes that fast path
+    /// dead code for every built-in agent — noted for phux-w7z2.28 ("no
+    /// shipped manifest asserts idle or done positively"). If this test ever
+    /// fails, a manifest has started using it and the dead-code note is
+    /// stale.
     #[test]
-    fn no_shipped_manifest_uses_a_visible_flag_to_say_more_than_state_does() {
-        let mut any_visible_idle = false;
-        for (kind, text) in super::BUILTIN_MANIFESTS {
+    fn no_shipped_manifest_sets_visible_idle() {
+        let any_visible_idle = super::BUILTIN_MANIFESTS.iter().any(|(_, text)| {
             let spec: ManifestSpec = toml::from_str(text).expect("builtin parses");
-            for rule in &spec.rules {
-                if rule.visible_blocker {
-                    assert_eq!(
-                        rule.state.as_deref(),
-                        Some("blocked"),
-                        "{kind}/{}: visible-blocker without state = \"blocked\" would carry \
-                         information `state` does not, and the flag is inert",
-                        rule.id,
-                    );
-                }
-                if rule.visible_working {
-                    assert_eq!(
-                        rule.state.as_deref(),
-                        Some("working"),
-                        "{kind}/{}: visible-working without state = \"working\" would carry \
-                         information `state` does not, and the flag is inert",
-                        rule.id,
-                    );
-                }
-                any_visible_idle |= rule.visible_idle;
-            }
-        }
+            spec.rules.iter().any(|rule| rule.visible_idle)
+        });
         assert!(
             !any_visible_idle,
             "a manifest now sets visible-idle: the working -> idle fast path is no longer \
@@ -1676,7 +1630,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             "the quiet title must not outrank a live permission dialog",
         );
         assert_eq!(got.matched.as_deref(), Some("prompt-permission-dialog"));
-        assert!(got.visible_blocker);
     }
 
     /// The captured permission dialog reads as `blocked`.
@@ -1691,7 +1644,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         let got = claude_eval("", &claude_blocked_screen());
         assert_eq!(got.state, Some(DetectedState::Blocked));
         assert_eq!(got.matched.as_deref(), Some("prompt-permission-dialog"));
-        assert!(got.visible_blocker);
     }
 
     /// The idle screen matches NO state-bearing rule, and that is the design:
@@ -1703,7 +1655,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
     fn claude_idle_screen_asserts_no_state_and_leaves_the_fail_safe_to_decide() {
         let got = claude_eval(CLAUDE_TITLE_QUIET, &claude_idle_screen());
         assert_eq!(got.state, None, "no rule should claim the idle screen");
-        assert!(!got.visible_blocker);
         assert!(!got.freeze);
     }
 
@@ -1746,7 +1697,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             "text in the transcript is not a live prompt; a false `blocked` is the one \
              failure that destroys trust in the feature",
         );
-        assert!(!got.visible_blocker);
     }
 
     /// A screen with no rules at all cannot be blocked, however dialog-shaped
@@ -1759,7 +1709,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         let screen = lines(&["  Do you want to proceed?", "  \u{276f} 1. Yes", "  2. No"]);
         let got = claude_eval(CLAUDE_TITLE_QUIET, &screen);
         assert_ne!(got.state, Some(DetectedState::Blocked));
-        assert!(!got.visible_blocker);
     }
 
     /// The transcript viewer (ctrl+o) is a pager over history: it carries no
@@ -1815,7 +1764,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
                 lines: &idle,
             });
             assert_eq!(got.state, None, "{kind}: idle is the fail-safe");
-            assert!(!got.visible_blocker, "{kind}: idle is not blocked");
 
             let working = captured(working);
             let got = manifest.evaluate(&Screen {
@@ -1828,8 +1776,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
                 "{kind}: captured working screen",
             );
             assert_eq!(got.matched.as_deref(), Some(working_rule));
-            assert!(got.visible_working);
-            assert!(!got.visible_blocker);
 
             let blocked = captured(blocked);
             let got = manifest.evaluate(&Screen {
@@ -1842,7 +1788,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
                 "{kind}: captured blocked screen",
             );
             assert_eq!(got.matched.as_deref(), Some(blocked_rule));
-            assert!(got.visible_blocker);
 
             let mut transcript_then_idle = blocked;
             transcript_then_idle.extend(idle);
@@ -1855,7 +1800,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
                 Some(DetectedState::Blocked),
                 "{kind}: a historical dialog above live idle chrome must not block",
             );
-            assert!(!got.visible_blocker);
         }
     }
 
@@ -2096,7 +2040,6 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             blocked.matched.as_deref(),
             Some("permission-required-dialog")
         );
-        assert!(blocked.visible_blocker);
 
         for screen in [opencode_idle_screen(), opencode_working_screen()] {
             let got = opencode_eval("OpenCode", &screen);

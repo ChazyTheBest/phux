@@ -90,12 +90,8 @@ pub struct EvaluatedRule {
     pub state: Option<String>,
     /// Whether its predicate matched.
     pub matched: bool,
-    /// `visible-blocker`.
-    pub visible_blocker: bool,
     /// `visible-idle`.
     pub visible_idle: bool,
-    /// `visible-working`.
-    pub visible_working: bool,
     /// `skip-state-update`.
     pub skip_state_update: bool,
     /// The predicate tree with per-node results.
@@ -146,12 +142,11 @@ pub struct Explanation {
     /// A `skip-state-update` rule matched: this screen carries no
     /// information about agent state and the detector freezes.
     pub freeze: bool,
-    /// A matching rule positively asserts a blocker is on screen.
-    pub visible_blocker: bool,
-    /// A matching rule positively asserts idleness.
+    /// A matching rule positively asserts idleness. The only `visible-*`
+    /// flag the manifest schema carries; see phux-w7z2.18 for why
+    /// `visible-blocker` / `visible-working` were removed rather than kept
+    /// as report-only fields here.
     pub visible_idle: bool,
-    /// A matching rule positively asserts work.
-    pub visible_working: bool,
     /// Every region, resolved against this screen. Includes regions no rule
     /// names: picking the right one is half of authoring a rule.
     pub regions: Vec<RegionPreview>,
@@ -232,9 +227,7 @@ pub fn explain(kind: &str, capture: &Capture) -> Option<Explanation> {
         matched_rule: evaluation.matched.clone(),
         fallback_reason,
         freeze: evaluation.freeze,
-        visible_blocker: evaluation.visible_blocker,
         visible_idle: evaluation.visible_idle,
-        visible_working: evaluation.visible_working,
         regions: explained
             .regions
             .into_iter()
@@ -259,9 +252,7 @@ fn evaluated_rule(trace: RuleTrace) -> EvaluatedRule {
         region: Region::as_str(trace.region),
         state: trace.state.map(|s| s.as_str().to_owned()),
         matched: trace.matched,
-        visible_blocker: trace.visible_blocker,
         visible_idle: trace.visible_idle,
-        visible_working: trace.visible_working,
         skip_state_update: trace.skip_state_update,
         evidence: evidence(trace.predicate),
     }
@@ -342,7 +333,6 @@ mod tests {
             Some("prompt-permission-dialog")
         );
         assert!(got.fallback_reason.is_none());
-        assert!(got.visible_blocker);
 
         let winner = got
             .evaluated_rules

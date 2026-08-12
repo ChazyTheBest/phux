@@ -1190,9 +1190,7 @@ distinguishable without reading further.
     "detector_state": "blocked",
     "matched_rule": "prompt-permission-dialog",
     "freeze": false,
-    "visible_blocker": true,
     "visible_idle": false,
-    "visible_working": false,
     "regions": [
       { "region": "title", "empty": false, "lines": ["phux"] },
       { "region": "prompt-box", "empty": true, "lines": [] }
@@ -1204,9 +1202,7 @@ distinguishable without reading further.
         "region": "after-last-rule",
         "state": "blocked",
         "matched": true,
-        "visible_blocker": true,
         "visible_idle": false,
-        "visible_working": false,
         "skip_state_update": false,
         "evidence": {
           "op": "all",

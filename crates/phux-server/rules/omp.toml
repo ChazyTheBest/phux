@@ -18,7 +18,6 @@ id = "bottom-running-status"
 state = "working"
 priority = 60
 region = "bottom-lines"
-visible-working = true
 match = { line-regex = '^\s*[⠀-⣿]\s+.+\s+⟦esc⟧\s*$' }
 
 # VERIFIED: OMP's per-tool approval is fenced by horizontal rules. Prompt-box
@@ -29,7 +28,6 @@ id = "tool-approval-dialog"
 state = "blocked"
 priority = 80
 region = "prompt-box"
-visible-blocker = true
 match = { all = [
   { line-regex = '^\s*❯\s*Approve\s*$' },
   { line-regex = '^\s*Deny\s*$' },

@@ -54,7 +54,6 @@ id = "footer-interrupt-affordance"
 state = "working"
 priority = 90
 region = "bottom-lines"
-visible-working = true
 match = { contains = "esc interrupt" }
 
 # An external-directory permission request replaces the live input box with a
@@ -81,7 +80,6 @@ id = "permission-required-dialog"
 state = "blocked"
 priority = 100
 region = "prompt-box"
-visible-blocker = true
 match = { all = [
   { contains = "permission required" },
   { line-regex = '^\s*.*Allow once\s+Allow always\s+Reject\b' },
