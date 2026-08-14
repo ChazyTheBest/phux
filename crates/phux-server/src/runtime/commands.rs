@@ -854,6 +854,10 @@ pub(crate) async fn handle_command(
             suggestions,
             elapsed_seconds,
         ),
+        Command::ReportAgentState {
+            terminal_id,
+            state: reported,
+        } => handle_report_agent_state(state, &terminal_id, reported).await,
         // `Command` is `#[non_exhaustive]`: a forward-compat command this
         // server doesn't implement decodes only if a newer peer sent a
         // tag we allocated but haven't wired (the decoder rejects truly
@@ -2966,6 +2970,56 @@ pub(crate) async fn handle_signal_terminal(
         Err(_) => CommandResult::Error {
             code: ErrorCode::InternalError,
             message: "pane actor dropped SIGNAL_TERMINAL reply".to_owned(),
+        },
+    }
+}
+
+/// Feed integration-hook lifecycle evidence into a pane's detector.
+pub(crate) async fn handle_report_agent_state(
+    state: &SharedState,
+    terminal_id: &phux_protocol::ids::TerminalId,
+    reported: phux_protocol::wire::frame::ReportedAgentState,
+) -> CommandResult {
+    if !terminal_id.is_local() {
+        return CommandResult::Error {
+            code: ErrorCode::UnsupportedSatelliteRoute,
+            message: format!("REPORT_AGENT_STATE on satellite route unsupported: {terminal_id:?}"),
+        };
+    }
+    let handle = state.with(|server| {
+        let core = server.terminal_from_wire(terminal_id)?;
+        server.terminal_handle(core).cloned()
+    });
+    let Some(handle) = handle else {
+        return CommandResult::Error {
+            code: ErrorCode::TerminalNotFound,
+            message: format!("no such terminal: {terminal_id:?}"),
+        };
+    };
+    let (reply, result) = oneshot::channel();
+    if handle
+        .control
+        .send(ControlRequest::ReportAgentState {
+            state: reported,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return CommandResult::Error {
+            code: ErrorCode::InternalError,
+            message: "pane actor unavailable for REPORT_AGENT_STATE".to_owned(),
+        };
+    }
+    match result.await {
+        Ok(Ok(())) => CommandResult::Ok,
+        Ok(Err(message)) => CommandResult::Error {
+            code: ErrorCode::InvalidCommand,
+            message,
+        },
+        Err(_) => CommandResult::Error {
+            code: ErrorCode::InternalError,
+            message: "pane actor dropped REPORT_AGENT_STATE reply".to_owned(),
         },
     }
 }

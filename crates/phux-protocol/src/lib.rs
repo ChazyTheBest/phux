@@ -108,9 +108,12 @@ pub use wire::frame::{
 /// is permanently retired. Explicit native/compatibility profile negotiation,
 /// generation-bound bootstrap/history streams, and READY-fenced attach replace
 /// synthesized snapshot ordering. Protocol 0.6 and 0.7 peers reject each other.
+///
+/// Bumped from `0.7.0` to `0.8.0` by ADR-0085: `REPORT_AGENT_STATE` adds
+/// capability-gated hook evidence to the server-side detector.
 pub const PROTOCOL_VERSION: Version = Version {
     major: 0,
-    minor: 7,
+    minor: 8,
     patch: 0,
 };
 

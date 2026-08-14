@@ -43,7 +43,7 @@ const MANIFEST: &str = "claude-install.json";
 /// `pub(crate)` because `phux doctor` compares it against what is actually on
 /// disk (phux-w7z2.46): upgrading the binary does not rewrite an installed
 /// shim, so the mismatch is real, silent, and behavioral.
-pub(crate) const SHIM_SCHEMA: u32 = 3;
+pub(crate) const SHIM_SCHEMA: u32 = 4;
 
 /// Prefix of the wrapper's schema stamp line. A `#` comment, so it is inert
 /// to `/bin/sh` and greppable without executing anything.
@@ -182,8 +182,10 @@ fn install_claude_into(
     let hook_settings = serde_json::json!({
         "hooks": {
             "SessionStart": [command_hook("start", "")],
+            "UserPromptSubmit": [command_hook("working", "")],
             "PermissionRequest": [command_hook("blocked", "")],
             "Notification": [command_hook("blocked", "permission_prompt|idle_prompt|elicitation_dialog")],
+            "Stop": [command_hook("done", "")],
             "SessionEnd": [command_hook("clear", "")]
         }
     });
@@ -395,7 +397,7 @@ run_phux() {{
   "$phux" "$@" >/dev/null 2>&1 || true
 }}
 
-# Identity only and exactly once; `blocked` only asks. See SHIM_SCHEMA 2 -> 3.
+# Identity stays detector-owned; per-turn hooks feed evidence into it.
 set_state() {{
   state=$1
   [ -n "${{PHUX_TERMINAL_ID:-}}" ] || return 0
@@ -403,7 +405,11 @@ set_state() {{
   case "$state" in
     clear) run_phux agent clear "$target" ;;
     start) run_phux agent set "$target" --name claude --kind claude ;;
-    blocked) run_phux ask "$target" "Claude needs attention" ;;
+    working|done) run_phux agent report-state "$target" "$state" ;;
+    blocked)
+      run_phux agent report-state "$target" blocked
+      run_phux ask "$target" "Claude needs attention"
+      ;;
   esac
 }}
 
@@ -695,7 +701,7 @@ mod tests {
             Path::new("/data/phux/shims/claude-hooks.json"),
         )
         .unwrap();
-        for state in ["clear", "start", "blocked"] {
+        for state in ["clear", "start", "working", "blocked", "done"] {
             assert!(
                 wrapper.contains(state),
                 "hook state `{state}` is wired by the installer but unhandled by set_state",
@@ -716,8 +722,7 @@ mod tests {
     /// clobber. CI was green with that bug in place.
     ///
     /// This asserts the shape structurally: only the `start` arm may reach
-    /// `agent set`, and `blocked` — which still fires per hook — must reach
-    /// `ask` and nothing else.
+    /// `agent set`; per-turn arms reach `report-state`, never metadata writes.
     #[test]
     fn only_the_start_arm_writes_the_record() {
         let wrapper = render_wrapper(
@@ -743,27 +748,11 @@ mod tests {
             writes[0]
         );
 
-        let blocked = wrapper
-            .lines()
-            .find(|line| line.trim_start().starts_with("blocked)"))
-            .expect("a blocked arm");
         assert!(
-            !blocked.contains("agent set"),
-            "blocked fires per hook, so a record write there is the w7z2.37 clobber: {blocked}"
+            wrapper.contains("working|done) run_phux agent report-state \"$target\" \"$state\"")
         );
-        assert!(
-            blocked.contains("run_phux ask"),
-            "blocked must still ask: {blocked}"
-        );
-
-        // A per-turn hook that writes nothing should not be wired at all: it
-        // would spawn a subprocess per turn to no effect.
-        for hook in ["UserPromptSubmit", "Stop"] {
-            assert!(
-                !wrapper.contains(hook),
-                "`{hook}` no longer writes anything and must not be wired",
-            );
-        }
+        assert!(wrapper.contains("run_phux agent report-state \"$target\" blocked"));
+        assert!(wrapper.contains("run_phux ask \"$target\""));
     }
 
     /// The wrapper carries its own behavioral version, so an install can tell

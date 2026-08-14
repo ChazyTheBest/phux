@@ -2228,6 +2228,38 @@ impl TerminalActor {
                     detector.invalidate_published();
                 }
             }
+            ControlRequest::ReportAgentState { state, reply } => {
+                let state = match state {
+                    phux_protocol::wire::frame::ReportedAgentState::Working => {
+                        crate::agent_detect::DetectedState::Working
+                    }
+                    phux_protocol::wire::frame::ReportedAgentState::Blocked => {
+                        crate::agent_detect::DetectedState::Blocked
+                    }
+                    phux_protocol::wire::frame::ReportedAgentState::Done => {
+                        crate::agent_detect::DetectedState::Done
+                    }
+                };
+                let result = self
+                    .agent_detect
+                    .as_mut()
+                    .ok_or_else(|| "agent detection is unavailable for this pane".to_owned())
+                    .map(|detector| detector.report_hook_state(state, std::time::Instant::now()));
+                match result {
+                    Ok(report) => {
+                        if let Some(report) = report {
+                            self.emit_agent_state(AgentDetectEvent::State(report));
+                        }
+                        // Force one normal derivation after the edge so hook
+                        // evidence never becomes a latch on a quiet screen.
+                        self.agent_dirty_since_detect = true;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
             ControlRequest::Signal {
                 signal,
                 input_holder,

@@ -112,7 +112,7 @@ mod tests {
         let doc = document(&crate::Cli::command(), None);
         assert_eq!(doc["schema_version"], 1);
         assert_eq!(doc["binary"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(doc["binary"]["wire_protocol"], "0.7.0");
+        assert_eq!(doc["binary"]["wire_protocol"], "0.8.0");
         assert_eq!(doc["mcp"]["available"], false);
         assert_eq!(doc["mcp"]["launcher"], json!(["phux", "mcp"]));
         let commands = doc["commands"].as_array().unwrap();

@@ -632,6 +632,8 @@ pub(crate) const COMMAND_TAG_PUT_FILE: u8 = 0x15;
 /// `0x0a` and `0x0b` are freed-and-reserved and MUST NOT be reallocated
 /// without a `minor` bump (`appendix-reserved.md`).
 pub(crate) const COMMAND_TAG_SHUTDOWN: u8 = 0x16;
+/// Wire tag for [`Command::ReportAgentState`].
+pub(crate) const COMMAND_TAG_REPORT_AGENT_STATE: u8 = 0x17;
 
 // Wire tags for the `InputEvent` tagged union (ROUTE_INPUT arg). These
 // mirror the four `INPUT_*` frame atoms (`docs/spec/input.md`).
@@ -1427,6 +1429,36 @@ impl TerminalSignal {
     }
 }
 
+/// Lifecycle evidence supplied by an integration hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReportedAgentState {
+    /// A turn began or resumed.
+    Working = 0,
+    /// The agent is waiting for human input.
+    Blocked = 1,
+    /// A turn completed.
+    Done = 2,
+}
+
+impl ReportedAgentState {
+    /// Wire byte for this state.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from the wire byte; `None` for unknown values.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Working),
+            1 => Some(Self::Blocked),
+            2 => Some(Self::Done),
+            _ => None,
+        }
+    }
+}
+
 /// Process lifecycle state of a Terminal, carried by
 /// [`AgentEvent::TerminalControl`] (ADR-0033).
 ///
@@ -1791,6 +1823,14 @@ pub enum Command {
         suggestions: Vec<String>,
         /// Optional seconds the agent has already been waiting.
         elapsed_seconds: Option<u64>,
+    },
+    /// Feed hook-sourced lifecycle evidence into the pane's detector without
+    /// writing `phux.agent/v1` or disabling subsequent screen derivation.
+    ReportAgentState {
+        /// Pane whose detected occupant produced the hook.
+        terminal_id: TerminalId,
+        /// Immediate lifecycle evidence.
+        state: ReportedAgentState,
     },
 }
 
@@ -4445,6 +4485,11 @@ pub(super) fn encode_command(command: &Command, enc: &mut Encoder<'_>) {
             encode_terminal_id(terminal_id, enc);
             encode_asked_fields(id, question, suggestions, *elapsed_seconds, enc);
         }
+        Command::ReportAgentState { terminal_id, state } => {
+            enc.write_u8(COMMAND_TAG_REPORT_AGENT_STATE);
+            encode_terminal_id(terminal_id, enc);
+            enc.write_u8(state.to_u8());
+        }
     }
 }
 
@@ -4624,6 +4669,17 @@ pub(super) fn decode_command(dec: &mut Decoder<'_>) -> Result<Command, DecodeErr
         }
         COMMAND_TAG_PUT_FILE => decode_put_file_command(dec),
         COMMAND_TAG_REPORT_ASKED => decode_report_asked_command(dec),
+        COMMAND_TAG_REPORT_AGENT_STATE => {
+            let terminal_id = decode_terminal_id(dec)?;
+            let value = dec.read_u8()?;
+            let state = ReportedAgentState::from_u8(value).ok_or_else(|| {
+                DecodeError::UnknownEnumValue {
+                    field: "ReportedAgentState",
+                    value: u32::from(value),
+                }
+            })?;
+            Ok(Command::ReportAgentState { terminal_id, state })
+        }
         other => Err(DecodeError::UnknownEnumValue {
             field: "Command",
             value: u32::from(other),

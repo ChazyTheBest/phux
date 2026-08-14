@@ -147,7 +147,6 @@ pub(crate) mod codes {
     pub(crate) const INVALID_KEY_SPEC: &str = "invalid_key_spec";
     /// A wait was asked for on a target set nothing in this build can ever
     /// satisfy, so it is refused up front instead of timing out. Exit 2.
-    pub(crate) const UNSATISFIABLE_WAIT: &str = "unsatisfiable_wait";
     /// A prompt or answer contained no text.
     pub(crate) const PROMPT_EMPTY: &str = "prompt_empty";
     /// Prompt text contained a raw newline, whose submission count cannot be
@@ -410,7 +409,6 @@ mod tests {
         assert_eq!(codes::INVALID_KEY_SPEC, "invalid_key_spec");
         // phux-w7z2.42, added after ADR-0071 point 6 was written: it needs
         // carving into that enumeration in the PR that ships it.
-        assert_eq!(codes::UNSATISFIABLE_WAIT, "unsatisfiable_wait");
         // phux-w7z2.60, added after ADR-0071 point 6 was written: it too
         // needs carving into that enumeration in the PR that ships it.
         assert_eq!(codes::INPUT_NOT_WRITTEN, "input_not_written");

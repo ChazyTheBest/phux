@@ -35,59 +35,11 @@ const RESULT_SCHEMA_VERSION: u8 = 1;
 /// well above the per-read round-trip cost on a local UDS.
 const POLL_INTERVAL: Duration = phux_client::wait::DEFAULT_POLL_INTERVAL;
 
-/// A `--until` set nothing in this build can satisfy, refused up front.
-///
-/// `done` has zero producers in the shipped binary. No detection manifest
-/// asserts it — `crates/phux-server/rules/*.toml` carry `working` and
-/// `blocked` rules and nothing else — and the bundled Claude shim, the only
-/// `done` writer phux ever shipped, now declares identity only. So
-/// `--until done` on its own is a gate that can never open on a pane phux
-/// itself instrumented, and letting it block for the full `--timeout` reports
-/// "the agent did not finish in time" for what is really "nothing here can
-/// ever say it did".
-///
-/// The check is on the *requested* set, not the resolved one: the default
-/// set (`idle`, `blocked`, `done`) keeps `done` untouched, because `idle` and
-/// `blocked` can both satisfy it and a third-party integration that does
-/// publish `done` still benefits from it being in the set.
-///
-/// Unconditional rather than conditioned on the pane's kind, deliberately: the
-/// pane's occupant is not known until after the selector resolves and the
-/// record is read, and refusing before connecting is what makes this a usage
-/// error rather than a late failure. That makes it wrong for a third-party
-/// integration that genuinely writes `done`, so the diagnostic says so and
-/// names the one-word fix.
-fn unsatisfiable_until(requested: &[String], resolved: &[AgentMetaState]) -> bool {
-    !requested.is_empty() && resolved == [AgentMetaState::Done]
-}
-
-/// The refusal [`unsatisfiable_until`] produces. Pure, so the wording that
-/// has to carry the explanation is testable without a server.
-fn unsatisfiable_until_error() -> json_err::CliError {
-    json_err::CliError::new(
-        json_err::codes::UNSATISFIABLE_WAIT,
-        "`--until done` on its own is a wait this build can never satisfy: no shipped \
-         detection manifest publishes 'done', and the bundled Claude shim declares identity \
-         only",
-        "add the state the turn actually lands in — `--until done --until idle` still fires \
-         on 'done' — or drop `--until` for the default set (idle, blocked, done). If a \
-         third-party integration on this pane does publish 'done', this refusal is wrong for \
-         you: pair it with whichever state that agent passes through and the wait keeps its \
-         'done' edge.",
-    )
-}
-
 /// Resolve `--until` words into the target set, or the refusal that replaces
 /// the wait.
 ///
-/// Both refusals happen here, before a selector resolves and before a socket
-/// opens, because both are usage errors: a word the vocabulary does not have,
-/// and a set nothing in this build can satisfy (phux-w7z2.42).
-///
-/// `pub(super)` because `--until` now has a second surface: `agent prompt
-/// --wait --until` re-implements this loop and so does not get the
-/// unsatisfiable refusal. Pointing that call site here is the fix, and it is
-/// one line.
+/// `pub(super)` because `--until` has a second surface: `agent prompt --wait
+/// --until` shares this vocabulary and default set.
 pub(super) fn resolve_until(until: &[String]) -> Result<Vec<AgentMetaState>, json_err::CliError> {
     // clap's value parser already restricts the vocabulary, so an unparsed
     // word here would be a wiring bug rather than user input; it is still
@@ -109,9 +61,6 @@ pub(super) fn resolve_until(until: &[String]) -> Result<Vec<AgentMetaState>, jso
     }
     if targets.is_empty() {
         targets.extend_from_slice(DEFAULT_UNTIL);
-    }
-    if unsatisfiable_until(until, &targets) {
-        return Err(unsatisfiable_until_error());
     }
     Ok(targets)
 }
@@ -397,46 +346,10 @@ mod tests {
         );
     }
 
-    /// phux-w7z2.42: `--until done` alone is refused as a usage error rather
-    /// than blocking for the whole `--timeout` and exiting 124. Repeats
-    /// collapse to the same set and are refused identically.
+    /// The whole `--until` resolution, as the verb runs it: every known state
+    /// resolves, including hook-produced `done`; unknown words are refused.
     #[test]
-    fn until_done_alone_is_unsatisfiable() {
-        let requested = vec!["done".to_owned()];
-        assert!(unsatisfiable_until(&requested, &[AgentMetaState::Done]));
-
-        let repeated = vec!["done".to_owned(), "done".to_owned()];
-        assert!(unsatisfiable_until(&repeated, &[AgentMetaState::Done]));
-    }
-
-    /// The refusal is narrow on purpose. The default set is untouched, and
-    /// `done` paired with any other state stays a legitimate wait — a
-    /// third-party integration that does publish `done` keeps its edge.
-    #[test]
-    fn done_alongside_another_state_and_the_default_set_are_not_refused() {
-        // No `--until` at all: the default set, which contains `done`.
-        assert!(!unsatisfiable_until(&[], DEFAULT_UNTIL));
-        // `--until done --until idle`.
-        let requested = vec!["done".to_owned(), "idle".to_owned()];
-        assert!(!unsatisfiable_until(
-            &requested,
-            &[AgentMetaState::Done, AgentMetaState::Idle]
-        ));
-        // Every single-state wait other than `done` has a producer.
-        for state in [
-            AgentMetaState::Idle,
-            AgentMetaState::Working,
-            AgentMetaState::Blocked,
-        ] {
-            let requested = vec![format!("{state:?}").to_lowercase()];
-            assert!(!unsatisfiable_until(&requested, &[state]), "{state:?}");
-        }
-    }
-
-    /// The whole `--until` resolution, as the verb runs it: both refusals
-    /// land before a socket opens, and everything else resolves to a set.
-    #[test]
-    fn resolve_until_refuses_exactly_the_two_usage_errors() {
+    fn resolve_until_accepts_done_and_refuses_unknown_words() {
         assert_eq!(
             resolve_until(&[]).ok().as_deref(),
             Some(DEFAULT_UNTIL),
@@ -447,8 +360,10 @@ mod tests {
             Some(vec![AgentMetaState::Done, AgentMetaState::Idle])
         );
 
-        let err = resolve_until(&["done".to_owned()]).expect_err("done alone is refused");
-        assert_eq!(err.code, json_err::codes::UNSATISFIABLE_WAIT);
+        assert_eq!(
+            resolve_until(&["done".to_owned()]).ok(),
+            Some(vec![AgentMetaState::Done])
+        );
 
         let err = resolve_until(&["finished".to_owned()]).expect_err("unknown word is refused");
         assert_eq!(err.code, json_err::codes::INVALID_SELECTOR);
@@ -484,34 +399,5 @@ mod tests {
         let doc = json_err::error_document(&err, crate::exit_codes::EXIT_USAGE);
         assert_eq!(doc["exit_code"], 2);
         assert_eq!(doc["error"]["code"], "satellite_target");
-    }
-
-    /// The point of the refusal is the diagnostic: it has to say why nothing
-    /// can satisfy the wait, admit the case where it is wrong, and name the
-    /// fix. A bare code would be no better than the 124 it replaces.
-    #[test]
-    fn the_unsatisfiable_refusal_explains_itself_and_names_the_fix() {
-        let err = unsatisfiable_until_error();
-        assert_eq!(err.code, json_err::codes::UNSATISFIABLE_WAIT);
-        assert!(err.message.contains("never satisfy"), "{}", err.message);
-        assert!(
-            err.message.contains("no shipped detection manifest"),
-            "must name the reason: {}",
-            err.message
-        );
-        assert!(
-            err.remedy.contains("--until done --until idle"),
-            "must name the fix: {}",
-            err.remedy
-        );
-        assert!(
-            err.remedy.contains("third-party"),
-            "must admit who this refusal is wrong for: {}",
-            err.remedy
-        );
-        // Refusals are usage errors, exit 2 — never the 124 they replace.
-        let doc = json_err::error_document(&err, crate::exit_codes::EXIT_USAGE);
-        assert_eq!(doc["exit_code"], 2);
-        assert_eq!(doc["error"]["code"], "unsatisfiable_wait");
     }
 }

@@ -53,6 +53,7 @@ const fn runtime_server_features() -> ServerFeatureSet {
         ServerFeature::TerminalReply,
         ServerFeature::Shutdown,
         ServerFeature::SpawnInitialSize,
+        ServerFeature::ReportAgentState,
     ])
 }
 

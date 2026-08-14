@@ -5,6 +5,7 @@ mod model;
 mod offline;
 mod prompt;
 mod record;
+mod report_state;
 mod send_keys;
 mod session;
 pub(crate) mod shim;
@@ -109,6 +110,14 @@ pub(crate) enum AgentAction {
         /// Free-form association label (fleet/job name).
         #[arg(long)]
         session: Option<String>,
+    },
+    /// Report hook-sourced lifecycle evidence to the pane's detector.
+    ReportState {
+        /// Target selector (resolves to one pane).
+        target: String,
+        /// Lifecycle evidence from the integration hook.
+        #[arg(value_parser = ["working", "blocked", "done"])]
+        state: String,
     },
     /// Block until a pane's agent TRANSITIONS into a lifecycle state.
     ///
@@ -388,6 +397,7 @@ pub(crate) fn run_agent(action: &AgentAction, socket: Option<PathBuf>) -> ExitCo
             session.as_deref(),
             socket,
         ),
+        AgentAction::ReportState { target, state } => report_state::run(target, state, socket),
         AgentAction::Answer {
             target,
             id,
@@ -487,6 +497,7 @@ fn run_agent_one(action: &AgentAction, socket: Option<PathBuf>) -> ExitCode {
         AgentAction::Answer { .. }
         | AgentAction::List { .. }
         | AgentAction::Set { .. }
+        | AgentAction::ReportState { .. }
         | AgentAction::Clear { .. }
         | AgentAction::Wait { .. }
         | AgentAction::Prompt { .. }

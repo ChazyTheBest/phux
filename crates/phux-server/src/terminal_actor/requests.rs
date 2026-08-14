@@ -7,7 +7,9 @@ use crate::mailbox::{Outbound, TerminalInput};
 use bytes::Bytes;
 use phux_protocol::ClientId;
 use phux_protocol::ids::{BootstrapId, StreamId};
-use phux_protocol::wire::frame::{ControlAction, FrameKind, TerminalEventType, TerminalSignal};
+use phux_protocol::wire::frame::{
+    ControlAction, FrameKind, ReportedAgentState, TerminalEventType, TerminalSignal,
+};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// A supervisory control request delivered to a [`super::TerminalActor`] over
@@ -43,6 +45,13 @@ pub enum ControlRequest {
     /// change" — which, for an agent sitting idle waiting on a human, is
     /// never. No-op on a pane with no detector.
     AgentRecordInvalidated,
+    /// Feed lifecycle-hook evidence into the pane's detector.
+    ReportAgentState {
+        /// Hook-reported state.
+        state: ReportedAgentState,
+        /// Whether the detector accepted the evidence.
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Deliver `signal` to the pane's process group, update the lifecycle
     /// (`Freeze` → `Frozen`, `Resume` → `Running`), and broadcast a
     /// `TerminalControl`. `reply` carries `Ok(())` on delivery or a

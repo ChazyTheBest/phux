@@ -32,8 +32,8 @@ use phux_protocol::input::paste::{PasteEvent, PasteTrust};
 use phux_protocol::wire::frame::{
     AgentEvent, AttachTarget, Command, CommandResult, CommandValue, ControlAction, DetachReason,
     ErrorCode, FileUploadAck, InputMode, MAX_APPLY_INPUT_COMMAND_BODY, MAX_APPLY_INPUT_EVENTS,
-    MAX_FILE_UPLOAD_CHUNK, MAX_FILE_UPLOAD_SIZE, MoveError, MoveResult, Scope, SpawnError,
-    SpawnResult, StateScope, TerminalLifecycle, TerminalSignal, ViewportInfo,
+    MAX_FILE_UPLOAD_CHUNK, MAX_FILE_UPLOAD_SIZE, MoveError, MoveResult, ReportedAgentState, Scope,
+    SpawnError, SpawnResult, StateScope, TerminalLifecycle, TerminalSignal, ViewportInfo,
 };
 use phux_protocol::wire::info::{
     LayoutNode, SessionInfo, SessionSnapshot, SplitDir, TerminalInfo, WindowInfo,
@@ -1476,6 +1476,10 @@ fn command_simple_variants_round_trip() {
             question: "Deploy to prod?".to_owned(),
             suggestions: vec!["Yes".to_owned(), "No".to_owned(), "Hold".to_owned()],
             elapsed_seconds: Some(9),
+        },
+        Command::ReportAgentState {
+            terminal_id: TerminalId::local(7),
+            state: ReportedAgentState::Done,
         },
     ] {
         assert_round_trip(&FrameKind::Command {

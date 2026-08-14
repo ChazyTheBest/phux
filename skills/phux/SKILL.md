@@ -435,6 +435,7 @@ phux agent list --json                 # every pane, inferred state
 phux agent show --json @7              # one pane, the LEVEL read
 phux agent explain --json @7           # the evidence trail behind that state
 phux agent set @7 --name reviewer --kind claude --session review-fleet
+phux agent report-state @7 done          # integration-hook evidence
 phux agent clear @7
 ```
 
@@ -455,6 +456,10 @@ screen, the title, or process identity.
 - Passing `--state` **outranks the detector for the lifetime of the record**.
   You have taken over reporting; nothing will correct you. Use it only if you
   will keep it current, and `phux agent clear` when done.
+
+`phux agent report-state TARGET working|blocked|done` is for lifecycle hooks.
+It feeds immediate evidence into an already identified pane's detector without
+writing the record, so later process and screen evidence can still correct it.
 
 `phux agent explain --file capture.json --kind claude` runs entirely offline
 against a captured screen and contacts no server — the mode for debugging why

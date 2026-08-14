@@ -223,14 +223,13 @@ frozen tools. That is a large, visible break to remove one verb.
 > would spend a deprecation cycle on stable surface immediately before the
 > freeze.
 
-**DRAFT — ADR-0076 point 5, two factual corrections:** `--timeout MS` is wrong;
+**DRAFT — ADR-0076 point 5:** `--timeout MS` is wrong;
 the shipped flag is `--timeout SECS` (`crates/phux/src/commands/agent/mod.rs:141`,
 converted with `Duration::from_secs` at
 `crates/phux/src/commands/agent/wait.rs:136`), and ADR-0071 point 6 already says
-SECS. And after "an unknown spelling is a usage error (exit 2)", add: "`--until
-done` *alone* is likewise a usage error (`unsatisfiable_wait`, exit 2), since no
-shipped writer emits it; the default set is exempt, degrading to `idle,blocked`
-on an uninstrumented pane."
+SECS. The former recommendation to reject `--until done` alone was superseded
+by ADR-0085, which gives the bundled Claude hooks a non-latching `done`
+producer.
 
 ## 6. Conflict 5 — the normative spec contradiction
 
@@ -386,15 +385,9 @@ Recommended answers are marked **[R]**.
    set @N --name <name>`. That is the correct behaviour — a kind is not a name —
    but "the feature does nothing until you rename something" is a product fact
    the ADR currently leaves to inference.
-5. **Drop `done` from the default `--until` set (phux-w7z2.28)?** **[R] Keep it,
-   and document the shipped asymmetry instead.** `--until done` alone is already
-   refused as `unsatisfiable_wait` (`crates/phux/src/commands/agent/wait.rs:60-78`)
-   while the default set containing it is exempt — which is the right shape, since
-   an explicitly unsatisfiable request is a usage error and a default that
-   degrades to `idle,blocked` is not. It appears in no ADR and in no ADR-0071
-   enumeration. Dropping `done` instead costs the forward compatibility of an
-   instrumented agent that does write it, for no gain the exemption does not
-   already deliver.
+5. **Drop `done` from the default `--until` set (phux-w7z2.28)?** **[R] Keep it.**
+    ADR-0085 subsequently restored a shipped, hook-sourced `done` producer and
+    removed the obsolete `unsatisfiable_wait` refusal.
 6. **Does ADR-0075 point 5's guard also cover `attach` and `kill`?** **[R] No,
    and say so rather than leaving it to a verb list.** `attach` writes no bytes.
    `kill` targets the *pane*, not the occupant; refusing to kill a pane whose
@@ -444,9 +437,8 @@ Every item below was read in the tree.
 4. **ADR-0076 point 5 says `--timeout MS`; the shipped flag is SECS**
    (`crates/phux/src/commands/agent/mod.rs:141`, `agent/wait.rs:136`), and
    ADR-0071 point 6 already says SECS. The ADR is the one that is wrong.
-5. **A shipped CLI refusal appears in no ADR:** `--until done` alone is rejected
-   up front as `unsatisfiable_wait`, exit 2, with the default set exempt
-   (`crates/phux/src/commands/agent/wait.rs:60-78`, `:113-115`).
+5. **Resolved by ADR-0085:** `--until done` now has a shipped Claude-hook
+    producer and is no longer rejected up front.
 6. **`ADR/README.md`'s row for ADR-0076 is stale**, saying "the `wait` half
    shipped, the `prompt` half has not". `agent prompt` is fully wired and tested.
    (Not corrected here: the index is being touched concurrently by another

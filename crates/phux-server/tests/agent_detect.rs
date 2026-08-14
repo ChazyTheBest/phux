@@ -33,7 +33,9 @@
 use std::time::Duration;
 
 use phux_protocol::ids::TerminalId;
-use phux_protocol::wire::frame::{FrameKind, Scope, TERMINAL_AGENT_KEY, TYPE_ATTACHED};
+use phux_protocol::wire::frame::{
+    Command, CommandResult, FrameKind, ReportedAgentState, Scope, TERMINAL_AGENT_KEY, TYPE_ATTACHED,
+};
 use portable_pty::CommandBuilder;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -406,6 +408,47 @@ fn detector_publishes_blocked_from_a_live_prompt_box() {
             Some("claude"),
             "identity comes from the foreground process group, not the screen: {record}",
         );
+
+        // Hook evidence enters the same detector/metadata pipeline without
+        // replacing the record or disabling later screen correction.
+        send_frame(
+            &mut stream,
+            &FrameKind::Command {
+                request_id: 71,
+                command: Command::ReportAgentState {
+                    terminal_id: terminal.clone(),
+                    state: ReportedAgentState::Done,
+                },
+            },
+        )
+        .await;
+        let end = tokio::time::Instant::now() + DETECT_DEADLINE;
+        let mut acked = false;
+        let mut saw_done = false;
+        while !(acked && saw_done) {
+            let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "REPORT_AGENT_STATE did not converge");
+            let (_, frame) = timeout(remaining, recv_typed(&mut stream))
+                .await
+                .expect("REPORT_AGENT_STATE deadline");
+            match frame {
+                FrameKind::CommandResult {
+                    request_id: 71,
+                    result: CommandResult::Ok,
+                } => acked = true,
+                FrameKind::MetadataChanged { scope, key, value }
+                    if scope == Scope::Terminal(terminal.clone()) && key == TERMINAL_AGENT_KEY =>
+                {
+                    saw_done = value
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|record| record.get("state").cloned())
+                        .and_then(|state| state.as_str().map(str::to_owned))
+                        .as_deref()
+                        == Some("done");
+                }
+                _ => {}
+            }
+        }
         assert_eq!(
             record.get("name").and_then(serde_json::Value::as_str),
             Some("claude"),

@@ -403,14 +403,11 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
 - **`phux agent wait [--until STATE]... [--timeout SECS] [--json] [--socket P]
   [TARGET]`** — block until the pane's agent **transitions into** a lifecycle
   state. `--until` repeats and ORs over `idle`, `working`, `blocked`, `done`,
-  defaulting to `idle,blocked,done` — the three ways a turn ends. **`done` has
-  no producer in the shipped binary**: no detection manifest emits it (a
-  finished-while-nobody-looked turn is not a fact on the screen) and the
-  Claude hook shim no longer writes it either, because a hook that declares a
-  `state` stands the detector down on its own pane. It stays in the vocabulary
-  and in the default set for integrations that do write it, but on a pane
-  phux itself instrumented, `--until done` alone can only time out. Wait on
-  `idle` and `blocked` unless you know your integration declares `done`.
+  defaulting to `idle,blocked,done` — the three ways a turn ends. Detection
+  manifests cannot honestly derive `done` from a screen, but the bundled
+  Claude shim reports the Stop hook through `REPORT_AGENT_STATE`; therefore
+  `--until done` is meaningful on an instrumented Claude pane. Other agents
+  need their own lifecycle integration and may otherwise time out.
   `unknown` is not spellable: it is *departure*, not a state to wait for.
   A **satellite `TARGET` is refused** (`satellite_target`, exit 2) as soon as
   the selector resolves, before the wait subscribes to anything:
@@ -523,31 +520,30 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   Noninteractive/admin invocations such as `claude -p`, `claude mcp`, and
   `claude --version` bypass phux.
 
-  **The lifecycle hooks declare identity only — `--name claude --kind claude`,
-  never a `--state` — and only the session-start hook writes the record at
-  all.** They announce *who* occupies the pane and leave *what it is doing* to
-  the server's derivation, which is the whole point: a hook that declared a
+  **Only the session-start hook writes the record, and it declares identity
+  only — `--name claude --kind claude`, never a `--state`.** Per-turn hooks
+  feed `working`, `blocked`, and `done` to the server detector with `phux agent
+  report-state`; they do not write metadata. A hook that declared a
   `state` would stand the ADR-0046 detector down on that pane for the record's
   lifetime, and `claude.toml` is the deepest manifest phux ships. The
   per-turn hooks write nothing to the record because an identity write also
   replaces the derived `state` (§3.7 records are replaced wholesale, not
   merged), which a repeated write turns into a false departure edge.
-  Blocked notifications still emit `phux ask`, so phone and TUI fleet
+  The detector publishes hook evidence immediately, then resumes ordinary
+  screen derivation, so a missed cleanup hook cannot latch stale state. Blocked
+  notifications still emit `phux ask`, so phone and TUI fleet
   views see attention without screen inference; that path is unchanged and
-  keeps the hook's exact timing. What the shim no longer writes is `done` —
-  the Stop hook was phux's only `done` producer, and `agent wait --until done`
-  is unsatisfiable on a shim pane (see `agent wait` above). `working` and
-  `blocked` now come from `claude.toml` instead of the hook, so they carry up
-  to one detect tick of extra latency; they are no less correct, and unlike
-  the hook they keep working when Claude dies without running its cleanup.
+  keeps the hook's exact timing. The Stop hook is again an honest `done`
+  producer, so `agent wait --until done` is satisfiable on shim panes.
 
   The installed shim is **version-stamped** (`# phux-shim-schema: N` on the
   second line). `install-claude` reports `installed`, `reinstalled`, or
-  `upgraded ... (schema N -> 3)` so you can tell a no-op from a real
+  `upgraded ... (schema N -> 4)` so you can tell a no-op from a real
   migration. Upgrading the phux binary does **not** rewrite an already
   installed shim. Schema 1 declares state and stands the detector down;
   schema 2 rewrites the record on every hook and can publish a false
-  departure; schema 3 writes identity once at session start. `phux doctor`
+  departure; schema 3 writes identity once; schema 4 adds detector-ingress
+  lifecycle reports. `phux doctor`
   reports a stale installed schema and names `phux agent install-claude` as
   the repair.
 - **`phux agent uninstall-claude`** — remove only the phux-owned shim, hook

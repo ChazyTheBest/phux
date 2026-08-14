@@ -129,6 +129,9 @@ const VACANT_CONFIRMATIONS: u8 = 2;
 /// launched at pane creation is identified promptly instead of waiting out
 /// a full [`IDENTIFY_RECHECK`].
 const IDENTIFY_ACQUIRE_WINDOW: Duration = Duration::from_millis(1500);
+/// A hook can beat the first identity poll during process startup. Retain only
+/// a short-lived edge so it cannot attach to an unrelated future occupant.
+const HOOK_IDENTITY_GRACE: Duration = Duration::from_millis(1500);
 /// Identity poll interval inside [`IDENTIFY_ACQUIRE_WINDOW`].
 const IDENTIFY_ACQUIRE_POLL: Duration = Duration::from_millis(500);
 /// Publish nothing for this long after an agent is IDENTIFIED: agents paint a
@@ -347,6 +350,8 @@ pub(crate) struct AgentDetector {
     pending_idle: Option<PendingIdle>,
     /// The last state we derived (used when a scan is skipped).
     current: Option<DetectedState>,
+    /// Latest hook edge received just before process identity resolved.
+    pending_hook: Option<(DetectedState, Instant)>,
     cadence: Cadence,
     /// Test seam: where [`Self::reidentify`] gets identity from.
     #[cfg(test)]
@@ -383,6 +388,33 @@ impl std::fmt::Debug for AgentDetector {
 }
 
 impl AgentDetector {
+    /// Inject high-priority hook evidence without latching the metadata record.
+    /// The actor marks the grid dirty after this call, so the next ordinary
+    /// detector tick re-evaluates screen evidence and may supersede the hook.
+    pub(crate) fn report_hook_state(
+        &mut self,
+        state: DetectedState,
+        now: Instant,
+    ) -> Option<AgentReport> {
+        let Some(kind) = self.identified.clone() else {
+            self.pending_hook = Some((state, now));
+            return None;
+        };
+        let report = AgentReport {
+            name: self.manifest_name(&kind),
+            kind,
+            state,
+        };
+        self.pending_idle = None;
+        self.cadence = Cadence::Identified;
+        self.current = Some(state);
+        if self.published.as_ref() == Some(&report) {
+            return None;
+        }
+        self.published = Some(report.clone());
+        Some(report)
+    }
+
     /// Build a detector. `now` anchors the identity acquire window, so the
     /// caller constructs this at the moment the child actually begins
     /// painting. The startup grace is anchored on IDENTIFICATION instead.
@@ -399,6 +431,7 @@ impl AgentDetector {
             published: None,
             pending_idle: None,
             current: None,
+            pending_hook: None,
             cadence: Cadence::Unidentified,
             #[cfg(test)]
             identity_source: IdentitySource::Kernel,
@@ -487,6 +520,24 @@ impl AgentDetector {
         let Some(kind) = self.identified.clone() else {
             return DetectOutcome::Quiet;
         };
+
+        // A lifecycle hook may run before the actor's first identity poll.
+        // Publish that edge as soon as the process resolves, but never carry
+        // it far enough to describe an unrelated future occupant.
+        if let Some((state, reported_at)) = self.pending_hook.take()
+            && now.saturating_duration_since(reported_at) <= HOOK_IDENTITY_GRACE
+        {
+            let report = AgentReport {
+                name: self.manifest_name(&kind),
+                kind,
+                state,
+            };
+            self.pending_idle = None;
+            self.cadence = Cadence::Identified;
+            self.current = Some(state);
+            self.published = Some(report.clone());
+            return DetectOutcome::Publish(report);
+        }
 
         // 2. Startup grace. Identity may already be resolved; we simply do
         //    not publish while the splash paints. Anchored at IDENTIFICATION,
@@ -751,6 +802,7 @@ impl AgentDetector {
         self.identified_at = None;
         self.pending_idle = None;
         self.current = None;
+        self.pending_hook = None;
         self.cadence = Cadence::Unidentified;
         self.vacant_streak = 0;
         // Gate on having HAD an identity, not on `published`. Every explicit
@@ -878,8 +930,8 @@ mod tests {
     use super::identify::{Occupancy, Occupant};
     use super::rules::{ManifestSpec, RuleSet};
     use super::{
-        AgentDetector, DetectOutcome, DetectedState, IDLE_CONFIRMATIONS, STARTUP_GRACE,
-        TICK_CONFIRMING, TICK_IDENTIFIED, VACANT_CONFIRMATIONS,
+        AgentDetector, DetectOutcome, DetectedState, HOOK_IDENTITY_GRACE, IDLE_CONFIRMATIONS,
+        STARTUP_GRACE, TICK_CONFIRMING, TICK_IDENTIFIED, VACANT_CONFIRMATIONS,
     };
 
     /// A manifest exercising every arm of the hysteresis machine with
@@ -1090,6 +1142,46 @@ match = { contains = "WORKING" }
     fn done_publishes_on_the_first_tick() {
         let mut h = Harness::new().past_grace();
         assert_eq!(published(&h.tick("DONE")), DetectedState::Done);
+    }
+
+    #[test]
+    fn hook_done_is_immediate_and_the_next_screen_can_supersede_it() {
+        let mut h = Harness::new().past_grace();
+        let report = h
+            .detector
+            .report_hook_state(DetectedState::Done, h.now)
+            .expect("new edge");
+        assert_eq!(report.state, DetectedState::Done);
+        assert_eq!(h.state(), Some(DetectedState::Done));
+        assert_eq!(
+            published(&h.tick("WORKING")),
+            DetectedState::Working,
+            "hook evidence must not stand screen derivation down"
+        );
+    }
+
+    #[test]
+    fn hook_state_waits_for_the_first_identity_poll() {
+        let mut h = Harness::unidentified();
+        assert_eq!(
+            h.detector.report_hook_state(DetectedState::Done, h.now),
+            None
+        );
+        h.launch_agent("t");
+        assert_eq!(published(&h.actor_tick("WORKING")), DetectedState::Done);
+    }
+
+    #[test]
+    fn pre_identity_hook_expires_before_an_unrelated_future_occupant() {
+        let mut h = Harness::unidentified();
+        assert_eq!(
+            h.detector.report_hook_state(DetectedState::Done, h.now),
+            None
+        );
+        h.now += HOOK_IDENTITY_GRACE + Duration::from_millis(1);
+        h.launch_agent("t");
+        assert!(matches!(h.actor_tick("WORKING"), DetectOutcome::Quiet));
+        assert_eq!(h.state(), None);
     }
 
     #[test]

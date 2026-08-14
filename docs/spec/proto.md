@@ -253,9 +253,9 @@ within the payload as defined per-message and per-field.
 
 ## 6. Version and profile negotiation
 
-This document specifies protocol `0.7.0`. Major/minor identify the wire
+This document specifies protocol `0.8.0`. Major/minor identify the wire
 contract and MUST match exactly; patch differences are allowed and never change
-encoded bytes. Protocol `0.6.x` and `0.7.x` reject each other. Every stateful
+encoded bytes. Protocol `0.7.x` and `0.8.x` reject each other. Every stateful
 connection, including same-UID Unix sockets, performs HELLO. `PING` is the only
 frame permitted before HELLO.
 
@@ -330,6 +330,7 @@ ServerFeature = bitset (u32) {
     TERMINAL_REPLY     = 0x00000080, // INPUT_TERMINAL_REPLY (L1.md §3.4; ADR-0070)
     SHUTDOWN           = 0x00000100, // SHUTDOWN (L1.md §5.1)
     SPAWN_INITIAL_SIZE = 0x00000200, // SPAWN_TERMINAL.initial_size (L1.md §3.1)
+    REPORT_AGENT_STATE = 0x00000400, // REPORT_AGENT_STATE (L1.md §5.1; ADR-0085)
 }
 
 EngineFeatureSet = bitset (u32) {
@@ -357,13 +358,13 @@ only. Native is selected first when both peers advertise it, share an exact
 codec, and the feature intersection contains all four required v2 features,
 including `BOUNDED_HISTORY_CONTROL`. The current native offer bit/tag are
 `0x08`/`3`; legacy native bit/tag `0x01`/`0` are permanently retired and ignored,
-so mixed old/new 0.7 peers fall back to a commonly advertised synthesized
+so mixed peers fall back to a commonly advertised synthesized
 profile or fail with `CODEC_UNAVAILABLE` before attach. Otherwise the selected
 synthesized variant must be in both advertised sets. No fallback occurs after
 HELLO_OK.
 
 `ClientCapabilities` is one positional sub-record inside HELLO field 5. Protocol
-0.7 fixes this exact order:
+0.8 fixes this exact order:
 
 ```
 color: u8
@@ -391,10 +392,11 @@ above the negotiated bound before allocating it; opaque cursors are at most
 `ServerCapabilities` remains a positional prefix: `layers: u8` followed by
 optional `features: u32`. A one-byte legacy value therefore decodes with an
 empty feature set. `ACKNOWLEDGED_INPUT = 0x10`, `FILE_UPLOAD = 0x20`,
-`MOVE_TERMINAL = 0x40`, and `TERMINAL_REPLY = 0x80`; unknown feature bits are
-ignored. A client MUST use the corresponding frame only when its feature is
-advertised. In particular, the absence of `TERMINAL_REPLY` in an otherwise
-valid 0.7 `HELLO_OK` is authoritative: that server does not accept
+`MOVE_TERMINAL = 0x40`, `TERMINAL_REPLY = 0x80`, `SHUTDOWN = 0x100`,
+`SPAWN_INITIAL_SIZE = 0x200`, and `REPORT_AGENT_STATE = 0x400`; unknown feature
+bits are ignored. A client MUST use the corresponding frame only when its
+feature is advertised. In particular, the absence of `TERMINAL_REPLY` in an
+otherwise valid `HELLO_OK` is authoritative: that server does not accept
 `INPUT_TERMINAL_REPLY`.
 
 `SPAWN_INITIAL_SIZE = 0x200` is the one bit that gates a field rather than a

@@ -100,6 +100,7 @@ phux agent explain
 phux agent install-claude
 phux agent list
 phux agent prompt
+phux agent report-state
 phux agent send-keys
 phux agent set
 phux agent show

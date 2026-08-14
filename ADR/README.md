@@ -113,6 +113,7 @@ amends / extends) are hand-curated from each ADR's body.
 | [0079](./0079-fatal-signal-terminal-restore.md) | Fatal-signal terminal restore | Accepted (covers the teardown path `RawModeGuard::drop` and the panic hook cannot reach — a SIGSEGV/SIGBUS/SIGABRT out of [0004](./0004-libghostty-vt-as-grid.md)'s native engine, which does not unwind; vendors `phux-crash`, the workspace's only Apache-2.0-ONLY crate, keeping its `unsafe` behind a crate boundary as [0032](./0032-graceful-server-upgrade.md) does for `portable-pty-adopt`) |
 | [0082](./0082-retire-the-ci-metrics-store.md) | Retire the CI metrics store; the run page is the dashboard | Accepted (supersedes [0047](./0047-ci-metrics-branch.md) — deletes the `ci-metrics` branch, its collector, and the `observatory` lane, keeping only the zero-cost step-summary half; a hosted dashboard, if it returns, is the site's to own) |
 | [0084](./0084-starting-an-agent-in-an-existing-shell.md) | Starting an agent in an existing shell | Accepted (separates in-place, shell-evaluated startup from [0042](./0042-launch-executor.md)'s direct-argv pane creation; positive OSC 133 prompt evidence gates submission, detector publication supplies identity, and possible delivery retains the bound name) |
+| [0085](./0085-hook-sourced-agent-state.md) | Hook-sourced agent state is detector evidence | Accepted (adds capability-gated `REPORT_AGENT_STATE`: hooks publish immediate working/blocked/done edges through the detector without writing a state declaration that disables self-healing) |
 
 ## When to write an ADR
 

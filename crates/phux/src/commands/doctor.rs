@@ -725,6 +725,10 @@ const fn stale_shim_consequence(found: u32) -> &'static str {
              detected state at the end of every turn and makes `phux agent wait` report \
              the agent as departed"
         }
+        3 => {
+            "schema 3 leaves lifecycle timing to screen detection and cannot publish the \
+             Claude Stop hook's exact `done` edge"
+        }
         _ => "the installed shim predates this binary's wrapper behavior",
     }
 }

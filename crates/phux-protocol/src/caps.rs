@@ -806,6 +806,8 @@ pub const TERMINAL_REPLY: u32 = 0x0000_0080;
 pub const SHUTDOWN: u32 = 0x0000_0100;
 /// Wire bit advertising `SPAWN_TERMINAL.initial_size` (phux-a5xj).
 pub const SPAWN_INITIAL_SIZE: u32 = 0x0000_0200;
+/// Wire bit advertising hook-sourced agent-state evidence.
+pub const REPORT_AGENT_STATE: u32 = 0x0000_0400;
 
 /// An additive server-owned protocol feature.
 #[repr(u32)]
@@ -836,6 +838,8 @@ pub enum ServerFeature {
     /// can tell whether the geometry it just asked for was honored, and
     /// therefore whether its follow-up `TERMINAL_RESIZE` is redundant.
     SpawnInitialSize = SPAWN_INITIAL_SIZE,
+    /// The server accepts `REPORT_AGENT_STATE` hook evidence.
+    ReportAgentState = REPORT_AGENT_STATE,
 }
 
 /// Bit-field of additive server-owned protocol features.
@@ -848,7 +852,8 @@ impl ServerFeatureSet {
         | (ServerFeature::MoveTerminal as u32)
         | (ServerFeature::TerminalReply as u32)
         | (ServerFeature::Shutdown as u32)
-        | (ServerFeature::SpawnInitialSize as u32);
+        | (ServerFeature::SpawnInitialSize as u32)
+        | (ServerFeature::ReportAgentState as u32);
 
     /// Empty set for servers that advertise no additive features.
     #[must_use]
@@ -1497,12 +1502,14 @@ mod tests {
         assert_eq!(TERMINAL_REPLY, 0x0000_0080);
         assert_eq!(SHUTDOWN, 0x0000_0100);
         assert_eq!(SPAWN_INITIAL_SIZE, 0x0000_0200);
+        assert_eq!(REPORT_AGENT_STATE, 0x0000_0400);
         assert_eq!(ServerFeature::Shutdown as u32, SHUTDOWN);
         assert_eq!(ServerFeature::SpawnInitialSize as u32, SPAWN_INITIAL_SIZE);
         assert_eq!(ServerFeature::AcknowledgedInput as u32, ACKNOWLEDGED_INPUT);
         assert_eq!(ServerFeature::FileUpload as u32, FILE_UPLOAD);
         assert_eq!(ServerFeature::MoveTerminal as u32, MOVE_TERMINAL);
         assert_eq!(ServerFeature::TerminalReply as u32, TERMINAL_REPLY);
+        assert_eq!(ServerFeature::ReportAgentState as u32, REPORT_AGENT_STATE);
         let set = ServerFeatureSet::with(&[
             ServerFeature::AcknowledgedInput,
             ServerFeature::FileUpload,
@@ -1521,8 +1528,9 @@ mod tests {
             ServerFeature::TerminalReply,
             ServerFeature::Shutdown,
             ServerFeature::SpawnInitialSize,
+            ServerFeature::ReportAgentState,
         ]);
-        assert_eq!(full.as_wire(), 0x0000_03F0);
+        assert_eq!(full.as_wire(), 0x0000_07F0);
         let future = 1_u32 << 31;
         assert!(ServerFeatureSet::from_wire(future).is_empty());
         assert_eq!(ServerFeatureSet::from_wire(set.as_wire() | future), set);

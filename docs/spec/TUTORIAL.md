@@ -14,7 +14,7 @@ last-reviewed: 2026-08-02
 
 A phux session, in one breath: a client connects to a server, negotiates capabilities, attaches to a terminal (or creates one), receives a stream of VT bytes as the PTY emits them, sends keypresses and mouse events back, and eventually detaches. The flow is asymmetric on purpose. The server sends opaque terminal **bytes**; the client sends **structured** input events. Both ends run the same terminal engine (libghostty), so neither side re-encodes terminal state into a second model — the bytes go straight onto the wire and are parsed once on each end.
 
-Protocol version for this walkthrough is `0.7.0`.
+Protocol version for this walkthrough is `0.8.0`.
 
 ---
 

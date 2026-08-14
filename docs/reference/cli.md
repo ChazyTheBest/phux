@@ -185,6 +185,7 @@ Commands:
   show              Show inferred state for one pane
   explain           Explain the evidence behind one pane's state
   set               Declare the agent identity and state associated with a pane
+  report-state      Report hook-sourced lifecycle evidence to the pane's detector
   wait              Block until a pane's agent TRANSITIONS into a lifecycle state
   prompt            Hand an agent a turn's worth of work, with a delivery receipt
   send-keys         Send keys to a pane, but only if it still hosts the expected agent
@@ -393,6 +394,30 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `phux agent report-state`
+
+```text
+Report hook-sourced lifecycle evidence to the pane's detector
+
+Usage: phux agent report-state [OPTIONS] <TARGET> <STATE>
+
+Arguments:
+  <TARGET>
+          Target selector (resolves to one pane)
+
+  <STATE>
+          Lifecycle evidence from the integration hook
+
+          [possible values: working, blocked, done]
+
+Options:
+      --socket <PATH>
+          Override the UDS path of the server to dial. Defaults to `$PHUX_SOCKET`, else `$XDG_RUNTIME_DIR/phux/phux.sock` (or `/tmp/phux-$USER/phux.sock` if `XDG_RUNTIME_DIR` isn't set)
+
+  -h, --help
+          Print help
 ```
 
 ## `phux agent send-keys`

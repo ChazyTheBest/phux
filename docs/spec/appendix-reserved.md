@@ -57,6 +57,7 @@ their own one-byte tag inside it. Allocated tags:
 | `0x14` | `APPLY_INPUT`               | [L1.md](./L1.md) | shipped |
 | `0x15` | `PUT_FILE`                  | [L1.md](./L1.md) | shipped |
 | `0x16` | `SHUTDOWN`                  | [L1.md](./L1.md) | shipped |
+| `0x17` | `REPORT_AGENT_STATE`        | [L1.md](./L1.md) | shipped |
 
 `KILL_TERMINALS` at tag `0x09` reuses the slot freed by the removed
 `CREATE_SESSION` command. Per

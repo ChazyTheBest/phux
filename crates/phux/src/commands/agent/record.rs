@@ -104,7 +104,7 @@ pub(super) fn run_agent_clear(target: Option<&str>, socket: Option<PathBuf>) -> 
 
 /// Resolve `target` to exactly one pane (focused-pane fallback, like
 /// `agent show`) and run `body` against it on a fresh connection.
-fn with_target_pane<F>(
+pub(super) fn with_target_pane<F>(
     target: Option<&str>,
     socket: Option<PathBuf>,
     verb: &'static str,

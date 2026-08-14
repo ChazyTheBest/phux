@@ -2243,6 +2243,16 @@ pub(crate) fn route_to_satellite(command: &Command) -> Option<(SatelliteHost, Co
                 },
             ))
         }
+        Command::ReportAgentState { terminal_id, state } => {
+            let (host, id) = satellite_route(terminal_id)?;
+            Some((
+                host,
+                Command::ReportAgentState {
+                    terminal_id: TerminalId::local(id),
+                    state: *state,
+                },
+            ))
+        }
         // GET_STATE / UPGRADE are hub-local; KILL_TERMINALS partitions its
         // mixed batch in `handle_kill_terminals`; forward-compat commands
         // this hub does not know cannot be routed (their terminal scope is
@@ -2440,11 +2450,15 @@ mod tests {
                 signal: phux_protocol::wire::frame::TerminalSignal::Interrupt,
             },
             Command::ReportAsked {
-                terminal_id: sat,
+                terminal_id: sat.clone(),
                 id: "q".to_owned(),
                 question: "?".to_owned(),
                 suggestions: vec![],
                 elapsed_seconds: None,
+            },
+            Command::ReportAgentState {
+                terminal_id: sat,
+                state: phux_protocol::wire::frame::ReportedAgentState::Done,
             },
         ];
         for command in commands {

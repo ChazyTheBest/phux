@@ -1004,7 +1004,7 @@ fn old_engine_capabilities_fall_back_without_changing_protocol_version() {
             .0,
         BootstrapProfile::SynthesizedVtRaw
     );
-    assert_eq!((PROTOCOL_VERSION.major, PROTOCOL_VERSION.minor), (0, 7));
+    assert_eq!((PROTOCOL_VERSION.major, PROTOCOL_VERSION.minor), (0, 8));
     assert_eq!(EngineCodec::LibghosttyCheckpointV2.as_wire(), 2);
 }
 
