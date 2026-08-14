@@ -505,6 +505,22 @@ fn root_help_documents_exit_status() {
     }
 }
 
+#[test]
+fn parser_reserved_agent_selector_is_not_advertised_as_live() {
+    let mut root = Cli::command();
+    let help = root.render_long_help().to_string();
+    assert!(
+        !help.contains("%agent-name"),
+        "root --help advertises the parser-reserved `%name` form as live"
+    );
+
+    let skill = crate::skill::render(crate::skill::SkillScope::Full);
+    assert!(
+        skill.contains("no shipped verb resolves it"),
+        "the compiled skill must explain that `%name` is parser-reserved"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The compiled agent skill vs the surface it describes
 //

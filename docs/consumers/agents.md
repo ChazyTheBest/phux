@@ -733,10 +733,14 @@ never parses a selector.
 
 The full grammar table and CLI examples live in [`tui.md`](./tui.md) §3. In one
 line, the forms are: `.` (current), `name` (session), `name:N` / `name:tag`
-(window), `name:N.M` (pane), `@N` (opaque id), and `%name` (an explicitly
-declared agent name). `%name` never matches detector-default kind names and
-refuses ambiguity rather than choosing among duplicate declarations. `=` is explicitly
+(window), `name:N.M` (pane), and `@N` (opaque id). `=` is explicitly
 unsupported for headless commands because they have no attached-client MRU.
+
+`%name` is reserved for the proposed agent-name addressing contract in
+[ADR-0075](../../ADR/0075-agent-name-addressing.md), but no shipped CLI verb
+resolves it yet. It fails closed as a selector miss rather than choosing a
+pane. Use the direct `@N` returned by inventory and creation verbs until that
+ADR is accepted and implemented.
 
 A selector that names several panes (a whole session or window) narrows to a
 single pane: the focused pane when it is among the matches, else the first in

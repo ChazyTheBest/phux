@@ -209,8 +209,8 @@ impl Refusal {
 ///
 /// Checked locally so a typo fails before any round trip. The record's `name`
 /// stays "any non-empty string" per `L3.md` §3.7 — this narrower grammar is
-/// what `%name` can address, and binding a name this verb's own success makes
-/// addressable would be dishonest.
+/// reserved for `%name` if ADR-0075 is accepted. The shipped selector surface
+/// still requires a direct Terminal id.
 #[must_use]
 pub(super) fn is_addressable_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -1546,8 +1546,8 @@ mod tests {
         }
     }
 
-    /// The grammar this verb binds is exactly the one `%name` can address:
-    /// binding a name its own success cannot address would be dishonest.
+    /// The grammar this verb binds is the one reserved for the proposed
+    /// `%name` selector.
     #[test]
     fn bound_names_are_addressable_names() {
         for name in ["build", "a", "rev-2", "with_underscore", &"x".repeat(32)] {

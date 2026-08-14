@@ -80,7 +80,7 @@ FEDERATION
   relay      Run a standalone relay, or enroll a route with it
 
 TARGET is a session name, `name:window`, `name:window.pane`, `@id`,
-`#tag`, `%agent-name`, or `.` (focused). `=` is reserved for the
+`#tag`, or `.` (focused). `=` is reserved for the
 attached view's focus history. The same selectors work across
 kill/snapshot/send-keys/run/wait/ask.
 
@@ -504,7 +504,7 @@ Usage: phux agent start [OPTIONS] --kind <KIND> --target <TARGET> <NAME> [-- <AR
 
 Arguments:
   <NAME>
-          Human-facing agent name to bind to the pane. Must match `^[a-z][a-z0-9_-]{0,31}$` so `%NAME` can address it afterwards
+          Human-facing agent name to bind to the pane. Must match `^[a-z][a-z0-9_-]{0,31}$`
 
   [ARGS]...
           Extra arguments appended to the integration's launch command

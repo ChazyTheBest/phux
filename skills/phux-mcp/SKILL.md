@@ -39,10 +39,10 @@ Read, act, observe under a finite bound, then verify with another read.
 6. Re-read state. A watcher ending or a quiet pane is not completion.
 
 Prefer returned direct selectors such as `@7` and `host/@7` for writes. Session
-names and `#tags` can select sets. `.` means the focused session. `%name` means
-one addressable agent. `=` is unavailable because headless MCP has no attached
-client's focus history. MCP layout tools change persisted topology but never
-move a human's client-local focus.
+names and `#tags` can select sets. `.` means the focused session. `%name` is
+reserved but no shipped MCP tool resolves it yet; use `@N`. `=` is unavailable
+because headless MCP has no attached client's focus history. MCP layout tools
+change persisted topology but never move a human's client-local focus.
 
 ## Agent lifecycle and delivery
 

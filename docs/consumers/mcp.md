@@ -147,8 +147,7 @@ takes a `target` selector string in the **same grammar as the CLI's
 `TARGET`**, whose table and examples live in
 [`tui.md`](./tui.md) §3. In one line, the forms are: `.` (current), `=`
 (last), `name` (session), `name:N` / `name:tag` (window), `name:N.M`
-(pane), `@N` (local opaque id), `host/@N` (satellite terminal), `%name`
-(an explicitly declared agent name), and `#tag`
+(pane), `@N` (local opaque id), `host/@N` (satellite terminal), and `#tag`
 (tag set, where the tool permits a set).
 
 Resolution is **client-side**, exactly as the CLI resolves it
@@ -171,8 +170,12 @@ attached-client focus history; callers must use `.` or an explicit target.
   the focused-pane tiebreak.
 - `phux_launch` and `phux_spawn` use optional `target` only for explicit local
   placement. The pane-specific `phux_agent_*` tools document optionality in
-  their schemas. `%name` never matches detector-default kind labels and
-  refuses ambiguity rather than choosing among duplicate declarations.
+  their schemas.
+
+`%name` is reserved for the proposed agent-name addressing contract in
+[ADR-0075](../../ADR/0075-agent-name-addressing.md), but no shipped MCP tool
+resolves it yet. It fails closed as a selector miss. Use a direct `@N` target
+until the ADR is accepted and implemented.
 
 Server-facing tools also take an optional `socket` string naming the
 Unix-domain socket to connect to. Precedence: an explicit `socket`

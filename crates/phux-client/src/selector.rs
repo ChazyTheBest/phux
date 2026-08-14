@@ -22,7 +22,7 @@
 //! | `@N`        | an opaque local Terminal id (`TerminalId::local(N)`) |
 //! | `host/@N`   | an opaque satellite Terminal id owned by `host`      |
 //! | `#tag`      | every Terminal carrying L3 tag `tag` (`phux.tags/v1`) |
-//! | `%name`     | the one hub-local Terminal whose `phux.agent/v1` name is `name` |
+//! | `%name`     | reserved agent-name form; no shipped verb resolves it  |
 //!
 //! `host` is an opaque registry token and may contain any UTF-8 text,
 //! including `/@` or be empty. Parsing uses the final `/@` delimiter so the
@@ -34,12 +34,13 @@
 //! [`resolve_with_tags`]. The server stays selector-agnostic
 //! ([ADR-0017](../../../ADR/0017-tui-not-protocol-privileged.md)).
 //!
-//! The `%name` form ([ADR-0075](../../../ADR/0075-agent-name-addressing.md))
-//! is the odd one out: it is the only selector that resolves to **exactly
-//! one** Terminal *or refuses*. It therefore does **not** go through
+//! The `%name` form is parser-reserved for the proposed
+//! [ADR-0075](../../../ADR/0075-agent-name-addressing.md). Its dormant resolver
+//! yields **exactly one** Terminal or refuses, so it does **not** go through
 //! [`resolve_with_tags`] — see [`resolve_agent`] and
-//! [`resolve_agent_for_input`], and read the warning on
-//! [`resolve_with_tags`] before adding a caller.
+//! [`resolve_agent_for_input`]. No shipped CLI or MCP verb calls those
+//! functions yet; every current command fails closed through the set-valued
+//! seam.
 
 use phux_protocol::ids::TerminalId;
 use phux_protocol::wire::info::SessionSnapshot;
@@ -69,14 +70,12 @@ pub enum Selector {
     /// `#tag` — every Terminal carrying the L3 tag `tag` (`phux.tags/v1`).
     /// Resolves to a set; see [`resolve_with_tags`].
     Tag(String),
-    /// `%name` — the one hub-local Terminal whose `phux.agent/v1` record is
-    /// named `name` (ADR-0075).
+    /// `%name` — the parser-reserved agent-name form proposed by ADR-0075.
     ///
-    /// Singular by construction: it resolves through [`resolve_agent`], which
-    /// yields one [`TerminalId`] or an [`AgentResolveError`]. It deliberately
-    /// resolves to nothing through the set-valued [`resolve_with_tags`] seam,
-    /// so a caller that has not been taught the singular form gets a selector
-    /// miss instead of an arbitrary pane.
+    /// Its dormant singular resolver, [`resolve_agent`], yields one
+    /// [`TerminalId`] or an [`AgentResolveError`]. It deliberately resolves to
+    /// nothing through the set-valued [`resolve_with_tags`] seam, which is the
+    /// path every shipped command currently uses.
     Agent(String),
 }
 

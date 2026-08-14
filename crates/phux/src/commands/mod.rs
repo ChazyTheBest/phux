@@ -2464,10 +2464,9 @@ mod tests {
                 id: 42,
             },
         );
-        // ADR-0075: `%name` addresses one agent by the name its
-        // `phux.agent/v1` record carries. Singular by construction — it
-        // resolves through `phux_client::selector::resolve_agent`, never
-        // through `resolve_targets` + `pick_target_pane`.
+        // ADR-0075 reserves `%name` for singular agent-name resolution. No
+        // shipped command calls that resolver yet, so it currently fails
+        // closed through the set-valued path.
         assert_eq!(
             parse_selector(Some("%build")).unwrap(),
             Selector::Agent("build".to_owned()),

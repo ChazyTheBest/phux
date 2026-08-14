@@ -97,8 +97,8 @@ production never builds (the ADR-0030 demotion cascade).
    `--choice` or `--text` and the explicit `--allow-unlisted` override; `agent
    start NAME --kind KIND --target TARGET` (`--integration`, `--timeout`,
    `--no-wait`, `--force`, trailing argv, `--json`); `agent install-claude`
-   and `agent uninstall-claude`; `spawn`; `launch`; `%name` selectors over
-   explicit names only and `#tag` selectors over pane tags; `watch --until
+   and `agent uninstall-claude`; `spawn`; `launch`; `#tag` selectors over pane
+   tags; `watch --until
    EVENT --timeout SECS`; `worktree new --json`; `skill`; `snapshot --tail[=N]`
    and `--unwrap` with `--rendered`'s
    conflict set; `wait --regex`, `--tail[=N]`, `--output-only`. **`--json`

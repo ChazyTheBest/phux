@@ -131,7 +131,7 @@ mod help_inventory;
           pair       Mint a pairing token for a remote consumer\n  \
           relay      Run a standalone relay, or enroll a route with it\n\n\
         TARGET is a session name, `name:window`, `name:window.pane`, `@id`,\n\
-        `#tag`, `%agent-name`, or `.` (focused). `=` is reserved for the\n\
+        `#tag`, or `.` (focused). `=` is reserved for the\n\
         attached view's focus history. The same selectors work across\n\
         kill/snapshot/send-keys/run/wait/ask.",
     // The EXIT STATUS section renders from the canonical table in

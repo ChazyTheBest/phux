@@ -106,7 +106,7 @@ flag placed after them is swallowed into the payload.
 | `name:W` | window `W` (index or window name) of that session |
 | `name:W.P` | pane `P` of window `W` |
 | `#tag` | every pane carrying L3 tag `tag` (see `phux tag`) |
-| `%name` | the one pane whose agent record is named `name` |
+| `%name` | reserved; no shipped verb resolves it yet, so it fails closed |
 | `=` | refused: it means the attached TUI's focus history, which a headless caller does not have |
 
 Get ids from the JSON of the verb that created the pane (`phux new --json`,
@@ -118,29 +118,10 @@ every pane in the session, and `phux tag add #web ci` tags every match. Verbs
 that need exactly one pane pick a representative from a set, which is fine for
 a read and wrong for a write. Address writes with `@N`.
 
-`%name` is the exception that never picks a representative: a name's whole
-value is that it names one thing, so it refuses instead of narrowing. Three
-distinct refusals, and they mean different things:
-
-- **exit 1** — no live pane holds that name. It does not exist.
-- **exit 2** — more than one pane holds it, or the name is a detector-written
-  kind constant (a pane whose `name` equals its `kind`). Fix it by choosing a
-  per-pane name: `phux agent set @N --name reviewer`. Retrying will not help.
-- **exit 3** — the index could not be built completely (an unreachable
-  federation satellite). The pane may exist; retry once the link is back.
-
-An agent that treats exit 2 as "retry" will loop forever. Branch on the status.
-
-`%name` is hub-local: a satellite's agents are not in the index. The
-addressable name grammar is `^[a-z][a-z0-9_-]{0,31}$`, checked before any
-round trip, so a typo fails locally. Give a pane an addressable name with
-`phux agent set @N --name reviewer` or by starting it with
-`phux agent start --kind claude --target @N reviewer`.
-
-`%name` is the newest form and verbs adopt it one at a time. Where a verb has
-not, it fails **closed** — a plain selector miss, exit 1 — rather than landing
-on the wrong pane. Check `phux help <verb>`, and keep `@N` for anything
-destructive.
+`%name` is parser-reserved for a proposed agent-name addressing contract, but
+no shipped verb resolves it. It fails **closed** as a selector miss rather
+than landing on the wrong pane. Use `@N`, especially for writes and destructive
+operations.
 
 **Sigil hygiene.** `%` is shell-safe unquoted in `sh`, `bash`, and `zsh`, which
 is why it was chosen. It is *not* safe everywhere else: `%` is a format
@@ -415,10 +396,10 @@ is a delivery or transport failure. Plain `phux send-keys` deliberately checks
 no identity and carries no receipt — use it when a *pane* is what you mean, and
 the agent form when an *agent* is.
 
-A write to a `%name` target is additionally refused when the record carries a
-`kind` and `state: "unknown"` — the exact shape a withdrawal leaves behind,
-which is positive evidence that something which knew this pane gave the claim
-up. Read-only verbs skip that gate.
+The reserved `%name` resolver includes a withdrawn-record safety gate, but no
+shipped write verb calls that resolver yet. Address the pane directly with
+`@N`; identity-sensitive writes still re-read and verify the record through
+`--expect-agent` and `--expect-kind`.
 
 ---
 
@@ -433,8 +414,8 @@ phux agent start --kind claude --target @7 --timeout 120 --json reviewer
 `phux agent start` creates, splits, and moves nothing: it types the
 integration's launch command into a pane whose child is a live shell, submits
 it as one acknowledged batch, binds `NAME` to the pane, and returns when the
-agent is **ready for input**. `NAME` must match the addressable grammar, so
-`%NAME` works immediately afterwards.
+agent is **ready for input**. `NAME` must match the reserved agent-name grammar,
+but the shipped selector surface still addresses the pane by `@N`.
 
 Ready means the first detector publication after submit, not `state == idle` —
 `idle` is the fail-safe fallthrough, so a gate on it would report ready for a

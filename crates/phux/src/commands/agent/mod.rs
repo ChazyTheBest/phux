@@ -299,7 +299,7 @@ pub(crate) enum AgentAction {
     /// readiness.
     Start {
         /// Human-facing agent name to bind to the pane. Must match
-        /// `^[a-z][a-z0-9_-]{0,31}$` so `%NAME` can address it afterwards.
+        /// `^[a-z][a-z0-9_-]{0,31}$`.
         name: String,
         /// Detection-manifest kind the started agent must identify as
         /// (`claude`, `codex`, ...). `phux agent explain --file` lists the
