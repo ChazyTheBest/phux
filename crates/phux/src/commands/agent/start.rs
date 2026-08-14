@@ -85,6 +85,7 @@ use std::time::{Duration, Instant};
 use phux_client::agent_meta::{
     AgentMetaState, AgentRecord, TERMINAL_AGENT_KEY, parse_agent_record,
 };
+use phux_client::agent_prompt::{ApplyVerdict, Refusal as ApplyRefusal, apply_input_once};
 use phux_client::agent_wait::{AgentWaitError, AgentWaitResult, wait_for_agent_state};
 use phux_client::attach::AttachError;
 use phux_client::attach::connection::{Answer, Connection};
@@ -92,7 +93,7 @@ use phux_core::screen::{ScreenState, SemanticContent};
 use phux_protocol::caps::ServerFeature;
 use phux_protocol::ids::{InputOperationId, TerminalId};
 use phux_protocol::input::InputEvent;
-use phux_protocol::wire::frame::{Command, CommandResult, ErrorCode, FrameKind, Scope};
+use phux_protocol::wire::frame::{FrameKind, Scope};
 use phux_server::agent_explain::{self, Explanation};
 use phux_server::runtime::default_socket_path;
 
@@ -1138,8 +1139,8 @@ struct SubmitFailure {
     wrote_nothing: bool,
 }
 
-/// Submit the batch under `operation_id` and map the reply onto ADR-0076
-/// point 2's readings.
+/// Submit the batch under `operation_id` through the shared acknowledged-input
+/// classifier and map its verdict onto this verb's diagnostics.
 async fn apply_input(
     conn: &mut Connection,
     terminal: &TerminalId,
@@ -1157,15 +1158,7 @@ async fn apply_input(
             wrote_nothing: true,
         });
     };
-    let reply = conn
-        .request(
-            110,
-            Command::ApplyInput {
-                operation_id,
-                terminal_id: terminal.clone(),
-                events,
-            },
-        )
+    let (verdict, interleaved) = apply_input_once(conn, terminal, operation_id, events, 110)
         .await
         .map_err(|err| SubmitFailure {
             refusal: Refusal::new(
@@ -1178,30 +1171,24 @@ async fn apply_input(
             // frame; treat the pane as touched rather than guessing.
             wrote_nothing: false,
         })?;
-    match reply.into_result_ignoring_interleaved() {
-        CommandResult::Ok | CommandResult::OkWith(_) => Ok(()),
-        CommandResult::Error { code, message } => Err(submit_error(code, &message)),
-        other => Err(SubmitFailure {
-            refusal: Refusal::new(
-                json_err::codes::TRANSPORT,
-                format!("unexpected reply to APPLY_INPUT: {other:?}"),
-                "run `phux doctor` for a health check",
-                EXIT_FAILURE,
-            ),
-            wrote_nothing: false,
-        }),
+    debug_assert!(
+        interleaved.is_empty(),
+        "unsubscribed connection received {interleaved:?} ahead of the APPLY_INPUT ack",
+    );
+    match verdict {
+        ApplyVerdict::Acked => Ok(()),
+        other => Err(submit_verdict(other)),
     }
 }
 
-/// Map one `APPLY_INPUT` refusal onto its code, exit status, and unwind
-/// safety (ADR-0076 point 2).
-fn submit_error(code: ErrorCode, message: &str) -> SubmitFailure {
-    match code {
-        // Terminal, and NOT exit 3: a same-id retry replays the cached
-        // unknown and a new-id retry is the duplicate the acknowledged lane
-        // exists to prevent, so "retry is correct" — the published meaning of
-        // 3 — would be a lie.
-        ErrorCode::InputDeliveryUnknown => SubmitFailure {
+/// Map the shared acknowledged-input verdict onto this verb's exit contract
+/// and bind-unwind safety.
+fn submit_verdict(verdict: ApplyVerdict) -> SubmitFailure {
+    match verdict {
+        // Terminal, and NOT exit 3: a same-id retry replays the cached unknown
+        // and a new-id retry is the duplicate the acknowledged lane exists to
+        // prevent, so "retry is correct" would be a lie.
+        ApplyVerdict::Unknown(message) => SubmitFailure {
             refusal: Refusal::new(
                 codes::AGENT_START_UNKNOWN,
                 format!("whether the launch command reached the pane is unknown: {message}"),
@@ -1212,7 +1199,35 @@ fn submit_error(code: ErrorCode, message: &str) -> SubmitFailure {
             ),
             wrote_nothing: false,
         },
-        ErrorCode::InputLeaseHeld => SubmitFailure {
+        ApplyVerdict::Busy(message) => SubmitFailure {
+            refusal: Refusal::new(
+                codes::AGENT_START_FAILED,
+                format!("the acknowledged input lane is busy: {message}"),
+                "nothing was typed; the lane is server-wide and single — back off and retry",
+                EXIT_FAILURE,
+            ),
+            wrote_nothing: true,
+        },
+        ApplyVerdict::NotWritten(message) => SubmitFailure {
+            refusal: Refusal::new(
+                codes::AGENT_START_FAILED,
+                format!("the launch command was not written: {message}"),
+                "nothing reached the pane; inspect its health, then retry — even a fresh \
+                 operation id cannot duplicate this attempt",
+                EXIT_FAILURE,
+            ),
+            wrote_nothing: true,
+        },
+        ApplyVerdict::NotFound(message) => SubmitFailure {
+            refusal: Refusal::new(
+                codes::AGENT_START_FAILED,
+                format!("the target pane disappeared before input handoff: {message}"),
+                "nothing was typed; choose a live shell pane and retry",
+                EXIT_FAILURE,
+            ),
+            wrote_nothing: true,
+        },
+        ApplyVerdict::Refused(ApplyRefusal::InputLeaseHeld(message)) => SubmitFailure {
             refusal: Refusal::new(
                 codes::AGENT_START_FAILED,
                 format!("another client holds the input lease on this pane: {message}"),
@@ -1221,7 +1236,7 @@ fn submit_error(code: ErrorCode, message: &str) -> SubmitFailure {
             ),
             wrote_nothing: true,
         },
-        ErrorCode::CanonicalLimitExceeded => SubmitFailure {
+        ApplyVerdict::Refused(ApplyRefusal::CanonicalLimitExceeded(message)) => SubmitFailure {
             refusal: Refusal::new(
                 codes::INVALID_LAUNCH_ARGV,
                 format!("the launch command exceeds the acknowledged-input limits: {message}"),
@@ -1230,21 +1245,21 @@ fn submit_error(code: ErrorCode, message: &str) -> SubmitFailure {
             ),
             wrote_nothing: true,
         },
-        ErrorCode::ResourceExhausted => SubmitFailure {
+        ApplyVerdict::Refused(reason) => SubmitFailure {
             refusal: Refusal::new(
                 codes::AGENT_START_FAILED,
-                format!("the acknowledged input lane is busy: {message}"),
-                "nothing was typed; the lane is server-wide and single — back off and \
-                 retry, unchanged, under the same operation id",
-                EXIT_FAILURE,
+                format!("the launch command was refused: {reason}"),
+                "nothing was typed; correct the refusal before retrying",
+                EXIT_USAGE,
             ),
             wrote_nothing: true,
         },
-        _ => SubmitFailure {
+        // Handled by the caller; retained so this mapping is total.
+        ApplyVerdict::Acked => SubmitFailure {
             refusal: Refusal::new(
-                codes::AGENT_START_FAILED,
-                format!("the launch command was refused: {message}"),
-                "run `phux doctor` for a health check",
+                json_err::codes::INTERNAL_ERROR,
+                "an acknowledged launch command was mapped as a failure",
+                "report this",
                 EXIT_FAILURE,
             ),
             wrote_nothing: false,
@@ -1762,36 +1777,41 @@ mod tests {
         );
     }
 
-    /// ADR-0076 point 2's readings, pinned. The distinction that matters is
-    /// `wrote_nothing`: it is the only thing that makes rolling the bound
-    /// name back safe, and it is false for `INPUT_DELIVERY_UNKNOWN` by
-    /// definition.
+    /// The shared verdicts retain their proof boundary when projected onto
+    /// start-specific errors. `NotWritten` must roll the provisional name
+    /// back; `Unknown` must retain it.
     #[test]
-    fn submit_errors_map_to_their_unwind_safety_and_exit() {
-        let unknown = submit_error(ErrorCode::InputDeliveryUnknown, "lost");
+    fn submit_verdicts_map_to_their_unwind_safety_and_exit() {
+        let unknown = submit_verdict(ApplyVerdict::Unknown("lost".to_owned()));
         assert!(!unknown.wrote_nothing);
         assert_eq!(unknown.refusal.err.code, codes::AGENT_START_UNKNOWN);
         // NOT exit 3: 3 means "retry is correct", and retrying this under a
         // new id produces the duplicate the acknowledged lane prevents.
         assert_eq!(unknown.refusal.exit, EXIT_FAILURE);
 
-        for code in [
-            ErrorCode::InputLeaseHeld,
-            ErrorCode::CanonicalLimitExceeded,
-            ErrorCode::ResourceExhausted,
+        for verdict in [
+            ApplyVerdict::Busy("no".to_owned()),
+            ApplyVerdict::NotWritten("no PTY".to_owned()),
+            ApplyVerdict::NotFound("gone".to_owned()),
+            ApplyVerdict::Refused(ApplyRefusal::InputLeaseHeld("no".to_owned())),
+            ApplyVerdict::Refused(ApplyRefusal::CanonicalLimitExceeded("no".to_owned())),
         ] {
-            let failure = submit_error(code, "no");
+            let failure = submit_verdict(verdict);
             assert!(
                 failure.wrote_nothing,
-                "{code:?} is a pre-handoff refusal and must be unwindable"
+                "a proven non-delivery must be unwindable: {failure:?}"
             );
         }
         assert_eq!(
-            submit_error(ErrorCode::InputLeaseHeld, "no").refusal.exit,
+            submit_verdict(ApplyVerdict::Refused(ApplyRefusal::InputLeaseHeld(
+                "no".to_owned()
+            )))
+            .refusal
+            .exit,
             EXIT_USAGE
         );
         assert_eq!(
-            submit_error(ErrorCode::ResourceExhausted, "no")
+            submit_verdict(ApplyVerdict::Busy("no".to_owned()))
                 .refusal
                 .exit,
             EXIT_FAILURE
