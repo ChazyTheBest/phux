@@ -241,6 +241,23 @@ pub fn answer_events(text: &str) -> Vec<InputEvent> {
 /// nothing this client sends can interleave between the liveness check and the
 /// write.
 ///
+/// # This is a single [`apply_input_once`] call, not [`crate::agent_prompt::deliver_acknowledged`]
+///
+/// `agent prompt` and `agent send-keys` both go through `deliver_acknowledged`,
+/// which retries [`ApplyVerdict::Busy`] under [`crate::agent_prompt::submit_with_backoff`]
+/// on the same operation id. This function deliberately does not: the caller's
+/// pre-write liveness check (a `GET_STATE` title read, matched against the
+/// asker's `--id`) is a snapshot that goes stale the moment the pane's title
+/// changes, and a multi-second backoff sleep is exactly long enough for that to
+/// happen — retrying here would risk typing a validated answer into a question
+/// the agent has since moved past, which is the one failure this verb exists to
+/// prevent. `ApplyVerdict::Busy` is therefore surfaced to the caller as-is
+/// (nothing was written) and left for the operator to re-run, which
+/// re-establishes the liveness check rather than reusing a stale one. Nothing
+/// subscribes on this connection either, so unlike `deliver_acknowledged` there
+/// is no interleaved `METADATA_CHANGED` to fold into an occupant-change
+/// check — see the `debug_assert!` below.
+///
 /// # Errors
 ///
 /// Returns [`AttachError`] on transport failure. A server *refusal* is not an
