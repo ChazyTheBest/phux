@@ -325,7 +325,7 @@ cmp -s "$RUN_DIR/mode.before" "$RUN_DIR/mode.after" \
 [[ "$(cat "$RUN_DIR/attach.status")" == "0" ]] || fail "attach returned non-zero"
 
 note "first detach reassures, then the same session returns"
-assert_file_contains "$CLIENT_LOG" 'phux: session still running; run `phux` when you want to come back'
+assert_file_contains "$CLIENT_LOG" 'phux: session still running; rerun the same phux command to come back'
 cp "$CLIENT_LOG" "$RUN_DIR/first-detach.log"
 VALID_COMPLETE_CAST="$RUN_DIR/first-complete.cast"
 cp "$COMPLETE_CAST" "$VALID_COMPLETE_CAST"

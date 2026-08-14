@@ -530,7 +530,7 @@ fn run_journey(harness: &mut Harness) {
     first.send(b"\x01d");
     first.wait_for_exit();
     first.wait_for("the cooked-terminal persistence message", |text| {
-        text.contains("phux: session still running; run `phux` when you want to come back")
+        text.contains("phux: session still running; rerun the same phux command to come back")
     });
     let mut second = PtyClient::naked(harness, "second-attach");
     second.wait_for("the preserved shell marker", |text| text.contains(MARKER));

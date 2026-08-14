@@ -12,6 +12,17 @@ For project-specific guidance see [`CLAUDE.md`](./CLAUDE.md); for the
 doc system see [`docs/CONVENTIONS.md`](./docs/CONVENTIONS.md).
 <!-- bd-doctor-divergence: ok -->
 
+## Worktree Isolation
+
+- **Never implement on `main` or in the primary repository worktree.** Before
+  editing, create a dedicated branch and linked worktree from current `main`;
+  make all code, documentation, test, and commit changes there.
+- Reserve the primary worktree for integration only: update `main`, squash or
+  fast-forward verified feature work, push, and remove completed worktrees.
+- If the primary worktree is dirty or another agent is using it, do not stash,
+  reset, clean, or overwrite those changes. Leave them untouched and isolate
+  your work in a new worktree.
+
 
 Tracker integration and command reference live in the auto-injected
 `<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->

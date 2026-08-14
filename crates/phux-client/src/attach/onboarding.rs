@@ -20,7 +20,7 @@ const LOCK_FILE: &str = "onboarding.lock";
 pub(super) const ONBOARDING_TITLE: &str = "Your session is live";
 pub(super) const RETURN_NOTICE: &str = "Welcome back - this is the session you left running";
 pub(super) const DETACH_NOTICE: &str =
-    "phux: session still running; run `phux` when you want to come back";
+    "phux: session still running; rerun the same phux command to come back";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttachMoment {

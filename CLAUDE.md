@@ -125,6 +125,12 @@ rest are `publish = false`.
   to `forbid(unsafe_code)`.
 - **No new deps without a paragraph of justification in the PR.**
 - **Linear history on `main`.** Rebase, ff-only merges; no `--no-ff`.
+- **Never implement on `main` or in the primary repository worktree.** Create
+  a dedicated branch and linked worktree from current `main` before editing;
+  make code, docs, tests, and commits there. The primary worktree is for
+  integration only: update `main`, squash or fast-forward verified work, push,
+  and remove completed worktrees. Never stash, reset, clean, or overwrite a
+  dirty primary worktree to make room.
 - **Multi-agent fan-out uses self-managed worktrees** — see
   CONTRIBUTING.md §"Multi-agent fan-out" for the wave-1 race that
   motivated this.
