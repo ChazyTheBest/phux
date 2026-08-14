@@ -965,6 +965,27 @@ impl ServerRuntime {
                         );
                     }
                 }
+                // The overlay address (if any) is shared by the WS and QUIC
+                // auto-listeners below. `get_or_insert_with` makes it lazy
+                // *and* memoized: `phux_config::overlay::detect()` shells out
+                // to the `tailscale` CLI (~140ms, phux-c6g6) and must run at
+                // most once per start, only when both the disable switch and
+                // the profile gate leave it relevant, and not at all when an
+                // explicit `--listen`/`--quic` flag or env var already
+                // answers both ports.
+                let mut auto_overlay_ip: Option<Option<std::net::IpAddr>> = None;
+                let mut auto_overlay_ip = || {
+                    *auto_overlay_ip.get_or_insert_with(|| {
+                        resolve_auto_overlay_ip(
+                            auto_overlay_gate_open(
+                                std::env::var_os(DISABLE_AUTO_LISTEN_ENV).is_some(),
+                                phux_config::instance::is_default_profile(),
+                            ),
+                            phux_config::overlay::detect,
+                        )
+                    })
+                };
+
                 // Optionally also accept WebSocket connections (phux-486.4) so
                 // browser consumers (`phux-web`) can speak the identical wire.
                 // Opt-in via `phux server --listen <ADDR>` or the `PHUX_WS_ADDR`
@@ -972,7 +993,7 @@ impl ServerRuntime {
                 // on. The flag wins when both are set.
                 let ws_addr = ws_addr_override
                     .or_else(|| env_socket_addr("PHUX_WS_ADDR"))
-                    .or_else(|| auto_overlay_addr(DEFAULT_WS_PORT));
+                    .or_else(|| auto_overlay_ip().map(|ip| SocketAddr::new(ip, DEFAULT_WS_PORT)));
                 let ws_listener = match ws_addr {
                     Some(addr) => build_ws_listener(addr).await,
                     None => None,
@@ -982,7 +1003,7 @@ impl ServerRuntime {
                 // QUIC carries the identical frames over a TLS 1.3 stream.
                 let quic_addr = quic_addr_override
                     .or_else(|| env_socket_addr("PHUX_QUIC_ADDR"))
-                    .or_else(|| auto_overlay_addr(DEFAULT_QUIC_PORT));
+                    .or_else(|| auto_overlay_ip().map(|ip| SocketAddr::new(ip, DEFAULT_QUIC_PORT)));
                 let quic_listener = quic_addr.and_then(build_quic_listener);
                 // Optionally also accept WebTransport connections (phux-0wmf):
                 // HTTP/3 over QUIC, the browser's QUIC-class door (`phux-web`
@@ -1074,15 +1095,10 @@ pub const DEFAULT_QUIC_PORT: u16 = 8788;
 /// Environment escape hatch disabling the overlay auto-listen entirely.
 const DISABLE_AUTO_LISTEN_ENV: &str = "PHUX_NO_AUTO_LISTEN";
 
-/// The address to auto-bind a remote listener on, when nothing was
-/// configured explicitly (phux-onbd).
-///
-/// Pairing a phone used to mean *reconfiguring and restarting* the server,
-/// because the listener only existed if the operator had set `PHUX_WS_ADDR`
-/// before startup. That is the wrong shape: a restart costs the running
-/// sessions, which are exactly what the user wanted on their phone. Binding
-/// the listener up front makes `phux pair` a pure credential operation — the
-/// door is already there; pairing turns the lock.
+/// The auto-bound remote listener (phux-onbd): binding the WS/QUIC overlay
+/// address up front, when nothing was configured explicitly, so `phux pair`
+/// is a pure credential operation instead of a reconfigure-and-restart that
+/// would cost the running sessions.
 ///
 /// **Why this is safe to default on.** The listener is:
 ///
@@ -1098,27 +1114,16 @@ const DISABLE_AUTO_LISTEN_ENV: &str = "PHUX_NO_AUTO_LISTEN";
 /// So before anyone runs `phux pair` this is a TLS port on an already
 /// authenticated network that authenticates nobody. `PHUX_NO_AUTO_LISTEN=1`
 /// turns it off for operators who want no unsolicited bind at all.
-fn auto_overlay_addr(port: u16) -> Option<SocketAddr> {
-    auto_overlay_addr_from(
-        std::env::var_os(DISABLE_AUTO_LISTEN_ENV).is_some(),
-        phux_config::instance::is_default_profile(),
-        // Best-effort by construction (ADR-0037): an empty result means no
-        // overlay, which means no listener, which is the correct outcome.
-        &phux_config::overlay::detect(),
-        port,
-    )
-}
-
-/// [`auto_overlay_addr`] with every input injected, so the gating matrix is
-/// testable without a tailnet, a profile, or process-global env mutation.
-fn auto_overlay_addr_from(
-    disabled: bool,
-    default_profile: bool,
-    overlay: &[std::net::IpAddr],
-    port: u16,
-) -> Option<SocketAddr> {
+///
+/// This gate is split out from the overlay lookup itself (phux-c6g6):
+/// [`phux_config::overlay::detect`] shells out to the `tailscale` CLI
+/// (~140ms per call) and callers must check `disabled`/`default_profile`
+/// BEFORE paying for that, not after — passing `detect()`'s result in as a
+/// plain function argument evaluates it unconditionally, which is what
+/// silently turned `PHUX_NO_AUTO_LISTEN` into a no-op.
+const fn auto_overlay_gate_open(disabled: bool, default_profile: bool) -> bool {
     if disabled {
-        return None;
+        return false;
     }
     // Only the default profile auto-binds. Profile isolation (ADR-0080)
     // scopes the *socket* per instance, but a TCP/UDP port is global to the
@@ -1126,7 +1131,43 @@ fn auto_overlay_addr_from(
     // and one of them would lose, at random, on every start. A dev build has
     // no business serving anyone's phone either way; an explicit
     // `--listen`/`--quic` still works for testing the remote path.
-    if !default_profile {
+    default_profile
+}
+
+/// Resolves the overlay IP to auto-bind, calling `detect` only when
+/// `gate_open` is true.
+///
+/// Split out from the production call site so a test can spy on `detect`
+/// and assert it is never invoked when the gate is closed — that is the
+/// concrete, previously-broken contract behind `PHUX_NO_AUTO_LISTEN`
+/// (phux-c6g6): the old code passed the equivalent detection call in as a
+/// plain function argument, which Rust evaluates before the callee ever
+/// looks at the gate, so the switch discarded the answer instead of
+/// avoiding the cost of computing it.
+fn resolve_auto_overlay_ip(
+    gate_open: bool,
+    detect: impl FnOnce() -> Vec<std::net::IpAddr>,
+) -> Option<std::net::IpAddr> {
+    if !gate_open {
+        return None;
+    }
+    detect().into_iter().next()
+}
+
+/// [`auto_overlay_gate_open`] plus the port, so the gating matrix is
+/// testable without a tailnet, a profile, or process-global env mutation.
+/// Test-only: the production path memoizes the overlay lookup once across
+/// both the WS and QUIC ports instead of taking it as a per-call argument
+/// (phux-c6g6), so this per-port composition only exists for the unit tests
+/// below.
+#[cfg(test)]
+fn auto_overlay_addr_from(
+    disabled: bool,
+    default_profile: bool,
+    overlay: &[std::net::IpAddr],
+    port: u16,
+) -> Option<SocketAddr> {
+    if !auto_overlay_gate_open(disabled, default_profile) {
         return None;
     }
     overlay.first().map(|addr| SocketAddr::new(*addr, port))
@@ -1463,6 +1504,54 @@ mod tests {
     use phux_protocol::caps::ClientCapabilities;
     use phux_protocol::wire::frame::{AttachTarget, ViewportInfo};
     use tokio::task::JoinSet;
+
+    /// phux-c6g6: the whole point of `PHUX_NO_AUTO_LISTEN` is to skip the
+    /// `tailscale` shell-out, not just to discard its answer afterward. This
+    /// pins that `resolve_auto_overlay_ip` never calls `detect` when the
+    /// gate is closed — the previously-broken contract, since the old code
+    /// evaluated the equivalent call as an eager function argument before
+    /// any gate got to look at it.
+    #[test]
+    fn closed_gate_never_calls_detect() {
+        let called = std::cell::Cell::new(false);
+        let result = resolve_auto_overlay_ip(false, || {
+            called.set(true);
+            vec![std::net::IpAddr::from([100, 79, 155, 27])]
+        });
+        assert_eq!(result, None, "a closed gate must resolve to no address");
+        assert!(
+            !called.get(),
+            "detect() must not run at all when the gate is closed — a kill \
+             switch that pays the cost and discards the answer is not a \
+             kill switch",
+        );
+    }
+
+    /// The mirror case: an open gate does call `detect` and takes its first
+    /// address.
+    #[test]
+    fn open_gate_calls_detect_and_uses_first_address() {
+        let called = std::cell::Cell::new(false);
+        let result = resolve_auto_overlay_ip(true, || {
+            called.set(true);
+            vec![
+                std::net::IpAddr::from([100, 79, 155, 27]),
+                std::net::IpAddr::from([100, 79, 155, 28]),
+            ]
+        });
+        assert!(called.get(), "an open gate must run detection");
+        assert_eq!(result, Some(std::net::IpAddr::from([100, 79, 155, 27])));
+    }
+
+    /// [`auto_overlay_gate_open`] is the pure decision the production path
+    /// checks BEFORE calling `phux_config::overlay::detect()`. Pinning it
+    /// directly documents the gating matrix independent of the detect seam
+    /// above.
+    #[test]
+    fn the_disable_env_closes_the_gate_regardless_of_profile() {
+        assert!(!auto_overlay_gate_open(true, true));
+        assert!(!auto_overlay_gate_open(true, false));
+    }
 
     /// phux-onbd: with an overlay present, the default profile binds it —
     /// this is what lets `phux pair` be a pure credential operation instead
