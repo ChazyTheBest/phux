@@ -35,9 +35,11 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -121,7 +123,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// gone by design: a panicking assertion must not leak a daemon, which is
 /// the failure mode this whole feature exists to prevent. Belt and braces.
 struct ServerGuard {
-    child: Child,
+    process: common::ServerProcess,
     socket: PathBuf,
     /// Owns the scratch directory `heartbeat` lives in. Never read — held
     /// solely so the directory outlives the guard rather than being unlinked
@@ -133,14 +135,6 @@ struct ServerGuard {
     /// it honour the interval?" — measuring from the end of harness setup
     /// would charge the server for time it had already spent counting.
     spawned_at: Instant,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
-    }
 }
 
 impl ServerGuard {
@@ -183,7 +177,7 @@ impl ServerGuard {
             .expect("spawn phux server");
 
         let guard = Self {
-            child,
+            process: common::ServerProcess::from_child(child, socket.clone()),
             socket,
             _dir: dir,
             heartbeat,
@@ -204,24 +198,13 @@ impl ServerGuard {
 
     /// Whether the server process has already exited, right now.
     fn has_exited(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(status) => status.is_some(),
-            Err(err) => panic!("try_wait on phux server: {err}"),
-        }
+        self.process.has_exited()
     }
 
     /// Poll until the server process has exited, returning how long it took.
     /// `None` if it was still running at the deadline.
     fn wait_for_exit(&mut self, within: Duration) -> Option<Duration> {
-        let start = Instant::now();
-        while start.elapsed() < within {
-            match self.child.try_wait() {
-                Ok(Some(_status)) => return Some(start.elapsed()),
-                Ok(None) => std::thread::sleep(POLL),
-                Err(err) => panic!("try_wait on phux server: {err}"),
-            }
-        }
-        None
+        self.process.wait_for_exit(within)
     }
 
     /// The seed pane's heartbeat counter, or `None` before its first tick.
@@ -421,26 +404,10 @@ fn without_the_flag_the_server_outlives_every_idle_window() {
 /// pid, which is what a user (or a leaked-server sweep) would do anyway.
 struct AutoSpawned {
     socket: PathBuf,
+    _server: common::AutoSpawnedServer,
     /// Owns the scratch directory. Never read — held so it outlives the
     /// guard rather than being unlinked the moment `start` returns.
     _dir: tempfile::TempDir,
-}
-
-impl Drop for AutoSpawned {
-    fn drop(&mut self) {
-        // `phux kill --server` is idempotent and exits 0 on an absent or
-        // stale socket (phux-pimp), so this is correct whether or not the
-        // idle limit already fired. A panicking assertion must not leak a
-        // daemon — the exact failure this feature exists to prevent.
-        let _ = Command::new(PHUX)
-            .args(["kill", "--server", "--socket"])
-            .arg(&self.socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = std::fs::remove_file(&self.socket);
-    }
 }
 
 impl AutoSpawned {
@@ -483,7 +450,13 @@ impl AutoSpawned {
             String::from_utf8_lossy(&out.stderr),
         );
 
-        Self { socket, _dir: dir }
+        let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+        server.capture_pid();
+        Self {
+            socket,
+            _server: server,
+            _dir: dir,
+        }
     }
 
     /// Whether the socket answers a connect, right now.

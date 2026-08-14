@@ -31,8 +31,10 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -133,18 +135,8 @@ fn fixture_cast() -> PathBuf {
 
 /// A running `phux server`, killed and unlinked when the guard drops.
 struct ServerGuard {
-    child: Child,
+    _process: common::ServerProcess,
     socket: PathBuf,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // The server unlinks on clean shutdown; we SIGKILL it, so a stale
-        // socket in /tmp would otherwise outlive every run.
-        let _ = std::fs::remove_file(&self.socket);
-    }
 }
 
 impl ServerGuard {
@@ -164,7 +156,10 @@ impl ServerGuard {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn phux server");
-        let guard = Self { child, socket };
+        let guard = Self {
+            _process: common::ServerProcess::from_child(child, socket.clone()),
+            socket,
+        };
         let deadline = Instant::now() + SOCKET_DEADLINE;
         while Instant::now() < deadline {
             if guard.socket.exists() {

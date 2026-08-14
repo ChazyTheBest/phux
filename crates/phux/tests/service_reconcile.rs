@@ -23,6 +23,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -38,36 +40,8 @@ const PROFILE: &str = "dev";
 /// Stop whatever server ended up on `socket`, so a failing assertion cannot
 /// leak a daemon holding a PTY (phux-whhd).
 struct Cleanup {
-    socket: PathBuf,
+    _server: common::AutoSpawnedServer,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let Ok(out) = Command::new(PHUX)
-            .args(["status", "--json", "--socket"])
-            .arg(&self.socket)
-            .output()
-        else {
-            return;
-        };
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-            return;
-        };
-        let Some(pid) = doc["pid"].as_i64() else {
-            return;
-        };
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
-        let deadline = Instant::now() + DEADLINE;
-        while Instant::now() < deadline {
-            if std::os::unix::net::UnixStream::connect(&self.socket).is_err() {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
 }
 
 /// Where this host's `phux service install` would have written its unit,
@@ -172,8 +146,10 @@ fn live_server() -> (PathBuf, Cleanup) {
         "phux new must start a server.\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    server.capture_pid();
     let cleanup = Cleanup {
-        socket: socket.clone(),
+        _server: server,
         _dir: dir,
     };
     assert!(wait_until_accepting(&socket), "server must be up");

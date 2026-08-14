@@ -16,6 +16,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -26,17 +28,8 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// Backstop for a test that fails before it reaches its own stop (phux-whhd).
 struct Cleanup {
-    socket: std::path::PathBuf,
+    _server: common::AutoSpawnedServer,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = Command::new(PHUX)
-            .args(["kill", "--server", "--socket"])
-            .arg(&self.socket)
-            .output();
-    }
 }
 
 fn wait_until_accepting(socket: &Path) -> bool {
@@ -50,7 +43,7 @@ fn wait_until_accepting(socket: &Path) -> bool {
     false
 }
 
-fn start_server(socket: &Path, session: &str) {
+fn start_server(socket: &Path, session: &str) -> common::AutoSpawnedServer {
     let out = Command::new(PHUX)
         .args(["new", "--session", session, "--json", "--socket"])
         .arg(socket)
@@ -62,6 +55,9 @@ fn start_server(socket: &Path, session: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(wait_until_accepting(socket), "server must be up");
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.to_owned());
+    server.capture_pid();
+    server
 }
 
 /// The contract: the server stops, and the socket is gone when the command
@@ -75,9 +71,9 @@ fn start_server(socket: &Path, session: &str) {
 fn kill_server_stops_the_server_and_frees_the_socket() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("phux.sock");
-    start_server(&socket, "doomed");
+    let server = start_server(&socket, "doomed");
     let _cleanup = Cleanup {
-        socket: socket.clone(),
+        _server: server,
         _dir: dir,
     };
 
@@ -114,9 +110,9 @@ fn kill_server_stops_the_server_and_frees_the_socket() {
 fn kill_server_is_idempotent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("phux.sock");
-    start_server(&socket, "doomed");
+    let server = start_server(&socket, "doomed");
     let _cleanup = Cleanup {
-        socket: socket.clone(),
+        _server: server,
         _dir: dir,
     };
 

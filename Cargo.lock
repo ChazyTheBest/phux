@@ -2134,6 +2134,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dhat",
+ "libc",
  "libghostty-vt",
  "phux-client",
  "phux-config",

@@ -111,6 +111,9 @@ libghostty-vt.workspace = true
 # binary against a real PTY-backed server. Already a workspace dep used
 # by the phux-server wire tests; no new third-party crate enters.
 tempfile.workspace = true
+# Shared real-server integration-test cleanup uses kill(2) directly rather
+# than depending on an external `kill` executable.
+libc = "0.2"
 
 [features]
 # Heap profiling via dhat, consumed ONLY by the `phux-dhat-heap` binary

@@ -13,6 +13,8 @@
 #![allow(clippy::print_stderr, reason = "failure must print retained artifacts")]
 #![allow(clippy::unwrap_used, reason = "acceptance harness")]
 
+mod common;
+
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,10 +29,10 @@ const BUILT_PHUX: &str = env!("CARGO_BIN_EXE_phux");
 const PROFILE: &str = "first-five-e2e";
 const MARKER: &str = "FIRST_FIVE_COMMAND_RAN";
 const DEADLINE: Duration = Duration::from_secs(30);
-const GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(50);
 
 struct Harness {
+    server: common::AutoSpawnedServer,
     root: Option<tempfile::TempDir>,
     phux: PathBuf,
     socket: PathBuf,
@@ -41,8 +43,6 @@ struct Harness {
     state: PathBuf,
     runtime: PathBuf,
     prefix: PathBuf,
-    server_pid: Option<u32>,
-    server_session: Option<String>,
 }
 
 impl Harness {
@@ -74,10 +74,12 @@ impl Harness {
             )
         });
 
+        let socket = runtime.join("first-five.sock");
         Self {
+            server: common::AutoSpawnedServer::new(phux.clone(), socket.clone()),
             root: Some(root),
             phux,
-            socket: runtime.join("first-five.sock"),
+            socket,
             home,
             config,
             cache,
@@ -85,8 +87,6 @@ impl Harness {
             state,
             runtime,
             prefix,
-            server_pid: None,
-            server_session: None,
         }
     }
 
@@ -169,94 +169,16 @@ impl Harness {
         assert!(output.status.success(), "status failed: {output:?}");
         let doc: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("status emits JSON");
-        self.server_pid = Some(
-            u32::try_from(doc["pid"].as_u64().expect("status JSON names server pid"))
-                .expect("server pid fits u32"),
-        );
-        self.server_session = Some(
-            doc["sessions"][0]["name"]
-                .as_str()
-                .expect("status JSON names the first session")
-                .to_owned(),
+        let reported_pid =
+            u32::try_from(doc["pid"].as_u64().expect("status JSON names server pid"));
+        assert_eq!(
+            self.server.capture_pid(),
+            reported_pid.expect("server pid fits u32")
         );
     }
 
-    fn cleanup(&mut self) -> Result<(), String> {
-        let deadline = Instant::now() + DEADLINE;
-        let socket_was_observed = self.socket.exists();
-        while self.server_pid.is_none() && self.socket.exists() && Instant::now() < deadline {
-            let output = self.capture("cleanup-status", &["status", "--json"]);
-            if output.status.success()
-                && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            {
-                self.server_pid = doc["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
-                self.server_session = doc["sessions"][0]["name"].as_str().map(ToOwned::to_owned);
-            }
-            if self.server_pid.is_none() {
-                std::thread::sleep(POLL);
-            }
-        }
-
-        let Some(pid) = self.server_pid else {
-            if socket_was_observed {
-                return Err(format!(
-                    "cleanup could not discover the server PID; socket_exists={}, path={}",
-                    self.socket.exists(),
-                    self.socket.display(),
-                ));
-            }
-            return Ok(());
-        };
-
-        if !process_exists(pid) {
-            if self.socket.exists() {
-                std::fs::remove_file(&self.socket)
-                    .map_err(|err| format!("remove stale cleanup socket: {err}"))?;
-            }
-            return Ok(());
-        }
-
-        let deadline = Instant::now() + DEADLINE;
-        let graceful = self.server_session.as_deref().is_some_and(|session| {
-            self.capture("cleanup-kill", &["kill", session])
-                .status
-                .success()
-        });
-        let graceful_deadline = Instant::now() + GRACEFUL_SHUTDOWN;
-        let mut term_sent = if graceful {
-            false
-        } else {
-            let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .output();
-            true
-        };
-
-        loop {
-            let process_gone = !process_exists(pid);
-            if !self.socket.exists() && process_gone {
-                return Ok(());
-            }
-            if process_gone && self.socket.exists() {
-                std::fs::remove_file(&self.socket)
-                    .map_err(|err| format!("remove stale cleanup socket: {err}"))?;
-                continue;
-            }
-            if !process_gone && !term_sent && Instant::now() >= graceful_deadline {
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .output();
-                term_sent = true;
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "cleanup timed out: socket_exists={}, server_pid={pid}, process_exists={}",
-                    self.socket.exists(),
-                    process_exists(pid),
-                ));
-            }
-            std::thread::sleep(POLL);
-        }
+    fn cleanup(&self) -> Result<(), String> {
+        self.server.cleanup()
     }
 
     fn retain(mut self) -> PathBuf {
@@ -266,15 +188,6 @@ impl Harness {
 
 fn executable_name(stem: &str) -> String {
     format!("{stem}{}", std::env::consts::EXE_SUFFIX)
-}
-
-fn process_exists(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 struct PtyClient {

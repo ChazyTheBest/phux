@@ -52,9 +52,11 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -138,17 +140,10 @@ impl Isolation {
 
 /// A running `phux server` on a private socket, killed on drop.
 struct ServerGuard {
-    child: Child,
+    process: common::ServerProcess,
     socket: PathBuf,
     // Held to keep the socket's temp dir alive for the guard's lifetime.
     _dir: tempfile::TempDir,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl ServerGuard {
@@ -173,7 +168,7 @@ impl ServerGuard {
         iso.apply(&mut cmd);
         let child = cmd.spawn().expect("spawn phux server");
         let guard = Self {
-            child,
+            process: common::ServerProcess::from_child(child, socket.clone()),
             socket,
             _dir: dir,
         };
@@ -209,8 +204,7 @@ impl ServerGuard {
     /// is SIGKILL on unix — no shutdown handler runs, and the socket file
     /// is left behind, exactly like a real crash.
     fn sigkill(&mut self) {
-        self.child.kill().expect("SIGKILL the server");
-        let _ = self.child.wait();
+        self.process.sigkill();
     }
 }
 

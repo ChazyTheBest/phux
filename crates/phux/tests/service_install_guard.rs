@@ -47,6 +47,8 @@
 
 #![allow(clippy::expect_used, clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -58,38 +60,8 @@ const POLL: Duration = Duration::from_millis(50);
 /// Stop whatever server ended up on `socket`, so a failing assertion cannot
 /// leak a daemon holding a PTY (phux-whhd).
 struct Cleanup {
-    socket: std::path::PathBuf,
+    _server: common::AutoSpawnedServer,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let Ok(out) = Command::new(PHUX)
-            .args(["status", "--json", "--socket"])
-            .arg(&self.socket)
-            .output()
-        else {
-            return;
-        };
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-            return;
-        };
-        let Some(pid) = doc["pid"].as_i64() else {
-            return;
-        };
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
-        // Wait for the exit before the `TempDir` field drops out from under
-        // the dying server.
-        let deadline = Instant::now() + DEADLINE;
-        while Instant::now() < deadline {
-            if std::os::unix::net::UnixStream::connect(&self.socket).is_err() {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
 }
 
 /// Every unit path `phux service install` could write, under a sandboxed home.
@@ -146,11 +118,13 @@ fn install_refuses_while_a_server_holds_the_socket() {
         "phux new must start a server.\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(wait_until_accepting(&socket), "server must be up");
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    server.capture_pid();
     let _cleanup = Cleanup {
-        socket: socket.clone(),
+        _server: server,
         _dir: dir,
     };
-    assert!(wait_until_accepting(&socket), "server must be up");
 
     let home = tempfile::tempdir().expect("sandboxed home");
     let install = sandboxed(home.path())
@@ -206,11 +180,13 @@ fn print_still_renders_while_a_server_holds_the_socket() {
         .output()
         .expect("run phux new");
     assert!(out.status.success(), "phux new must start a server");
+    assert!(wait_until_accepting(&socket), "server must be up");
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    server.capture_pid();
     let _cleanup = Cleanup {
-        socket: socket.clone(),
+        _server: server,
         _dir: dir,
     };
-    assert!(wait_until_accepting(&socket), "server must be up");
 
     let home = tempfile::tempdir().expect("sandboxed home");
     let printed = sandboxed(home.path())

@@ -18,8 +18,10 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -42,16 +44,9 @@ const SERVER_IDLE_LIMIT_SECS: &str = "600";
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 struct ServerGuard {
-    child: Child,
+    process: common::ServerProcess,
     socket: PathBuf,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl ServerGuard {
@@ -80,7 +75,7 @@ impl ServerGuard {
             .spawn()
             .expect("spawn phux server");
         let guard = Self {
-            child,
+            process: common::ServerProcess::from_child(child, socket.clone()),
             socket,
             _dir: dir,
         };
@@ -133,12 +128,7 @@ impl ServerGuard {
 /// `pid` is alive iff `kill -0 pid` succeeds (POSIX; no `libc` dependency,
 /// which is macOS-gated in the server crate anyway).
 fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    common::process_exists(pid)
 }
 
 /// The first direct child PID of `parent`, via `pgrep -P`.
@@ -171,8 +161,8 @@ fn child_and_scrollback_survive_graceful_upgrade() {
     // The seed pane prints the marker, then `exec`s a long-lived `sleep` — so
     // the pane's child is a stable, observable process (the shell's pid is
     // preserved across its own exec).
-    let server = ServerGuard::start_with_seed(&format!("printf '{marker}\\n'; exec sleep 600"));
-    let server_pid = server.child.id();
+    let mut server = ServerGuard::start_with_seed(&format!("printf '{marker}\\n'; exec sleep 600"));
+    let server_pid = server.process.child_mut().id();
 
     // The pane child (the sleep) must come up, and the marker must reach the
     // grid (observable via `wait --until`).

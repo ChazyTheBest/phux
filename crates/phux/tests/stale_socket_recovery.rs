@@ -15,8 +15,10 @@
 
 #![allow(clippy::expect_used, clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -33,48 +35,8 @@ const POLL: Duration = Duration::from_millis(50);
 /// "stop the server" verb to lean on here; `phux kill` takes a session
 /// selector, and killing sessions is not the same as ending the daemon.
 struct Cleanup {
-    socket: PathBuf,
+    _server: common::AutoSpawnedServer,
     _dir: tempfile::TempDir,
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let Ok(out) = Command::new(PHUX)
-            .args(["status", "--json", "--socket"])
-            .arg(&self.socket)
-            .output()
-        else {
-            return;
-        };
-        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-            return;
-        };
-        let Some(pid) = doc["pid"].as_i64() else {
-            return;
-        };
-        // SIGTERM, not SIGKILL: the server's shutdown path is what unlinks
-        // the socket, and leaving a stale entry behind in a temp dir that is
-        // about to be removed would be a strange way to end a test about
-        // stale entries.
-        //
-        // That invariant is load-bearing and was, until phux-1wka, FALSE --
-        // the server registered no SIGTERM handler, so it died on the default
-        // disposition and unlinked nothing. `sigterm_unlinks_the_socket`
-        // below is what keeps this comment honest.
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
-        // Wait for the exit before this guard returns: `Drop::drop` runs
-        // before the struct's fields drop, so without this the `TempDir` is
-        // unlinked racing the dying server.
-        let deadline = Instant::now() + DEADLINE;
-        while Instant::now() < deadline {
-            if std::os::unix::net::UnixStream::connect(&self.socket).is_err() {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
 }
 
 /// A socket file with no listener — exactly what a `SIGKILL`ed server leaves.
@@ -126,11 +88,6 @@ fn auto_spawn_reaps_a_stale_socket_instead_of_wedging() {
     let socket = dir.path().join("phux.sock");
     leave_stale_socket(&socket);
 
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        _dir: dir,
-    };
-
     let out = Command::new(PHUX)
         .args(["new", "--session", "revived", "--json", "--socket"])
         .arg(&socket)
@@ -143,6 +100,12 @@ fn auto_spawn_reaps_a_stale_socket_instead_of_wedging() {
         out.status.success(),
         "a stale socket must not be fatal.\nstdout: {stdout}\nstderr: {stderr}"
     );
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    server.capture_pid();
+    let _cleanup = Cleanup {
+        _server: server,
+        _dir: dir,
+    };
     assert!(
         stdout.contains("\"session\": \"revived\""),
         "the session should have been created on a freshly spawned server.\n\
@@ -166,11 +129,6 @@ fn a_second_invocation_reuses_the_live_server() {
     let socket = dir.path().join("phux.sock");
     leave_stale_socket(&socket);
 
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        _dir: dir,
-    };
-
     let first = Command::new(PHUX)
         .args(["new", "--session", "first", "--json", "--socket"])
         .arg(&socket)
@@ -178,6 +136,12 @@ fn a_second_invocation_reuses_the_live_server() {
         .expect("run phux new (first)");
     assert!(first.status.success(), "first invocation must succeed");
     assert!(wait_until_accepting(&socket), "server must be up");
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    server.capture_pid();
+    let _cleanup = Cleanup {
+        _server: server,
+        _dir: dir,
+    };
 
     let second = Command::new(PHUX)
         .args(["new", "--session", "second", "--json", "--socket"])
@@ -226,11 +190,6 @@ fn sigterm_unlinks_the_socket_instead_of_leaving_a_stale_entry() {
     // assertion that fails before the SIGTERM would otherwise leak a daemon
     // holding a PTY (phux-whhd). It is idempotent against an already-stopped
     // server -- `status` then reports no pid and the guard returns.
-    let _cleanup = Cleanup {
-        socket: socket.clone(),
-        _dir: dir,
-    };
-
     let out = Command::new(PHUX)
         .args(["new", "--session", "graceful", "--json", "--socket"])
         .arg(&socket)
@@ -242,24 +201,14 @@ fn sigterm_unlinks_the_socket_instead_of_leaving_a_stale_entry() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(wait_until_accepting(&socket), "server must be up");
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    let pid = server.capture_pid();
+    let _cleanup = Cleanup {
+        _server: server,
+        _dir: dir,
+    };
 
-    let status = Command::new(PHUX)
-        .args(["status", "--json", "--socket"])
-        .arg(&socket)
-        .output()
-        .expect("run phux status");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&status.stdout).expect("status --json is a document");
-    let pid = doc["pid"].as_i64().expect("a live server reports its pid");
-
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .expect("send SIGTERM")
-            .success(),
-        "SIGTERM must be deliverable to the server"
-    );
+    common::terminate(pid);
 
     // The socket FILE must go, not merely stop accepting: a file that outlives
     // its listener is precisely the stale entry.

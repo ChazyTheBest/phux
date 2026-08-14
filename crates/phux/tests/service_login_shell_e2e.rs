@@ -45,9 +45,11 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -97,16 +99,8 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// from deep worktree paths that can already exceed it before adding a
 /// filename.
 struct ServerGuard {
-    child: Child,
+    _process: common::ServerProcess,
     socket: PathBuf,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
-    }
 }
 
 impl ServerGuard {
@@ -142,7 +136,8 @@ impl ServerGuard {
         cmd.args(["server", "--session", "svc", "--socket"])
             .arg(&socket)
             .arg("--seed-command")
-            .arg(seed_command);
+            .arg(seed_command)
+            .args(["--exit-after-idle", common::SERVER_IDLE_LIMIT_SECS]);
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -150,7 +145,10 @@ impl ServerGuard {
             .spawn()
             .expect("spawn phux server");
 
-        let guard = Self { child, socket };
+        let guard = Self {
+            _process: common::ServerProcess::from_child(child, socket.clone()),
+            socket,
+        };
         let deadline = Instant::now() + SOCKET_DEADLINE;
         while Instant::now() < deadline {
             if guard.socket.exists() {

@@ -30,6 +30,8 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -69,18 +71,10 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// A running `phux server`, killed when the guard drops so a failing
 /// assertion never leaks a daemon.
 struct ServerGuard {
-    child: Child,
+    _process: common::ServerProcess,
     socket: PathBuf,
     // Held to keep the temp dir alive for the guard's lifetime.
     _dir: tempfile::TempDir,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        // Best-effort: the OS reaps it; we just stop it leaking.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// A headless `phux watch --json` subprocess with its stdout decoded by a
@@ -143,7 +137,7 @@ impl ServerGuard {
             .expect("spawn phux server");
 
         let guard = Self {
-            child,
+            _process: common::ServerProcess::from_child(child, socket.clone()),
             socket,
             _dir: dir,
         };
