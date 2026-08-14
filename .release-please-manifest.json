@@ -1,3 +1,6 @@
 {
-  ".": "0.16.0"
+  ".": "0.16.0",
+  "integrations/opencode": "0.1.0",
+  "integrations/pi": "0.1.0",
+  "integrations/claude": "0.1.0"
 }

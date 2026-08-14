@@ -53,6 +53,7 @@ cd "$ROOT"
 
 echo "==> release version"
 bash scripts/check-release-version.sh "$tag"
+node scripts/check-agent-integration-versions.mjs
 
 echo "==> install surface"
 bash scripts/check-install-surface.sh

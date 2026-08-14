@@ -1,7 +1,7 @@
 {
   "name": "@phux/opencode",
   "version": "0.1.0",
-  "description": "Public OpenCode tools for shared phux terminals",
+  "description": "OpenCode V2 tools and fleet context for shared phux terminals",
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -13,6 +13,11 @@
     "dist",
     "README.md"
   ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -21,21 +26,24 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsup src/index.ts --format esm --platform node --dts",
+    "build": "npm run clean && tsup src/index.ts --format esm --platform node --dts --external @opencode-ai/plugin",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run typecheck && npm run build && node --test test/*.test.mjs && npm run pack:check",
+    "test": "node --test test/*.test.mjs",
+    "gates": "npm run typecheck && npm run build && npm test && npm run pack:check && npm audit --audit-level=high",
     "smoke:opencode": "node scripts/smoke-opencode.mjs",
     "smoke:real": "node scripts/smoke-real.mjs",
     "pack:check": "node scripts/test-pack.mjs",
     "prepack": "npm run build"
   },
+  "dependencies": {
+    "@opencode-ai/plugin": "0.0.0-next-17430"
+  },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.1",
-    "@types/node": "24.0.0",
+    "@types/node": "24.12.2",
     "tsup": "8.5.1",
     "typescript": "5.9.2"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

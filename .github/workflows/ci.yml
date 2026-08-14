@@ -214,6 +214,16 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            integrations/opencode/package-lock.json
+            integrations/pi/package-lock.json
+            integrations/claude/package-lock.json
+      - name: agent integration gates
+        run: just agent-integrations-check
       # Runner disk headroom (phux-a5g7): the restore stack (nix store via
       # cachix + rust-cache + sccache) sits near the hosted runner's free
       # space; run 29443995632 died with ENOSPC before its first cargo

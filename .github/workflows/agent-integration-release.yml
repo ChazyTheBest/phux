@@ -1,0 +1,222 @@
+name: Release agent integration
+
+on:
+  push:
+    tags:
+      - "opencode-plugin-v*.*.*"
+      - "pi-extension-v*.*.*"
+      - "claude-plugin-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing component-vX.Y.Z tag to validate
+        required: true
+        type: string
+      dry_run:
+        description: Validate without publishing or changing the GitHub release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-integration-release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      component: ${{ steps.release.outputs.component }}
+      directory: ${{ steps.release.outputs.directory }}
+      version: ${{ steps.release.outputs.version }}
+      package_name: ${{ steps.release.outputs.package_name }}
+      publish_npm: ${{ steps.release.outputs.publish_npm }}
+      dry_run: ${{ steps.release.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+      - name: Validate tag, commit, and component version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == push ]]; then
+            tag="$PUSH_TAG"
+            dry_run=false
+          else
+            tag="$DISPATCH_TAG"
+            dry_run="$DISPATCH_DRY_RUN"
+          fi
+          if [[ ! "$tag" =~ ^(opencode-plugin|pi-extension|claude-plugin)-v([0-9]+[.][0-9]+[.][0-9]+)$ ]]; then
+            echo "::error::tag must be opencode-plugin-vX.Y.Z, pi-extension-vX.Y.Z, or claude-plugin-vX.Y.Z"
+            exit 1
+          fi
+          component="${BASH_REMATCH[1]}"
+          version="${BASH_REMATCH[2]}"
+          case "$component" in
+            opencode-plugin) directory=integrations/opencode; publish_npm=true ;;
+            pi-extension) directory=integrations/pi; publish_npm=true ;;
+            claude-plugin) directory=integrations/claude; publish_npm=false ;;
+          esac
+
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "refs/tags/${tag}")"
+          package_version="$(node -p "require('./${directory}/package.json').version")"
+          package_name="$(node -p "require('./${directory}/package.json').name")"
+          test "$package_version" = "$version"
+          node scripts/check-agent-integration-versions.mjs
+
+          {
+            echo "tag=$tag"
+            echo "component=$component"
+            echo "directory=$directory"
+            echo "version=$version"
+            echo "package_name=$package_name"
+            echo "publish_npm=$publish_npm"
+            echo "dry_run=$dry_run"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Test and package exact artifact
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ needs.prepare.outputs.directory }}/package-lock.json
+
+      - name: Install and run component gates
+        working-directory: ${{ needs.prepare.outputs.directory }}
+        run: |
+          npm install --global npm@11.5.1
+          npm ci
+          npm run gates
+
+      - name: Build immutable release artifact
+        id: artifact
+        shell: bash
+        env:
+          COMPONENT: ${{ needs.prepare.outputs.component }}
+          DIRECTORY: ${{ needs.prepare.outputs.directory }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PUBLISH_NPM: ${{ needs.prepare.outputs.publish_npm }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          if [[ "$PUBLISH_NPM" == true ]]; then
+            tarball="$(cd "$DIRECTORY" && npm pack --json | node -e 'let s="";process.stdin.on("data",c=>s+=c);process.stdin.on("end",()=>process.stdout.write(JSON.parse(s)[0].filename))')"
+            mv "$DIRECTORY/$tarball" "release/$tarball"
+          else
+            tarball="phux-claude-plugin-${VERSION}.tar.gz"
+            git archive --format=tar.gz --prefix="phux-claude-plugin-${VERSION}/" -o "release/$tarball" "${TAG}:${DIRECTORY}"
+          fi
+          (cd release && sha256sum "$tarball" > "${tarball}.sha256")
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Verify exact packed npm artifact
+        if: needs.prepare.outputs.publish_npm == 'true'
+        env:
+          PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          test_dir="$(mktemp -d)"
+          cd "$test_dir"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --package-lock=false "$GITHUB_WORKSPACE/release/$TARBALL"
+          npm ls --depth=0 "${PACKAGE_NAME}@${VERSION}"
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ needs.prepare.outputs.component }}-${{ needs.prepare.outputs.tag }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish validated component
+    needs: [prepare, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: ${{ needs.prepare.outputs.component }}-${{ needs.prepare.outputs.tag }}
+          path: release
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify downloaded artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tarballs < <(find release -maxdepth 1 -type f -name '*.tgz' -o -name '*.tar.gz')
+          test "${#tarballs[@]}" -eq 1
+          (cd release && sha256sum --check "$(basename "${tarballs[0]}").sha256")
+          echo "tarball=${tarballs[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Exercise npm publication
+        if: needs.prepare.outputs.publish_npm == 'true' && needs.prepare.outputs.dry_run == 'true'
+        env:
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+        run: npm publish --dry-run "$TARBALL"
+
+      - name: Publish exact npm artifact with provenance
+        if: needs.prepare.outputs.publish_npm == 'true' && needs.prepare.outputs.dry_run == 'false'
+        env:
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+          PACKAGE_NAME: ${{ needs.prepare.outputs.package_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm install --global npm@11.5.1
+          local_shasum="$(sha1sum "$TARBALL" | cut -d' ' -f1)"
+          published_shasum="$(npm view "${PACKAGE_NAME}@${VERSION}" dist.shasum 2>/dev/null || true)"
+          if [[ -n "$published_shasum" ]]; then
+            test "$published_shasum" = "$local_shasum"
+          else
+            npm publish --provenance --access public "$TARBALL"
+          fi
+
+      - name: Attach assets and publish component release
+        if: needs.prepare.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" release/* --clobber
+          mapfile -t expected < <(find release -maxdepth 1 -type f -exec basename {} \; | sort)
+          mapfile -t actual < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          diff -u <(printf '%s\n' "${expected[@]}") <(printf '%s\n' "${actual[@]}")
+          gh release edit "$TAG" --draft=false

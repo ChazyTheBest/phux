@@ -75,6 +75,11 @@ There's an MCP server too (`phux mcp`), so agent hosts get the same verbs as
 tools. It transparently launches the bundled `phux-mcp` companion binary.
 Start at [Agents](./docs/consumers/agents.md).
 
+First-party, independently versioned host integrations are available for
+[OpenCode V2](./docs/consumers/opencode.md), [Pi](./docs/consumers/pi.md), and
+[Claude Code](./docs/consumers/claude.md). Their package, packed-artifact, and
+native host validation runs in the required CI gate.
+
 ```sh
 phux --skill=quick          # installed CLI operating guide
 phux --capabilities --json # versions, commands, schemas, MCP availability

@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import PhuxPlugin, { PhuxCli } from "../dist/index.js";
+import { handleLifecycleEvent, OpenCodeLifecycle, PhuxCli } from "../dist/index.js";
+
+function activate({ cli, env = {}, lifecycleTimeoutMs, onLifecycleError }) {
+  const lifecycle = new OpenCodeLifecycle({
+    cli,
+    target: () => env.PHUX_TARGET,
+    ...(lifecycleTimeoutMs === undefined ? {} : { timeoutMs: lifecycleTimeoutMs }),
+    ...(onLifecycleError === undefined ? {} : { onError: onLifecycleError }),
+  });
+  return {
+    event: ({ event }) => handleLifecycleEvent(lifecycle, event),
+    dispose: () => lifecycle.dispose(),
+  };
+}
 
 function completed(stdout = "", exitCode = 0) {
   return { termination: "completed", exitCode, stdout, stderr: "" };
@@ -35,7 +48,7 @@ test("documented session status events declare owner-labelled identity, and neve
     };
     return completed(`@5\t${JSON.stringify(record)}`);
   } });
-  const hooks = await PhuxPlugin({}, { cli, env: { PHUX_TARGET: "@5" }, lifecycleTimeoutMs: 321 });
+  const hooks = activate({ cli, env: { PHUX_TARGET: "@5" }, lifecycleTimeoutMs: 321 });
 
   await hooks.event({ event: {
     type: "session.status",
@@ -111,7 +124,7 @@ test("session deletion resolves a session/window selector and clears only the ow
     if (request.args[1] === "clear") return completed("@6\t-");
     throw new Error(`unexpected agent command: ${request.args.join(" ")}`);
   } });
-  const hooks = await PhuxPlugin({}, { cli, env: { PHUX_TARGET: "shared:window-0" } });
+  const hooks = activate({ cli, env: { PHUX_TARGET: "shared:window-0" } });
 
   await hooks.event({ event: {
     type: "session.status",
@@ -178,7 +191,7 @@ test("dispose isolates owned sessions when the first cleanup fails", async () =>
     if (request.args[1] === "clear") return completed("@10\t-");
     throw new Error(`unexpected agent command: ${request.args.join(" ")}`);
   } });
-  const hooks = await PhuxPlugin({}, {
+  const hooks = activate({
     cli,
     env: { PHUX_TARGET: "@10" },
     onLifecycleError: (error) => errors.push(error),
@@ -208,7 +221,7 @@ test("retry and unrelated public events do not invent lifecycle transitions", as
     calls += 1;
     return completed();
   } });
-  const hooks = await PhuxPlugin({}, { cli, env: { PHUX_TARGET: "@8" } });
+  const hooks = activate({ cli, env: { PHUX_TARGET: "@8" } });
 
   await hooks.event({ event: {
     type: "session.status",

@@ -1,7 +1,7 @@
 ---
 audience: humans, agents, consumers, contributors
 stability: evolving
-last-reviewed: 2026-08-01
+last-reviewed: 2026-08-14
 ---
 
 # OpenCode integration
@@ -16,17 +16,18 @@ to remote phux transports.
 
 ## Requirements
 
-The package requires Node.js 20 or newer, OpenCode, a compatible external
+The package requires Node.js 22 or newer, OpenCode V2, a compatible external
 `phux` executable, and a running local phux server. It does not bundle or start
-phux. The current adapter expects the documented `phux 0.1.0` CLI shapes:
+phux. The current adapter targets `phux 0.16.0` and its versioned CLI shapes:
 
 ```sh
 phux --version
 ```
 
-The package is built against the public root API of `@opencode-ai/plugin`
-1.18.1. Both OpenCode and this integration are pre-1.0 surfaces, so validate a
-new OpenCode version before rolling it out broadly.
+The package uses the public OpenCode V2 Promise API and pins the exact
+`@opencode-ai/plugin` prerelease it is tested against. V2 remains beta, so each
+dependency update must pass the package gates and packed-artifact smoke before
+release.
 
 ## Install and load
 
@@ -38,7 +39,7 @@ form for a registry release:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@phux/opencode"]
+  "plugins": ["@phux/opencode"]
 }
 ```
 
@@ -61,7 +62,7 @@ cd /absolute/path/to/your/project
 mkdir -p .opencode/plugins
 npm install --prefix .opencode --save-exact /absolute/path/to/phux/integrations/opencode
 cat > .opencode/plugins/phux.js <<'EOF'
-export { default as PhuxPlugin } from "@phux/opencode"
+export { default } from "@phux/opencode"
 EOF
 ```
 
@@ -83,7 +84,7 @@ cd /absolute/path/to/your/project
 mkdir -p .opencode/plugins
 npm install --prefix .opencode --save-exact /tmp/phux-opencode-0.1.0.tgz
 cat > .opencode/plugins/phux.js <<'EOF'
-export { default as PhuxPlugin } from "@phux/opencode"
+export { default } from "@phux/opencode"
 EOF
 ```
 
@@ -112,14 +113,17 @@ package entry:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    ["@phux/opencode", {
-      "executable": "/absolute/path/to/phux",
-      "socket": "/absolute/path/to/phux.sock",
-      "lifecycleTimeoutMs": 1000,
-      "contextAwareness": true,
-      "contextTimeoutMs": 1000
-    }]
+  "plugins": [
+    {
+      "package": "@phux/opencode",
+      "options": {
+        "executable": "/absolute/path/to/phux",
+        "socket": "/absolute/path/to/phux.sock",
+        "lifecycleTimeoutMs": 1000,
+        "contextAwareness": true,
+        "contextTimeoutMs": 1000
+      }
+    }
   ]
 }
 ```
@@ -133,12 +137,11 @@ to a configured npm entry. An automatically discovered local shim should use
 
 ## Automatic fleet context
 
-For each new OpenCode user message, the plugin reads the public phux agent
-inventory. The first observation is a synthetic text part appended to that new
-message. Later changes append sequenced deltas; unchanged state adds nothing.
-The plugin never puts live values in `experimental.chat.system.transform`, so
-the static system prompt and tool definitions remain an exact provider-cache
-prefix.
+Before each OpenCode V2 model dispatch, the public session-context hook reads
+the phux agent inventory. The first observation is a bounded checkpoint; later
+changes become sequenced deltas. When the inventory is unchanged, the plugin
+reuses the exact same system suffix, preserving the static prompt and tool
+prefix for provider caching.
 
 A checkpoint carries OpenCode's inherited Terminal id, the selected target, and
 up to 64 sorted pane records: canonical Terminal/session/window identity,
@@ -147,13 +150,11 @@ agent label and kind, lifecycle state, attention, and cwd. Context is capped at
 Screen rows, scrollback, titles, detector evidence, explanations, tool output,
 and credentials are excluded; terminal content remains an explicit tool read.
 
-The `experimental.session.compacting` hook gives OpenCode's compactor a current
-canonical checkpoint. A successful `session.compacted` event forces another
-checkpoint onto the next synthetic continue or user message. A missing server
-emits one edge-filtered `unavailable` checkpoint and does not fail the user
-turn. Awareness is current at new-message boundaries rather than continuously
-inside one uninterrupted model/tool loop. OpenCode and this plugin are pre-1.0,
-so the runtime smoke guards these experimental hooks. The shared rationale is
+Because the suffix is reconstructed from plugin state for every dispatch, it
+also survives compaction without using a private compactor hook. A missing
+server emits one edge-filtered `unavailable` checkpoint and does not fail the
+user turn. Awareness is current at model-dispatch boundaries rather than
+continuously while a provider response is streaming. The shared rationale is
 [ADR-0067](../../ADR/0067-cache-preserving-agent-fleet-context.md).
 
 ## The six tools
@@ -245,9 +246,10 @@ Metadata failures and local deadlines do not fail terminal tools.
 
 The source reuses the host-independent `PhuxCli` adapter maintained with the
 [Pi integration](./pi.md). The OpenCode build bundles that adapter, its schema
-validation, and the public OpenCode tool helper into the artifact. The packed
-runtime has no dependency on `@phux/pi` or `@opencode-ai/plugin`; it still
-executes the external phux CLI. This shared implementation boundary does not
+validation, and the tool runtime into the artifact. The packed runtime has no
+dependency on `@phux/pi`; it retains an exact production dependency on the
+public OpenCode V2 plugin API and still executes the external phux CLI. This
+shared implementation boundary does not
 make Pi target persistence, commands, or lifecycle behavior part of the
 OpenCode contract.
 

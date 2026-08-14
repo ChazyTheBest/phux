@@ -1,6 +1,6 @@
 # @phux/opencode
 
-Public OpenCode plugin for operating shared terminals through an external local
+OpenCode V2 plugin for operating shared terminals through an external local
 phux server and appending cache-preserving fleet context. Installation,
 configuration, tool behavior, target precedence,
 lifecycle gaps, and safety boundaries live in the canonical
@@ -13,15 +13,14 @@ directory:
 
 ```sh
 npm ci
-npm run typecheck
-npm run build
-npm test
-npm run pack:check
+npm run gates
 npm run smoke:opencode
 ```
 
-`smoke:opencode` loads the built plugin through an isolated OpenCode config and
-requires an `opencode` executable. Set `OPENCODE_BIN` to choose it.
+`smoke:opencode` starts an isolated OpenCode V2 server and verifies that its
+resolved config accepts the built plugin URL. Plugin setup, registration,
+cleanup, and tool behavior are covered by `npm run gates`. The smoke requires
+an `opencode2` executable; set `OPENCODE_BIN` to choose it.
 
 The real packed-plugin smoke is opt-in and requires `phux >= 0.1.0`:
 

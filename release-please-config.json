@@ -3,6 +3,8 @@
 
   "draft-pull-request": true,
   "draft": true,
+  "separate-pull-requests": false,
+  "sequential-calls": true,
 
   "include-v-in-tag": true,
   "include-component-in-tag": false,
@@ -26,11 +28,53 @@
       "release-type": "simple",
       "package-name": "phux",
       "changelog-path": "CHANGELOG.md",
+      "exclude-paths": [
+        "integrations/opencode",
+        "integrations/pi",
+        "integrations/claude",
+        ".claude-plugin"
+      ],
       "extra-files": [
         {
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
+        }
+      ]
+    },
+    "integrations/opencode": {
+      "release-type": "node",
+      "component": "opencode-plugin",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "tag-separator": "-",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "integrations/pi": {
+      "release-type": "node",
+      "component": "pi-extension",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "tag-separator": "-",
+      "changelog-path": "CHANGELOG.md"
+    },
+    "integrations/claude": {
+      "release-type": "node",
+      "component": "claude-plugin",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "tag-separator": "-",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": ".claude-plugin/plugin.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "/.claude-plugin/marketplace.json",
+          "jsonpath": "$.plugins[?(@.name=='phux')].version"
         }
       ]
     }

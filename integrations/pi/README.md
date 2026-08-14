@@ -19,16 +19,7 @@ Install the locked development dependencies from this directory:
 
 ```sh
 npm ci
-```
-
-Run the deterministic gates, which do not call an LLM:
-
-```sh
-npm test
-npm run typecheck
-npm run build
-npm run pack:check
-npm run smoke:load
+npm run gates
 ```
 
 The real integration harness is opt-in:

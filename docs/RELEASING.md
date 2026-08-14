@@ -13,6 +13,8 @@ Merging that PR tags `vX.Y.Z`, creates a draft GitHub release, and triggers
 `release.yml` to build and **attach** the `phux and phux-mcp artifacts`,
 refresh the Homebrew tap, and publish the completed release. Publishing
 `phux-protocol` to crates.io stays a separate, deliberate human dispatch.
+OpenCode, Pi, and Claude Code integrations are independent Release Please
+components with their own `*-vX.Y.Z` tags and validated artifact workflows.
 `cargo install phux is unsupported`
 because the binary/internal crates are not publishable. Windows is not
 supported by this release lane.
@@ -32,6 +34,8 @@ same release.
 | Homebrew tap formula | `release.yml` |
 | Draft -> published transition | `release.yml`, after all assets and Homebrew succeed |
 | `phux-protocol` on crates.io | a human, via `publish-crate.yml` |
+| Integration versions | release-please component PRs |
+| Integration validation, assets, and publication | `agent-integration-release.yml` |
 
 `release.yml` never creates a tag, release, or release body. It uploads assets
 onto the draft release-please made and only flips that draft to public after the
@@ -47,18 +51,20 @@ generated changelog or expose a half-built release.
 | Skip crates.io packaging during a fast/offline binary-only check | `just release-preflight-fast vX.Y.Z` |
 | Re-build or re-attach assets for an existing tag | Dispatch **Actions -> release** with `tag=vX.Y.Z` |
 | Publish `phux-protocol` to crates.io | Dispatch **Actions -> publish-crate** with `tag=vX.Y.Z`, `dry_run=false` |
+| Revalidate an integration tag without publishing | Dispatch **Actions -> Release agent integration** with its component tag and `dry_run=true` |
 | Check a suspected install-doc drift | `bash scripts/check-install-surface.sh` |
 
 ## What runs when
 
 | Flow | Trigger | What it does |
 |---|---|---|
-| Pull request CI | `pull_request` | Docs-only detection, docs check, fmt, clippy, rustdoc, cargo-deny, unit tests, and fast real-PTY e2e unless the change is docs-only. Draft PRs skip all of it until marked ready — release PRs idle as drafts for free. |
+| Pull request CI | `pull_request` | Docs, Rust, OpenCode V2, Pi, and Claude package gates plus fast real-PTY e2e unless the change is docs-only. Draft PRs skip all of it until marked ready. |
 | Conventional-commit gate | `pull_request` | `commitlint` lints every PR commit and the PR title against `commitlint.config.mjs`; required by main's ruleset so nothing non-conventional reaches the release-please log. |
 | Main CI | push to `main` | Same gates as PR CI and refreshes warm caches; a narrowly identified release-only merge skips the duplicate compile because its exact tree already passed required PR CI. |
 | release-please | push to `main` | Maintains the release PR; on merge, tags `vX.Y.Z`, creates a draft GitHub release, and calls `release.yml`. |
 | Release artifacts | called by release-please (or manual dispatch) | Requires all target builds, attaches tarballs + checksums, updates Homebrew, then publishes the complete release. |
 | Crate publish | manual `publish-crate` workflow | `phux-protocol` package dry-run, then publish when `dry_run=false`. |
+| Agent integration release | component tag or manual dry run | Re-runs locked gates, creates one checksummed artifact, clean-installs npm artifacts, publishes npm with provenance where applicable, and publishes the component draft release. |
 | Stress lane | nightly, manual, or PR label `stress` | Heavy resize/output/lifecycle storms that are useful but too slow for every PR. |
 
 Required secrets:
@@ -67,6 +73,7 @@ Required secrets:
 |---|---|---|
 | `HOMEBREW_TAP_DEPLOY_KEY` | `release.yml` | Automatic push to `phall1/homebrew-tap`. If absent, the release still publishes and the tap step warns/skips. |
 | `CARGO_REGISTRY_TOKEN` | `publish-crate.yml` | Publishing `phux-protocol` to crates.io. Not needed for binary/Homebrew-only releases. |
+| `NPM_TOKEN` | `agent-integration-release.yml` | Publishing `@phux/opencode` and `@phux/pi`; npm trusted publishing should also be configured for provenance. |
 
 Post-release verification:
 
@@ -74,6 +81,9 @@ Post-release verification:
 scripts/install.sh --dry-run --version vX.Y.Z
 brew fetch --formula phall1/tap/phux
 cargo search phux-protocol --limit 1
+npm view @phux/opencode version
+npm view @phux/pi version
+claude plugin marketplace list
 ```
 
 Use the GitHub release page to confirm that the expected target tarballs and
@@ -86,6 +96,9 @@ Linux x86_64, and Linux arm64.
 |---|---|---|
 | `phux`, `phux-mcp` binaries | Homebrew + GitHub release | [`release.yml`](../.github/workflows/release.yml), called by release-please |
 | `phux-protocol` crate | crates.io | [`publish-crate.yml`](../.github/workflows/publish-crate.yml), manual dispatch only |
+| `@phux/opencode` | npm + GitHub release | `opencode-plugin-vX.Y.Z`, [`agent-integration-release.yml`](../.github/workflows/agent-integration-release.yml) |
+| `@phux/pi` | npm + GitHub release | `pi-extension-vX.Y.Z`, [`agent-integration-release.yml`](../.github/workflows/agent-integration-release.yml) |
+| Claude Code plugin | repository marketplace + GitHub release | `claude-plugin-vX.Y.Z`, [`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json) |
 
 Every other crate (`phux`, `phux-core`, `phux-server`, `phux-client`,
 `phux-config`, `phux-mcp`) is `publish = false`: binary or internal-only.
@@ -125,6 +138,14 @@ The workspace shares one `version` in the root `Cargo.toml`
 (`[workspace.package]`). All in-repo crates inherit it with
 `version.workspace = true`, and internal workspace dependencies use path-only
 requirements so release bumps do not require duplicate manifest edits.
+
+The three host integrations intentionally version independently under
+`integrations/{opencode,pi,claude}`. Their versions live in the Release Please
+manifest and package lockfiles; Claude's component also synchronizes its plugin
+manifest and repository marketplace entry. Run
+`node scripts/check-agent-integration-versions.mjs` after any version-bearing
+change. Host APIs and the phux CLI evolve on different schedules, so these
+components do not mirror the Rust workspace version.
 
 **Do not hand-edit the version.** release-please derives it from the
 conventional-commit log and writes it into `[workspace.package].version` on the

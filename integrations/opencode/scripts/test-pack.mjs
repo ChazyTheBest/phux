@@ -34,17 +34,14 @@ try {
 
   const installedEntry = join(consumerRoot, "node_modules", "@phux", "opencode", "dist", "index.js");
   const bundledSource = await readFile(installedEntry, "utf8");
-  assert.doesNotMatch(bundledSource, /(?:from\s+|import\s*\()["'](?:@phux\/pi|@opencode-ai\/plugin|\.\.\/\.\.\/pi)/);
+  assert.doesNotMatch(bundledSource, /(?:from\s+|import\s*\()["'](?:@phux\/pi|\.\.\/\.\.\/pi)/);
+  assert.match(bundledSource, /@opencode-ai\/plugin/, "the package must use OpenCode's public V2 runtime dependency");
   assert.match(bundledSource, /child_process/);
 
   const plugin = await import(pathToFileURL(installedEntry).href);
-  assert.equal(typeof plugin.default, "function");
+  assert.equal(plugin.default.id, "phux.terminal");
+  assert.equal(typeof plugin.default.setup, "function");
   assert.equal(typeof plugin.PhuxCli, "function");
-  const hooks = await plugin.default({});
-  assert.deepEqual(Object.keys(hooks.tool).sort(), [
-    "phux_create", "phux_list", "phux_run", "phux_send_keys", "phux_snapshot", "phux_wait",
-  ]);
-  await hooks.dispose();
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

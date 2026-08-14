@@ -1,17 +1,63 @@
-import { tool, type ToolContext, type ToolDefinition, type ToolResult } from "@opencode-ai/plugin";
+type JsonSchema = Readonly<Record<string, unknown>>;
+
+export interface ToolContext {
+  readonly sessionID: string;
+  readonly agent: string;
+  readonly messageID: string;
+  readonly id: string;
+}
+
+export interface ToolResult {
+  readonly content: string;
+  readonly metadata: PhuxToolMetadata;
+}
+
+export interface PhuxToolDefinition<Input = never> {
+  readonly name: string;
+  readonly description: string;
+  readonly input: JsonSchema;
+  readonly execute: (input: Input, context: ToolContext) => Promise<ToolResult>;
+}
 
 import { PhuxCli } from "../../pi/src/adapter.js";
 import type { ScreenState } from "../../pi/src/schemas.js";
 
-const schema = tool.schema;
-const TARGET = schema.string().min(1).max(512).regex(/\S/, "target must contain a non-whitespace character").optional()
-  .describe("Explicit phux target selector; otherwise use this plugin instance's selected target, then PHUX_TARGET");
-const LOCAL_TIMEOUT = schema.number().int().min(1).max(3_600_000).optional()
-  .describe("Local subprocess timeout in milliseconds");
-const RUN_TIMEOUT = schema.number().int().min(0).max(86_400).optional()
-  .describe("phux run timeout in seconds; 0 waits indefinitely");
-const WAIT_TIMEOUT = schema.number().int().min(1).max(86_400).optional()
-  .describe("phux wait timeout in seconds; omit to wait indefinitely");
+const TARGET = stringSchema(1, 512, "Explicit phux target selector; otherwise use this plugin instance's selected target, then PHUX_TARGET");
+const LOCAL_TIMEOUT = integerSchema(1, 3_600_000, "Local subprocess timeout in milliseconds");
+const RUN_TIMEOUT = integerSchema(0, 86_400, "phux run timeout in seconds; 0 waits indefinitely");
+const WAIT_TIMEOUT = integerSchema(1, 86_400, "phux wait timeout in seconds; omit to wait indefinitely");
+
+interface ListInput { readonly local_timeout_ms?: number }
+interface CreateInput {
+  readonly name: string;
+  readonly cwd?: string;
+  readonly command?: string[];
+  readonly local_timeout_ms?: number;
+}
+interface SnapshotInput {
+  readonly target?: string;
+  readonly scrollback?: number;
+  readonly cells?: boolean;
+  readonly local_timeout_ms?: number;
+}
+interface SendKeysInput {
+  readonly target?: string;
+  readonly keys: string[];
+  readonly local_timeout_ms?: number;
+}
+interface RunInput {
+  readonly target?: string;
+  readonly command: string;
+  readonly timeout_seconds?: number;
+  readonly local_timeout_ms?: number;
+}
+interface WaitInput {
+  readonly target?: string;
+  readonly until?: string;
+  readonly idle_ms?: number;
+  readonly timeout_seconds?: number;
+  readonly local_timeout_ms?: number;
+}
 
 export const MAX_MODEL_BYTES = 12 * 1024;
 export const MAX_MODEL_LINES = 200;
@@ -41,11 +87,12 @@ export interface PhuxToolRuntime {
 }
 
 /** Build the six public OpenCode tools around one plugin-instance target selection. */
-export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, ToolDefinition> {
+export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, PhuxToolDefinition<any>> {
   return {
-    phux_list: tool({
+    phux_list: defineTool<ListInput>({
+      name: "phux_list",
       description: "List phux sessions. Output is compact and bounded; this never changes phux focus.",
-      args: { local_timeout_ms: LOCAL_TIMEOUT },
+      input: objectSchema({ local_timeout_ms: LOCAL_TIMEOUT }),
       async execute(args, context) {
         const result = await runtime.cli.ls(shortExecution(args.local_timeout_ms, context));
         const lines = result.sessions.map((session) =>
@@ -62,15 +109,15 @@ export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, ToolDe
       },
     }),
 
-    phux_create: tool({
+    phux_create: defineTool<CreateInput>({
+      name: "phux_create",
       description: "Create a named phux session without attaching, then select its seed @id for this plugin instance.",
-      args: {
-        name: schema.string().min(1).max(255).regex(/\S/, "name must contain a non-whitespace character"),
-        cwd: schema.string().min(1).max(4096).regex(/\S/, "cwd must contain a non-whitespace character").optional(),
-        command: schema.array(schema.string().max(65_536)).min(1).max(256).optional()
-          .describe("Optional command argv; this is an argv array only for session creation"),
+      input: objectSchema({
+        name: stringSchema(1, 255),
+        cwd: stringSchema(1, 4096),
+        command: arraySchema({ type: "string", maxLength: 65_536 }, 1, 256, "Optional command argv; this is an argv array only for session creation"),
         local_timeout_ms: LOCAL_TIMEOUT,
-      },
+      }, ["name"]),
       async execute(args, context) {
         const created = await runtime.cli.create(args.name, {
           ...(args.cwd === undefined ? {} : { cwd: args.cwd }),
@@ -90,14 +137,15 @@ export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, ToolDe
       },
     }),
 
-    phux_snapshot: tool({
+    phux_snapshot: defineTool<SnapshotInput>({
+      name: "phux_snapshot",
       description: "Read a phux pane without attaching or resizing. Target resolution is explicit target, selected created target, then PHUX_TARGET. Terminal text is bounded to 200 lines and 12 KiB.",
-      args: {
+      input: objectSchema({
         target: TARGET,
-        scrollback: schema.number().int().min(0).max(100_000).optional(),
-        cells: schema.boolean().optional(),
+        scrollback: integerSchema(0, 100_000),
+        cells: { type: "boolean" },
         local_timeout_ms: LOCAL_TIMEOUT,
-      },
+      }),
       async execute(args, context) {
         const target = resolveTarget(args.target, runtime);
         const screen = await runtime.cli.snapshot({
@@ -110,13 +158,14 @@ export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, ToolDe
       },
     }),
 
-    phux_send_keys: tool({
+    phux_send_keys: defineTool<SendKeysInput>({
+      name: "phux_send_keys",
       description: "Send named keys or literal key strings to a phux pane. This is not a paste operation and never uses phux focus.",
-      args: {
+      input: objectSchema({
         target: TARGET,
-        keys: schema.array(schema.string().min(1).max(65_536)).min(1).max(256),
+        keys: arraySchema(stringSchema(1, 65_536), 1, 256),
         local_timeout_ms: LOCAL_TIMEOUT,
-      },
+      }, ["keys"]),
       async execute(args, context) {
         const target = resolveTarget(args.target, runtime);
         await runtime.cli.sendKeys(target, args.keys, shortExecution(args.local_timeout_ms, context));
@@ -128,15 +177,15 @@ export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, ToolDe
       },
     }),
 
-    phux_run: tool({
+    phux_run: defineTool<RunInput>({
+      name: "phux_run",
       description: "Run one shell command string in a phux pane through phux's documented sentinel. The command is passed as one argument. Output is bounded to 200 lines and 12 KiB.",
-      args: {
+      input: objectSchema({
         target: TARGET,
-        command: schema.string().min(1).max(65_536).regex(/\S/, "command must contain a non-whitespace character")
-          .describe("One shell command line, passed to phux as one argument"),
+        command: stringSchema(1, 65_536, "One shell command line, passed to phux as one argument"),
         timeout_seconds: RUN_TIMEOUT,
         local_timeout_ms: LOCAL_TIMEOUT,
-      },
+      }, ["command"]),
       async execute(args, context) {
         const target = resolveTarget(args.target, runtime);
         const result = await runtime.cli.run(target, [args.command], {
@@ -159,15 +208,16 @@ export function createPhuxTools(runtime: PhuxToolRuntime): Record<string, ToolDe
       },
     }),
 
-    phux_wait: tool({
+    phux_wait: defineTool<WaitInput>({
+      name: "phux_wait",
       description: "Wait for visible text or terminal idleness and return the bounded final screen. until and idle_ms are exclusive; omit both and timeout_seconds to wait indefinitely.",
-      args: {
+      input: objectSchema({
         target: TARGET,
-        until: schema.string().min(1).max(4096).optional(),
-        idle_ms: schema.number().int().min(0).max(86_400_000).optional(),
+        until: stringSchema(1, 4096),
+        idle_ms: integerSchema(0, 86_400_000),
         timeout_seconds: WAIT_TIMEOUT,
         local_timeout_ms: LOCAL_TIMEOUT,
-      },
+      }),
       async execute(args, context) {
         if (args.until !== undefined && args.idle_ms !== undefined) {
           throw new Error("phux_wait accepts either until or idle_ms, not both");
@@ -195,12 +245,11 @@ export function resolveTarget(explicit: string | undefined, runtime: Pick<PhuxTo
 }
 
 function shortExecution(localTimeoutMs: number | undefined, context: ToolContext) {
-  return { signal: context.abort, timeoutMs: localTimeoutMs ?? DEFAULT_SHORT_TIMEOUT_MS };
+  return { timeoutMs: localTimeoutMs ?? DEFAULT_SHORT_TIMEOUT_MS };
 }
 
 function longExecution(localTimeoutMs: number | undefined, context: ToolContext) {
   return {
-    signal: context.abort,
     ...(localTimeoutMs === undefined ? {} : { timeoutMs: localTimeoutMs }),
   };
 }
@@ -225,7 +274,49 @@ function screenResult(
 }
 
 function resultObject(title: string, output: string, metadata: PhuxToolMetadata): ToolResult {
-  return { title, output, metadata };
+  return { content: `${title}\n${output}`, metadata };
+}
+
+function defineTool<Input>(definition: PhuxToolDefinition<Input>): PhuxToolDefinition<Input> {
+  return definition;
+}
+
+function objectSchema(properties: Record<string, JsonSchema>, required: string[] = []): JsonSchema {
+  return {
+    type: "object",
+    properties,
+    ...(required.length === 0 ? {} : { required }),
+    additionalProperties: false,
+  };
+}
+
+function stringSchema(minLength: number, maxLength: number, description?: string): JsonSchema {
+  return {
+    type: "string",
+    minLength,
+    maxLength,
+    pattern: "\\S",
+    ...(description === undefined ? {} : { description }),
+  };
+}
+
+function integerSchema(minimum: number, maximum: number, description?: string): JsonSchema {
+  return {
+    type: "integer",
+    minimum,
+    maximum,
+    ...(description === undefined ? {} : { description }),
+  };
+}
+
+function arraySchema(items: JsonSchema, minItems: number, maxItems: number, description?: string): JsonSchema {
+  return {
+    type: "array",
+    items,
+    minItems,
+    maxItems,
+    ...(description === undefined ? {} : { description }),
+  };
 }
 
 /** Bound terminal body text while preserving the header and explicit notices. */

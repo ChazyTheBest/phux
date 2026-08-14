@@ -153,6 +153,27 @@ jobs:
             -f "sha=${GITHUB_SHA}" >/dev/null
           echo "created ${TAG} at ${GITHUB_SHA}"
 
+      - name: Create component tags for draft integration releases
+        if: steps.rp.outputs.paths_released != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_OUTPUTS: ${{ toJSON(steps.rp.outputs) }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r key; do
+            prefix="${key%--release_created}"
+            tag="$(jq -r --arg key "${prefix}--tag_name" '.[$key] // empty' <<<"$RELEASE_OUTPUTS")"
+            [[ -n "$tag" ]] || continue
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              echo "tag ${tag} already exists; nothing to do."
+              continue
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${tag}" \
+              -f "sha=${GITHUB_SHA}" >/dev/null
+            echo "created ${tag} at ${GITHUB_SHA}"
+          done < <(jq -r 'to_entries[] | select(.key | endswith("--release_created")) | select(.value == "true") | .key' <<<"$RELEASE_OUTPUTS")
+
   sync-lockfile:
     name: sync Cargo.lock on the release PR
     needs: release-please

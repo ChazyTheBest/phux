@@ -1,5 +1,3 @@
-import type { Hooks } from "@opencode-ai/plugin";
-
 import type { ExecutionOptions } from "../../pi/src/adapter.js";
 import { PhuxCli } from "../../pi/src/adapter.js";
 import type { AgentRecord, AgentStateList } from "../../pi/src/schemas.js";
@@ -159,20 +157,35 @@ export class OpenCodeLifecycle {
   }
 }
 
-export function handleLifecycleEvent(lifecycle: OpenCodeLifecycle, event: Parameters<NonNullable<Hooks["event"]>>[0]["event"]): Promise<void> {
+export interface OpenCodeLifecycleEvent {
+  readonly type: string;
+  readonly properties: Record<string, unknown>;
+}
+
+export function handleLifecycleEvent(lifecycle: OpenCodeLifecycle, event: OpenCodeLifecycleEvent): Promise<void> {
   switch (event.type) {
-    case "session.status":
-      if (event.properties.status.type === "busy") {
-        return lifecycle.observeState(event.properties.sessionID, "working");
+    case "session.status": {
+      const sessionID = event.properties.sessionID;
+      const status = event.properties.status;
+      if (typeof sessionID !== "string" || status === null || typeof status !== "object") return Promise.resolve();
+      const statusType = (status as { readonly type?: unknown }).type;
+      if (statusType === "busy") {
+        return lifecycle.observeState(sessionID, "working");
       }
-      if (event.properties.status.type === "idle") {
-        return lifecycle.observeState(event.properties.sessionID, "idle");
+      if (statusType === "idle") {
+        return lifecycle.observeState(sessionID, "idle");
       }
       return Promise.resolve();
-    case "session.idle":
-      return lifecycle.observeState(event.properties.sessionID, "idle");
-    case "session.deleted":
-      return lifecycle.deleteSession(event.properties.info.id);
+    }
+    case "session.idle": {
+      const sessionID = event.properties.sessionID;
+      return typeof sessionID === "string" ? lifecycle.observeState(sessionID, "idle") : Promise.resolve();
+    }
+    case "session.deleted": {
+      const info = event.properties.info;
+      const sessionID = info !== null && typeof info === "object" ? (info as { readonly id?: unknown }).id : undefined;
+      return typeof sessionID === "string" ? lifecycle.deleteSession(sessionID) : Promise.resolve();
+    }
     default:
       return Promise.resolve();
   }

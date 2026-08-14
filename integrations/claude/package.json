@@ -1,0 +1,24 @@
+{
+  "name": "@phux/claude-plugin",
+  "version": "0.1.0",
+  "description": "Claude Code lifecycle and MCP integration for phux",
+  "private": true,
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/phall1/phux.git",
+    "directory": "integrations/claude"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node --check test/package.test.mjs && claude plugin validate . --strict",
+    "test": "node --test test/*.test.mjs",
+    "gates": "npm run check && npm test && npm audit --audit-level=high"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-code": "2.1.232"
+  }
+}

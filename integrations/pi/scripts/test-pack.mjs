@@ -36,7 +36,8 @@ try {
   run("tar", ["-xzf", archive, "-C", temp], packageDir);
   const packedRoot = join(temp, "package");
   const metadata = JSON.parse(await readFile(join(packedRoot, "package.json"), "utf8"));
-  assert.equal(metadata.private, true, "the in-tree package must not be publishable accidentally");
+  assert.equal(metadata.private, undefined, "the release package must be publishable");
+  assert.deepEqual(metadata.publishConfig, { access: "public", provenance: true });
   assert.deepEqual(metadata.pi?.extensions, ["./extensions/index.ts"]);
   assert.equal(metadata.exports?.["."]?.import, "./dist/src/index.js");
 

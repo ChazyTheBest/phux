@@ -356,7 +356,17 @@ e2e-lane-check:
 # no `ratatui` dependency.
 
 # The inner-loop bar — every deterministic gate CI runs. Run before pushing.
-ci: fmt-check lint doc deny docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract test
+agent-integrations-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    node scripts/check-agent-integration-versions.mjs
+    for package in integrations/opencode integrations/pi integrations/claude; do
+      npm --prefix "$package" ci
+      npm --prefix "$package" run gates
+    done
+
+# The inner-loop bar — every deterministic gate CI runs. Run before pushing.
+ci: fmt-check lint doc deny docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract agent-integrations-check test
     @echo "ok"
 
 # The COMPLETE PR bar: `ci` plus the two lanes that spawn real processes.

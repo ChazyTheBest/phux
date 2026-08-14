@@ -1,7 +1,7 @@
 ---
 audience: humans, agents, consumers, contributors
 stability: evolving
-last-reviewed: 2026-08-02
+last-reviewed: 2026-08-14
 ---
 
 # Pi integration
@@ -16,9 +16,9 @@ metadata. It does not embed a terminal or own the server.
 
 ## Requirements and installation
 
-The package requires Node.js 20 or newer, Pi, and an external `phux` executable
+The package requires Node.js 22 or newer, Pi, and an external `phux` executable
 on `PATH`. It does not bundle phux or start a separate implementation. The
-minimum compatible binary is `phux 0.1.0`; check it before loading the package:
+minimum compatible binary is `phux 0.16.0`; check it before loading the package:
 
 ```sh
 phux --version
@@ -32,17 +32,20 @@ instead of registering duplicate tools. This lets contributors keep a preferred
 or in-development global checkout while preserving the out-of-box project
 integration for everyone else.
 
-To use this checkout's package in other repositories, install the package
-directory, not the git root:
+Install the independently versioned public package:
+
+```sh
+pi install npm:@phux/pi
+```
+
+For package development, install the package directory from a trusted checkout:
 
 ```sh
 pi install ./integrations/pi
 ```
 
 The repository root is not a Pi package, so a git source that resolves to that
-root is not an installation method for this integration. `@phux/pi` is also not
-published to npm today. Do not use `npm:@phux/pi` unless a future release is
-actually present in the registry.
+root is not an installation method for this integration.
 
 A packed artifact can be tested or moved to another machine without implying
 registry publication:

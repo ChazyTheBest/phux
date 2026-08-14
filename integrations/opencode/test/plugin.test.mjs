@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import PhuxPlugin, {
+  createPhuxPlugin,
   DEFAULT_SHORT_TIMEOUT_MS,
   MAX_MODEL_BYTES,
   MAX_MODEL_LINES,
@@ -19,55 +20,64 @@ const screen = {
   scrollback: ["older"],
 };
 
-function context(sessionID = "public-session", signal = new AbortController().signal) {
-  return {
-    sessionID,
-    messageID: "message",
-    agent: "build",
-    directory: "/project",
-    worktree: "/project",
-    abort: signal,
-    metadata() {},
-    async ask() {},
-  };
-}
-
 function completed(stdout = "", exitCode = 0) {
   return { termination: "completed", exitCode, stdout, stderr: "" };
 }
 
-function userMessage(sessionID, id) {
+function toolContext(sessionID = "public-session") {
+  return { sessionID, messageID: "message", agent: "build", id: "call" };
+}
+
+async function activate(options = {}) {
+  const tools = {};
+  const hooks = {};
+  let disposed = 0;
+  const plugin = createPhuxPlugin(options);
+  const cleanup = await plugin.setup({
+    options: {},
+    tool: {
+      async transform(callback) {
+        callback({ add(definition) { tools[definition.name] = definition; } });
+        return { async dispose() { disposed += 1; } };
+      },
+    },
+    session: {
+      async hook(name, callback) {
+        hooks[name] = callback;
+        return { async dispose() { disposed += 1; } };
+      },
+    },
+    event: {
+      subscribe({ signal }) {
+        return {
+          async *[Symbol.asyncIterator]() {
+            await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+          },
+        };
+      },
+    },
+  });
   return {
-    id,
-    sessionID,
-    role: "user",
-    time: { created: Date.now() },
-    agent: "build",
-    model: { providerID: "test", modelID: "test" },
+    tools,
+    hooks,
+    async dispose() {
+      await cleanup();
+      assert.equal(disposed, 2, "V2 registrations must be released on plugin cleanup");
+    },
   };
 }
 
-function textPart(sessionID, messageID, text) {
-  return {
-    id: `${messageID}-text`,
-    sessionID,
-    messageID,
-    type: "text",
-    text,
-  };
-}
-
-test("public plugin loads six tools without invoking phux", async () => {
-  let calls = 0;
-  const cli = new PhuxCli({ runner: async () => {
-    calls += 1;
-    return completed();
-  } });
-
+test("exports one named OpenCode V2 plugin and registers six structural tools", async () => {
   assert.equal(PhuxPlugin, NamedPhuxPlugin);
-  const hooks = await PhuxPlugin({}, { cli, env: {} });
+  assert.equal(PhuxPlugin.id, "phux.terminal");
+  assert.equal(typeof PhuxPlugin.setup, "function");
 
-  assert.deepEqual(Object.keys(hooks.tool).sort(), [
+  let calls = 0;
+  const active = await activate({
+    cli: new PhuxCli({ runner: async () => { calls += 1; return completed(); } }),
+    env: { PHUX_CONTEXT_AWARENESS: "0" },
+  });
+  assert.deepEqual(Object.keys(active.tools).sort(), [
     "phux_create",
     "phux_list",
     "phux_run",
@@ -75,16 +85,19 @@ test("public plugin loads six tools without invoking phux", async () => {
     "phux_snapshot",
     "phux_wait",
   ]);
-  assert.equal(typeof hooks["chat.message"], "function");
-  assert.equal(typeof hooks["experimental.session.compacting"], "function");
-  assert.equal(typeof hooks.event, "function");
-  assert.equal(typeof hooks.dispose, "function");
+  for (const [name, definition] of Object.entries(active.tools)) {
+    assert.equal(definition.name, name);
+    assert.equal(definition.input.type, "object");
+    assert.equal(definition.input.additionalProperties, false);
+    assert.equal(typeof definition.execute, "function");
+  }
+  assert.equal(typeof active.hooks.context, "function");
   assert.equal(calls, 0);
-  await hooks.dispose();
+  await active.dispose();
   assert.equal(calls, 0);
 });
 
-test("tools preserve target precedence, command shape, deadlines, cancellation, and bounded results", async () => {
+test("V2 tools preserve target precedence, command shape, deadlines, and bounded results", async () => {
   const requests = [];
   const cli = new PhuxCli({
     executable: "/opt/bin/phux",
@@ -105,66 +118,48 @@ test("tools preserve target precedence, command shape, deadlines, cancellation, 
         case "wait":
           return completed(JSON.stringify(screen));
         case "agent":
-          if (request.args[1] === "set") {
-            const record = {
-              name: request.args[request.args.indexOf("--name") + 1],
-              kind: request.args[request.args.indexOf("--kind") + 1],
-              state: request.args[request.args.indexOf("--state") + 1],
-              attention: request.args[request.args.indexOf("--attention") + 1],
-              session: request.args[request.args.indexOf("--session") + 1],
-            };
-            return completed(`@44\t${JSON.stringify(record)}`);
-          }
           return completed(JSON.stringify({ schema_version: 1, agents: [] }));
         default:
           throw new Error(`unexpected args: ${request.args.join(" ")}`);
       }
     },
   });
-  const hooks = await PhuxPlugin({}, { cli, env: { PHUX_TARGET: "@9" } });
-  const tools = hooks.tool;
-  const toolContext = context();
+  const active = await activate({ cli, env: { PHUX_TARGET: "@9", PHUX_CONTEXT_AWARENESS: "0" } });
+  const context = toolContext();
 
-  const listed = await tools.phux_list.execute({}, toolContext);
+  const listed = await active.tools.phux_list.execute({}, context);
   assert.equal(listed.metadata.count, 1);
-
-  await tools.phux_snapshot.execute({}, toolContext);
-  await tools.phux_snapshot.execute({ target: "@10" }, toolContext);
-  await tools.phux_create.execute({ name: "made" }, toolContext);
-  await tools.phux_send_keys.execute({ keys: ["C-c", "literal"] }, toolContext);
-  const run = await tools.phux_run.execute({ command: "printf '%s' one two" }, toolContext);
-  const waited = await tools.phux_wait.execute({}, toolContext);
+  await active.tools.phux_snapshot.execute({}, context);
+  await active.tools.phux_snapshot.execute({ target: "@10" }, context);
+  await active.tools.phux_create.execute({ name: "made" }, context);
+  await active.tools.phux_send_keys.execute({ keys: ["C-c", "literal"] }, context);
+  const run = await active.tools.phux_run.execute({ command: "printf '%s' one two" }, context);
+  const waited = await active.tools.phux_wait.execute({}, context);
 
   const snapshots = requests.filter((request) => request.args[0] === "snapshot");
-  assert.equal(snapshots[0].args.at(-1), "@9", "PHUX_TARGET is the initial fallback");
-  assert.equal(snapshots[1].args.at(-1), "@10", "an explicit target wins");
+  assert.equal(snapshots[0].args.at(-1), "@9");
+  assert.equal(snapshots[1].args.at(-1), "@10");
   const send = requests.find((request) => request.args[0] === "send-keys");
-  assert.deepEqual(send.args.slice(-3), ["@44", "C-c", "literal"], "create auto-selects its seed pane");
-
+  assert.deepEqual(send.args.slice(-3), ["@44", "C-c", "literal"]);
   const runRequest = requests.find((request) => request.args[0] === "run");
   assert.equal(runRequest.args.at(-2), "@44");
-  assert.equal(runRequest.args.at(-1), "printf '%s' one two", "run passes one command string argument");
-  assert.equal(runRequest.timeoutMs, undefined, "long operations are not given an implicit local deadline");
-  assert.equal(runRequest.signal, toolContext.abort);
-  assert.equal(Buffer.byteLength(run.output), MAX_MODEL_BYTES);
-  assert.ok(run.output.split("\n").length <= MAX_MODEL_LINES);
-  assert.match(run.output, /OpenCode adapter truncated terminal output/);
+  assert.equal(runRequest.args.at(-1), "printf '%s' one two");
+  assert.equal(runRequest.timeoutMs, undefined);
+  assert.equal(Buffer.byteLength(run.content.split("\n").slice(1).join("\n")), MAX_MODEL_BYTES);
+  assert.ok(run.content.split("\n").length <= MAX_MODEL_LINES + 1);
+  assert.match(run.content, /OpenCode adapter truncated terminal output/);
   assert.equal(run.metadata.modelOutputTruncated, true);
-
   const waitRequest = requests.find((request) => request.args[0] === "wait");
   assert.equal(waitRequest.args.includes("--until"), false);
   assert.equal(waitRequest.args.includes("--idle"), false);
   assert.equal(waitRequest.args.includes("--timeout"), false);
-  assert.equal(waitRequest.timeoutMs, undefined, "omitted wait deadlines mean indefinite");
+  assert.equal(waitRequest.timeoutMs, undefined);
   assert.equal(waited.metadata.outcome, "satisfied");
-
-  const snapshotRequest = snapshots[0];
-  assert.equal(snapshotRequest.timeoutMs, DEFAULT_SHORT_TIMEOUT_MS);
-  assert.equal(snapshotRequest.signal, toolContext.abort);
-  await hooks.dispose();
+  assert.equal(snapshots[0].timeoutMs, DEFAULT_SHORT_TIMEOUT_MS);
+  await active.dispose();
 });
 
-test("appends sequenced synthetic fleet context without rewriting prior messages", async () => {
+test("V2 context hook keeps one stable fleet part and advances only on changes", async () => {
   let state = "working";
   let calls = 0;
   const cli = new PhuxCli({ runner: async (request) => {
@@ -179,7 +174,7 @@ test("appends sequenced synthetic fleet context without rewriting prior messages
         agent: { id: "codex", label: "Codex", kind: "codex" },
         state,
         confidence: 1,
-        attention: state === "working" ? "normal" : "low",
+        attention: "normal",
         title: "do not inject screen title",
         cwd: "/repo",
         sources: [{ kind: "screen", signal: "secret screen evidence", confidence: 1, observed: "contents" }],
@@ -187,84 +182,52 @@ test("appends sequenced synthetic fleet context without rewriting prior messages
       }],
     }));
   } });
-  const hooks = await PhuxPlugin({}, {
-    cli,
-    env: { PHUX_TARGET: "@7", PHUX_TERMINAL_ID: "65" },
-    contextTimeoutMs: 432,
-  });
-  const hook = hooks["chat.message"];
+  const active = await activate({ cli, env: { PHUX_TARGET: "@7", PHUX_TERMINAL_ID: "65" } });
 
-  const first = { message: userMessage("session-one", "message-one"), parts: [textPart("session-one", "message-one", "user request")] };
-  await hook({ sessionID: "session-one", messageID: "message-one" }, first);
-  assert.equal(first.parts.length, 2);
-  assert.equal(first.parts[1].synthetic, true);
-  assert.match(first.parts[1].text, /kind="checkpoint" seq="1"/);
-  assert.match(first.parts[1].text, /"self":"@65"/);
-  assert.doesNotMatch(first.parts[1].text, /do not inject screen title|secret screen evidence|"contents"/);
+  const first = { sessionID: "session-one", system: [], messages: [], tools: {}, agent: "build", model: {} };
+  await active.hooks.context(first);
+  assert.equal(first.system.length, 1);
+  assert.match(first.system[0].text, /kind="checkpoint" seq="1"/);
+  assert.match(first.system[0].text, /"self":"@65"/);
+  assert.doesNotMatch(first.system[0].text, /do not inject screen title|secret screen evidence|"contents"/);
 
-  const unchanged = { message: userMessage("session-one", "message-two"), parts: [textPart("session-one", "message-two", "next request")] };
-  await hook({ sessionID: "session-one", messageID: "message-two" }, unchanged);
-  assert.equal(unchanged.parts.length, 1, "unchanged fleet state adds no suffix");
-
+  const unchanged = { ...first, system: [] };
+  await active.hooks.context(unchanged);
+  assert.equal(unchanged.system[0].text, first.system[0].text, "unchanged context remains an exact cacheable suffix");
   state = "idle";
-  const changed = { message: userMessage("session-one", "message-three"), parts: [textPart("session-one", "message-three", "next request")] };
-  await hook({ sessionID: "session-one", messageID: "message-three" }, changed);
-  assert.match(changed.parts[1].text, /kind="delta" seq="2"/);
-  assert.match(changed.parts[1].text, /"state":"idle"/);
+  const changed = { ...first, system: [] };
+  await active.hooks.context(changed);
+  assert.match(changed.system[0].text, /kind="delta" seq="2"/);
+  assert.match(changed.system[0].text, /"state":"idle"/);
   assert.equal(calls, 3);
-  await hooks.dispose();
-});
-
-test("compaction receives a canonical checkpoint and forces the next message checkpoint", async () => {
-  const cli = new PhuxCli({ runner: async () => completed(JSON.stringify({ schema_version: 1, agents: [] })) });
-  const hooks = await PhuxPlugin({}, { cli, env: {} });
-  const compacting = hooks["experimental.session.compacting"];
-  const output = { context: [] };
-
-  await compacting({ sessionID: "compact-me" }, output);
-  assert.equal(output.context.length, 1);
-  assert.match(output.context[0], /canonical phux fleet checkpoint/);
-  assert.match(output.context[0], /kind="checkpoint" seq="1"/);
-
-  await hooks.event({ event: { type: "session.compacted", properties: { sessionID: "compact-me" } } });
-  const after = { message: userMessage("compact-me", "after-compact"), parts: [textPart("compact-me", "after-compact", "continue")] };
-  await hooks["chat.message"]({ sessionID: "compact-me", messageID: "after-compact" }, after);
-  assert.match(after.parts[1].text, /kind="checkpoint" seq="2"/);
-  await hooks.dispose();
+  await active.dispose();
 });
 
 test("context awareness can be disabled without probing phux", async () => {
   let calls = 0;
-  const cli = new PhuxCli({ runner: async () => { calls += 1; return completed(); } });
-  const hooks = await PhuxPlugin({}, { cli, env: { PHUX_CONTEXT_AWARENESS: "0" } });
-  const output = { message: userMessage("off", "message"), parts: [textPart("off", "message", "hello")] };
-  await hooks["chat.message"]({ sessionID: "off", messageID: "message" }, output);
-  await hooks["experimental.session.compacting"]({ sessionID: "off" }, { context: [] });
-  assert.equal(output.parts.length, 1);
+  const active = await activate({
+    cli: new PhuxCli({ runner: async () => { calls += 1; return completed(); } }),
+    env: { PHUX_CONTEXT_AWARENESS: "0" },
+  });
+  const event = { sessionID: "off", system: [], messages: [], tools: {}, agent: "build", model: {} };
+  await active.hooks.context(event);
+  assert.deepEqual(event.system, []);
   assert.equal(calls, 0);
-  await hooks.dispose();
+  await active.dispose();
 });
 
-test("public argument contracts reject invalid forms and wait enforces exclusive conditions", async () => {
-  const cli = new PhuxCli({ runner: async () => completed() });
-  const hooks = await PhuxPlugin({}, { cli, env: {} });
-  const z = (await import("@opencode-ai/plugin")).tool.schema;
-
-  const runSchema = z.object(hooks.tool.phux_run.args).strict();
-  assert.equal(runSchema.safeParse({ command: ["echo", "no"] }).success, false);
-  assert.equal(runSchema.safeParse({ command: "echo yes", surprise: true }).success, false);
-  assert.equal(runSchema.safeParse({ command: "   " }).success, false);
-
-  const waitSchema = z.object(hooks.tool.phux_wait.args).strict();
-  assert.equal(waitSchema.safeParse({ idle_ms: -1 }).success, false);
-  assert.equal(waitSchema.safeParse({ timeout_seconds: 0 }).success, false);
+test("public V2 schemas are closed and encode required and bounded arguments", async () => {
+  const active = await activate({
+    cli: new PhuxCli({ runner: async () => completed() }),
+    env: { PHUX_CONTEXT_AWARENESS: "0" },
+  });
+  assert.deepEqual(active.tools.phux_run.input.required, ["command"]);
+  assert.equal(active.tools.phux_run.input.properties.command.pattern, "\\S");
+  assert.equal(active.tools.phux_wait.input.properties.timeout_seconds.minimum, 1);
+  assert.equal(active.tools.phux_wait.input.additionalProperties, false);
   await assert.rejects(
-    hooks.tool.phux_wait.execute({ target: "@1", until: "done", idle_ms: 10 }, context()),
+    active.tools.phux_wait.execute({ target: "@1", until: "done", idle_ms: 10 }, toolContext()),
     /either until or idle_ms/,
   );
-  await assert.rejects(
-    hooks.tool.phux_snapshot.execute({}, context()),
-    /Pass target explicitly.*PHUX_TARGET/,
-  );
-  await hooks.dispose();
+  await active.dispose();
 });

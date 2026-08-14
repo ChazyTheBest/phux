@@ -69,7 +69,7 @@ try {
     `global and project @phux/pi copies must arbitrate without conflicts: ${rpc.stderr}`,
   );
   const commands = response.data.commands
-    .filter((command) => command.source === "extension")
+    .filter((command) => command.source === "extension" && command.name.startsWith("phux"))
     .map((command) => command.name)
     .sort();
   assert.deepEqual(commands, ["phux", "phux-attach", "phux-status"]);
