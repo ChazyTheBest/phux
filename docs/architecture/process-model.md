@@ -63,7 +63,9 @@ timers on its `select!`: the state-sync tick that paces output emission to its
 consumers, and a second, slower agent-state detector tick
 ([ADR-0046](../../ADR/0046-server-side-agent-state-detection.md)) that
 re-derives the pane's `phux.agent/v1` record from the PTY's foreground process,
-the OSC title, and the live screen. The detector timer is the sole driver of
+the OSC title, and the live screen, and publishes the privacy-bounded
+`phux.pane-occupant/v1` foreground basename/shell answer from the same process
+query. The detector timer is the sole driver of
 that work — PTY bytes never wake it — so a chatty pane costs no extra
 detection. It is constructed only for a PTY-backed actor, only when a rule set
 loaded, and it publishes through its own `mpsc` channel to a per-terminal drain

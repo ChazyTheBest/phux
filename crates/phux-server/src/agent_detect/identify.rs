@@ -46,6 +46,7 @@ const RUNTIME_WRAPPERS: [&str; 14] = [
     "node", "nodejs", "bun", "deno", "python", "python3", "sh", "bash", "zsh", "fish", "env",
     "npx", "uv", "uvx",
 ];
+const PANE_SHELLS: [&str; 4] = ["sh", "bash", "zsh", "fish"];
 
 /// Suffixes stripped from a script name before matching (`cli.js` -> `cli`).
 const SCRIPT_SUFFIXES: [&str; 5] = [".js", ".mjs", ".cjs", ".py", ".ts"];
@@ -135,6 +136,16 @@ pub(crate) enum Occupancy {
     },
 }
 
+/// Privacy-bounded description of the pane's foreground process.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PaneOccupant {
+    /// Login-dash-stripped basename of `argv[0]`.
+    pub(crate) foreground: String,
+    /// The foreground group is the pane's original child and that child is a
+    /// known interactive shell.
+    pub(crate) is_pane_shell: bool,
+}
+
 impl Occupancy {
     /// The process group this occupancy is ABOUT, if the question was
     /// answered. [`Self::Unresolved`] carries none — unresolved is not
@@ -200,24 +211,47 @@ pub(crate) fn foreground_pgid(master_fd: Option<i32>) -> Option<i32> {
 /// First hit wins. A pane whose foreground process matches nothing is
 /// [`Occupancy::Vacant`] — an answer, not a shrug; any step that fails to
 /// produce an answer is [`Occupancy::Unresolved`].
+#[cfg(test)]
 pub(crate) fn foreground_occupancy(master_fd: Option<i32>, rules: &RuleSet) -> Occupancy {
+    foreground_observation(master_fd, None, rules).0
+}
+
+/// Resolve agent identity and pane-shell availability from one process query.
+pub(crate) fn foreground_observation(
+    master_fd: Option<i32>,
+    pane_child_pid: Option<i32>,
+    rules: &RuleSet,
+) -> (Occupancy, Option<PaneOccupant>) {
     let Some(fd) = master_fd else {
-        return Occupancy::Unresolved;
+        return (Occupancy::Unresolved, None);
     };
     let Some(pgid) = proc_query::foreground_pgid(fd) else {
-        return Occupancy::Unresolved;
+        return (Occupancy::Unresolved, None);
     };
     let Some(argv) = proc_query::process_argv(pgid) else {
-        return Occupancy::Unresolved;
+        return (Occupancy::Unresolved, None);
     };
-    kind_from_argv(&argv, rules).map_or(Occupancy::Vacant { pgid }, |kind| Occupancy::Agent {
-        kind,
-        // Queried HERE and not before the match: a pane running a shell is
-        // the common case, its pgid is compared to nothing, and the whole
-        // point of the cadence budget is that an unoccupied pane costs one
-        // timer wakeup.
-        occupant: Occupant::new(pgid, proc_start::start_time(pgid)),
-    })
+    let pane_occupant = pane_occupant(pgid, pane_child_pid, &argv);
+    let occupancy = kind_from_argv(&argv, rules).map_or(Occupancy::Vacant { pgid }, |kind| {
+        Occupancy::Agent {
+            kind,
+            // Queried HERE and not before the match: a pane running a shell is
+            // the common case, its pgid is compared to nothing, and the whole
+            // point of the cadence budget is that an unoccupied pane costs one
+            // timer wakeup.
+            occupant: Occupant::new(pgid, proc_start::start_time(pgid)),
+        }
+    });
+    (occupancy, Some(pane_occupant))
+}
+
+fn pane_occupant(pgid: i32, pane_child_pid: Option<i32>, argv: &[String]) -> PaneOccupant {
+    let foreground = argv.first().map_or("", String::as_str);
+    let foreground = basename(foreground).trim_start_matches('-').to_owned();
+    PaneOccupant {
+        is_pane_shell: pane_child_pid == Some(pgid) && PANE_SHELLS.contains(&foreground.as_str()),
+        foreground,
+    }
 }
 
 /// The group leader's start time, which is what makes a recycled pgid
@@ -489,7 +523,7 @@ fn is_runtime_wrapper(arg: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::{Occupancy, Occupant, foreground_occupancy, kind_from_argv};
+    use super::{Occupancy, Occupant, foreground_occupancy, kind_from_argv, pane_occupant};
     use crate::agent_detect::rules::{ManifestSpec, RuleSet};
 
     fn rules() -> RuleSet {
@@ -503,6 +537,16 @@ binaries = ["claude", "claude-code"]
         let mut set = RuleSet::default();
         set.install(spec).expect("compiles");
         set
+    }
+
+    #[test]
+    fn pane_shell_requires_the_child_pgid_and_a_known_shell() {
+        let login = pane_occupant(42, Some(42), &["-zsh".to_owned()]);
+        assert_eq!(login.foreground, "zsh");
+        assert!(login.is_pane_shell);
+
+        assert!(!pane_occupant(43, Some(42), &["zsh".to_owned()]).is_pane_shell);
+        assert!(!pane_occupant(42, Some(42), &["vim".to_owned()]).is_pane_shell);
     }
 
     fn argv(parts: &[&str]) -> Vec<String> {

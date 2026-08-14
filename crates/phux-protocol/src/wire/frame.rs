@@ -271,6 +271,12 @@ pub const TERMINAL_AGENT_KEY: &str = "phux.agent/v1";
 /// ADR-0068. `SPAWN_TERMINAL.agent_session` may install these opaque bytes
 /// atomically with a local spawn; ordinary L3 reads and writes use this key.
 pub const TERMINAL_AGENT_SESSION_KEY: &str = "phux.agent-session/v1";
+
+/// Conventional Terminal-scoped metadata key for the server-observed
+/// foreground process and available-shell answer. Clients may read and
+/// subscribe to this key but MUST NOT set or delete it.
+pub const TERMINAL_PANE_OCCUPANT_KEY: &str = "phux.pane-occupant/v1";
+
 /// Maximum encoded `phux.agent-session/v1` record accepted by server mutations.
 pub const MAX_AGENT_SESSION_RECORD_BYTES: usize = 4 * 1024;
 

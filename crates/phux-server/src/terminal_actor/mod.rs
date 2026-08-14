@@ -1904,9 +1904,14 @@ impl TerminalActor {
     /// event rather than stalling the actor. Safe to drop — the detector is
     /// level-triggered, so the next tick re-derives and re-publishes.
     fn emit_agent_state(&self, event: AgentDetectEvent) {
+        let _ = self.try_emit_agent_state(event);
+    }
+
+    fn try_emit_agent_state(&self, event: AgentDetectEvent) -> bool {
         if let Some(sink) = self.agent_state_sink.as_ref() {
-            let _ = sink.try_send(event);
+            return sink.try_send(event).is_ok();
         }
+        false
     }
 
     /// Sync `last_title` with libghostty's tracked OSC 0/2 title. Returns
@@ -1986,14 +1991,28 @@ impl TerminalActor {
             .pty
             .as_ref()
             .and_then(|p| p.master.lock().ok().and_then(|m| m.as_raw_fd()));
-        let outcome = detector.tick(
+        let pane_child_pid = self
+            .pty
+            .as_ref()
+            .and_then(|p| p.child.process_id().and_then(|pid| i32::try_from(pid).ok()));
+        let outcome = detector.tick_for_pane(
             now,
             master_fd,
+            pane_child_pid,
             &self.last_title,
             &self.last_progress,
             screen.as_deref(),
         );
+        let occupant = detector.take_occupant_update();
         let next = detector.interval();
+
+        if let Some(occupant) = occupant {
+            if self.try_emit_agent_state(AgentDetectEvent::Occupant(occupant.clone())) {
+                detector.occupant_update_sent(occupant);
+            } else {
+                detector.retry_occupant_update(occupant);
+            }
+        }
         self.agent_detect = Some(detector);
 
         match outcome {

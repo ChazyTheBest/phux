@@ -16,6 +16,34 @@
 use serde::{Deserialize, Serialize};
 
 pub use phux_protocol::wire::frame::TERMINAL_AGENT_KEY;
+pub use phux_protocol::wire::frame::TERMINAL_PANE_OCCUPANT_KEY;
+
+/// Server-observed foreground process for `phux.pane-occupant/v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneOccupantRecord {
+    /// Login-dash-stripped basename of the foreground process.
+    pub foreground: String,
+    /// Whether it is the pane's original interactive shell.
+    pub is_pane_shell: bool,
+}
+
+/// Parse a `phux.pane-occupant/v1` value. Malformed or future-incompatible
+/// records are absent evidence, never an available-shell answer.
+#[must_use]
+pub fn parse_pane_occupant(bytes: &[u8]) -> Option<PaneOccupantRecord> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let record: PaneOccupantRecord = serde_json::from_value(value).ok()?;
+    if record.foreground.is_empty()
+        || record.foreground.chars().any(char::is_control)
+        || record.foreground.contains('/')
+    {
+        return None;
+    }
+    Some(record)
+}
 
 /// Lifecycle state a `phux.agent/v1` record declares.
 ///
@@ -221,6 +249,24 @@ mod tests {
         };
         let parsed = parse_agent_record(&record.encode()).expect("roundtrip");
         assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn pane_occupant_is_strict_and_privacy_bounded() {
+        let record = parse_pane_occupant(br#"{"foreground":"zsh","is_pane_shell":true}"#)
+            .expect("valid occupant");
+        assert_eq!(record.foreground, "zsh");
+        assert!(record.is_pane_shell);
+
+        for malformed in [
+            br#"{"foreground":"","is_pane_shell":true}"#.as_slice(),
+            br#"{"foreground":"/bin/zsh","is_pane_shell":true}"#.as_slice(),
+            br#"{"foreground":"zsh\n","is_pane_shell":true}"#.as_slice(),
+            br#"{"foreground":"zsh"}"#.as_slice(),
+            br#"["zsh",true]"#.as_slice(),
+        ] {
+            assert_eq!(parse_pane_occupant(malformed), None, "{malformed:?}");
+        }
     }
 
     #[test]

@@ -158,14 +158,16 @@ exactly, and nothing else:
 - **The pane's own PTY.** Its foreground process group id, and that process's
   `argv` (`/proc/<pid>/cmdline` on Linux, a `sysctl` on macOS; unavailable
   elsewhere, where the detector simply never identifies an agent). This is used
-  only to answer "which agent binary is running here", and only for terminals
-  this server owns.
+  only to answer "which agent binary is running here" and whether the
+  foreground group is the pane's original shell, and only for terminals this
+  server owns. L3 exposes only the login-dash-stripped process basename and
+  that boolean; no pid or argv tail leaves the process.
 - **That terminal's OSC title and its live viewport rows.** Both are already in
   the server's own engine state; the detector reads them, matches them against
   its rule manifests, and derives a state word.
 
-Nothing leaves the process: no network call, no subprocess, no file write. Screen
-content is **not** logged — the detector logs its derived state transitions at
+There is no network call, subprocess, or file write. Screen content is **not**
+logged — the detector logs its derived state transitions at
 `debug` and its rule-match bookkeeping at `trace`, never the matched text.
 
 **Kill switch.** `PHUX_AGENT_DETECT=0` in the server's environment loads an empty

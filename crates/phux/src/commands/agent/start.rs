@@ -56,26 +56,20 @@
 //! identification plus its startup grace on top. So any derived state the wait
 //! observes is strictly post-submit without the CLI needing a sequence field.
 //!
-//! # The available-shell precondition, and the surface it is missing
+//! # The available-shell precondition
 //!
 //! herdr's gate is three clauses: the pane's foreground pgid equals its child
 //! pid, the job holds only that shell, and the name is a known shell. phux has
-//! the raw materials for clauses 1 and 3 **server-side only** — the detector
-//! already makes both syscalls on its identify path
-//! (`phux-server/src/proc_query.rs`) — and no wire surface carries the answer:
-//! `TerminalInfo` has no foreground-process field, and there is no other read
-//! path. Publishing a server-derived `phux.pane-occupant/v1` L3 key is the
-//! right fix and is filed; it is normative spec surface and is not this
-//! change.
+//! the raw materials for clauses 1 and 3 server-side, where the detector
+//! already makes both process queries. It publishes the privacy-bounded answer
+//! as `phux.pane-occupant/v1`. The CLI waits through the detector's first tick,
+//! refuses a foreground process that is not the pane shell, and accepts an
+//! unmarked shell from that server-owned record.
 //!
-//! What ships here is the degraded check, stated out loud rather than
-//! silently: the pane's `phux.agent/v1` record must not name a live occupant,
-//! and the pane must show an OSC-133 semantic mark **on the cursor's row** —
-//! positive evidence that the thing holding the screen right now is a shell
-//! prompt. Three-valued on purpose (see [`ShellCheck`]), because "shell
-//! integration is off" and "the cursor is not at a prompt" are different
-//! answers and only the second is a confident refusal. `--force` skips it, and
-//! `--json` always reports which check ran.
+//! OSC-133 remains a conservative cross-check: a Prompt/Input mark on the
+//! cursor row corroborates availability, while marks elsewhere positively
+//! prove the screen is busy and override a possibly stale periodic process
+//! observation. `--force` skips the entire precondition.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,7 +77,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use phux_client::agent_meta::{
-    AgentMetaState, AgentRecord, TERMINAL_AGENT_KEY, parse_agent_record,
+    AgentMetaState, AgentRecord, TERMINAL_AGENT_KEY, TERMINAL_PANE_OCCUPANT_KEY,
+    parse_agent_record, parse_pane_occupant,
 };
 use phux_client::agent_prompt::{ApplyVerdict, Refusal as ApplyRefusal, apply_input_once};
 use phux_client::agent_wait::{AgentWaitError, AgentWaitResult, wait_for_agent_state};
@@ -107,6 +102,9 @@ const RESULT_SCHEMA_VERSION: u8 = 1;
 /// Poll-floor cadence for the readiness wait's `GET_METADATA` re-read — the
 /// same gap `phux wait` and `phux agent wait` use.
 const POLL_INTERVAL: Duration = phux_client::wait::DEFAULT_POLL_INTERVAL;
+/// Covers the detector's first 500 ms unidentified tick without turning an
+/// older or degraded server into an unbounded preflight.
+const PANE_OCCUPANT_WAIT: Duration = Duration::from_millis(650);
 
 /// Default readiness deadline, in seconds.
 ///
@@ -355,6 +353,31 @@ impl ShellCheck {
             Self::NotAtPrompt => "not-at-prompt",
             Self::Unanswerable => "unanswerable",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellAvailability {
+    Available,
+    BusyProcess(String),
+    BusyScreen,
+    Unanswerable,
+}
+
+fn shell_availability(
+    occupant: Option<&phux_client::agent_meta::PaneOccupantRecord>,
+    screen: ShellCheck,
+) -> ShellAvailability {
+    if let Some(occupant) = occupant
+        && !occupant.is_pane_shell
+    {
+        return ShellAvailability::BusyProcess(occupant.foreground.clone());
+    }
+    match screen {
+        ShellCheck::AtPrompt => ShellAvailability::Available,
+        ShellCheck::NotAtPrompt => ShellAvailability::BusyScreen,
+        ShellCheck::Unanswerable if occupant.is_some() => ShellAvailability::Available,
+        ShellCheck::Unanswerable => ShellAvailability::Unanswerable,
     }
 }
 
@@ -964,21 +987,30 @@ fn check_cwd_agreement(
     ))
 }
 
-/// The available-shell precondition, degraded to what a client can see.
+/// The available-shell precondition: server process truth, conservatively
+/// cross-checked with client-visible OSC-133 state.
 ///
-/// Fails CLOSED: a screen phux could not read is [`ShellCheck::Unanswerable`],
-/// which refuses, because "I could not look" is not "it was fine".
+/// Fails CLOSED when neither source answers. A missing screen cannot erase a
+/// positive server observation, but it is never itself evidence of safety.
 async fn check_shell_available(socket_path: &Path, terminal: &TerminalId) -> Result<(), Refusal> {
+    let label = crate::selector::format_terminal_id(terminal);
+    let occupant = read_pane_occupant(socket_path, terminal).await;
     let screen =
         phux_client::snapshot::get_screen_scrollback(socket_path, terminal.clone(), None, true)
             .await;
-    let label = crate::selector::format_terminal_id(terminal);
-    match screen
+    let screen = screen
         .as_ref()
-        .map_or(ShellCheck::Unanswerable, shell_check)
-    {
-        ShellCheck::AtPrompt => Ok(()),
-        ShellCheck::NotAtPrompt => Err(Refusal::new(
+        .map_or(ShellCheck::Unanswerable, shell_check);
+    match shell_availability(occupant.as_ref(), screen) {
+        ShellAvailability::Available => Ok(()),
+        ShellAvailability::BusyProcess(foreground) => Err(Refusal::new(
+            codes::AGENT_PANE_NOT_AVAILABLE,
+            format!("{label} is running '{foreground}' in the foreground, not its pane shell"),
+            "wait for the foreground job to finish, pick another pane, or pass `--force` if \
+             you know the pane is free",
+            EXIT_USAGE,
+        )),
+        ShellAvailability::BusyScreen => Err(Refusal::new(
             codes::AGENT_PANE_NOT_AVAILABLE,
             format!(
                 "{label} is not sitting at its shell prompt — the cursor is not on a marked \
@@ -988,7 +1020,7 @@ async fn check_shell_available(socket_path: &Path, terminal: &TerminalId) -> Res
              you know the pane is free",
             EXIT_USAGE,
         )),
-        ShellCheck::Unanswerable => Err(Refusal::new(
+        ShellAvailability::Unanswerable => Err(Refusal::new(
             codes::AGENT_PANE_NOT_AVAILABLE,
             format!(
                 "cannot establish that {label} is at an idle shell prompt: the pane reports \
@@ -999,6 +1031,40 @@ async fn check_shell_available(socket_path: &Path, terminal: &TerminalId) -> Res
              own pane and needs no precondition), or pass `--force`",
             EXIT_USAGE,
         )),
+    }
+}
+
+/// Read the detector-owned occupant record, allowing its first 500 ms tick to
+/// land. Absence remains distinguishable from `is_pane_shell: false` so the
+/// OSC-133 compatibility fallback can serve older or degraded servers.
+async fn read_pane_occupant(
+    socket_path: &Path,
+    terminal: &TerminalId,
+) -> Option<phux_client::agent_meta::PaneOccupantRecord> {
+    let mut conn = Connection::connect(socket_path).await.ok()?;
+    let deadline = tokio::time::Instant::now() + PANE_OCCUPANT_WAIT;
+    let mut request_id = 70;
+    loop {
+        let reply = conn
+            .request_metadata(
+                request_id,
+                Scope::Terminal(terminal.clone()),
+                TERMINAL_PANE_OCCUPANT_KEY.to_owned(),
+            )
+            .await
+            .ok()?;
+        let (answer, _) = reply.into_parts();
+        match answer {
+            Answer::Ok(Some(bytes)) => return parse_pane_occupant(&bytes),
+            Answer::Ok(None) => {}
+            Answer::Err(_) => return None,
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+        request_id += 1;
     }
 }
 
@@ -1678,6 +1744,36 @@ mod tests {
             Some(vec![cell(3, 0, Some(SemanticContent::Prompt))]),
         );
         assert_eq!(shell_check(&busy), ShellCheck::NotAtPrompt);
+    }
+
+    #[test]
+    fn server_shell_evidence_fills_only_the_unanswerable_case() {
+        use phux_client::agent_meta::PaneOccupantRecord;
+
+        let shell = PaneOccupantRecord {
+            foreground: "zsh".to_owned(),
+            is_pane_shell: true,
+        };
+        let busy = PaneOccupantRecord {
+            foreground: "vim".to_owned(),
+            is_pane_shell: false,
+        };
+        assert_eq!(
+            shell_availability(Some(&shell), ShellCheck::Unanswerable),
+            ShellAvailability::Available
+        );
+        assert_eq!(
+            shell_availability(Some(&shell), ShellCheck::NotAtPrompt),
+            ShellAvailability::BusyScreen
+        );
+        assert_eq!(
+            shell_availability(Some(&busy), ShellCheck::AtPrompt),
+            ShellAvailability::BusyProcess("vim".to_owned())
+        );
+        assert_eq!(
+            shell_availability(None, ShellCheck::Unanswerable),
+            ShellAvailability::Unanswerable
+        );
     }
 
     /// No marks at all is an ADMISSION, not a refusal reason of the same

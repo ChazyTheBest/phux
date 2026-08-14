@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use phux_protocol::ids::TerminalId;
 use phux_protocol::wire::frame::{
-    Command, CommandResult, FrameKind, ReportedAgentState, Scope, TERMINAL_AGENT_KEY, TYPE_ATTACHED,
+    Command, CommandResult, FrameKind, ReportedAgentState, Scope, TERMINAL_AGENT_KEY,
+    TERMINAL_PANE_OCCUPANT_KEY, TYPE_ATTACHED,
 };
 use portable_pty::CommandBuilder;
 use tempfile::TempDir;
@@ -314,6 +315,32 @@ async fn collect_agent_record(
     }
 }
 
+/// Drain until the detector publishes its privacy-bounded foreground-process
+/// record for `terminal`.
+async fn collect_pane_occupant(
+    stream: &mut UnixStream,
+    terminal: &TerminalId,
+    deadline: Duration,
+) -> Option<serde_json::Value> {
+    let end = tokio::time::Instant::now() + deadline;
+    loop {
+        let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok((_type_byte, frame)) = timeout(remaining, recv_typed(stream)).await else {
+            return None;
+        };
+        if let FrameKind::MetadataChanged { scope, key, value } = frame
+            && key == TERMINAL_PANE_OCCUPANT_KEY
+            && scope == Scope::Terminal(terminal.clone())
+            && let Some(bytes) = value
+        {
+            return serde_json::from_slice(&bytes).ok();
+        }
+    }
+}
+
 /// Drain `METADATA_CHANGED` frames for `terminal` until one carries
 /// `state: <want>`, or `deadline` elapses.
 ///
@@ -492,6 +519,20 @@ fn a_plain_shell_pane_never_gets_an_agent_record() {
             panic!("expected ATTACHED");
         };
         let terminal = snapshot.focused_pane.clone();
+
+        send_frame(
+            &mut stream,
+            &FrameKind::SubscribeMetadata {
+                scope: Scope::Terminal(terminal.clone()),
+                key: TERMINAL_PANE_OCCUPANT_KEY.to_owned(),
+            },
+        )
+        .await;
+        let occupant = collect_pane_occupant(&mut stream, &terminal, DETECT_DEADLINE)
+            .await
+            .expect("plain shell should publish a pane-occupant record");
+        assert_eq!(occupant["foreground"], "sh");
+        assert_eq!(occupant["is_pane_shell"], true);
 
         send_frame(
             &mut stream,

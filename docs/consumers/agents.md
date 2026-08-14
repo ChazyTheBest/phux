@@ -509,7 +509,12 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   moves, or focuses layout. Without `--no-wait`, success requires the first
   detector publication after submit; a kind with no manifest is refused
   because readiness would be unenforceable. Timeout exits `124` after the
-  command was typed. `--force` skips only the available-shell precondition.
+  command was typed. Before writing, the verb reads the server-owned
+  `phux.pane-occupant/v1` record: a foreground process other than the pane's
+  original shell is refused, while a confirmed pane shell works even without
+  OSC-133 shell integration. A contradictory OSC-133 busy mark still refuses
+  because the process observation is periodic. `--force` skips only this
+  available-shell precondition.
 
 - **`phux agent install-claude [--shell zsh|bash|fish] [--real PATH]`** —
   make plain interactive `claude` invocations enter phux automatically. The

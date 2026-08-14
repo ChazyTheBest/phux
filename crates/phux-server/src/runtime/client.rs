@@ -95,7 +95,7 @@ pub(crate) fn spawn_pane_event_drain(
     });
 }
 
-/// Spawn the per-pane agent-state drain (ADR-0046).
+/// Spawn the per-pane detector metadata drain (ADR-0046).
 ///
 /// The `TerminalActor` derives the state — it owns the grid and the PTY — but
 /// it cannot write it: `ServerState` (and therefore the metadata store, the
@@ -103,10 +103,9 @@ pub(crate) fn spawn_pane_event_drain(
 /// edge-filtered [`AgentDetectEvent`] and this task performs the authority
 /// check and the write.
 ///
-/// The write rides the shipped `SET_METADATA` / `METADATA_CHANGED` path for
-/// `phux.agent/v1`. There is no new wire surface, no new frame, and no
-/// `PROTOCOL_VERSION` bump: the detector is simply another *writer* of a key
-/// the protocol already carries.
+/// Writes ride the shipped `SET_METADATA` / `METADATA_CHANGED` path for
+/// `phux.agent/v1` and `phux.pane-occupant/v1`. There is no new wire frame or
+/// `PROTOCOL_VERSION` bump: the detector is simply another metadata writer.
 ///
 /// `metadata_set` suppresses a broadcast when the bytes are unchanged, which
 /// — together with the detector's own edge filter — is what makes a `working`
@@ -134,6 +133,16 @@ pub(crate) fn spawn_agent_state_drain(
                 // not pay for a notification nobody asked for.
                 let hooks_live = s.hook_dispatcher().is_some();
                 match event {
+                    AgentDetectEvent::Occupant(occupant) => {
+                        if let Ok(bytes) = serde_json::to_vec(&occupant) {
+                            s.metadata_set(
+                                &scope,
+                                phux_protocol::wire::frame::TERMINAL_PANE_OCCUPANT_KEY,
+                                bytes,
+                            );
+                        }
+                        None
+                    }
                     AgentDetectEvent::Retract => {
                         drain_retract(s, &wire_terminal_id, &scope, hooks_live)
                     }
@@ -2234,12 +2243,20 @@ pub(crate) fn handle_set_metadata(
 ) {
     use phux_protocol::wire::frame::{
         MAX_AGENT_SESSION_RECORD_BYTES, SESSION_CREATE_KEY, Scope, TERMINAL_AGENT_SESSION_KEY,
+        TERMINAL_PANE_OCCUPANT_KEY,
     };
     debug!(?client_id, request_id, ?scope, %key, "SET_METADATA");
     if is_reserved_session_create_result(scope, key) {
         warn!(
             ?client_id,
             request_id, "SET_METADATA: reserved session-create result key; ignoring"
+        );
+        return;
+    }
+    if key == TERMINAL_PANE_OCCUPANT_KEY {
+        warn!(
+            ?client_id,
+            request_id, "SET_METADATA: server-owned pane-occupant key; ignoring"
         );
         return;
     }
@@ -2352,6 +2369,13 @@ pub(crate) fn handle_delete_metadata(
         warn!(
             ?client_id,
             request_id, "DELETE_METADATA: reserved session-create result key; ignoring"
+        );
+        return;
+    }
+    if key == phux_protocol::wire::frame::TERMINAL_PANE_OCCUPANT_KEY {
+        warn!(
+            ?client_id,
+            request_id, "DELETE_METADATA: server-owned pane-occupant key; ignoring"
         );
         return;
     }
@@ -3245,7 +3269,7 @@ mod terminal_metadata_scope_tests {
     use phux_protocol::wire::frame::Scope;
     use tokio_util::sync::CancellationToken;
 
-    use super::handle_set_metadata;
+    use super::{handle_delete_metadata, handle_set_metadata};
     use crate::state::{ClientId, SharedState};
 
     #[test]
@@ -3349,6 +3373,34 @@ mod terminal_metadata_scope_tests {
                 .with(|s| s.metadata().get(&Scope::Global, &reserved_key))
                 .is_none(),
             "the owner-only result namespace must reject ordinary metadata writes",
+        );
+    }
+
+    #[test]
+    fn pane_occupant_record_is_server_owned() {
+        let state = SharedState::new();
+        let (_session, _window, pane) = state.with_mut(|s| s.seed_session("occupant-owner"));
+        let wire = state.with_mut(|s| s.intern_terminal_wire(pane));
+        let scope = Scope::Terminal(wire);
+        let key = phux_protocol::wire::frame::TERMINAL_PANE_OCCUPANT_KEY;
+        let authoritative = br#"{"foreground":"zsh","is_pane_shell":true}"#.to_vec();
+        state.with_mut(|s| s.metadata_set(&scope, key, authoritative.clone()));
+
+        handle_set_metadata(
+            &state,
+            ClientId(2),
+            5,
+            &scope,
+            key,
+            br#"{"foreground":"vim","is_pane_shell":true}"#.to_vec(),
+            &CancellationToken::new(),
+        );
+        handle_delete_metadata(&state, ClientId(2), 6, &scope, key);
+
+        assert_eq!(
+            state.with(|s| s.metadata().get(&scope, key)),
+            Some(authoritative),
+            "ordinary clients must neither forge nor delete the safety record",
         );
     }
 

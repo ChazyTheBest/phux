@@ -217,9 +217,12 @@ pub(crate) struct AgentReport {
 ///
 /// Deliberately NOT a `phux_protocol` `AgentEvent`: that is a wire type, and
 /// the detector introduces no wire surface. It rides the shipped
-/// `SET_METADATA` / `METADATA_CHANGED` path for `phux.agent/v1`.
+/// `SET_METADATA` / `METADATA_CHANGED` path for the conventional detector-owned
+/// Terminal keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentDetectEvent {
+    /// Publish the privacy-bounded foreground-process observation.
+    Occupant(identify::PaneOccupant),
     /// Write this record.
     State(AgentReport),
     /// The pane's occupant CHANGED identity — a different kind, or the same
@@ -350,6 +353,10 @@ pub(crate) struct AgentDetector {
     pending_idle: Option<PendingIdle>,
     /// The last state we derived (used when a scan is skipped).
     current: Option<DetectedState>,
+    /// Last pane-occupant record emitted, for independent edge filtering.
+    published_occupant: Option<identify::PaneOccupant>,
+    /// New occupant observation waiting for the actor to drain it.
+    pending_occupant: Option<identify::PaneOccupant>,
     /// Latest hook edge received just before process identity resolved.
     pending_hook: Option<(DetectedState, Instant)>,
     cadence: Cadence,
@@ -431,6 +438,8 @@ impl AgentDetector {
             published: None,
             pending_idle: None,
             current: None,
+            published_occupant: None,
+            pending_occupant: None,
             pending_hook: None,
             cadence: Cadence::Unidentified,
             #[cfg(test)]
@@ -505,6 +514,7 @@ impl AgentDetector {
     /// `screen` is `None` when [`Self::wants_screen`] said the scan could be
     /// skipped; the detector then holds its last derivation rather than
     /// inventing a new one.
+    #[cfg(test)]
     pub(crate) fn tick(
         &mut self,
         now: Instant,
@@ -513,8 +523,22 @@ impl AgentDetector {
         progress: &str,
         screen: Option<&[String]>,
     ) -> DetectOutcome {
+        self.tick_for_pane(now, master_fd, None, title, progress, screen)
+    }
+
+    /// Production tick with the pane's original child pid, used to distinguish
+    /// that shell from another foreground job.
+    pub(crate) fn tick_for_pane(
+        &mut self,
+        now: Instant,
+        master_fd: Option<RawFd>,
+        pane_child_pid: Option<i32>,
+        title: &str,
+        progress: &str,
+        screen: Option<&[String]>,
+    ) -> DetectOutcome {
         // 1. Identity.
-        if let Some(outcome) = self.maybe_identify(now, master_fd) {
+        if let Some(outcome) = self.maybe_identify(now, master_fd, pane_child_pid) {
             return outcome;
         }
         let Some(kind) = self.identified.clone() else {
@@ -648,9 +672,14 @@ impl AgentDetector {
     /// (it is the same integer) and is caught by the full recheck exactly as
     /// before; this only ever shortens the wait for the case the probe CAN
     /// see.
-    fn maybe_identify(&mut self, now: Instant, master_fd: Option<RawFd>) -> Option<DetectOutcome> {
+    fn maybe_identify(
+        &mut self,
+        now: Instant,
+        master_fd: Option<RawFd>,
+        pane_child_pid: Option<i32>,
+    ) -> Option<DetectOutcome> {
         if now >= self.next_identify {
-            return self.reidentify(now, master_fd);
+            return self.reidentify(now, master_fd, pane_child_pid);
         }
         let probed = self.resolve_pgid(master_fd);
         if let Some(pgid) = probed
@@ -659,7 +688,7 @@ impl AgentDetector {
             // The cheap answer disagrees with what we last resolved in full.
             // Pay for the expensive path now instead of waiting out the rest
             // of the recheck interval.
-            return self.reidentify(now, master_fd);
+            return self.reidentify(now, master_fd, pane_child_pid);
         }
         None
     }
@@ -667,24 +696,59 @@ impl AgentDetector {
     /// Re-derive identity from the kernel, in full (pgid AND argv). Returns
     /// `Some(outcome)` when the tick is fully resolved by the identity step
     /// alone (the agent went away, or none has appeared yet).
-    fn reidentify(&mut self, now: Instant, master_fd: Option<RawFd>) -> Option<DetectOutcome> {
-        let found = self.resolve_identity(master_fd);
+    fn reidentify(
+        &mut self,
+        now: Instant,
+        master_fd: Option<RawFd>,
+        pane_child_pid: Option<i32>,
+    ) -> Option<DetectOutcome> {
+        let (found, occupant) = self.resolve_identity(master_fd, pane_child_pid);
+        if let Some(occupant) = occupant
+            && self.published_occupant.as_ref() != Some(&occupant)
+        {
+            self.pending_occupant = Some(occupant);
+        }
         self.apply_identity(now, found)
     }
 
     /// Ask the kernel who owns the PTY's foreground process group.
     #[cfg(not(test))]
-    fn resolve_identity(&self, master_fd: Option<RawFd>) -> identify::Occupancy {
-        identify::foreground_occupancy(master_fd, &self.rules)
+    fn resolve_identity(
+        &self,
+        master_fd: Option<RawFd>,
+        pane_child_pid: Option<i32>,
+    ) -> (identify::Occupancy, Option<identify::PaneOccupant>) {
+        identify::foreground_observation(master_fd, pane_child_pid, &self.rules)
     }
 
     /// As above, honouring the [`IdentitySource`] test seam.
     #[cfg(test)]
-    fn resolve_identity(&self, master_fd: Option<RawFd>) -> identify::Occupancy {
+    fn resolve_identity(
+        &self,
+        master_fd: Option<RawFd>,
+        pane_child_pid: Option<i32>,
+    ) -> (identify::Occupancy, Option<identify::PaneOccupant>) {
         match &self.identity_source {
-            IdentitySource::Kernel => identify::foreground_occupancy(master_fd, &self.rules),
-            IdentitySource::Forced(occupancy) => occupancy.clone(),
+            IdentitySource::Kernel => {
+                identify::foreground_observation(master_fd, pane_child_pid, &self.rules)
+            }
+            IdentitySource::Forced(occupancy) => (occupancy.clone(), None),
         }
+    }
+
+    /// Take the independently edge-filtered pane-occupant observation.
+    pub(crate) const fn take_occupant_update(&mut self) -> Option<identify::PaneOccupant> {
+        self.pending_occupant.take()
+    }
+
+    /// Advance the occupant edge filter only after the actor enqueues it.
+    pub(crate) fn occupant_update_sent(&mut self, occupant: identify::PaneOccupant) {
+        self.published_occupant = Some(occupant);
+    }
+
+    /// Preserve a failed best-effort enqueue for the next detector tick.
+    pub(crate) fn retry_occupant_update(&mut self, occupant: identify::PaneOccupant) {
+        self.pending_occupant = Some(occupant);
     }
 
     /// The cheap half: ask the kernel for the foreground pgid ONLY. See
