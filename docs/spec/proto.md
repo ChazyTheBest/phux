@@ -637,12 +637,14 @@ version bump ([ADR-0061](../../ADR/0061-capabilities-add-versions-break.md)).
 > **Status: partial.** The frame, both fields, and the consumer surface
 > are shipped. The reference server states `REQUESTED` (for a client's
 > `DETACH` and for a `DETACH_CLIENTS` sweep) and `SESSION_KILLED` (when
-> the group an attach was rooted in is reaped). It does not yet *emit*
-> `SERVER_SHUTDOWN`, `REPLACED`, `PROTOCOL_ERROR`, or `INTERNAL_ERROR`:
-> shutdown and fatal-error closes still drop the transport without a
-> `DETACHED`, and role takeover is unimplemented (§7.1). A consumer must
-> therefore keep treating a bare disconnect as an ending, exactly as
-> before.
+> the group an attach was rooted in is reaped). Server-wide cancellation gives
+> each connection a bounded drain through `SERVER_SHUTDOWN` before close;
+> fatal protocol paths order their final `ERROR`, `PROTOCOL_ERROR`, and close.
+> It does not emit `REPLACED`, because role takeover is unimplemented (§7.1),
+> or `INTERNAL_ERROR`, because the reference server has no internal-failure
+> path that deliberately closes an otherwise valid connection. Transport
+> failure can still prevent delivery, so consumers must keep treating a bare
+> disconnect as an ending.
 
 ### 7.3 SUBSCRIBE
 

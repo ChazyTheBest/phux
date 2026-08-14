@@ -109,12 +109,20 @@ async fn recv_command_result(stream: &mut UnixStream, expected_request: u32) -> 
 }
 
 async fn assert_server_closed(stream: &mut UnixStream) {
+    let (_, detached) = recv_typed(stream).await;
+    assert!(matches!(
+        detached,
+        FrameKind::Detached {
+            reason: Some(DetachReason::ProtocolError),
+            ..
+        }
+    ));
     let mut byte = [0_u8; 1];
     let read = timeout(WIRE_RECV_TIMEOUT, stream.read(&mut byte))
         .await
         .expect("server must close after flushing the protocol error")
         .expect("read after protocol error");
-    assert_eq!(read, 0, "server must close after the error frame");
+    assert_eq!(read, 0, "server must close after ERROR and DETACHED");
 }
 
 #[test]
@@ -403,6 +411,13 @@ fn negotiated_chunk_limit_rejects_oversized_payload_at_runtime_decode() {
             },
         )
         .await;
+        assert!(matches!(
+            recv_typed(&mut stream).await.1,
+            FrameKind::Error {
+                code: ErrorCode::MalformedMessage,
+                ..
+            }
+        ));
         assert_server_closed(&mut stream).await;
         shutdown_and_join(shutdown_tx, server_handle, &socket_path).await;
     });

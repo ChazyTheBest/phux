@@ -54,13 +54,14 @@ pub enum TerminalInput {
 ///   lifecycle frames, and so on.
 ///
 /// * [`Outbound::TerminalError`] is an ordered terminal sentinel. The writer
-///   writes that final `ERROR`, immediately closes the transport, and discards
-///   anything producers race into the mailbox after it.
+///   writes that final `ERROR`, follows it with `DETACHED(PROTOCOL_ERROR)`,
+///   closes the transport, and discards anything producers race into the
+///   mailbox after it.
 #[derive(Debug)]
 pub enum Outbound {
     /// A structured frame; the writer encodes it before writing.
     Frame(phux_protocol::wire::frame::FrameKind),
-    /// Final protocol error followed by an immediate transport close.
+    /// Final protocol error and `DETACHED(PROTOCOL_ERROR)`, then transport close.
     TerminalError {
         /// Optional request correlation.
         request_id: Option<u32>,

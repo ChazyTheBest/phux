@@ -549,11 +549,16 @@ pub unsafe extern "C" fn phux_client_feed_frame(
                 "feed_frame accepts exactly one complete frame",
             ));
         }
-        if !client.protocol_ready && !matches!(&frame, FrameKind::HelloOk { .. }) {
-            return Err(BridgeError::state("server frame arrived before HELLO_OK"));
-        }
         if client.detached {
             return Err(BridgeError::protocol("server frame arrived after DETACHED"));
+        }
+        if !client.protocol_ready
+            && !matches!(
+                &frame,
+                FrameKind::HelloOk { .. } | FrameKind::Error { .. } | FrameKind::Detached { .. }
+            )
+        {
+            return Err(BridgeError::state("server frame arrived before HELLO_OK"));
         }
         match frame {
             FrameKind::HelloOk {
@@ -877,11 +882,6 @@ pub unsafe extern "C" fn phux_client_feed_frame(
                 client.rebuild_effect_views();
             }
             FrameKind::Detached { reason, message } => {
-                if !client.attach_queued && !client.attached {
-                    return Err(BridgeError::protocol(
-                        "DETACHED arrived outside an active ATTACH phase",
-                    ));
-                }
                 client.detach();
                 let mut effect = OwnedEffect::simple(2, 5, phux_protocol::TerminalId::local(0));
                 // phux-l83x: carry the ending's reason across the bridge as a
@@ -1990,29 +1990,30 @@ mod tests {
     }
 
     #[test]
-    fn detached_before_attach_rejects_without_poisoning_connection_state() {
-        let client = boxed_client();
-        unsafe {
-            (*client).inner.protocol_ready = true;
+    fn detached_before_attach_cleanly_ends_prehello_and_negotiated_connections() {
+        for protocol_ready in [false, true] {
+            let client = boxed_client();
+            unsafe {
+                (*client).inner.protocol_ready = protocol_ready;
+            }
+            assert_eq!(
+                feed_kind(
+                    client,
+                    &FrameKind::Detached {
+                        reason: Some(DetachReason::ProtocolError),
+                        message: "connection refused".to_owned()
+                    }
+                ),
+                PhuxClientResult::Ok
+            );
+            assert!(unsafe { (*client).inner.detached });
+            assert_eq!(
+                feed_kind(client, &FrameKind::Ping { nonce: 7 }),
+                PhuxClientResult::ProtocolError,
+                "nothing follows DETACHED"
+            );
+            unsafe { phux_client_free(client) };
         }
-        assert_eq!(
-            feed_kind(
-                client,
-                &FrameKind::Detached {
-                    reason: None,
-                    message: String::new()
-                }
-            ),
-            PhuxClientResult::ProtocolError
-        );
-        assert!(!unsafe { (*client).inner.detached });
-        assert_eq!(
-            feed_kind(client, &FrameKind::Ping { nonce: 7 }),
-            PhuxClientResult::Ok
-        );
-        let client_ref = unsafe { &*client };
-        assert_eq!(client_ref.inner.outgoing.len(), 1);
-        unsafe { phux_client_free(client) };
     }
 
     #[test]

@@ -27,7 +27,7 @@ use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use phux_protocol::PROTOCOL_VERSION;
 use phux_protocol::caps::ClientCapabilities;
-use phux_protocol::wire::frame::{AttachTarget, ErrorCode, FrameKind, ViewportInfo};
+use phux_protocol::wire::frame::{AttachTarget, DetachReason, ErrorCode, FrameKind, ViewportInfo};
 use phux_server::{ServerConfig, ServerError, ServerRuntime};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -221,6 +221,16 @@ fn ws_hello_attach_receives_attached_and_snapshot() {
                 message,
                 ..
             } if message.contains("attach_id must be nonzero")
+        ));
+        let Some(Ok(Message::Binary(detached))) = bad_ws.next().await else {
+            panic!("server must explain the fatal close");
+        };
+        assert!(matches!(
+            FrameKind::decode(&detached).unwrap().0,
+            FrameKind::Detached {
+                reason: Some(DetachReason::ProtocolError),
+                ..
+            }
         ));
         let closed = tokio::time::timeout(HANDSHAKE_DEADLINE, bad_ws.next())
             .await

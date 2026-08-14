@@ -1015,11 +1015,10 @@ impl ServerRuntime {
                     .and_then(build_wt_listener);
 
                 // UDS is always on; WS and QUIC are additive. Each transport's
-                // accept loop runs until the root token cancels; whichever
-                // returns first ends the server (on shutdown all observe the
-                // cancellation). `select_all` drives them concurrently without
-                // the combinatorial `select!` nesting the optional transports
-                // would otherwise need.
+                // accept loop runs until the root token cancels. The first
+                // fatal listener result cancels the others; after the first
+                // completion we still join every remaining loop so their
+                // client tasks can flush SERVER_SHUTDOWN before teardown.
                 let mut accepts: Vec<AcceptLoopFuture<'_>> = vec![Box::pin(accept_loop(
                     &listener,
                     state.clone(),
@@ -1051,23 +1050,26 @@ impl ServerRuntime {
                         Some(input_lane_handle.clone()),
                     )));
                 }
-                let (result, _index, _remaining) = futures_util::future::select_all(accepts).await;
+                let (mut result, _index, remaining) =
+                    futures_util::future::select_all(accepts).await;
+                if result.is_err() {
+                    root_token.cancel();
+                }
+                for tail in futures_util::future::join_all(remaining).await {
+                    if result.is_ok() && tail.is_err() {
+                        result = tail;
+                    }
+                }
                 result
             })
             .await;
 
-        // `run_until` returns the instant the accept-loop future is ready — on
-        // shutdown that is the tick where `accept_loop` observed the cancelled
-        // root token and dropped its per-client `JoinSet`. Dropping that
-        // `JoinSet` only *aborts* the client tasks; their futures still live on
-        // this `LocalSet` and are not dropped until the set advances or is
-        // itself dropped. Each such future holds a cloned `InputLaneHandle`
-        // (`task_input_lane`) that keeps the lane channel open. So we must drop
-        // the `LocalSet` FIRST — that destroys every remaining client-task
-        // future and releases its handle clone — and only then drop the lane
+        // `run_until` returns after every accept loop has drained its client
+        // tasks. Other local futures can still hold an `InputLaneHandle` clone,
+        // so we must drop the `LocalSet` FIRST and only then drop the lane
         // owner. Reversing this order deadlocks: `InputLane::drop` joins the
         // lane thread, whose `blocking_recv` never returns `None` while a
-        // client-task clone keeps the channel open (ADR-0044).
+        // handle clone keeps the channel open (ADR-0044).
         drop(local);
         drop(input_lane);
 

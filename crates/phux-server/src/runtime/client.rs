@@ -1027,9 +1027,9 @@ pub(crate) async fn handle_existing_socket(socket_path: &Path) -> Result<(), Ser
 /// `!Send` because they call into pane actors that own `!Send`
 /// `Terminal`s.
 ///
-/// `root_token` is the per-server root cancellation token. Cancellation
-/// drives a clean return from this loop (the `JoinSet` of per-client
-/// tasks then drops, aborting any in-flight client tasks).
+/// `root_token` is the per-server root cancellation token. Cancellation stops
+/// admission, then waits for every child client task to flush its shutdown
+/// `DETACHED` before returning.
 #[allow(
     clippy::future_not_send,
     reason = "ADR-0014: the server runs on a LocalSet; per-connection transports (L::Reader/Writer) are !Send by design"
@@ -1052,7 +1052,16 @@ pub(crate) async fn accept_loop<L: Incoming>(
     loop {
         tokio::select! {
             () = root_token.cancelled() => {
-                info!("root cancellation token fired; accept loop exiting");
+                info!("root cancellation token fired; draining client tasks");
+                if tokio::time::timeout(CLIENT_SHUTDOWN_DRAIN_TIMEOUT, async {
+                    while clients.join_next().await.is_some() {}
+                })
+                .await
+                .is_err()
+                {
+                    warn!("client shutdown drain timed out; aborting remaining tasks");
+                    clients.shutdown().await;
+                }
                 return Ok(());
             }
             accept = listener.accept() => {
@@ -1142,6 +1151,8 @@ fn incompatible_protocol_message(
 }
 
 const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Bound the server-wide wait for clients to flush their shutdown ending.
+const CLIENT_SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn close_client_writer(
     out_tx: tokio::sync::mpsc::Sender<Outbound>,
@@ -1162,6 +1173,30 @@ async fn close_client_writer(
         sibling_tasks.abort_all();
         while sibling_tasks.join_next().await.is_some() {}
     }
+}
+
+/// End one connection for a protocol violation in the order required by §9.
+async fn close_for_protocol_error(
+    out_tx: tokio::sync::mpsc::Sender<Outbound>,
+    writer_close: &tokio::sync::watch::Sender<bool>,
+    sibling_tasks: &mut JoinSet<()>,
+    code: ErrorCode,
+    message: String,
+) {
+    let _ = out_tx
+        .send(Outbound::Frame(FrameKind::Error {
+            request_id: None,
+            code,
+            message: message.clone(),
+        }))
+        .await;
+    let _ = out_tx
+        .send(Outbound::Frame(FrameKind::Detached {
+            reason: Some(DetachReason::ProtocolError),
+            message,
+        }))
+        .await;
+    close_client_writer(out_tx, writer_close, sibling_tasks).await;
 }
 
 /// Per-client task. Reads frames in a loop and dispatches each one.
@@ -1241,6 +1276,14 @@ where
             () = token.cancelled() => {
                 debug!(?client_id, "client task cancelled");
                 abort_output_pumps(&mut output_pumps, client_id, "connection cancellation").await;
+                if root_token.is_cancelled() {
+                    let _ = out_tx
+                        .send(Outbound::Frame(FrameKind::Detached {
+                            reason: Some(DetachReason::ServerShutdown),
+                            message: "server is shutting down".to_owned(),
+                        }))
+                        .await;
+                }
                 detach_and_release_consumer_state(&state, client_id);
                 close_client_writer(out_tx, &writer_close_tx, &mut sibling_tasks).await;
                 return Ok(());
@@ -1266,6 +1309,17 @@ where
             Ok((frame, _rest)) => frame,
             Err(err) => {
                 warn!(error = ?err, "client sent undecodable frame; closing");
+                let message = format!("could not decode client frame: {err:?}");
+                abort_output_pumps(&mut output_pumps, client_id, "undecodable frame").await;
+                detach_and_release_consumer_state(&state, client_id);
+                close_for_protocol_error(
+                    out_tx,
+                    &writer_close_tx,
+                    &mut sibling_tasks,
+                    ErrorCode::MalformedMessage,
+                    message,
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -1278,16 +1332,14 @@ where
             && !matches!(frame, FrameKind::Hello { .. } | FrameKind::Ping { .. })
         {
             warn!(?client_id, "stateful frame before HELLO; closing");
-            let _ = out_tx
-                .send(Outbound::Frame(FrameKind::Error {
-                    request_id: None,
-                    code: ErrorCode::VersionIncompatible,
-                    message: "HELLO required before any stateful frame".to_owned(),
-                }))
-                .await;
-            // Flush the refusal before closing the transport.
-            drop(out_tx);
-            let _ = sibling_tasks.join_next().await;
+            close_for_protocol_error(
+                out_tx,
+                &writer_close_tx,
+                &mut sibling_tasks,
+                ErrorCode::VersionIncompatible,
+                "HELLO required before any stateful frame".to_owned(),
+            )
+            .await;
             return Ok(());
         }
 
@@ -1301,20 +1353,19 @@ where
             } => {
                 if negotiated.is_some() {
                     warn!(?client_id, "duplicate HELLO; closing");
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
-                            code: ErrorCode::InvalidCommand,
-                            message: "HELLO already completed on this connection".to_owned(),
-                        }))
-                        .await;
                     // Never patch a live client's capabilities. Tear down any
                     // attached profile so its mailbox sender cannot keep the
                     // writer alive, flush the protocol-order error, then close.
                     abort_output_pumps(&mut output_pumps, client_id, "duplicate HELLO").await;
                     detach_and_release_consumer_state(&state, client_id);
-                    drop(out_tx);
-                    let _ = sibling_tasks.join_next().await;
+                    close_for_protocol_error(
+                        out_tx,
+                        &writer_close_tx,
+                        &mut sibling_tasks,
+                        ErrorCode::InvalidCommand,
+                        "HELLO already completed on this connection".to_owned(),
+                    )
+                    .await;
                     return Ok(());
                 }
                 debug!(
@@ -1333,17 +1384,14 @@ where
                         protocol_patch,
                     );
                     warn!(?client_id, %message, "HELLO protocol mismatch");
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
-                            code: ErrorCode::VersionIncompatible,
-                            message,
-                        }))
-                        .await;
-                    // Closing the last sender lets the writer flush the ERROR
-                    // before this task closes the transport.
-                    drop(out_tx);
-                    let _ = sibling_tasks.join_next().await;
+                    close_for_protocol_error(
+                        out_tx,
+                        &writer_close_tx,
+                        &mut sibling_tasks,
+                        ErrorCode::VersionIncompatible,
+                        message,
+                    )
+                    .await;
                     return Ok(());
                 }
                 // Policy check: authorize HELLO only against the identity
@@ -1354,18 +1402,17 @@ where
                         ?client_id,
                         "HELLO denied: authenticated peer identity missing"
                     );
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
-                            code: ErrorCode::PermissionDenied,
-                            message: "authenticated peer identity missing".to_owned(),
-                        }))
-                        .await;
-                    drop(out_tx);
-                    let _ = sibling_tasks.join_next().await;
+                    close_for_protocol_error(
+                        out_tx,
+                        &writer_close_tx,
+                        &mut sibling_tasks,
+                        ErrorCode::PermissionDenied,
+                        "authenticated peer identity missing".to_owned(),
+                    )
+                    .await;
                     return Ok(());
                 };
-                let policy_ok = {
+                let policy_error = {
                     let engine = state.with(|s| s.policy_engine().clone());
                     // Placeholder requested-capability set: HELLO carries no
                     // capability request on the wire, so there is nothing to
@@ -1382,25 +1429,22 @@ where
                         expires_at: None,
                     }];
                     match engine.authorize_hello(&peer, requested_caps).await {
-                        Ok(_granted) => true,
+                        Ok(_granted) => None,
                         Err(err) => {
                             warn!(?client_id, error = %err, "HELLO denied by policy");
-                            let _ = out_tx
-                                .send(Outbound::Frame(FrameKind::Error {
-                                    request_id: None,
-                                    code: ErrorCode::PermissionDenied,
-                                    message: format!("policy denied: {err}"),
-                                }))
-                                .await;
-                            false
+                            Some(format!("policy denied: {err}"))
                         }
                     }
                 };
-                if !policy_ok {
-                    // Do not abort the writer before the policy refusal is on
-                    // the transport.
-                    drop(out_tx);
-                    let _ = sibling_tasks.join_next().await;
+                if let Some(message) = policy_error {
+                    close_for_protocol_error(
+                        out_tx,
+                        &writer_close_tx,
+                        &mut sibling_tasks,
+                        ErrorCode::PermissionDenied,
+                        message,
+                    )
+                    .await;
                     return Ok(());
                 }
                 #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
@@ -1420,15 +1464,14 @@ where
                         server_bootstrap.native_features.as_wire(),
                     );
                     warn!(?client_id, %message, "HELLO codec unavailable");
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
-                            code: ErrorCode::CodecUnavailable,
-                            message,
-                        }))
-                        .await;
-                    drop(out_tx);
-                    let _ = sibling_tasks.join_next().await;
+                    close_for_protocol_error(
+                        out_tx,
+                        &writer_close_tx,
+                        &mut sibling_tasks,
+                        ErrorCode::CodecUnavailable,
+                        message,
+                    )
+                    .await;
                     return Ok(());
                 };
                 let mut effective_client_caps = client_caps;
@@ -1493,17 +1536,16 @@ where
             } => {
                 if attach_id == 0 {
                     warn!(?client_id, "ATTACH used reserved zero attach_id; closing");
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
-                            code: ErrorCode::MalformedMessage,
-                            message: "ATTACH attach_id must be nonzero".to_owned(),
-                        }))
-                        .await;
                     abort_output_pumps(&mut output_pumps, client_id, "zero ATTACH id").await;
                     detach_and_release_consumer_state(&state, client_id);
-                    drop(out_tx);
-                    let _ = sibling_tasks.join_next().await;
+                    close_for_protocol_error(
+                        out_tx,
+                        &writer_close_tx,
+                        &mut sibling_tasks,
+                        ErrorCode::MalformedMessage,
+                        "ATTACH attach_id must be nonzero".to_owned(),
+                    )
+                    .await;
                     return Ok(());
                 }
                 if !used_attach_ids.insert(attach_id) {
@@ -1894,19 +1936,18 @@ where
             }
             other => {
                 warn!(?client_id, kind = ?other, "direction-invalid client frame; closing");
-                let _ = out_tx
-                    .send(Outbound::Frame(FrameKind::Error {
-                        request_id: None,
-                        code: ErrorCode::InvalidCommand,
-                        message: format!(
-                            "frame is not valid from a client in the negotiated phase: {other:?}"
-                        ),
-                    }))
-                    .await;
+                let message =
+                    format!("frame is not valid from a client in the negotiated phase: {other:?}");
                 abort_output_pumps(&mut output_pumps, client_id, "direction-invalid frame").await;
                 detach_and_release_consumer_state(&state, client_id);
-                drop(out_tx);
-                let _ = sibling_tasks.join_next().await;
+                close_for_protocol_error(
+                    out_tx,
+                    &writer_close_tx,
+                    &mut sibling_tasks,
+                    ErrorCode::InvalidCommand,
+                    message,
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -2661,8 +2702,8 @@ pub(crate) async fn writer_task<W: FrameWriter>(
         let Some(message) = message else {
             break;
         };
-        let (frame, terminal) = match message {
-            Outbound::Frame(frame) => (frame, false),
+        let (frame, terminal_message) = match message {
+            Outbound::Frame(frame) => (frame, None),
             Outbound::TerminalError {
                 request_id,
                 code,
@@ -2671,9 +2712,9 @@ pub(crate) async fn writer_task<W: FrameWriter>(
                 FrameKind::Error {
                     request_id,
                     code,
-                    message,
+                    message: message.clone(),
                 },
-                true,
+                Some(message),
             ),
         };
         buf.clear();
@@ -2683,7 +2724,16 @@ pub(crate) async fn writer_task<W: FrameWriter>(
             let _ = writer.close().await;
             return;
         }
-        if terminal {
+        if let Some(message) = terminal_message {
+            buf.clear();
+            FrameKind::Detached {
+                reason: Some(DetachReason::ProtocolError),
+                message,
+            }
+            .encode(&mut buf);
+            if let Err(err) = writer.write_frame(&buf).await {
+                debug!(?client_id, error = %err, "writer error on terminal DETACHED");
+            }
             let _ = writer.close().await;
             return;
         }
@@ -2700,16 +2750,20 @@ mod writer_close_tests {
     use std::io;
     use std::rc::Rc;
 
-    use phux_protocol::wire::frame::{ErrorCode, FrameKind};
+    use bytes::BytesMut;
+    use phux_protocol::wire::frame::{DetachReason, ErrorCode, FrameKind};
+    use tokio::task::LocalSet;
+    use tokio_util::sync::CancellationToken;
 
-    use super::writer_task;
-    use crate::state::{ClientId, Outbound};
-    use crate::transport::FrameWriter;
+    use super::{handle_client, writer_task};
+    use crate::state::{ClientId, Outbound, SharedState};
+    use crate::transport::{FrameReader, FrameWriter};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum WriterEvent {
         Frame,
         Error,
+        Detached(Option<DetachReason>),
         Close,
     }
 
@@ -2719,6 +2773,7 @@ mod writer_close_tests {
         async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
             let event = match FrameKind::decode(frame).expect("encoded frame").0 {
                 FrameKind::Error { .. } => WriterEvent::Error,
+                FrameKind::Detached { reason, .. } => WriterEvent::Detached(reason),
                 _ => WriterEvent::Frame,
             };
             self.0.borrow_mut().push(event);
@@ -2754,9 +2809,53 @@ mod writer_close_tests {
         writer_task(writer, rx, close_rx, ClientId(7)).await;
         assert_eq!(
             events.borrow().as_slice(),
-            [WriterEvent::Frame, WriterEvent::Error, WriterEvent::Close],
-            "the terminal ERROR is the last decoded frame before transport close",
+            [
+                WriterEvent::Frame,
+                WriterEvent::Error,
+                WriterEvent::Detached(Some(DetachReason::ProtocolError)),
+                WriterEvent::Close
+            ],
+            "the terminal ERROR and DETACHED precede transport close",
         );
+    }
+
+    struct PendingReader;
+
+    impl FrameReader for PendingReader {
+        async fn read_frame(&mut self) -> io::Result<Option<BytesMut>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_cancellation_flushes_server_shutdown_before_transport_close() {
+        LocalSet::new()
+            .run_until(async {
+                let events = Rc::new(RefCell::new(Vec::new()));
+                let root_token = CancellationToken::new();
+                let task = tokio::task::spawn_local(handle_client(
+                    PendingReader,
+                    RecordingWriter(Rc::clone(&events)),
+                    SharedState::new(),
+                    ClientId(9),
+                    root_token.child_token(),
+                    root_token.clone(),
+                    None,
+                ));
+                tokio::task::yield_now().await;
+                root_token.cancel();
+                task.await
+                    .expect("client task")
+                    .expect("clean shutdown path");
+                assert_eq!(
+                    events.borrow().as_slice(),
+                    [
+                        WriterEvent::Detached(Some(DetachReason::ServerShutdown)),
+                        WriterEvent::Close
+                    ],
+                );
+            })
+            .await;
     }
 }
 #[cfg(test)]
@@ -2771,7 +2870,9 @@ mod fatal_preflight_close_tests {
         BootstrapCapabilities, ClientCapabilities, EngineCodec, EngineFeatureSet,
     };
     use phux_protocol::policy::{PeerIdentity, TransportType};
-    use phux_protocol::wire::frame::{AttachTarget, ErrorCode, FrameKind, ViewportInfo};
+    use phux_protocol::wire::frame::{
+        AttachTarget, DetachReason, ErrorCode, FrameKind, ViewportInfo,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{broadcast, mpsc};
     use tokio::task::LocalSet;
@@ -3003,6 +3104,21 @@ mod fatal_preflight_close_tests {
                         ..
                     }
                 ));
+                let detached = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    read_frame(&mut client_read),
+                )
+                .await
+                .expect("terminal DETACHED timed out")
+                .expect("read terminal DETACHED")
+                .expect("terminal DETACHED frame");
+                assert!(matches!(
+                    detached,
+                    FrameKind::Detached {
+                        reason: Some(DetachReason::ProtocolError),
+                        ..
+                    }
+                ));
                 assert!(
                     tokio::time::timeout(
                         std::time::Duration::from_secs(1),
@@ -3012,7 +3128,7 @@ mod fatal_preflight_close_tests {
                     .expect("duplex EOF timed out")
                     .expect("read duplex EOF")
                     .is_none(),
-                    "transport closes only after flushing terminal ERROR"
+                    "transport closes only after flushing terminal ERROR and DETACHED"
                 );
                 actor.await.expect("actor task");
                 task.await
