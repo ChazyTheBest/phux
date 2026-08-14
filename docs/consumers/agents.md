@@ -412,6 +412,13 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   phux itself instrumented, `--until done` alone can only time out. Wait on
   `idle` and `blocked` unless you know your integration declares `done`.
   `unknown` is not spellable: it is *departure*, not a state to wait for.
+  A **satellite `TARGET` is refused** (`satellite_target`, exit 2) as soon as
+  the selector resolves, before the wait subscribes to anything:
+  `phux.agent/v1` is hub-local, so a hub has no record for a remote pane and
+  can never be told one changed. Run the wait on the
+  satellite's own server. `phux watch` still carries that pane's agent
+  *events* across the hub — it is the metadata half that does not federate,
+  not the event half.
   `TARGET` is optional (the focused pane). `--timeout` is in seconds and is
   unbounded when omitted, matching `phux wait`; always pass one from a
   script. `--json` emits
@@ -1727,7 +1734,7 @@ Exit codes are not uniform across verbs:
 | `agent` | `0` ok; `1` no server, unknown pane, or JSON render failure; `3` the miss is not trustworthy — see below (`show`/`explain`/`set`/`clear`; `list` enumerates and stays `0`; `wait` and `send-keys` have their own rows and keep `1`). |
 | `run` | the child's own code clamped to `0..=255` (negative or `>255` saturate to `255`); `125` when phux gave up waiting for the sentinel (`--timeout`); `1` for no server / refused target / other. |
 | `wait` | `0` condition met; `124` on `--timeout`; `2` usage — an invalid `--regex`, or `--until` combined with `--regex` (clap's own status, raised before any poll); `1` no server / parse / read error. |
-| `agent wait` | `0` a transition into a `--until` state was observed; `124` on `--timeout`, including a pane that held a target state for the whole wait; `2` the pane declares no record, or an unknown `--until` word; `1` the agent departed mid-wait (record deleted or state withdrawn to `unknown`), no server, or transport. |
+| `agent wait` | `0` a transition into a `--until` state was observed; `124` on `--timeout`, including a pane that held a target state for the whole wait; `2` the pane declares no record, an unknown `--until` word, or a satellite target (`satellite_target` — `phux.agent/v1` does not federate); `1` the agent departed mid-wait (record deleted or state withdrawn to `unknown`), no server, or transport. |
 | `agent send-keys` | `0` the acknowledged batch reached the kernel tty queue; `2` a refusal before any byte was written; `1` transport, selector, or indeterminate delivery. Do not resend `delivery_unknown`. |
 | `agent prompt` | `0` delivered (and, with `--wait`, a target transition observed); `124` delivered but no target transition observed before timeout; `2` usage, identity, capability, or pre-write refusal; `1` transport or indeterminate delivery. |
 | `agent answer` | `0` the exact live ask was validated and the answer delivered; `2` stale/unidentified ask, invalid choice/text, or pre-write refusal; `1` transport or indeterminate delivery. |
@@ -1840,6 +1847,12 @@ and **stderr carries one line of JSON** (ADR-0065 §4):
   `agent answer`, `agent start`):
   `no_agent_record` (exit 2 — the pane declares no `phux.agent/v1` record, so
   there is no lifecycle to wait on and no identity to verify against),
+  `satellite_target` (exit 2 — the pane belongs to a federation satellite;
+  `phux.agent/v1` is hub-local and does not cross a satellite link, so a hub
+  can neither observe nor write it. Refused as soon as the selector
+  resolves, so nothing was read and nothing was typed. Run the verb against the
+  satellite's own server. This is *not* `no_agent_record`: the remote pane
+  may well have a live agent),
   `agent_departed` (exit 1 — the record was deleted or its state withdrew to
   `unknown` mid-wait; a departure, never a completion), `agent_mismatch`
   (exit 2 — the pane hosts a different agent than `--expect-agent` /

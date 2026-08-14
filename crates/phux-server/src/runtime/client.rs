@@ -2376,12 +2376,90 @@ pub(crate) async fn handle_list_metadata(
     }
 }
 
+/// Refuse an L3 metadata subscription whose `Terminal` scope names a
+/// satellite pane, pushing the typed `ERROR` that says so (phux-w7z2.57).
+///
+/// Returns `true` when the caller must abandon the subscription.
+///
+/// # Why refuse rather than route
+///
+/// L3 metadata does not federate — at all. The hub relay
+/// ([`crate::hub::relay`]) forwards L1 commands and `SUBSCRIBE_EVENTS`;
+/// it carries no `GET`/`SET`/`SUBSCRIBE_METADATA` leg and no
+/// `METADATA_CHANGED` return leg, so the hub's metadata store holds nothing
+/// for a satellite pane and never will until federation is extended.
+/// Accepting the subscription anyway is the worst of the three options: the
+/// consumer believes it is watching a remote pane's `phux.agent/v1` record
+/// and blocks forever on a `METADATA_CHANGED` no code path can emit. That is
+/// the shape `phux agent wait host/@N` hit — it read the hub's (empty) store
+/// and reported `no_agent_record` for a live remote agent.
+///
+/// Routing is the eventual answer, but it is not this change. It needs a
+/// return leg that re-tags `Scope::Terminal(Local(id))` to
+/// `Scope::Terminal(Satellite { host, id })`, a decision about what `Global`
+/// and `Group` scopes even mean across a federation boundary, and — to be
+/// worth having — the federated `APPLY_INPUT` that would let a caller act on
+/// what it observed (phux-2en, post-1.0). A refusal is upgradeable to
+/// routing without breaking a single consumer: today's `ERROR` becomes
+/// tomorrow's `METADATA_CHANGED`, and nothing that works now stops working.
+///
+/// # Why this code, and why it is not a wire change
+///
+/// [`ErrorCode::UnsupportedSatelliteRoute`] already means "this frame
+/// carried a `TerminalId::Satellite` and there is no route for it"
+/// ([`phux_protocol::ids::TerminalId::Satellite`] makes the non-hub case a
+/// MUST). "This *command* has no satellite route on any server" is the same
+/// fact about a different axis, and reusing the code keeps the change
+/// decode-safe: a new `ErrorCode` value is a hard decode error on a peer
+/// that predates it (`ErrorCode::from_wire` → `None` →
+/// `DecodeError::UnknownEnumValue`), whereas `106` has shipped since 0.7.0.
+/// `PROTOCOL_VERSION` is untouched.
+///
+/// The push is uncorrelated (`request_id: None`) because
+/// `SUBSCRIBE_METADATA` carries no `request_id` to correlate to — the same
+/// shape [`handle_subscribe_events`] already uses for its missing-route
+/// refusal, and the reason that arm exists: a command with no reply frame
+/// still owes the consumer a signal when it is refused.
+fn refuse_satellite_metadata_scope(
+    client_id: ClientId,
+    scope: &phux_protocol::wire::frame::Scope,
+    key: &str,
+    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
+) -> bool {
+    let phux_protocol::wire::frame::Scope::Terminal(terminal) = scope else {
+        return false;
+    };
+    let Some((host, id)) = crate::hub::relay::satellite_route(terminal) else {
+        return false;
+    };
+    warn!(
+        ?client_id,
+        satellite = %host,
+        %key,
+        "SUBSCRIBE_METADATA refused: L3 metadata has no satellite route"
+    );
+    let _ = out_tx.try_send(Outbound::Frame(FrameKind::Error {
+        request_id: None,
+        code: ErrorCode::UnsupportedSatelliteRoute,
+        message: format!(
+            "L3 metadata does not federate: no subscription to key '{key}' on \
+             {host}/@{id}. The record lives on that satellite's own server; run \
+             the command there.",
+            host = host.as_str(),
+        ),
+    }));
+    true
+}
+
 /// Record an L3 metadata subscription for `client_id` (SPEC §7.4).
 ///
 /// `out_tx` is the connection's outbound mailbox, captured in the
 /// subscription so `METADATA_CHANGED` fanout reaches a consumer that never
 /// attached — `phux watch` subscribes and streams without an ATTACH, the
 /// same shape [`handle_subscribe_events`] already accounts for.
+///
+/// A `Terminal` scope naming a satellite pane is **refused**, not recorded
+/// (phux-w7z2.57): see [`refuse_satellite_metadata_scope`].
 pub(crate) fn handle_subscribe_metadata(
     state: &SharedState,
     client_id: ClientId,
@@ -2406,6 +2484,9 @@ pub(crate) fn handle_subscribe_metadata(
             // this for an explicit `ERROR { OUT_OF_TIER }` once the
             // error code lands.
             debug!(?client_id, ?scope, %key, "SUBSCRIBE_METADATA refused (non-L3)");
+            return;
+        }
+        if refuse_satellite_metadata_scope(client_id, &scope, &key, out_tx) {
             return;
         }
         // Cloned only for the post-call log line below; `scope` and `key`
@@ -2941,6 +3022,106 @@ mod fatal_preflight_close_tests {
             .await;
     }
 }
+/// phux-w7z2.57: a `SUBSCRIBE_METADATA` naming a satellite pane is refused,
+/// not recorded.
+#[cfg(test)]
+mod satellite_metadata_subscription_tests {
+    use phux_protocol::ids::{SatelliteHost, TerminalId as WireTerminalId};
+    use phux_protocol::wire::frame::{ErrorCode, FrameKind, Scope};
+
+    use super::handle_subscribe_metadata;
+    use crate::state::{ClientId, Outbound, SharedState};
+
+    const AGENT_KEY: &str = "phux.agent/v1";
+
+    fn satellite_scope() -> Scope {
+        Scope::Terminal(WireTerminalId::Satellite {
+            host: SatelliteHost::new("gpubox"),
+            id: 7,
+        })
+    }
+
+    /// The refusal has to do both halves. Pushing the `ERROR` while still
+    /// recording the subscription would leave the consumer told "no" by one
+    /// frame and holding a live-looking registration that can never fire; not
+    /// pushing it while declining to record is the silent acceptance this
+    /// ticket exists to remove.
+    #[test]
+    fn a_satellite_scope_is_refused_with_a_typed_error_and_installs_nothing() {
+        let state = SharedState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(4);
+        let client = ClientId(1);
+        let scope = satellite_scope();
+
+        handle_subscribe_metadata(&state, client, scope.clone(), AGENT_KEY.to_owned(), &tx);
+
+        assert!(
+            state
+                .with(|s| s.metadata().subscribers_for(&scope, AGENT_KEY))
+                .is_empty(),
+            "a refused subscription must not be recorded",
+        );
+        match rx.try_recv() {
+            Ok(Outbound::Frame(FrameKind::Error {
+                request_id,
+                code,
+                message,
+            })) => {
+                assert_eq!(
+                    request_id, None,
+                    "SUBSCRIBE_METADATA carries no request_id to correlate to"
+                );
+                assert_eq!(code, ErrorCode::UnsupportedSatelliteRoute);
+                assert!(
+                    message.contains("does not federate"),
+                    "the diagnostic must name the limitation, not just the code: {message}",
+                );
+                assert!(
+                    message.contains("gpubox"),
+                    "the diagnostic must name the satellite: {message}",
+                );
+            }
+            other => panic!("expected a typed ERROR push, got {other:?}"),
+        }
+    }
+
+    /// The refusal is scoped to satellite `Terminal` scopes only. A local
+    /// pane's record is the whole reason this subscription exists, and
+    /// `Global` / `Group` keys (the TUI's layout coordination) never carry a
+    /// `TerminalId` at all.
+    #[test]
+    fn local_and_unscoped_subscriptions_are_untouched() {
+        let state = SharedState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(4);
+        let client = ClientId(2);
+        let local = Scope::Terminal(WireTerminalId::local(1));
+
+        handle_subscribe_metadata(&state, client, local.clone(), AGENT_KEY.to_owned(), &tx);
+        handle_subscribe_metadata(
+            &state,
+            client,
+            Scope::Global,
+            "phux.tui.focus/v1".to_owned(),
+            &tx,
+        );
+
+        assert_eq!(
+            state.with(|s| s.metadata().subscribers_for(&local, AGENT_KEY)),
+            vec![client],
+        );
+        assert_eq!(
+            state.with(|s| s
+                .metadata()
+                .subscribers_for(&Scope::Global, "phux.tui.focus/v1")),
+            vec![client],
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an accepted subscription pushes nothing",
+        );
+    }
+}
+
 #[cfg(test)]
 mod terminal_metadata_scope_tests {
     use phux_protocol::ids::TerminalId as WireTerminalId;

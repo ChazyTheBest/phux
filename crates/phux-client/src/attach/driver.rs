@@ -4244,6 +4244,17 @@ async fn sync_agent_meta_subscriptions(
         if agent_meta.subscribed.contains(id) {
             continue;
         }
+        // phux-w7z2.57: `phux.agent/v1` does not federate. A hub's metadata
+        // store holds nothing for a satellite pane, so the `GET` can only
+        // answer "unset" and the server now refuses the `SUBSCRIBE` outright
+        // with `ERROR { UNSUPPORTED_SATELLITE_ROUTE }`. Sending them anyway
+        // would spend two frames per remote pane to earn a warning notice in
+        // the status area on every pane-set change. Deliberately not recorded
+        // in `subscribed`: that set means "a live watch exists", and none
+        // does — the re-skip costs nothing because no frame is sent either way.
+        if !id.is_local() {
+            continue;
+        }
         let request_id = *next_request_id;
         *next_request_id = next_request_id.wrapping_add(1);
         agent_meta.pending.insert(request_id, id.clone());

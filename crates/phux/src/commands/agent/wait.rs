@@ -116,6 +116,41 @@ pub(super) fn resolve_until(until: &[String]) -> Result<Vec<AgentMetaState>, jso
     Ok(targets)
 }
 
+/// The refusal for a satellite target, or `None` for a local pane
+/// (phux-w7z2.57).
+///
+/// `phux.agent/v1` is hub-local: the relay carries L1 commands and
+/// `SUBSCRIBE_EVENTS` across a federation link and nothing L3, so a hub's
+/// metadata store holds no record for a satellite pane and never receives a
+/// `METADATA_CHANGED` about one. Without this check the wait subscribes to a
+/// scope the server will not serve, reads the hub's empty store, and reports
+/// `no_agent_record` — "this pane declares no agent" — about a pane that may
+/// well have a live agent running on it. Misreporting a remote agent as
+/// undeclared is worse than the 124 it replaces, because it reads as a fact
+/// about the pane rather than a limit of this build.
+///
+/// Refused the moment the selector resolves — before the wait subscribes to
+/// anything — for the same reason `agent start` and `agent answer` refuse a
+/// satellite target at the same point: nothing was observed and nothing was
+/// written, so the caller loses no work by learning early. `agent wait` was
+/// the last of the three to still try.
+fn satellite_refusal(terminal: &TerminalId) -> Option<json_err::CliError> {
+    if terminal.is_local() {
+        return None;
+    }
+    Some(json_err::CliError::new(
+        json_err::codes::SATELLITE_TARGET,
+        format!(
+            "{} is on a federation satellite; phux.agent/v1 records are hub-local \
+             and do not federate, so this hub can never observe its lifecycle",
+            crate::selector::format_terminal_id(terminal)
+        ),
+        "run `phux agent wait` against the satellite's own server. \
+         `phux watch <TARGET>` still streams that pane's agent events across the \
+         hub — it is the metadata half that does not cross, not the event half",
+    ))
+}
+
 /// `phux agent wait [TARGET] [--until STATE]... [--timeout SECS] [--json]`.
 pub(super) fn run_agent_wait(
     target: Option<&str>,
@@ -145,6 +180,9 @@ pub(super) fn run_agent_wait(
             Ok(id) => id,
             Err(code) => return code,
         };
+        if let Some(err) = satellite_refusal(&terminal) {
+            return json_err::emit(json, &err, crate::exit_codes::EXIT_USAGE);
+        }
         let outcome =
             wait_for_agent_state(&socket_path, &terminal, &targets, timeout, POLL_INTERVAL).await;
         let result = match outcome {
@@ -414,6 +452,38 @@ mod tests {
 
         let err = resolve_until(&["finished".to_owned()]).expect_err("unknown word is refused");
         assert_eq!(err.code, json_err::codes::INVALID_SELECTOR);
+    }
+
+    /// phux-w7z2.57: a satellite target is refused up front rather than
+    /// waiting on a hub store that can never hold the pane's record. The old
+    /// behaviour was worse than the 124 the bead named — the empty hub store
+    /// read back as `no_agent_record`, i.e. "this pane declares no agent",
+    /// about a pane whose agent is alive on another machine.
+    #[test]
+    fn a_satellite_target_is_refused_and_a_local_one_is_not() {
+        assert!(satellite_refusal(&TerminalId::local(3)).is_none());
+
+        let err = satellite_refusal(&TerminalId::Satellite {
+            host: phux_protocol::ids::SatelliteHost::new("gpubox"),
+            id: 7,
+        })
+        .expect("a satellite target is refused");
+        assert_eq!(err.code, json_err::codes::SATELLITE_TARGET);
+        assert!(
+            err.message.contains("do not federate"),
+            "must name the limitation rather than the pane: {}",
+            err.message
+        );
+        assert!(
+            err.remedy.contains("satellite's own server"),
+            "must name where the wait does work: {}",
+            err.remedy
+        );
+        // A refusal, not the timeout it replaces, and never the
+        // `no_agent_record` lie it replaces either.
+        let doc = json_err::error_document(&err, crate::exit_codes::EXIT_USAGE);
+        assert_eq!(doc["exit_code"], 2);
+        assert_eq!(doc["error"]["code"], "satellite_target");
     }
 
     /// The point of the refusal is the diagnostic: it has to say why nothing
