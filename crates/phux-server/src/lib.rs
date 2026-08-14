@@ -7,6 +7,7 @@
 //! ADR-0013.
 
 #![deny(missing_docs)]
+#![deny(rustdoc::private_intra_doc_links)]
 
 pub(crate) mod agent_asked;
 pub(crate) mod agent_detect;

@@ -341,13 +341,22 @@ e2e-lane-check:
 # `just ci` losing a gate CI still runs is how PR #306 shipped five rustdoc
 # failures to a red build after a green local run.
 #
+# `test` must NOT precede any deterministic, test-independent gate (doc,
+# deny, the bash guard rails). `just` fail-fasts on the first non-zero
+# recipe, so a gate placed after `test` silently stops running the moment a
+# test flakes on that machine -- this repo has load-dependent flakes, and
+# that exact ordering bug is how two more branches (phux-j1zj,
+# phux-w7z2.59) reached CI with private-intra-doc-links failures despite a
+# green local `just ci` (phux-yb1m). Keep every gate whose result does not
+# depend on the test suite ahead of `test`.
+#
 # The ratatui-confinement boundary (ADR-0020) used to be a grep guard
 # (`check-ratatui-boundary`); phux-0fv replaced it with a crate split, so
 # `cargo build`/`lint` now enforce it structurally — `phux-client-core` has
 # no `ratatui` dependency.
 
 # The inner-loop bar — every deterministic gate CI runs. Run before pushing.
-ci: fmt-check lint docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract test deny doc
+ci: fmt-check lint doc deny docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract test
     @echo "ok"
 
 # The COMPLETE PR bar: `ci` plus the two lanes that spawn real processes.

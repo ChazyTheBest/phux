@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![deny(rustdoc::private_intra_doc_links)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 // The wire codec and its input atoms are libghostty-free (ADR-0024) and so

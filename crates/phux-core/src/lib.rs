@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![deny(rustdoc::private_intra_doc_links)]
 
 pub mod ids;
 pub mod registry;

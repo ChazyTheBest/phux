@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![deny(rustdoc::private_intra_doc_links)]
 
 pub mod check; // phux-q9wj.3 (`phux config check`: schema-unknown keys)
 pub mod connector;

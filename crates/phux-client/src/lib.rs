@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![deny(rustdoc::private_intra_doc_links)]
 
 pub mod agent_meta;
 // Acknowledged, idempotent input delivery to an agent (ADR-0053, ADR-0076
