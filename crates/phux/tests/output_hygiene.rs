@@ -200,6 +200,29 @@ fn version_is_clean_stdout_with_no_banner() {
 }
 
 #[test]
+fn skill_flag_is_clean_and_matches_the_legacy_verb() {
+    let (flag_code, flag_stdout, flag_stderr) = run(&["--skill"]);
+    let (verb_code, verb_stdout, verb_stderr) = run(&["skill"]);
+
+    assert_eq!(flag_code, 0, "--skill should exit 0; stderr={flag_stderr}");
+    assert_eq!(verb_code, 0, "skill should exit 0; stderr={verb_stderr}");
+    assert_eq!(flag_stdout, verb_stdout);
+    assert!(flag_stdout.starts_with("---\nname: phux\n"));
+    assert!(flag_stdout.ends_with('\n'));
+    assert!(flag_stderr.is_empty(), "--skill stderr={flag_stderr:?}");
+    assert!(verb_stderr.is_empty(), "skill stderr={verb_stderr:?}");
+}
+
+#[test]
+fn skill_flag_refuses_a_command_instead_of_ignoring_it() {
+    let (code, stdout, stderr) = run(&["--skill", "ls"]);
+
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty(), "stdout={stdout:?}");
+    assert!(stderr.contains("--skill is a standalone endpoint"));
+}
+
+#[test]
 fn help_does_not_print_banner() {
     let (code, stdout, stderr) = run(&["--help"]);
     assert_eq!(code, 0, "--help should exit 0");
@@ -1031,4 +1054,5 @@ fn doctor_survives_a_closed_stdout() {
 fn clap_output_survives_a_closed_stdout() {
     assert_survives_closed_stdout(&["--version"]);
     assert_survives_closed_stdout(&["--help"]);
+    assert_survives_closed_stdout(&["--skill"]);
 }

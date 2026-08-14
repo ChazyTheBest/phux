@@ -1,6 +1,6 @@
 # skills/
 
-`phux/SKILL.md` is the agent skill `phux skill` prints. It is **compiled into
+`phux/SKILL.md` is the agent skill `phux --skill` prints. It is **compiled into
 the binary** with `include_str!` (see `crates/phux/src/lib.rs`), so the text an
 agent reads always belongs to the binary it is driving. There is no separate
 shipped copy to fall out of date.
@@ -18,5 +18,5 @@ is a build artifact of the surface, not a hope.
 
 The example skills under `examples/skills/` are separate, hand-maintained
 illustrations (CLI + MCP orchestration, the `phux-terminal` read/act loop).
-They are examples, not the contract; when they disagree with `phux skill`,
-`phux skill` wins.
+They are examples, not the contract; when they disagree with `phux --skill`,
+`phux --skill` wins.

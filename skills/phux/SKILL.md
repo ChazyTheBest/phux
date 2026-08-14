@@ -9,10 +9,10 @@ phux is a terminal multiplexer with a headless control plane. Every verb here
 works without a TTY, so an agent can create panes, read what is on them, type
 into them, and wait for something to happen.
 
-This file is compiled into the `phux` binary. `phux skill` prints the copy that
+This file is compiled into the `phux` binary. `phux --skill` prints the copy that
 belongs to the binary you are actually running, so it cannot describe a verb
 this build does not have. If you obtained this text any other way, run
-`phux skill` and trust that instead.
+`phux --skill` and trust that instead. `phux skill` is an equivalent command.
 
 Deeper reference: `phux help <verb>` for any verb below. Every claim in this
 file is about the binary that printed it.
@@ -586,7 +586,7 @@ binary, so nothing is invisible to you.
 | `phux workspace` | `inspect` a git repo and its worktrees; `save` / `restore` a session archive |
 | `phux doctor` | diagnose the install: config, socket, server, plugins, shims |
 | `phux logs` | where the logs live, or tail one |
-| `phux skill` | print this file |
+| `phux --skill` | print this file (`phux skill` is equivalent) |
 
 **Act**
 

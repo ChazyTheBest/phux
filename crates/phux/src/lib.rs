@@ -158,6 +158,10 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<std::path::PathBuf>,
 
+    /// Print the agent skill compiled into this binary, then exit.
+    #[arg(long, exclusive = true)]
+    skill: bool,
+
     /// Subcommand. Defaults to attaching to the last session if omitted.
     #[command(subcommand)]
     command: Option<Command>,
@@ -411,7 +415,7 @@ pub(crate) fn print_banner() {
 /// scans this constant along with every help string).
 pub(crate) const BANNER: &str = concat!("phux ", env!("CARGO_PKG_VERSION"));
 
-/// The agent skill `phux skill` prints, compiled into the executable.
+/// The agent skill `phux --skill` prints, compiled into the executable.
 ///
 /// `include_str!` rather than a shipped file, and that is the entire point of
 /// the verb. The skill is the agent-to-agent UX: it is the document another
@@ -428,13 +432,13 @@ pub(crate) const BANNER: &str = concat!("phux ", env!("CARGO_PKG_VERSION"));
 /// cannot land into a skill that does not mention it.
 pub(crate) const SKILL: &str = include_str!("../../../skills/phux/SKILL.md");
 
-/// `phux skill` — write the compiled skill to stdout and exit 0.
+/// `phux --skill` / `phux skill` — write the compiled skill to stdout and exit 0.
 ///
 /// Contacts no server and reads no config, which is what makes it safe to run
 /// from anywhere, including a pane that has no server behind it yet.
 fn run_skill() -> ExitCode {
     // `output::bytes` rather than `print!`: a reader that hangs up
-    // (`phux skill | head`) must end the process in silence like every other
+    // (`phux --skill | head`) must end the process in silence like every other
     // stdout write in this crate. Raw bytes rather than `out!` because the
     // payload is a whole document, not a formatted line — the same path
     // `phux completion` uses. The file ends in exactly one newline, so
@@ -483,6 +487,22 @@ pub fn run() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => return report_parse_error(&err),
     };
+
+    // Clap's root args intentionally coexist with subcommands so the global
+    // --socket works on either side of a verb. That also means `exclusive`
+    // alone does not reject a following subcommand, so close that edge here
+    // rather than silently ignoring the verb.
+    if cli.skill {
+        if cli.command.is_some() {
+            eprintln!(
+                "phux: --skill is a standalone endpoint and cannot be combined with a command"
+            );
+            return ExitCode::from(2);
+        }
+        // Like clap's built-in --help and --version actions, this socketless
+        // endpoint exits before tracing, config, or TTY setup.
+        return run_skill();
+    }
 
     // Usage errors caught after clap: the `--rec` scope rule (see
     // `root_rec_before_verb`) and a `--socket` handed to a verb that never
@@ -553,6 +573,7 @@ pub fn run() -> ExitCode {
     // arm shares (each arm consumes it at most once, and only one arm runs).
     let Cli {
         rec: root_rec,
+        skill: _,
         socket,
         command,
     } = cli;

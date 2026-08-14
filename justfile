@@ -291,7 +291,7 @@ docs-check:
 # output on every `just test`, so a stale tree fails CI with this recipe as
 # the remedy. Idempotent. See docs/CONVENTIONS.md §"Generated reference docs".
 docs-gen:
-    cargo run -q -p phux -- gen-reference-docs
+    cargo run -q -p phux --bin phux -- gen-reference-docs
 
 # Homebrew formula generator vs the shapes release.yml's matrix can produce.
 formula-check:

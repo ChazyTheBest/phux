@@ -654,7 +654,8 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   `{schema_version, branch, path, session, terminal_id}`. `terminal_id` is the
   seed pane's numeric id. The sibling `open` and `remove` verbs also accept
   `--json`; all three use the shared `workspace` error code for git failures.
-- **`phux skill`** — print the agent skill compiled into this exact binary.
+- **`phux --skill`** — print the agent skill compiled into this exact binary
+  (`phux skill` is equivalent).
   Prefer it to a copied checkout example when teaching another agent: CI
   checks that it names every visible top-level and `agent` verb.
 - **`phux doctor [--json]`** — inspect the installation, including the

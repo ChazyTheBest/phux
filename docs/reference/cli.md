@@ -107,6 +107,9 @@ Usage: phux [OPTIONS] [COMMAND]
       --socket <PATH>
           Override the UDS path of the server to dial. Defaults to `$PHUX_SOCKET`, else `$XDG_RUNTIME_DIR/phux/phux.sock` (or `/tmp/phux-$USER/phux.sock` if `XDG_RUNTIME_DIR` isn't set)
 
+      --skill
+          Print the agent skill compiled into this binary, then exit
+
   -h, --help
           Print help (see a summary with '-h')
 
