@@ -11,7 +11,10 @@
 //!    paints a prompt box shaped like a real permission dialog, then idles so
 //!    the screen stays put.
 //! 2. Attach, and `SUBSCRIBE_METADATA` on the pane's `phux.agent/v1` key.
-//! 3. Assert a `METADATA_CHANGED` arrives carrying `state: "blocked"`.
+//! 3. Wait for the pane to have actually painted ([`await_pane_painted`]) —
+//!    a barrier, so the detector's deadline measures the detector and not the
+//!    kernel's willingness to schedule a freshly spawned `/bin/sh`.
+//! 4. Assert a `METADATA_CHANGED` arrives carrying `state: "blocked"`.
 //!
 //! Note what this exercises that a unit test cannot: the actor's detector
 //! timer actually fires; `foreground_pgid` + `process_argv` actually resolve a
@@ -72,6 +75,26 @@ const TEST_IDENTIFY_RECHECK: Duration = Duration::from_millis(200);
 /// loaded parallel test pool.
 const DEPARTURE_DEADLINE: Duration = Duration::from_secs(12);
 
+/// How long a test waits for the seed pane's process to finish painting
+/// before it starts measuring the DETECTOR (see [`await_pane_painted`]).
+///
+/// Deliberately much larger than [`DETECT_DEADLINE`], and deliberately NOT
+/// part of it. This bounds the one thing no test-side change can influence:
+/// how long the kernel takes to give a freshly `posix_spawn`ed `/bin/sh` its
+/// first slice of CPU. Measured on a developer box under a ~130 load average
+/// (a multi-agent fleet building concurrently), that was **7.8 seconds** —
+/// the pane's very first PTY byte did not arrive until then, while the
+/// server, the actor and the detector all ran normally throughout. See the
+/// [`await_pane_painted`] docs for why this is a separate budget rather than
+/// a bigger `DETECT_DEADLINE`.
+const PANE_PAINT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often [`await_pane_painted`] re-checks the paint marker. Short enough
+/// that the barrier costs nothing on an idle machine, and it is a poll of the
+/// local filesystem — it touches neither the server nor the pane, so it
+/// cannot perturb what it is waiting for.
+const PAINT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Shrink the detector's identity recheck for this test process. Same
 /// constraints as [`shorten_startup_grace`].
 fn shorten_identify_recheck() {
@@ -113,8 +136,63 @@ fn shorten_startup_grace() {
 /// one: a rounded box containing the question and a numbered option list.
 /// Then it sleeps, so the live screen keeps saying `blocked` while the test
 /// collects.
+///
+/// It also creates [`paint_marker`] once the painting is done — the barrier
+/// every caller must wait on before it starts timing the detector. See
+/// [`await_pane_painted`].
 fn write_fake_agent(dir: &std::path::Path) -> std::path::PathBuf {
     write_fake_agent_ending_with(dir, "sleep 30")
+}
+
+/// The file a fake agent creates once it has written its whole screen to the
+/// PTY. One per pane directory, which is one per test: each case builds its
+/// own [`TempDir`] and seeds exactly one painting agent into it.
+fn paint_marker(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("painted")
+}
+
+/// Block until the seed pane's process has painted, or fail with a message
+/// that says so.
+///
+/// WHY THIS EXISTS (phux-m64c). Every case in this file used to start its
+/// [`DETECT_DEADLINE`] the moment it had attached, so that one budget paid for
+/// two unrelated things: the detector converging (what is under test) and the
+/// pane's `/bin/sh` getting scheduled at all (what is not). The second is
+/// unbounded and entirely ambient. Caught in the act under a ~130 load
+/// average, with `RUST_LOG` trace on: the actor started at T+0.00s, identified
+/// `claude` from its argv at T+0.50s, scanned a still-blank grid at T+0.81s
+/// and published the fail-safe `idle` — and then the pane's FIRST PTY byte
+/// arrived at T+7.77s, 0.2s after the 8s deadline had already expired. The
+/// detector was right at every step and never got a second screen to look at,
+/// because a static permission dialog paints once and then nothing changes;
+/// the test failed with "claude was never detected in this pane", which is
+/// not what happened.
+///
+/// So the two budgets are separated. This one is generous and its failure
+/// names the environment; [`DETECT_DEADLINE`] stays tight and measures only
+/// the detector, starting from a point where the screen it must derive from
+/// provably exists. Lengthening `DETECT_DEADLINE` instead would have bought
+/// the same margin while destroying the distinction — a real detector
+/// regression and a starved test box would look identical, and the number
+/// needed to cover starvation is not bounded by anything.
+///
+/// The marker is a file rather than anything on the wire because it must
+/// report on the CHILD, not on the server: the pane's process writes its
+/// screen and then creates the file, so the marker appearing means the bytes
+/// are in the PTY. Everything after that — the reader thread, the actor, the
+/// libghostty projection, the detector — is server work that
+/// `DETECT_DEADLINE` should and does cover.
+async fn await_pane_painted(marker: &std::path::Path) {
+    let end = tokio::time::Instant::now() + PANE_PAINT_DEADLINE;
+    while !marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < end,
+            "the seed pane never painted its screen within {PANE_PAINT_DEADLINE:?}: the fake \
+             agent's process was starved, or never ran. This is the ENVIRONMENT, not the \
+             detector — nothing downstream of the grid has been exercised yet.",
+        );
+        tokio::time::sleep(PAINT_POLL_INTERVAL).await;
+    }
 }
 
 /// As [`write_fake_agent`], but the agent LEAVES the pane — replacing itself
@@ -189,7 +267,14 @@ fn write_fake_agent_ending_with(dir: &std::path::Path, tail: &str) -> std::path:
          echo '   3. No'\n\
          echo ''\n\
          echo ' Esc to cancel'\n";
-    let script = format!("{script}{tail}\n");
+    // The paint barrier (phux-m64c). `:` with a redirect is a shell builtin,
+    // so it forks nothing: the script stays the process group leader and
+    // identification is untouched. It runs AFTER the last `echo`, so the
+    // marker's existence means the whole screen is already in the PTY — see
+    // `await_pane_painted` for why any test that times the detector has to
+    // wait for it first.
+    let painted = format!(": > '{}'\n", paint_marker(dir).display());
+    let script = format!("{script}{painted}{tail}\n");
     std::fs::write(&path, script).expect("write fake agent");
     #[cfg(unix)]
     {
@@ -296,6 +381,11 @@ fn detector_publishes_blocked_from_a_live_prompt_box() {
             },
         )
         .await;
+
+        // ---- the pane has painted ---- (barrier, not a wait: `DETECT_DEADLINE`
+        // must not also pay for the child's scheduling latency. See
+        // `await_pane_painted`.)
+        await_pane_painted(&paint_marker(tmp.path())).await;
 
         // ---- the detector should derive `blocked` and publish it ----
         // (poll for the converged state, not just the first publish: see
@@ -428,6 +518,8 @@ fn deleting_the_record_hands_it_back_to_the_detector() {
         )
         .await;
 
+        await_pane_painted(&paint_marker(tmp.path())).await;
+
         // Poll for the converged `blocked` state rather than sampling the
         // first publish (see `await_agent_state`): the detector can land on
         // an intermediate state like `idle` a tick before it derives
@@ -518,6 +610,8 @@ fn an_unattached_subscriber_receives_the_detectors_record() {
             },
         )
         .await;
+
+        await_pane_painted(&paint_marker(tmp.path())).await;
 
         let record = await_agent_state(&mut watcher, &terminal, "blocked", DETECT_DEADLINE).await;
         let record = record.expect(
@@ -668,6 +762,8 @@ fn a_declared_state_does_not_survive_the_death_of_the_process_it_describes() {
         )
         .await;
 
+        await_pane_painted(&paint_marker(tmp.path())).await;
+
         // Precondition: the detector has identified a live agent in this pane.
         assert!(
             await_agent_state(&mut stream, &terminal, "blocked", DETECT_DEADLINE)
@@ -766,6 +862,8 @@ fn a_detector_written_record_is_retracted_when_the_agent_leaves_the_pane() {
         )
         .await;
 
+        await_pane_painted(&paint_marker(tmp.path())).await;
+
         assert!(
             await_agent_state(&mut stream, &terminal, "blocked", DETECT_DEADLINE)
                 .await
@@ -849,6 +947,8 @@ fn a_kind_change_never_leaves_a_stale_kind_beside_a_live_state() {
             },
         )
         .await;
+
+        await_pane_painted(&paint_marker(tmp.path())).await;
 
         assert!(
             await_agent_state(&mut stream, &terminal, "blocked", DETECT_DEADLINE)
@@ -960,6 +1060,8 @@ fn a_declared_kind_never_gains_a_state_derived_from_a_different_occupant() {
         )
         .await;
 
+        await_pane_painted(&paint_marker(tmp.path())).await;
+
         assert!(
             await_agent_state(&mut stream, &terminal, "blocked", DETECT_DEADLINE)
                 .await
@@ -1059,6 +1161,8 @@ fn an_identity_only_set_gets_its_state_filled_in_by_the_detector() {
             },
         )
         .await;
+
+        await_pane_painted(&paint_marker(tmp.path())).await;
 
         let first = collect_agent_record(&mut stream, &terminal, DETECT_DEADLINE).await;
         assert!(first.is_some(), "precondition: the detector published");
