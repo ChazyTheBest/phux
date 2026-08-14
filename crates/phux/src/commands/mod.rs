@@ -246,7 +246,7 @@ pub(crate) const fn socketless_verb(command: &Command) -> Option<&'static str> {
         Command::Relay { .. } => Some("relay"),
         Command::Pair { .. } => Some("pair"),
         Command::Completion { .. } => Some("completion"),
-        Command::Skill {} => Some("skill"),
+        Command::Skill { .. } => Some("skill"),
         Command::Logs { .. } => Some("logs"),
         Command::GenReferenceDocs { .. } => Some("gen-reference-docs"),
         _ => None,
@@ -1537,12 +1537,19 @@ pub(crate) enum Command {
             read-act-wait loop, the selector grammar, the difference between a \
             level read and an observed transition, the exit codes, and the \
             safety rules for driving a terminal a human may also be using.\n\n\
-            Examples:\n  \
+            Scopes are `quick` (core loop and safety), `agent` (lifecycle and \
+            identity), `terminal` (screen and input mechanics), and `full` \
+            (everything, the default). Examples:\n  \
             phux skill\n  \
-            phux skill > ~/.claude/skills/phux/SKILL.md\n  \
-            phux skill | pbcopy"
+            phux skill agent\n  \
+            phux --skill=terminal\n  \
+            phux --skill=quick | pbcopy"
     )]
-    Skill {},
+    Skill {
+        /// Amount and subject of guidance to print.
+        #[arg(value_enum, default_value = "full", value_name = "SCOPE")]
+        scope: crate::skill::SkillScope,
+    },
 
     /// Diagnose a phux install: config, socket, server, plugins.
     ///

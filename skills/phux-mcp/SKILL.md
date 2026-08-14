@@ -1,0 +1,96 @@
+---
+name: phux-mcp
+description: Drive phux through its installed MCP stdio adapter. Covers live schema discovery, the read-act-observe-verify loop, selectors, agent lifecycle edges, delivery uncertainty, bounded waits, and destructive-operation confirmation.
+---
+
+# Driving phux through MCP
+
+`phux-mcp` is a stdio MCP server. Configure an MCP host to launch `phux-mcp`
+with no arguments. `--skill` and `--schema` are standalone discovery endpoints,
+not server arguments.
+
+Inside MCP, the live `tools/list` catalog is authoritative. Outside an MCP
+session, run:
+
+```sh
+phux-mcp --schema
+```
+
+It prints the exact same tool descriptor array, including every current
+`inputSchema`, compiled into this binary. Do not infer required fields, limits,
+or enums from examples when the catalog can answer them.
+
+`phux-mcp` finds the sibling `phux` executable first, then `phux` on `PATH`.
+`PHUX_SOCKET` selects the default local server; a tool's `socket` argument
+overrides it. Installing or registering MCP does not imply a phux server is
+running.
+
+## Operating loop
+
+Read, act, observe under a finite bound, then verify with another read.
+
+1. Discover sessions with `phux_ls`.
+2. Create or place work with `phux_new`, `phux_launch`, `phux_spawn`, or
+   `phux_agent_start`.
+3. Read with `phux_snapshot`, `phux_agent_show`, or `phux_agent_explain`.
+4. Use `phux_run` for one shell command, `phux_paste` plus `phux_send_keys`
+   `Enter` for multiline input, and `phux_agent_prompt` for an agent turn.
+5. Observe with `phux_wait`, bounded `phux_watch`, or `phux_agent_wait`.
+6. Re-read state. A watcher ending or a quiet pane is not completion.
+
+Prefer returned direct selectors such as `@7` and `host/@7` for writes. Session
+names and `#tags` can select sets. `.` means the focused session. `%name` means
+one addressable agent. `=` is unavailable because headless MCP has no attached
+client's focus history. MCP layout tools change persisted topology but never
+move a human's client-local focus.
+
+## Agent lifecycle and delivery
+
+`phux_agent_show` and `phux_agent_list` are level reads: what appears true now.
+`phux_agent_wait` is an edge read: it requires an observed transition after its
+baseline. An already-idle pane is not proof that a turn completed. Prefer
+`phux_agent_prompt` when submitting work because it fuses the write and edge
+observation without a race.
+
+Always set finite timeout values. A timeout says no qualifying transition was
+observed; it does not prove the agent is still working. `unknown` or a removed
+record is departure, never completion.
+
+An acknowledged input write proves bytes entered the kernel tty queue, not that
+the application consumed them. A `delivery_unknown` result is terminal: inspect
+the pane and do not resend, because the first operation may still land. Use
+identity-checked `phux_agent_send_keys` or `phux_agent_prompt` when stale pane
+occupancy would be dangerous. Serialize acknowledged fleet prompts because the
+input lane is server-scoped. A paste inserts text; it does not submit it.
+
+## Tool inventory
+
+Read exact arguments from `tools/list` or `phux-mcp --schema`.
+
+**Read and observe:** `phux_ls`, `phux_snapshot`, `phux_wait`, `phux_watch`,
+`phux_agent_list`, `phux_agent_show`, `phux_agent_explain`, `phux_agent_wait`.
+
+**Create and act:** `phux_new`, `phux_launch`, `phux_spawn`, `phux_run`,
+`phux_send_keys`, `phux_paste`, `phux_ask`, `phux_signal`, `phux_tag`,
+`phux_rename`, `phux_agent_set`, `phux_agent_clear`, `phux_agent_send_keys`,
+`phux_agent_prompt`, `phux_agent_answer`, `phux_agent_start`.
+
+**Shape and extend:** `phux_insert_pane`, `phux_move_pane`, `phux_swap_pane`,
+`phux_workspace`, `phux_plugin_action`, `phux_plugin_workspace`.
+
+**Destructive boundary:** `phux_kill` and `phux_detach` require `confirm: true`.
+Before either one, resolve and display the exact target, inspect current state,
+explain the effect, obtain affirmative human confirmation, execute the narrowest
+operation, and verify the resulting inventory. `phux_detach` ejects viewers but
+does not kill panes. Treat destructive `phux_signal` values the same way.
+
+## MCP results
+
+Tool success and tool failure are JSON-RPC successes carrying one text content
+block. Structured successful text is JSON. Tool failures set `isError: true`;
+they are not protocol errors. Malformed requests and unknown methods use
+JSON-RPC errors.
+
+There is deliberately no attach/live-ANSI tool, headless focus tool, durable
+input lease, scheduler, credential mutation surface, or endless watch call.
+Those omissions keep agent control explicit and bounded.

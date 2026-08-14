@@ -203,10 +203,14 @@ fn version_is_clean_stdout_with_no_banner() {
 fn skill_flag_is_clean_and_matches_the_legacy_verb() {
     let (flag_code, flag_stdout, flag_stderr) = run(&["--skill"]);
     let (verb_code, verb_stdout, verb_stderr) = run(&["skill"]);
+    let (_, explicit_flag, _) = run(&["--skill=full"]);
+    let (_, explicit_verb, _) = run(&["skill", "full"]);
 
     assert_eq!(flag_code, 0, "--skill should exit 0; stderr={flag_stderr}");
     assert_eq!(verb_code, 0, "skill should exit 0; stderr={verb_stderr}");
     assert_eq!(flag_stdout, verb_stdout);
+    assert_eq!(flag_stdout, explicit_flag);
+    assert_eq!(flag_stdout, explicit_verb);
     assert!(flag_stdout.starts_with("---\nname: phux\n"));
     assert!(flag_stdout.ends_with('\n'));
     assert!(flag_stderr.is_empty(), "--skill stderr={flag_stderr:?}");
@@ -214,12 +218,52 @@ fn skill_flag_is_clean_and_matches_the_legacy_verb() {
 }
 
 #[test]
-fn skill_flag_refuses_a_command_instead_of_ignoring_it() {
+fn scoped_skills_match_across_flag_and_verb_forms() {
+    for scope in ["quick", "agent", "terminal"] {
+        let (_, flag, flag_err) = run(&[&format!("--skill={scope}")]);
+        let (_, verb, verb_err) = run(&["skill", scope]);
+        assert_eq!(flag, verb, "scope={scope}");
+        assert!(flag.starts_with("---\nname: phux\n"));
+        assert!(!flag.contains("phux-skill-region:"));
+        assert!(flag_err.is_empty());
+        assert!(verb_err.is_empty());
+    }
+}
+
+#[test]
+fn skill_flag_refuses_a_command_as_an_invalid_scope() {
     let (code, stdout, stderr) = run(&["--skill", "ls"]);
 
     assert_eq!(code, 2);
     assert!(stdout.is_empty(), "stdout={stdout:?}");
-    assert!(stderr.contains("--skill is a standalone endpoint"));
+    assert!(stderr.contains("invalid value 'ls'"));
+    assert!(stderr.contains("quick"));
+    assert!(stderr.contains("terminal"));
+}
+
+#[test]
+fn capabilities_are_clean_machine_readable_and_socketless() {
+    let (code, stdout, stderr) = run(&["--capabilities", "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stderr.is_empty());
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["binary"]["name"], "phux");
+    assert_eq!(
+        doc["skill"]["scopes"],
+        serde_json::json!(["quick", "agent", "terminal", "full"])
+    );
+    assert!(
+        doc["commands"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty())
+    );
+
+    let socket = dead_socket();
+    let (code, stdout, stderr) = run(&["--capabilities", "--json", "--socket", &socket]);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("standalone endpoint"));
 }
 
 #[test]
@@ -240,6 +284,7 @@ fn short_and_long_help_progressively_disclose_the_root() {
     assert_eq!(long_code, 0, "long help failed: {long_err}");
     assert!(short.contains("Start here:"), "short help:\n{short}");
     assert!(short.contains("phux                     Attach"));
+    assert!(short.contains("phux --skill"));
     assert!(!short.contains("ATTACH / SERVE"), "short help:\n{short}");
     assert!(long.contains("ATTACH / SERVE"), "long help:\n{long}");
     assert!(long.contains("  spawn      Create a pane"));

@@ -46,6 +46,7 @@ mod tools;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -67,31 +68,81 @@ type Dispatcher = Arc<dyn Fn(String, Value) -> DispatchFuture + Send + Sync>;
 /// Newer MCP revisions are additive; bump when we adopt one.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Argument that dumps the tool catalog instead of serving.
-const SCHEMA_FLAG: &str = "--schema";
+const SKILL: &str = include_str!("../../../skills/phux-mcp/SKILL.md");
+const HELP: &str = "phux-mcp - MCP stdio adapter for phux\n\n\
+Usage: phux-mcp [OPTION]\n\n\
+Options:\n  \
+  --skill   Print the agent operating guide compiled into this binary\n  \
+  --schema  Print the same MCP tool catalog returned by tools/list\n  \
+  -h, --help     Print help\n  \
+  -V, --version  Print version\n\n\
+With no arguments, serve MCP over newline-delimited JSON-RPC on stdin/stdout.\n";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Serve,
+    Skill,
+    Schema,
+    Help,
+    Version,
+}
+
+fn parse_mode<I, S>(args: I) -> Result<Mode, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    match args.as_slice() {
+        [] => Ok(Mode::Serve),
+        [arg] if arg.as_ref() == "--skill" => Ok(Mode::Skill),
+        [arg] if arg.as_ref() == "--schema" => Ok(Mode::Schema),
+        [arg] if arg.as_ref() == "-h" || arg.as_ref() == "--help" => Ok(Mode::Help),
+        [arg] if arg.as_ref() == "-V" || arg.as_ref() == "--version" => Ok(Mode::Version),
+        _ => Err(
+            "expected no arguments or exactly one of --skill, --schema, --help, --version"
+                .to_owned(),
+        ),
+    }
+}
+
+fn write_stdout(bytes: &[u8]) -> std::process::ExitCode {
+    match std::io::stdout().lock().write_all(bytes) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("phux-mcp: stdout write failed: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn write_schema() -> std::process::ExitCode {
+    match serde_json::to_vec_pretty(&tools::catalog()) {
+        Ok(mut rendered) => {
+            rendered.push(b'\n');
+            write_stdout(&rendered)
+        }
+        Err(err) => {
+            eprintln!("phux-mcp: could not render the tool catalog: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
 fn main() -> std::process::ExitCode {
-    // `phux-mcp --schema` prints the same catalog `tools/list` returns and
-    // exits. Handled before the runtime is built because it needs neither a
-    // runtime nor a server: the catalog is a compile-time constant of this
-    // binary, so an agent can read the tool surface without a phux server
-    // running and without speaking JSON-RPC to discover it.
-    //
-    // It lives here rather than as `phux api schema` because this binary
-    // already owns the catalog. Exposing it from the main `phux` binary
-    // would mean either duplicating the schemas — which then drift — or
-    // linking the whole MCP stack into every `phux ls`.
-    if std::env::args().skip(1).any(|arg| arg == SCHEMA_FLAG) {
-        return match serde_json::to_string_pretty(&tools::catalog()) {
-            Ok(rendered) => {
-                println!("{rendered}");
-                std::process::ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("phux-mcp: could not render the tool catalog: {err}");
-                std::process::ExitCode::FAILURE
-            }
-        };
+    match parse_mode(std::env::args_os().skip(1)) {
+        Ok(Mode::Skill) => return write_stdout(SKILL.as_bytes()),
+        Ok(Mode::Schema) => return write_schema(),
+        Ok(Mode::Help) => return write_stdout(HELP.as_bytes()),
+        Ok(Mode::Version) => {
+            return write_stdout(concat!("phux-mcp ", env!("CARGO_PKG_VERSION"), "\n").as_bytes());
+        }
+        Ok(Mode::Serve) => {}
+        Err(message) => {
+            eprintln!("phux-mcp: {message}\nTry `phux-mcp --help` for usage.");
+            return std::process::ExitCode::from(2);
+        }
     }
 
     // Current-thread runtime: the phux client surface is async and its
@@ -108,6 +159,7 @@ fn main() -> std::process::ExitCode {
     };
     match rt.block_on(serve()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("phux-mcp: fatal: {err}");
             std::process::ExitCode::FAILURE
@@ -416,6 +468,17 @@ mod tests {
     /// scheduler on a saturated one (phux-br1f); a real hang still fails,
     /// just later, with the same message.
     const NO_HANG_DEADLINE: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn standalone_mode_parser_is_exact() {
+        assert_eq!(parse_mode([] as [&str; 0]).unwrap(), Mode::Serve);
+        assert_eq!(parse_mode(["--skill"]).unwrap(), Mode::Skill);
+        assert_eq!(parse_mode(["--schema"]).unwrap(), Mode::Schema);
+        assert_eq!(parse_mode(["--help"]).unwrap(), Mode::Help);
+        assert_eq!(parse_mode(["--version"]).unwrap(), Mode::Version);
+        assert!(parse_mode(["--skill", "--schema"]).is_err());
+        assert!(parse_mode(["junk"]).is_err());
+    }
 
     fn sleeping_cli() -> (TempDir, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().unwrap();

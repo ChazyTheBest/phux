@@ -508,7 +508,7 @@ fn root_help_documents_exit_status() {
 // ---------------------------------------------------------------------------
 // The compiled agent skill vs the surface it describes
 //
-// `crate::SKILL` is `include_str!`d, so it always belongs to this build — but
+// `skill::SOURCE` is `include_str!`d, so it always belongs to this build — but
 // "compiled in" only guarantees it ships together with the binary, not that it
 // still says true things about it. These three tests are the part that catches
 // drift, on the same principle as
@@ -532,6 +532,7 @@ const SKILL_REMEDY: &str = "document it in skills/phux/SKILL.md (the file \
 /// deliberately excluded, exactly as they are from the curated `--help`.
 #[test]
 fn skill_names_every_visible_top_level_verb() {
+    let skill = crate::skill::render(crate::skill::SkillScope::Full);
     for sub in Cli::command().get_subcommands() {
         let name = sub.get_name();
         if name == "help" || sub.is_hide_set() {
@@ -539,7 +540,7 @@ fn skill_names_every_visible_top_level_verb() {
         }
         let needle = format!("phux {name}");
         assert!(
-            crate::SKILL.contains(&needle),
+            skill.contains(&needle),
             "the compiled agent skill never mentions `{needle}`; {SKILL_REMEDY}"
         );
     }
@@ -552,6 +553,7 @@ fn skill_names_every_visible_top_level_verb() {
 /// hand-maintained example skill still described a surface without them.
 #[test]
 fn skill_names_every_agent_subcommand() {
+    let skill = crate::skill::render(crate::skill::SkillScope::Agent);
     let root = Cli::command();
     let agent = root
         .get_subcommands()
@@ -564,7 +566,7 @@ fn skill_names_every_agent_subcommand() {
         }
         let needle = format!("agent {name}");
         assert!(
-            crate::SKILL.contains(&needle),
+            skill.contains(&needle),
             "the compiled agent skill never mentions `phux {needle}`; {SKILL_REMEDY}"
         );
     }
@@ -602,6 +604,7 @@ fn taught_selector_token(selector: &crate::selector::Selector) -> &'static str {
 /// it too.
 #[test]
 fn skill_teaches_every_selector_sigil_the_parser_accepts() {
+    let skill = crate::skill::render(crate::skill::SkillScope::Quick);
     for probe in [
         "@7",
         "edge/@7",
@@ -617,7 +620,7 @@ fn skill_teaches_every_selector_sigil_the_parser_accepts() {
         };
         let token = taught_selector_token(&selector);
         assert!(
-            crate::SKILL.contains(token),
+            skill.contains(token),
             "the parser accepts the selector `{probe}` but the compiled agent \
              skill never teaches {token}; {SKILL_REMEDY}"
         );
@@ -628,7 +631,7 @@ fn skill_teaches_every_selector_sigil_the_parser_accepts() {
         "`=` is refused for headless callers; if that changed, teach it"
     );
     assert!(
-        crate::SKILL.contains("`=`"),
+        skill.contains("`=`"),
         "the compiled agent skill must explain why `=` is refused; {SKILL_REMEDY}"
     );
 }
@@ -645,6 +648,7 @@ fn skill_teaches_every_selector_sigil_the_parser_accepts() {
 /// things and are routinely conflated.
 #[test]
 fn skill_teaches_the_load_bearing_rules() {
+    let skill = crate::skill::render(crate::skill::SkillScope::Quick);
     for needle in [
         "PHUX_TERMINAL_ID",
         "PHUX_SOCKET",
@@ -654,7 +658,7 @@ fn skill_teaches_the_load_bearing_rules() {
         "125",
     ] {
         assert!(
-            crate::SKILL.contains(needle),
+            skill.contains(needle),
             "the compiled agent skill no longer teaches {needle:?}; it is one \
              of the rules the skill exists to carry"
         );
@@ -668,16 +672,17 @@ fn skill_teaches_the_load_bearing_rules() {
 /// prints.
 #[test]
 fn skill_cites_nothing_only_a_checkout_has() {
+    let skill = crate::skill::render(crate::skill::SkillScope::Full);
     assert!(
-        !crate::SKILL.contains("ADR-"),
+        !skill.contains("ADR-"),
         "the compiled agent skill cites an ADR; its reader has no checkout"
     );
     assert!(
-        !crate::SKILL.contains("docs/"),
+        !skill.contains("docs/"),
         "the compiled agent skill cites a repo-internal docs/ path; point at \
          `phux help <verb>` instead"
     );
-    let leaks = ticket_like_tokens(crate::SKILL);
+    let leaks = ticket_like_tokens(&skill);
     assert!(
         leaks.is_empty(),
         "the compiled agent skill leaks internal ticket id(s): {leaks:?}"

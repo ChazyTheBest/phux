@@ -72,7 +72,8 @@
 #     first thing to revert. Judge hit-rate via the `sccache stats` step.
 #
 # Docs-only fast path: the `changes` gate skips the compile-heavy steps when
-# EVERY changed file is documentation (`docs/`, `ADR/`, or `*.md`). It is
+# EVERY changed file is documentation (`docs/`, `ADR/`, or `*.md`, except
+# `skills/**`, whose Markdown is compiled into release binaries). It is
 # deliberately fail-safe — any file outside that set, an empty diff, or a
 # non-PR event all resolve to "run everything." The jobs themselves still
 # run (and report green), so the gate never breaks a required status check;
@@ -170,9 +171,10 @@ jobs:
           if [ -z "$files" ]; then
             exit 0
           fi
-          # docs_only iff NO changed file falls outside docs/ ADR/ *.md. The
-          # grep -v exits 0 the moment it sees one non-docs path.
-          if echo "$files" | grep -qvE '(^docs/|^ADR/|\.md$)'; then
+          # docs_only iff NO changed file falls outside docs/ ADR/ *.md.
+          # skills/*.md is executable input, so it deliberately forces CI.
+          if echo "$files" | grep -qE '^skills/' \
+             || echo "$files" | grep -qvE '(^docs/|^ADR/|\.md$)'; then
             :
           else
             echo "docs_only=true" >> "$GITHUB_OUTPUT"

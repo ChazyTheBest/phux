@@ -99,6 +99,10 @@ Start with the CLI guide for selectors, safe input, events, and result shapes:
 Useful first commands:
 
 ```sh
+phux --skill=quick
+phux --capabilities --json
+phux-mcp --skill
+phux-mcp --schema
 phux ls --json
 phux snapshot --json .
 phux watch --json .
@@ -107,7 +111,9 @@ phux agent explain .
 
 `watch` streams terminal events until interrupted. `agent explain` reports the
 public state phux can infer for a coding agent in the pane, including its
-confidence and evidence.
+confidence and evidence. The two `--skill` endpoints are compiled into their
+respective installed binaries; `--schema` is the same MCP catalog returned by
+live `tools/list`.
 
 ## Know the edges
 

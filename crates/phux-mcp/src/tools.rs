@@ -949,6 +949,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compiled_skill_names_every_tool_and_load_bearing_rule() {
+        let skill = crate::SKILL;
+        for tool in catalog().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(skill.contains(name), "compiled MCP skill omits {name}");
+        }
+        for rule in [
+            "tools/list",
+            "phux-mcp --schema",
+            "finite timeout",
+            "level read",
+            "observed transition",
+            "delivery_unknown",
+            "confirm: true",
+            "human's client-local focus",
+        ] {
+            assert!(skill.contains(rule), "compiled MCP skill omits {rule:?}");
+        }
+        assert!(!skill.contains("ADR-"));
+        assert!(!skill.contains("docs/"));
+    }
+
     /// `phux-mcp --schema` renders the catalog as a standalone document.
     /// The dump has to survive a round-trip, because its whole purpose is to
     /// be read by a tool that is not this binary.

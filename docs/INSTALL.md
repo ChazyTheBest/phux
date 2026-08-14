@@ -324,7 +324,11 @@ The agent surface ships with the same release artifact — nothing extra to
 install. The MCP adapter is its own bundled binary:
 
 ```sh
-phux-mcp     # JSON-RPC over stdio; wire it into your MCP client
+phux --skill=quick          # installed CLI guide
+phux --capabilities --json # build, command, schema, and MCP discovery
+phux-mcp --skill            # installed MCP guide
+phux-mcp --schema           # exact tools/list input schemas
+phux-mcp                    # JSON-RPC over stdio; wire it into your MCP client
 ```
 
 Tool catalog and JSON contracts: [`consumers/mcp.md`](./consumers/mcp.md). The

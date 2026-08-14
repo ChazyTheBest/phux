@@ -201,7 +201,9 @@ is forwarded to that pane.
 
 ## 6. MCP parity
 
-`phux-mcp` exposes 21 strict tools. The orchestration mappings are direct:
+The installed `phux-mcp --skill` guide and live `tools/list` catalog are the
+authority; `phux-mcp --schema` prints that catalog offline. The orchestration
+mappings are direct:
 
 | CLI | MCP tool | Bound/safety rule |
 |---|---|---|
@@ -216,7 +218,7 @@ is forwarded to that pane.
 | `ask --json` | `phux_ask` | same advisory `asked` event |
 | spatial verbs | `phux_insert_pane`, `phux_move_pane`, `phux_swap_pane` | exact local same-session panes |
 | `signal` | `phux_signal` | destructive signals require `confirm: true` |
-| `agent` | `phux_agent` | identity/state projection and record updates |
+| `agent` | `phux_agent_list`, `phux_agent_show`, `phux_agent_explain`, `phux_agent_set`, `phux_agent_clear`, `phux_agent_wait`, `phux_agent_send_keys`, `phux_agent_prompt`, `phux_agent_answer`, `phux_agent_start` | one strict tool per lifecycle operation |
 | `workspace` | `phux_workspace` | inspect/save/restore only |
 
 The remaining tools cover send-keys, kill, tags, rename, plugin actions, and

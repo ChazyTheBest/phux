@@ -1,20 +1,22 @@
 ---
 audience: consumers, contributors, agents
 stability: evolving
-last-reviewed: 2026-07-15
+last-reviewed: 2026-08-14
 ---
 
 # The phux MCP adapter
 
-**TL;DR.** This doc covers what is MCP-specific in `phux-mcp`: the 32
+**TL;DR.** This doc covers what is MCP-specific in `phux-mcp`: the live
 JSON-RPC stdio tools spanning inspection, execution, session lifecycle,
 agent identity, existing-pane layout, and bounded plugin/workspace operations;
 the stdio transport and lifecycle; target resolution; and the `tools/call`
 envelope.
-The structured shapes the tools return and the selector grammar are the
+The installed, binary-matched operating guide is `phux-mcp --skill`; exact
+tool inputs come from live `tools/list` or the identical offline
+`phux-mcp --schema` catalog. The structured shapes the tools return and the selector grammar are the
 shared agent surface and live in their owning docs; this file links them. The
-canonical orchestration loop and safety boundaries live in
-[`phux-agent-cli/SKILL.md`](../../examples/skills/phux-agent-cli/SKILL.md).
+canonical orchestration loop and safety boundaries are compiled into the
+adapter rather than copied from a checkout example.
 
 ---
 
@@ -65,6 +67,23 @@ An individual tool call can instead supply its optional `socket` argument;
 that argument takes precedence over `PHUX_SOCKET`. The adapter does not read
 credentials or require credentials in its host configuration: access is to
 the local Unix socket under the permissions of the user running the host.
+
+### Binary discovery
+
+Before registration, inspect the installed binary without a server, config
+read, or JSON-RPC handshake:
+
+```sh
+phux-mcp --skill
+phux-mcp --schema
+phux-mcp --help
+```
+
+`--skill` is the compiled operating guide. `--schema` is the exact MCP Tool
+descriptor array returned by live `tools/list`, including each `inputSchema`;
+it is not a catalog of tool output schemas. These are standalone modes and do
+not belong in the host's normal server command. `phux --capabilities --json`
+reports whether this companion is discoverable beside phux or on `PATH`.
 
 ## 0. What this is, what this isn't
 
@@ -166,7 +185,7 @@ the literal `default`).
 
 ## 3. The tool catalog
 
-Thirty-two tools, returned verbatim by `tools/list`. Each `inputSchema` is a
+The live tools are returned verbatim by `tools/list`. Each `inputSchema` is a
 JSON Schema `object`. Tools that take no required argument (e.g.
 `phux_ls`) work with no `arguments` at all. The return shapes are the
 shared agent shapes owned by [`agents.md`](./agents.md) §4; each tool

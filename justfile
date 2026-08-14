@@ -308,6 +308,11 @@ zig-pin-check:
 install-surface-check:
     bash scripts/check-install-surface.sh
 
+# Every released agent-facing binary embeds a configless, EPIPE-safe --skill.
+skill-contract:
+    cargo build -p phux -p phux-mcp
+    bash scripts/check-skill-contract.sh
+
 # Drift gate for the one generated Rust source in the tree:
 # crates/phux-record/src/font/spleen_8x16.rs vs its vendored .bdf. Compile-free
 # (python3 + cmp). See scripts/check-generated-font.sh for why this is a check
@@ -331,7 +336,7 @@ e2e-lane-check:
 #
 # The gate list mirrors ci.yml's `check` job step for step — fmt, clippy,
 # rustdoc, deny, docs-check, formula-check, font-check, e2e-lane-check,
-# zig-pin-check, install-surface-check — plus the unit test pool from the `test`
+# zig-pin-check, install-surface-check, skill-contract — plus the unit test pool from the `test`
 # job. Keep it that way:
 # `just ci` losing a gate CI still runs is how PR #306 shipped five rustdoc
 # failures to a red build after a green local run.
@@ -342,7 +347,7 @@ e2e-lane-check:
 # no `ratatui` dependency.
 
 # The inner-loop bar — every deterministic gate CI runs. Run before pushing.
-ci: fmt-check lint docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check test deny doc
+ci: fmt-check lint docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract test deny doc
     @echo "ok"
 
 # The COMPLETE PR bar: `ci` plus the two lanes that spawn real processes.

@@ -214,6 +214,10 @@ jobs:
           test -x "${stage}/phux"
           test -x "${stage}/phux-mcp"
           "${stage}/phux" --version
+          "${stage}/phux" --skill=quick > /dev/null
+          "${stage}/phux" --capabilities --json | jq -e '.schema_version == 1' > /dev/null
+          "${stage}/phux-mcp" --skill > /dev/null
+          "${stage}/phux-mcp" --schema | jq -e 'length > 0' > /dev/null
           "${stage}/phux-mcp" < /dev/null
           tar -czf "${stage}.tar.gz" "${stage}"
           # Portable sha256 (shasum on macOS, sha256sum on Linux).

@@ -107,8 +107,17 @@ Usage: phux [OPTIONS] [COMMAND]
       --socket <PATH>
           Override the UDS path of the server to dial. Defaults to `$PHUX_SOCKET`, else `$XDG_RUNTIME_DIR/phux/phux.sock` (or `/tmp/phux-$USER/phux.sock` if `XDG_RUNTIME_DIR` isn't set)
 
-      --skill
-          Print the agent skill compiled into this binary, then exit
+      --skill [<SCOPE>]
+          Print compiled agent guidance, optionally scoped, then exit
+
+          Possible values:
+          - quick:    Essential read-act-wait-verify guidance and safety rules
+          - agent:    Quick guidance plus agent identity and lifecycle supervision
+          - terminal: Quick guidance plus terminal screen and input mechanics
+          - full:     The complete guide and command inventory
+
+      --capabilities
+          Print machine-readable capabilities with `--json`, then exit
 
   -h, --help
           Print help (see a summary with '-h')
@@ -2258,12 +2267,25 @@ The text is compiled into the executable, so it describes the verbs and flags TH
 
 Give it to any agent that needs to drive phux: it teaches the read-act-wait loop, the selector grammar, the difference between a level read and an observed transition, the exit codes, and the safety rules for driving a terminal a human may also be using.
 
-Examples:
+Scopes are `quick` (core loop and safety), `agent` (lifecycle and identity), `terminal` (screen and input mechanics), and `full` (everything, the default). Examples:
   phux skill
-  phux skill > ~/.claude/skills/phux/SKILL.md
-  phux skill | pbcopy
+  phux skill agent
+  phux --skill=terminal
+  phux --skill=quick | pbcopy
 
-Usage: phux skill [OPTIONS]
+Usage: phux skill [OPTIONS] [SCOPE]
+
+Arguments:
+  [SCOPE]
+          Amount and subject of guidance to print
+
+          Possible values:
+          - quick:    Essential read-act-wait-verify guidance and safety rules
+          - agent:    Quick guidance plus agent identity and lifecycle supervision
+          - terminal: Quick guidance plus terminal screen and input mechanics
+          - full:     The complete guide and command inventory
+
+          [default: full]
 
 Options:
       --socket <PATH>

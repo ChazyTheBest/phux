@@ -13,13 +13,20 @@ This file is compiled into the `phux` binary. `phux --skill` prints the copy tha
 belongs to the binary you are actually running, so it cannot describe a verb
 this build does not have. If you obtained this text any other way, run
 `phux --skill` and trust that instead. `phux skill` is an equivalent command.
+Use `--skill=quick`, `--skill=agent`, or `--skill=terminal` for focused output;
+`--skill=full` is the default and includes everything.
+
+A current state is a level read; completion requires an observed transition.
+Always bound waits. Exit 124 is an observation timeout; `phux run` reserves 125
+for its own timeout because it otherwise mirrors the child process status.
 
 Deeper reference: `phux help <verb>` for any verb below. Every claim in this
 file is about the binary that printed it.
 
 ---
 
-## 1. First: are you inside phux right now?
+<!-- phux-skill-region: quick -->
+## First: are you inside phux right now?
 
 phux injects two environment variables into every pane it spawns.
 
@@ -50,7 +57,7 @@ only to reach a different server.
 
 ---
 
-## 2. The loop
+## The loop
 
 Read, act, wait, verify. Never act and assume.
 
@@ -86,7 +93,7 @@ flag placed after them is swallowed into the payload.
 
 ---
 
-## 3. Targets: the selector grammar
+## Targets: the selector grammar
 
 `TARGET` is resolved on the client side; the server never sees a selector.
 
@@ -144,7 +151,8 @@ interactive shell, so quote it there (`phux kill '#build'`).
 
 ---
 
-## 4. Level versus edge: the rule that decides if your loop is correct
+<!-- phux-skill-region: agent -->
+## Level versus edge: the rule that decides if your loop is correct
 
 This is the single most important paragraph in this file.
 
@@ -220,7 +228,8 @@ run the fix unasked.
 
 ---
 
-## 5. Screen reads
+<!-- phux-skill-region: terminal -->
+## Screen reads
 
 `phux snapshot` is the floor: it walks the server's own grid, so it neither
 attaches nor resizes the pane and is safe to poll against a pane a human is
@@ -293,7 +302,7 @@ finished. Verify with a read.
 
 ---
 
-## 6. Acting on a pane
+## Acting on a pane
 
 ```sh
 phux send-keys @7 "echo hi" Enter        # named keys or literal text
@@ -320,6 +329,7 @@ phux signal @7 resume
   advisory event the TUI and dashboards consume; it does not move anyone's
   focus.
 
+<!-- phux-skill-region: agent -->
 ### Answering a question an agent asked
 
 An `asked` event carries the question **and** the suggestions the asking agent
@@ -412,7 +422,7 @@ up. Read-only verbs skip that gate.
 
 ---
 
-## 7. Agent identity and state
+## Agent identity and state
 
 ### Starting an agent in a pane you already have
 
@@ -473,7 +483,8 @@ nothing else makes that visible.
 
 ---
 
-## 8. Exit codes
+<!-- phux-skill-region: quick -->
+## Exit codes
 
 Uniform across the surface unless a verb had to spend the number on something
 else.
@@ -507,7 +518,7 @@ is how an orchestrator concludes a pane is gone and kills its replacement.
 
 ---
 
-## 9. JSON
+## JSON
 
 `--json` is per verb, always after the verb. There is no `-j`.
 
@@ -537,7 +548,7 @@ stdout on a timeout (exit 124) so you can read `baseline`; and
 
 ---
 
-## 10. Safety rules
+## Safety rules
 
 1. **Every wait is bounded.** Give `phux wait`, `phux agent wait`, and
    `phux watch` a finite `--timeout`. All three run forever without one, and an
@@ -568,7 +579,8 @@ stdout on a timeout (exit 124) so you can read `baseline`; and
 
 ---
 
-## 11. The whole surface
+<!-- phux-skill-region: full -->
+## The whole surface
 
 Verbs you will use constantly are above. This is the complete inventory of the
 binary, so nothing is invisible to you.
@@ -641,7 +653,8 @@ binary, so nothing is invisible to you.
 
 ---
 
-## 12. A worked supervision loop
+<!-- phux-skill-region: agent -->
+## A worked supervision loop
 
 ```sh
 set -eu
@@ -676,7 +689,8 @@ phux snapshot --json --tail 200 --unwrap "@$pane" > transcript.json
 
 ---
 
-## 13. What phux is not
+<!-- phux-skill-region: quick -->
+## What phux is not
 
 Not a scheduler, not a credential channel, not a durable lock service, and not
 a message bus. It is explicit terminal identity plus observable state. If a

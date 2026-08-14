@@ -46,7 +46,7 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use commands::Command;
 
 // Declared FIRST and with `#[macro_use]`: `macro_rules!` are visible only to
@@ -55,11 +55,13 @@ use commands::Command;
 #[macro_use]
 mod output;
 
+mod capabilities;
 mod commands;
 mod deprecations;
 mod exit_codes;
 mod refdocs;
 mod selector;
+mod skill;
 
 #[cfg(test)]
 mod help_inventory;
@@ -158,9 +160,20 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<std::path::PathBuf>,
 
-    /// Print the agent skill compiled into this binary, then exit.
-    #[arg(long, exclusive = true)]
-    skill: bool,
+    /// Print compiled agent guidance, optionally scoped, then exit.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "full",
+        exclusive = true,
+        value_name = "SCOPE"
+    )]
+    skill: Option<skill::SkillScope>,
+
+    /// Print machine-readable capabilities with `--json`, then exit.
+    #[arg(long)]
+    capabilities: bool,
 
     /// Subcommand. Defaults to attaching to the last session if omitted.
     #[command(subcommand)]
@@ -217,10 +230,10 @@ Start here:\n  \
   phux new NAME            Create and attach to a session\n  \
   phux ls                  List sessions\n  \
   phux spawn -- COMMAND    Create a pane without attaching\n  \
-  phux launch --list       List configured agent integrations\n  \
   phux snapshot TARGET     Read a pane\n  \
   phux send-keys TARGET K  Send input to a pane\n  \
-  phux agent list          See agents and their current state\n\n\
+  phux agent list          See agents and their current state\n  \
+  phux --skill             Teach an agent how to drive phux\n\n\
 Run `phux --help` for every command or `phux <command> --help` for details.\n";
 
 fn short_help_requested() -> bool {
@@ -415,38 +428,6 @@ pub(crate) fn print_banner() {
 /// scans this constant along with every help string).
 pub(crate) const BANNER: &str = concat!("phux ", env!("CARGO_PKG_VERSION"));
 
-/// The agent skill `phux --skill` prints, compiled into the executable.
-///
-/// `include_str!` rather than a shipped file, and that is the entire point of
-/// the verb. The skill is the agent-to-agent UX: it is the document another
-/// agent reads to learn what this CLI can do, so a copy that lags the binary
-/// silently teaches verbs the binary does not have and hides the ones it
-/// gained. Baking it in makes "the skill matches the build" true by
-/// construction instead of by discipline — the same argument
-/// `phux completion` makes for generating completions from the live clap tree
-/// rather than checking scripts in.
-///
-/// Three tests in `help_inventory` keep the CONTENT honest against the tree
-/// (every visible top-level verb, every `phux agent` subcommand, and every
-/// selector sigil the parser accepts must appear in the text), so a new verb
-/// cannot land into a skill that does not mention it.
-pub(crate) const SKILL: &str = include_str!("../../../skills/phux/SKILL.md");
-
-/// `phux --skill` / `phux skill` — write the compiled skill to stdout and exit 0.
-///
-/// Contacts no server and reads no config, which is what makes it safe to run
-/// from anywhere, including a pane that has no server behind it yet.
-fn run_skill() -> ExitCode {
-    // `output::bytes` rather than `print!`: a reader that hangs up
-    // (`phux --skill | head`) must end the process in silence like every other
-    // stdout write in this crate. Raw bytes rather than `out!` because the
-    // payload is a whole document, not a formatted line — the same path
-    // `phux completion` uses. The file ends in exactly one newline, so
-    // nothing is appended.
-    output::bytes(SKILL.as_bytes());
-    ExitCode::SUCCESS
-}
-
 /// Whether this invocation will enter the interactive TUI (raw mode +
 /// alt screen) and therefore MUST keep logs off stderr.
 ///
@@ -478,6 +459,19 @@ fn json_output_requested() -> bool {
     reason = "one match arm per CLI subcommand; the dispatch is a flat verb table, clearer whole than split."
 )]
 pub fn run() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let wants_capabilities = args.iter().any(|arg| arg == "--capabilities");
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    if wants_capabilities && wants_json {
+        if args.len() != 2 {
+            eprintln!(
+                "phux: --capabilities --json is a standalone endpoint and cannot be combined with other arguments"
+            );
+            return ExitCode::from(2);
+        }
+        return capabilities::run(&Cli::command());
+    }
+
     if short_help_requested() {
         output::bytes(SHORT_HELP.as_bytes());
         return ExitCode::SUCCESS;
@@ -492,7 +486,7 @@ pub fn run() -> ExitCode {
     // --socket works on either side of a verb. That also means `exclusive`
     // alone does not reject a following subcommand, so close that edge here
     // rather than silently ignoring the verb.
-    if cli.skill {
+    if let Some(scope) = cli.skill {
         if cli.command.is_some() {
             eprintln!(
                 "phux: --skill is a standalone endpoint and cannot be combined with a command"
@@ -501,7 +495,12 @@ pub fn run() -> ExitCode {
         }
         // Like clap's built-in --help and --version actions, this socketless
         // endpoint exits before tracing, config, or TTY setup.
-        return run_skill();
+        return skill::run(scope);
+    }
+
+    if cli.capabilities {
+        eprintln!("phux: --capabilities requires --json");
+        return ExitCode::from(2);
     }
 
     // Usage errors caught after clap: the `--rec` scope rule (see
@@ -574,6 +573,7 @@ pub fn run() -> ExitCode {
     let Cli {
         rec: root_rec,
         skill: _,
+        capabilities: _,
         socket,
         command,
     } = cli;
@@ -906,7 +906,7 @@ pub fn run() -> ExitCode {
             json,
         }) => commands::pair::run_pair(tokens, cert, qr, host, name, json),
         Some(Command::Completion { shell }) => commands::completion::run_completion(shell),
-        Some(Command::Skill {}) => run_skill(),
+        Some(Command::Skill { scope }) => skill::run(scope),
         Some(Command::Worktree(action)) => commands::worktree::run_worktree(&action, socket),
         Some(Command::Doctor { json }) => commands::doctor::run_doctor(json, socket),
         Some(Command::Logs {

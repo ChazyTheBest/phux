@@ -655,9 +655,17 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   seed pane's numeric id. The sibling `open` and `remove` verbs also accept
   `--json`; all three use the shared `workspace` error code for git failures.
 - **`phux --skill`** — print the agent skill compiled into this exact binary
-  (`phux skill` is equivalent).
+  (`phux skill` is equivalent). Add `=quick`, `=agent`, `=terminal`, or
+  `=full`; bare output is `full`. Every scope is derived from one source.
   Prefer it to a copied checkout example when teaching another agent: CI
   checks that it names every visible top-level and `agent` verb.
+- **`phux --capabilities --json`** — socketless installed-build discovery:
+  phux and wire versions, every visible command path from the live parser,
+  skill scopes, CLI JSON contract versions (including intentional unversioned
+  results and streams), and actual sibling/PATH discovery of `phux-mcp`. It
+  reports compile-time capability, not negotiated running-server state; use
+  `status --json` for that. Its MCP entry points to `phux-mcp --schema`, the
+  authoritative tool input catalog.
 - **`phux doctor [--json]`** — inspect the installation, including the
   on-disk Claude shim schema. A stale shim is a warning, not a failed doctor
   run, and the remedy is to rerun `phux agent install-claude`.
@@ -790,11 +798,8 @@ empty**, deliberately: an absent key is what a pre-v3 `phux` produces, and a
 consumer cannot tell that apart from a degraded answer. Treat `sessions` and
 `terminals` as a lower bound whenever it is non-empty.
 
-**Cross-surface gotcha:** the MCP
-`phux_ls` tool ([`mcp.md`](./mcp.md)
-§3.1) surfaces the raw wire fields `window_count` / `attached_client_count`;
-the CLI's `--json` projects them to `windows` / `attached`. The two surfaces do
-not share identical keys — do not carry a parser across them.
+The MCP `phux_ls` tool ([`mcp.md`](./mcp.md) §3.1) executes and parses this
+same canonical CLI document, so one parser covers both surfaces.
 
 ### 4.2 `ScreenState` — `phux snapshot --json` (and `phux wait --json`)
 
@@ -1878,7 +1883,7 @@ its short-flag surface reserved for high-frequency human-typed options.
 The CLI verbs here are the stable contract. The
 [OpenCode integration](./opencode.md) selects a host-specific six-tool subset;
 the [Pi integration](./pi.md) exposes nineteen bounded tools, including spatial
-placement and topology edits. The [MCP adapter](./mcp.md) exposes 31 strict
+placement and topology edits. The [MCP adapter](./mcp.md) exposes 32 strict
 tools, including paste, launch/spawn, bounded watch, ask, spatial edits, agent
 state, and workspace parity, over JSON-RPC stdio. Adapter guides link here instead of
 redefining CLI syntax.
