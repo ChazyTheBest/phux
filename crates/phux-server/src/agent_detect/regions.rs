@@ -22,6 +22,8 @@
 pub(crate) struct Screen<'a> {
     /// The pane's current OSC 0/2 title, as libghostty tracks it.
     pub(crate) title: &'a str,
+    /// Last ConEmu-style OSC 9;4 payload, with the leading `9;` removed.
+    pub(crate) progress: &'a str,
     /// Live viewport rows, top to bottom.
     pub(crate) lines: &'a [String],
 }
@@ -42,6 +44,8 @@ pub(crate) enum Region {
     /// it flips the instant the agent's state changes, costs no grid lock
     /// and no allocation, and agent CLIs already maintain it.
     Title,
+    /// The latest OSC 9;4 progress payload, independent of title rendering.
+    OscProgress,
     /// The last N **non-empty** rows, in screen order. Where a TUI agent
     /// paints its status line and key hints. Spelled `bottom-lines` (N
     /// defaults to [`DEFAULT_BOTTOM_LINES`]) or `bottom-lines(N)`.
@@ -75,8 +79,9 @@ impl Region {
     /// union is the property that matters: "the region I scoped my rule to is
     /// empty" is the failure the explainer exists to make visible, and it
     /// cannot show it for a window it never resolved.
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Title,
+        Self::OscProgress,
         Self::PromptBox,
         Self::AfterLastRule,
         Self::BottomLines(DEFAULT_BOTTOM_LINES),
@@ -94,6 +99,7 @@ impl Region {
     pub(crate) fn as_str(self) -> String {
         match self {
             Self::Title => "title".to_owned(),
+            Self::OscProgress => "osc-progress".to_owned(),
             Self::BottomLines(n) if n == DEFAULT_BOTTOM_LINES => "bottom-lines".to_owned(),
             Self::BottomLines(n) => format!("bottom-lines({n})"),
             Self::TopNonEmptyLines(n) if n == DEFAULT_TOP_NON_EMPTY_LINES => {
@@ -151,6 +157,7 @@ impl Region {
 
         match word {
             "title" => unwindowed(Self::Title),
+            "osc-progress" => unwindowed(Self::OscProgress),
             "after-last-rule" => unwindowed(Self::AfterLastRule),
             "prompt-box" => unwindowed(Self::PromptBox),
             "viewport" => unwindowed(Self::Viewport),
@@ -159,7 +166,7 @@ impl Region {
                 DEFAULT_TOP_NON_EMPTY_LINES,
             )?)),
             _ => Err(format!(
-                "region `{spec}`: unknown region; expected one of title, prompt-box, \
+                "region `{spec}`: unknown region; expected one of title, osc-progress, prompt-box, \
                  after-last-rule, bottom-lines[(N)], top-non-empty-lines[(N)], viewport"
             )),
         }
@@ -264,6 +271,7 @@ fn strip_borders(line: &str) -> &str {
 pub(crate) fn extract<'a>(region: Region, screen: &Screen<'a>) -> Vec<&'a str> {
     match region {
         Region::Title => vec![screen.title],
+        Region::OscProgress => vec![screen.progress],
         Region::Viewport => screen.lines.iter().map(String::as_str).collect(),
         Region::BottomLines(count) => bottom_lines(screen.lines, count as usize),
         Region::TopNonEmptyLines(count) => top_non_empty_lines(screen.lines, count as usize),
@@ -419,7 +427,22 @@ mod tests {
     }
 
     fn screen<'a>(title: &'a str, buf: &'a [String]) -> Screen<'a> {
-        Screen { title, lines: buf }
+        Screen {
+            title,
+            progress: "",
+            lines: buf,
+        }
+    }
+
+    #[test]
+    fn osc_progress_region_returns_the_latest_payload() {
+        let lines = Vec::new();
+        let screen = Screen {
+            title: "",
+            progress: "4;3;",
+            lines: &lines,
+        };
+        assert_eq!(extract(Region::OscProgress, &screen), vec!["4;3;"]);
     }
 
     /// Whatever the explainer prints, an operator must be able to type back

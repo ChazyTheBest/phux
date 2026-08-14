@@ -45,6 +45,25 @@ priority = 100
 region = "title"
 match = { line-regex = "^[⠂⠐]" }
 
+# Claude Code 2.1.227/228 emits OSC 9;4 independently of OSC 0 titles: `4;3;`
+# when a turn starts and `4;0;` when it ends, including when
+# CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1. Permission prompts were not captured,
+# so these stay below the blocked screen rule's priority.
+[[rules]]
+id = "osc-progress-working"
+state = "working"
+priority = 70
+region = "osc-progress"
+match = { line-regex = '^4;3;?$' }
+
+[[rules]]
+id = "osc-progress-idle"
+state = "idle"
+priority = 70
+visible-idle = true
+region = "osc-progress"
+match = { line-regex = '^4;0;?$' }
+
 # --- Screen rules -----------------------------------------------------------
 
 # A screen-side `working` backstop, for installs that set

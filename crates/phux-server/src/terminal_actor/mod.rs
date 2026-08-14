@@ -188,12 +188,10 @@ fn color_query_reply(selector: u8, color: libghostty_vt::style::RgbColor) -> Vec
 /// Sentinel prefix an in-pane agent writes into the terminal title (OSC 0 /
 /// OSC 2) to signal a pending human-answerable question (phux-2sl6).
 ///
-/// The v1 ask-trigger is OSC-driven. libghostty-vt does not surface OSC 9 /
-/// OSC 777 desktop-notification escapes through its Rust API (title, pwd, and
-/// bell are the only user-notification signals it exposes), so the title is
-/// the honest closest signal an agent can drive and the server can observe
-/// without disturbing the per-consumer state-sync synthesizer. An agent that
-/// has blocked for input sets its title to:
+/// The v1 ask-trigger is OSC-driven. The safe libghostty-vt wrapper does not
+/// expose OSC 9 / OSC 777 desktop notifications; phux's bounded raw scanner
+/// handles OSC 9;4 progress only. The title therefore remains the explicit ask
+/// signal. An agent that has blocked for input sets its title to:
 ///
 /// ```text
 /// ESC ] 2 ; phux-ask:<question>                         ST
@@ -734,6 +732,8 @@ pub struct TerminalActor {
     /// agent-state detector reads it on its own timer and the OSC title is
     /// its highest-priority signal (ADR-0046 §B).
     last_title: String,
+    /// Latest OSC 9;4 payload, mirrored from the raw PTY stream for detection.
+    last_progress: String,
     /// Level-triggered agent-state detector (ADR-0046). `Some` only for a
     /// PTY-backed actor with a wired `agent_state_sink` and a non-empty rule
     /// set; constructed in [`Self::run`], so no existing constructor or test
@@ -763,12 +763,9 @@ pub struct TerminalActor {
     /// currently pending; clearing the marker (retitling to anything else)
     /// resets it so the next distinct ask fires.
     ///
-    /// NOTE (phux-2sl6): libghostty-vt does not surface OSC 9 / OSC 777
-    /// desktop-notification escapes through its API — title (OSC 0/2), pwd
-    /// (OSC 7), and bell are the only user-notification signals it exposes —
-    /// so the title sentinel is the honest closest signal for v1. Full
-    /// agent-state detection (manifests / hooks / OSC-9 surfacing) is the
-    /// follow-up phux-2sl6.4.
+    /// The raw scanner mirrors OSC 9;4 for state detection, but does not treat
+    /// generic OSC 9 / OSC 777 desktop notifications as asks. The title
+    /// sentinel remains the explicit v1 ask signal.
     last_ask: Option<AskMarker>,
     /// Whether the pane is currently in an active output "burst": a
     /// `dirty` event has been emitted and no settling `idle` has followed.
@@ -792,8 +789,8 @@ pub struct TerminalActor {
     /// OSC-133 prompt boundaries and on output-idle via `process_cwd`
     /// (`proc_pidinfo` on macOS, `/proc/PID/cwd` on Linux).
     last_known_cwd: RefCell<String>,
-    /// phux-foz.4: incremental OSC-133 prompt-mark scanner over the raw PTY
-    /// byte stream. Sources `command_started` / `command_finished` (with the
+    /// Incremental OSC scanner over the raw PTY byte stream. Sources
+    /// `command_started` / `command_finished` (with the
     /// `D`-mark exit code libghostty's grid projection does not retain) and
     /// triggers the prompt-boundary cwd re-query. Stateful so a mark split
     /// across two PTY read chunks is still recognised.
@@ -1206,6 +1203,7 @@ impl TerminalActor {
             token,
             event_sink: None,
             last_title: String::new(),
+            last_progress: String::new(),
             agent_detect: None,
             agent_state_sink: None,
             agent_dirty_since_detect: false,
@@ -1988,7 +1986,13 @@ impl TerminalActor {
             .pty
             .as_ref()
             .and_then(|p| p.master.lock().ok().and_then(|m| m.as_raw_fd()));
-        let outcome = detector.tick(now, master_fd, &self.last_title, screen.as_deref());
+        let outcome = detector.tick(
+            now,
+            master_fd,
+            &self.last_title,
+            &self.last_progress,
+            screen.as_deref(),
+        );
         let next = detector.interval();
         self.agent_detect = Some(detector);
 
@@ -2036,6 +2040,12 @@ impl TerminalActor {
         // title parser (libghostty's) and one mirror. Costs one FFI read plus
         // one compare per chunk, and allocates only when the title changes.
         let title_changed = self.refresh_title();
+        let marks = self.osc133.feed(chunk);
+        for mark in &marks {
+            if let osc133::OscMark::Progress(progress) = mark {
+                self.last_progress.clone_from(progress);
+            }
+        }
         if self.event_sink.is_none() && self.event_subscribers.borrow().is_empty() {
             return;
         }
@@ -2043,13 +2053,13 @@ impl TerminalActor {
         // OSC-133 prompt marks (phux-foz.4). Scanned before the coalesced
         // dirty/title sources below so a command boundary and its dirty
         // burst arrive in stream order.
-        for mark in self.osc133.feed(chunk) {
+        for mark in marks {
             match mark {
-                osc133::PromptMark::CommandStart => {
+                osc133::OscMark::CommandStart => {
                     self.emit_event(AgentEvent::CommandStarted);
                     self.broadcast_agent_event(&AgentEvent::CommandStarted);
                 }
-                osc133::PromptMark::CommandEnd { exit_code } => {
+                osc133::OscMark::CommandEnd { exit_code } => {
                     self.emit_event(AgentEvent::CommandFinished { exit_code });
                     self.broadcast_agent_event(&AgentEvent::CommandFinished { exit_code });
                     // The command just finished: the shell is back at a
@@ -2057,6 +2067,7 @@ impl TerminalActor {
                     // cwd and announce a change.
                     self.check_cwd_changed();
                 }
+                osc133::OscMark::Progress(_) => {}
             }
         }
         if chunk.contains(&0x07) {
@@ -6611,6 +6622,24 @@ mod tests {
             actor.terminal_dirty_since_tick,
             "gated tick must not weaken state-sync dirty bookkeeping",
         );
+    }
+
+    #[test]
+    fn osc_progress_is_mirrored_without_event_listeners() {
+        let bundle = TerminalActor::new(20, 5).expect("new");
+        let mut actor = bundle.actor;
+        assert!(actor.event_sink.is_none());
+        assert!(actor.event_subscribers.borrow().is_empty());
+
+        actor.source_events_from_chunk(b"\x1b]9;4;");
+        assert!(
+            actor.last_progress.is_empty(),
+            "split mark is not complete yet"
+        );
+        actor.source_events_from_chunk(b"3;\x07");
+        assert_eq!(actor.last_progress, "4;3;");
+        actor.source_events_from_chunk(b"\x1b]9;4;0;\x07");
+        assert_eq!(actor.last_progress, "4;0;");
     }
 
     /// phux-yeca: production defaults the synthesized tick emitter OFF so

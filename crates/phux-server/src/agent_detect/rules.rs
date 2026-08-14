@@ -179,9 +179,8 @@ pub(crate) struct RuleSpec {
     /// ADR-0046 point 8 and needs the ADR amended first — a bigger change
     /// than this schema cleanup.
     ///
-    /// No shipped manifest sets `visible-idle` either, which means the fast
-    /// path it unlocks is dead code for every built-in agent today (relevant
-    /// to phux-w7z2.28: no manifest asserts idle positively at all).
+    /// Claude's captured OSC 9;4 remove signal sets this flag. Screen-derived
+    /// idle remains fail-safe-only for every built-in agent.
     #[serde(default)]
     pub(crate) visible_idle: bool,
     /// The screen is a transcript viewer / model picker / pager and
@@ -911,6 +910,7 @@ match = { contains = "-- pager --" }
         let buf = lines(&["do you want to proceed?", " 1. Yes"]);
         let got = manifest.evaluate(&Screen {
             title: "W busy",
+            progress: "",
             lines: &buf,
         });
         assert_eq!(got.state, Some(DetectedState::Working));
@@ -924,6 +924,7 @@ match = { contains = "-- pager --" }
         let buf = lines(&["ready", "do you want to proceed?", " 1. Yes"]);
         let got = manifest.evaluate(&Screen {
             title: "idle",
+            progress: "",
             lines: &buf,
         });
         assert_eq!(got.state, Some(DetectedState::Blocked), "90 beats 40");
@@ -938,6 +939,7 @@ match = { contains = "-- pager --" }
         let buf = lines(&["do you want to proceed?"]);
         let got = manifest.evaluate(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         assert_eq!(got.state, None);
@@ -950,6 +952,7 @@ match = { contains = "-- pager --" }
         let buf = lines(&["nothing interesting here"]);
         let got = manifest.evaluate(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         assert_eq!(got.state, None);
@@ -963,6 +966,7 @@ match = { contains = "-- pager --" }
         let buf = lines(&["do you want to proceed?", " 1. Yes", "-- pager --"]);
         let got = manifest.evaluate(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         assert!(
@@ -1087,21 +1091,25 @@ match = { contains = "x" }
     /// reached by nothing matching (ADR-0046 point 5), so asserting it
     /// positively is a real and distinct claim, and it is the one flag the
     /// detector's control flow consumes (bypassing the working -> idle
-    /// hold). No shipped manifest sets it today, which makes that fast path
-    /// dead code for every built-in agent — noted for phux-w7z2.28 ("no
-    /// shipped manifest asserts idle or done positively"). If this test ever
-    /// fails, a manifest has started using it and the dead-code note is
-    /// stale.
+    /// hold). Claude's OSC 9;4 remove signal is the one shipped positive-idle
+    /// source; pinning that narrow exception keeps ordinary screen fallthrough
+    /// from silently becoming a completion claim.
     #[test]
-    fn no_shipped_manifest_sets_visible_idle() {
-        let any_visible_idle = super::BUILTIN_MANIFESTS.iter().any(|(_, text)| {
-            let spec: ManifestSpec = toml::from_str(text).expect("builtin parses");
-            spec.rules.iter().any(|rule| rule.visible_idle)
-        });
-        assert!(
-            !any_visible_idle,
-            "a manifest now sets visible-idle: the working -> idle fast path is no longer \
-             dead code, and phux-w7z2.18's note about it is stale",
+    fn only_claudes_captured_progress_sets_visible_idle() {
+        let visible_idle: Vec<(&str, String)> = super::BUILTIN_MANIFESTS
+            .iter()
+            .flat_map(|(kind, text)| {
+                let spec: ManifestSpec = toml::from_str(text).expect("builtin parses");
+                spec.rules
+                    .into_iter()
+                    .filter(|rule| rule.visible_idle)
+                    .map(move |rule| (*kind, rule.id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            visible_idle,
+            vec![("claude", "osc-progress-idle".to_owned())]
         );
     }
 
@@ -1141,6 +1149,7 @@ match = { contains = "spinner" }
         let buf = lines(&["spinner", "a", "b", "c", "d", "e"]);
         let got = manifest.evaluate(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         assert_eq!(got.state, Some(DetectedState::Blocked));
@@ -1150,6 +1159,7 @@ match = { contains = "spinner" }
         let buf = lines(&["a", "spinner"]);
         let got = manifest.evaluate(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         assert_eq!(got.matched.as_deref(), Some("footer-block"), "20 beats 10");
@@ -1175,6 +1185,7 @@ match = { contains = "thinking" }
             manifest
                 .evaluate(&Screen {
                     title: "",
+                    progress: "",
                     lines: &banner
                 })
                 .state,
@@ -1188,6 +1199,7 @@ match = { contains = "thinking" }
             manifest
                 .evaluate(&Screen {
                     title: "",
+                    progress: "",
                     lines: &transcript
                 })
                 .state,
@@ -1221,6 +1233,7 @@ match = { contains = "zzz" }
         let buf = lines(&["a", "b", "c"]);
         let explained = manifest.explain(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         let names: Vec<String> = explained
@@ -1232,6 +1245,7 @@ match = { contains = "zzz" }
             names,
             vec![
                 "title",
+                "osc-progress",
                 "prompt-box",
                 "after-last-rule",
                 "bottom-lines",
@@ -1255,6 +1269,7 @@ match = { contains = "zzz" }
         let buf = lines(&["a"]);
         let explained = manifest.explain(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         let names: Vec<String> = explained
@@ -1266,6 +1281,7 @@ match = { contains = "zzz" }
             names,
             vec![
                 "title",
+                "osc-progress",
                 "prompt-box",
                 "after-last-rule",
                 "bottom-lines",
@@ -1515,6 +1531,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             manifest
                 .evaluate(&Screen {
                     title: "",
+                    progress: "",
                     lines: &with
                 })
                 .state,
@@ -1524,6 +1541,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             manifest
                 .evaluate(&Screen {
                     title: "",
+                    progress: "",
                     lines: &without
                 })
                 .state,
@@ -1595,12 +1613,37 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
     const CLAUDE_TITLE_QUIET: &str = "\u{2733} phux";
 
     fn claude_eval(title: &str, screen: &[String]) -> super::Evaluation {
+        claude_eval_with_progress(title, "", screen)
+    }
+
+    fn claude_eval_with_progress(
+        title: &str,
+        progress: &str,
+        screen: &[String],
+    ) -> super::Evaluation {
         let set = compile(builtin("claude"));
         let manifest = set.manifest("claude").expect("claude manifest");
         manifest.evaluate(&Screen {
             title,
+            progress,
             lines: screen,
         })
+    }
+
+    #[test]
+    fn claude_progress_is_title_independent_and_blocked_still_wins() {
+        let working = claude_eval_with_progress("", "4;3;", &claude_idle_screen());
+        assert_eq!(working.state, Some(DetectedState::Working));
+        assert_eq!(working.matched.as_deref(), Some("osc-progress-working"));
+
+        let idle = claude_eval_with_progress("", "4;0;", &claude_idle_screen());
+        assert_eq!(idle.state, Some(DetectedState::Idle));
+        assert!(idle.visible_idle);
+        assert_eq!(idle.matched.as_deref(), Some("osc-progress-idle"));
+
+        let blocked = claude_eval_with_progress("", "4;3;", &claude_blocked_screen());
+        assert_eq!(blocked.state, Some(DetectedState::Blocked));
+        assert_eq!(blocked.matched.as_deref(), Some("prompt-permission-dialog"));
     }
 
     /// Both animation frames of the busy title read as `working`.
@@ -1786,6 +1829,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             let idle = captured(idle);
             let got = manifest.evaluate(&Screen {
                 title: "",
+                progress: "",
                 lines: &idle,
             });
             assert_eq!(got.state, None, "{kind}: idle is the fail-safe");
@@ -1793,6 +1837,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             let working = captured(working);
             let got = manifest.evaluate(&Screen {
                 title: "",
+                progress: "",
                 lines: &working,
             });
             assert_eq!(
@@ -1805,6 +1850,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             let blocked = captured(blocked);
             let got = manifest.evaluate(&Screen {
                 title: "",
+                progress: "",
                 lines: &blocked,
             });
             assert_eq!(
@@ -1818,6 +1864,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             transcript_then_idle.extend(idle);
             let got = manifest.evaluate(&Screen {
                 title: "",
+                progress: "",
                 lines: &transcript_then_idle,
             });
             assert_ne!(
@@ -1889,6 +1936,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         let manifest = set.manifest("codex").expect("codex manifest");
         manifest.evaluate(&Screen {
             title,
+            progress: "",
             lines: screen,
         })
     }
@@ -2061,6 +2109,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         let manifest = set.manifest("opencode").expect("opencode manifest");
         manifest.evaluate(&Screen {
             title,
+            progress: "",
             lines: screen,
         })
     }
@@ -2176,7 +2225,11 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             for body in *screens {
                 let buf = captured(body);
                 for title in titles {
-                    let screen = Screen { title, lines: &buf };
+                    let screen = Screen {
+                        title,
+                        progress: "",
+                        lines: &buf,
+                    };
                     let direct = manifest.evaluate(&screen);
                     let explained = manifest.explain(&screen);
                     assert_eq!(
@@ -2211,6 +2264,7 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         let buf = lines(&["nothing here at all"]);
         let explained = manifest.explain(&Screen {
             title: "",
+            progress: "",
             lines: &buf,
         });
         let rule = explained

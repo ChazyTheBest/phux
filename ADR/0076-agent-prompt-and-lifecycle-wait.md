@@ -157,10 +157,10 @@ pane", the wrong one for "this pane finished". As an *edge*, `working -> idle`
 asserts that whatever claimed `working` stopped claiming it: positive evidence
 about a transition even where the level is not positive evidence about a
 condition. Safety gates take the level, completion gates take the edge, which is
-why point 5 refuses to be satisfied by a read. A new open-enum value
-(`quiescent`) was rejected — only a positive idle rule could emit one, and none
-can be honestly authored until viewports are captured from the real agent CLIs,
-a bill ADR-0046's Tradeoffs already paid once.
+why point 5 refuses to be satisfied by a read. Claude's captured OSC 9;4 remove
+signal now supplies one positive-idle source, but that does not establish when
+the level was reached relative to a wait's baseline. A separate open-enum
+`quiescent` value remains unnecessary.
 
 ## Tradeoffs
 

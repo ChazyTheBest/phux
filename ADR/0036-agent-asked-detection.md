@@ -66,9 +66,9 @@ Use a layered source model:
   consumer-specific code entering the core substrate.
 - Passive detection becomes an evidence problem, not a copied-manifest problem.
   A detector PR must include the captured local/CI corpus it claims to support.
-- If libghostty-vt later exposes OSC 9 / OSC 777 or richer prompt state, that
-  can become another source feeding the same event, below hooks and alongside
-  explicit sentinels.
+- Bounded raw-stream scanning can surface explicit terminal signals such as
+  OSC 9;4 without waiting for a libghostty accessor. Those signals remain below
+  hooks and alongside explicit sentinels.
 
 ## Follow-up Work
 

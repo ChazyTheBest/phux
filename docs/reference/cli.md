@@ -559,7 +559,7 @@ Options:
 ```text
 Block until a pane's agent TRANSITIONS into a lifecycle state.
 
-Satisfied only by an observed transition, never by a level read of the current state. That distinction is the point of the verb: `idle` is the detector's fail-safe fallthrough — no shipped detection manifest asserts it positively — so it is equally true of a finished agent, a half-painted TUI, a crashed agent, and a pane running `less`. A gate that fired on that level would return success on a corpse, instantly, and on any pane with no manifest at all.
+Satisfied only by an observed transition, never by a level read of the current state. That distinction is the point of the verb: `idle` is normally the detector's fail-safe fallthrough. Claude's OSC 9;4 remove signal can assert it positively, but a level still cannot prove that the transition happened after this wait's baseline. A gate that fired on a level would return success on a corpse, instantly, and on any pane with no manifest at all.
 
 The consequence is deliberate: a pane already resting in a target state when the wait begins times out (124) rather than succeeding. `phux agent show` is the level read; this verb reports transitions.
 

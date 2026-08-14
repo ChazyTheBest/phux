@@ -701,10 +701,9 @@ mod tests {
         outcome
     }
 
-    /// THE test. A pane resting at `idle` — the detector's fail-safe
-    /// fallthrough, which no shipped manifest asserts positively, and which
-    /// is exactly what a crashed agent's pane reads — must NOT satisfy
-    /// `--until idle`. A level read is not an edge.
+    /// THE test. A pane resting at `idle` — whether from the detector's
+    /// fail-safe or a positive signal observed before this wait — must NOT
+    /// satisfy `--until idle`. A level read is not an edge.
     #[test]
     fn a_level_read_of_idle_never_satisfies_the_wait() {
         let mut tracker = EdgeTracker::new(AgentMetaState::Idle, &[AgentMetaState::Idle]);

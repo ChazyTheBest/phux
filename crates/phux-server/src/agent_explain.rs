@@ -189,6 +189,7 @@ pub fn explain(kind: &str, capture: &Capture) -> Option<Explanation> {
     let manifest = set.manifest(kind)?;
     let screen = Screen {
         title: &capture.title,
+        progress: "",
         lines: &capture.lines,
     };
     let explained = manifest.explain(&screen);
@@ -397,6 +398,7 @@ mod tests {
             names,
             vec![
                 "title",
+                "osc-progress",
                 "prompt-box",
                 "after-last-rule",
                 "bottom-lines",
@@ -412,6 +414,12 @@ mod tests {
             title.empty,
             "an unsupplied title is an EMPTY region and must read as one",
         );
+        let progress = got
+            .regions
+            .iter()
+            .find(|r| r.region == "osc-progress")
+            .expect("osc-progress region");
+        assert!(progress.empty, "offline captures carry no raw OSC progress");
         let live = got
             .regions
             .iter()
@@ -442,6 +450,7 @@ mod tests {
             let lines: Vec<String> = body.lines().map(str::to_owned).collect();
             let screen = Screen {
                 title,
+                progress: "",
                 lines: &lines,
             };
             let direct = manifest.evaluate(&screen);

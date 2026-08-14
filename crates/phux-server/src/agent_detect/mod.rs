@@ -477,6 +477,7 @@ impl AgentDetector {
         now: Instant,
         master_fd: Option<RawFd>,
         title: &str,
+        progress: &str,
         screen: Option<&[String]>,
     ) -> DetectOutcome {
         // 1. Identity.
@@ -512,7 +513,11 @@ impl AgentDetector {
             // Scan skipped: hold the last derivation, do not guess.
             None => (self.current.unwrap_or(DetectedState::Idle), false),
             Some(lines) => {
-                let evaluation = manifest.evaluate(&regions::Screen { title, lines });
+                let evaluation = manifest.evaluate(&regions::Screen {
+                    title,
+                    progress,
+                    lines,
+                });
                 if evaluation.freeze {
                     // A transcript viewer / model picker / pager. The screen
                     // carries NO information about agent state, so freeze the
@@ -992,7 +997,7 @@ match = { contains = "WORKING" }
                 self.dirty = false;
             }
             self.detector
-                .tick(self.now, None, "", scan.then_some(&lines[..]))
+                .tick(self.now, None, "", "", scan.then_some(&lines[..]))
         }
 
         /// The human types an agent's name at the pane's shell prompt. The
@@ -1028,13 +1033,13 @@ match = { contains = "WORKING" }
         fn tick(&mut self, screen: &str) -> DetectOutcome {
             self.now += self.detector.interval();
             let lines = vec![screen.to_owned()];
-            self.detector.tick(self.now, None, "", Some(&lines))
+            self.detector.tick(self.now, None, "", "", Some(&lines))
         }
 
         /// Tick with the scan skipped (the cheap steady state).
         fn tick_no_scan(&mut self) -> DetectOutcome {
             self.now += self.detector.interval();
-            self.detector.tick(self.now, None, "", None)
+            self.detector.tick(self.now, None, "", "", None)
         }
 
         fn state(&self) -> Option<DetectedState> {
@@ -1160,7 +1165,7 @@ match = { contains = "WORKING" }
         // without waiting for the confirmation count.
         h.now += super::IDLE_HOLD_CAP;
         let lines = vec!["nothing".to_owned()];
-        let out = h.detector.tick(h.now, None, "", Some(&lines));
+        let out = h.detector.tick(h.now, None, "", "", Some(&lines));
         assert_eq!(published(&out), DetectedState::Idle);
     }
 
@@ -1264,7 +1269,7 @@ match = { contains = "WORKING" }
         // Once the grace expires, the very same screen publishes.
         h.now += STARTUP_GRACE;
         let lines = vec!["BLOCKED".to_owned()];
-        let out = h.detector.tick(h.now, None, "", Some(&lines));
+        let out = h.detector.tick(h.now, None, "", "", Some(&lines));
         assert_eq!(published(&out), DetectedState::Blocked);
     }
 
@@ -1339,7 +1344,7 @@ match = { contains = "WORKING" }
         let mut detector = AgentDetector::new(Rc::new(set), now);
         for i in 0..5 {
             let at = now + Duration::from_secs(i * 6);
-            assert_eq!(detector.tick(at, None, "", None), DetectOutcome::Quiet);
+            assert_eq!(detector.tick(at, None, "", "", None), DetectOutcome::Quiet);
         }
     }
 
@@ -1759,7 +1764,7 @@ match = { contains = "WORKING" }
         // And then the truth, attributed to the RIGHT process.
         h.now += STARTUP_GRACE;
         let lines = vec!["WORKING".to_owned()];
-        match h.detector.tick(h.now, None, "", Some(&lines)) {
+        match h.detector.tick(h.now, None, "", "", Some(&lines)) {
             DetectOutcome::Publish(report) => {
                 assert_eq!(report.kind, "u");
                 assert_eq!(report.name, "u-agent");
@@ -2027,7 +2032,7 @@ match = { contains = "IDLE" }
         detector.force_identity("t", now);
         let at = now + STARTUP_GRACE + Duration::from_millis(1);
         let lines = vec!["IDLE".to_owned()];
-        let out = detector.tick(at, None, "busy", Some(&lines));
+        let out = detector.tick(at, None, "busy", "", Some(&lines));
         assert_eq!(published(&out), DetectedState::Working);
     }
 }

@@ -421,12 +421,12 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
   the current state**, for the reason [`../spec/L3.md`](../spec/L3.md) §3.7
   states normatively: a level read of `state` asserts only that nothing
   contrary is being asserted, and `idle` is the weakest value in the
-  vocabulary — the reference detector's fail-safe fallthrough
-  ([ADR-0046](../../ADR/0046-server-side-agent-state-detection.md)), asserted
-  positively by none of the five manifests phux ships. A completion gate that
-  fired on that level would report success on a pane whose agent crashed,
-  instantly, and on every pane with no manifest loaded at all. §5.1 has the
-  loop this changes.
+  vocabulary — normally the reference detector's fail-safe fallthrough
+  ([ADR-0046](../../ADR/0046-server-side-agent-state-detection.md)). Claude's
+  captured OSC 9;4 remove signal is one positive-idle source, but a level read
+  still says nothing about whether that transition occurred after this wait's
+  baseline. A completion gate that fired on a level would also report success
+  instantly on crashed panes and panes with no manifest. §5.1 has the loop.
 
   The verb subscribes to the pane's `phux.agent/v1` key **before** reading the
   pre-wait baseline, on one connection, so no transition falls in the gap; it

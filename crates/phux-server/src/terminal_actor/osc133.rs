@@ -1,4 +1,4 @@
-//! Incremental OSC-133 prompt-mark scanner (phux-foz.4).
+//! Incremental OSC scanner for prompt marks and progress reports.
 //!
 //! Sources the `command_started` / `command_finished` agent events (SPEC
 //! §7.1) directly from the raw PTY byte stream. libghostty records OSC-133
@@ -10,22 +10,23 @@
 //!
 //! Recognised marks (`FinalTerm` / iTerm2 shell-integration vocabulary):
 //!
-//! * `OSC 133 ; C …`  → [`PromptMark::CommandStart`] — the shell is about
+//! * `OSC 133 ; C …`  → [`OscMark::CommandStart`] — the shell is about
 //!   to execute the typed command (output begins). `A` (prompt start) and
 //!   `B` (input start) are accepted and ignored: emitting on `C` yields
 //!   exactly one `command_started` per command, where `B` would double-fire.
-//! * `OSC 133 ; D`     → [`PromptMark::CommandEnd { exit_code: None }`].
-//! * `OSC 133 ; D ; n` → [`PromptMark::CommandEnd { exit_code: Some(n) }`].
+//! * `OSC 133 ; D`     → [`OscMark::CommandEnd { exit_code: None }`].
+//! * `OSC 133 ; D ; n` → [`OscMark::CommandEnd { exit_code: Some(n) }`].
+//! * `OSC 9 ; 4 ; …`   → [`OscMark::Progress`] with the leading `9;` removed.
 //!
-//! Terminators: BEL (`0x07`) or ST (`ESC \`). Any other escape sequence —
-//! including every non-133 OSC — passes through unrecognised. Payloads are
+//! Terminators: BEL (`0x07`) or ST (`ESC \`). Any other escape sequence and
+//! every OSC except 133 and 9;4 passes through unrecognised. Payloads are
 //! bounded: an OSC whose collected bytes exceed [`MAX_OSC_LEN`] is
 //! abandoned (consumed to its terminator, yielding nothing), so a
 //! pathological stream cannot grow the scanner's buffer.
 
-/// A recognised OSC-133 prompt-boundary mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PromptMark {
+/// A recognised OSC mark consumed by the terminal actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OscMark {
     /// `OSC 133 ; C` — command execution began.
     CommandStart,
     /// `OSC 133 ; D [; code]` — command finished, with the shell-reported
@@ -34,10 +35,12 @@ pub(super) enum PromptMark {
         /// Exit code from `OSC 133 ; D ; n`, or `None` when absent/bogus.
         exit_code: Option<i32>,
     },
+    /// `OSC 9 ; 4 ; ...` — ConEmu-style progress payload, without `9;`.
+    Progress(String),
 }
 
-/// Longest OSC payload the scanner will buffer. Real 133 marks are a
-/// handful of bytes (`133;D;127` is nine); anything longer is not ours.
+/// Longest OSC payload the scanner will buffer. Recognised prompt/progress
+/// marks are a handful of bytes; anything longer is not ours.
 const MAX_OSC_LEN: usize = 64;
 
 /// Scanner state between chunks.
@@ -77,7 +80,7 @@ impl Osc133Scanner {
 
     /// Feed one PTY chunk; returns the prompt marks completed inside it,
     /// in stream order.
-    pub(super) fn feed(&mut self, chunk: &[u8]) -> Vec<PromptMark> {
+    pub(super) fn feed(&mut self, chunk: &[u8]) -> Vec<OscMark> {
         let mut marks = Vec::new();
         for &byte in chunk {
             // A byte may need re-processing after an aborted OSC (the
@@ -142,27 +145,35 @@ impl Osc133Scanner {
     /// Terminate the in-flight OSC: parse a 133 prompt mark out of the
     /// collected payload (or `None` for foreign / overflowed payloads)
     /// and return to ground.
-    fn finish(&mut self) -> Option<PromptMark> {
+    fn finish(&mut self) -> Option<OscMark> {
         self.state = State::Ground;
         let overflow = std::mem::take(&mut self.overflow);
         let buf = std::mem::take(&mut self.buf);
         if overflow {
             return None;
         }
-        parse_133(&buf)
+        parse_osc(&buf)
     }
 }
 
-/// Parse a complete OSC payload (`133;D;0`, `133;C`, ...); `None` for
-/// anything that is not a `C` or `D` prompt mark.
-fn parse_133(payload: &[u8]) -> Option<PromptMark> {
+/// Parse a complete OSC payload; `None` for marks this actor does not consume.
+fn parse_osc(payload: &[u8]) -> Option<OscMark> {
+    if let Some(progress) = payload.strip_prefix(b"9;") {
+        if progress.starts_with(b"4;") {
+            return String::from_utf8(progress.to_vec())
+                .ok()
+                .map(OscMark::Progress);
+        }
+        return None;
+    }
+
     let rest = payload.strip_prefix(b"133;")?;
     let (kind, params) = match rest.split_first()? {
         (kind, []) => (*kind, None),
         (kind, params) => (*kind, params.strip_prefix(b";")),
     };
     match kind {
-        b'C' => Some(PromptMark::CommandStart),
+        b'C' => Some(OscMark::CommandStart),
         b'D' => {
             // `133;D` alone, or `133;D;<code>[;...]` — take the first
             // parameter; a non-numeric or over-range code degrades to
@@ -171,7 +182,7 @@ fn parse_133(payload: &[u8]) -> Option<PromptMark> {
                 let first = params.split(|&b| b == b';').next()?;
                 std::str::from_utf8(first).ok()?.parse::<i32>().ok()
             });
-            Some(PromptMark::CommandEnd { exit_code })
+            Some(OscMark::CommandEnd { exit_code })
         }
         _ => None,
     }
@@ -181,7 +192,7 @@ fn parse_133(payload: &[u8]) -> Option<PromptMark> {
 mod tests {
     use super::*;
 
-    fn scan(chunks: &[&[u8]]) -> Vec<PromptMark> {
+    fn scan(chunks: &[&[u8]]) -> Vec<OscMark> {
         let mut scanner = Osc133Scanner::new();
         let mut marks = Vec::new();
         for chunk in chunks {
@@ -194,11 +205,11 @@ mod tests {
     fn d_mark_with_exit_code_bel_terminated() {
         assert_eq!(
             scan(&[b"prompt\x1b]133;D;0\x07more"]),
-            vec![PromptMark::CommandEnd { exit_code: Some(0) }]
+            vec![OscMark::CommandEnd { exit_code: Some(0) }]
         );
         assert_eq!(
             scan(&[b"\x1b]133;D;127\x07"]),
-            vec![PromptMark::CommandEnd {
+            vec![OscMark::CommandEnd {
                 exit_code: Some(127)
             }]
         );
@@ -208,7 +219,7 @@ mod tests {
     fn d_mark_st_terminated() {
         assert_eq!(
             scan(&[b"\x1b]133;D;1\x1b\\"]),
-            vec![PromptMark::CommandEnd { exit_code: Some(1) }]
+            vec![OscMark::CommandEnd { exit_code: Some(1) }]
         );
     }
 
@@ -216,7 +227,7 @@ mod tests {
     fn d_mark_without_code_is_none() {
         assert_eq!(
             scan(&[b"\x1b]133;D\x07"]),
-            vec![PromptMark::CommandEnd { exit_code: None }]
+            vec![OscMark::CommandEnd { exit_code: None }]
         );
     }
 
@@ -224,7 +235,7 @@ mod tests {
     fn bogus_code_degrades_to_none() {
         assert_eq!(
             scan(&[b"\x1b]133;D;nope\x07"]),
-            vec![PromptMark::CommandEnd { exit_code: None }]
+            vec![OscMark::CommandEnd { exit_code: None }]
         );
     }
 
@@ -235,8 +246,8 @@ mod tests {
         assert_eq!(
             scan(&[b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07"]),
             vec![
-                PromptMark::CommandStart,
-                PromptMark::CommandEnd { exit_code: Some(0) }
+                OscMark::CommandStart,
+                OscMark::CommandEnd { exit_code: Some(0) }
             ]
         );
     }
@@ -246,10 +257,30 @@ mod tests {
         // The whole point of statefulness: the OSC arrives in three reads.
         assert_eq!(
             scan(&[b"abc\x1b]13", b"3;D;", b"42\x07xyz"]),
-            vec![PromptMark::CommandEnd {
+            vec![OscMark::CommandEnd {
                 exit_code: Some(42)
             }]
         );
+    }
+
+    #[test]
+    fn progress_marks_preserve_payload_for_bel_st_and_split_chunks() {
+        assert_eq!(
+            scan(&[b"\x1b]9;4;3;\x07", b"\x1b]9;4;0;\x1b\\"]),
+            vec![
+                OscMark::Progress("4;3;".to_owned()),
+                OscMark::Progress("4;0;".to_owned()),
+            ]
+        );
+        assert_eq!(
+            scan(&[b"\x1b]9;", b"4;3", b";\x07"]),
+            vec![OscMark::Progress("4;3;".to_owned())]
+        );
+    }
+
+    #[test]
+    fn foreign_osc_9_and_invalid_progress_are_ignored() {
+        assert_eq!(scan(&[b"\x1b]9;hello\x07\x1b]9;4;\xff\x07"]), Vec::new());
     }
 
     #[test]
@@ -271,7 +302,7 @@ mod tests {
         // And the scanner recovers: a following well-formed mark parses.
         assert_eq!(
             scanner.feed(b"\x1b]133;D;7\x07"),
-            vec![PromptMark::CommandEnd { exit_code: Some(7) }]
+            vec![OscMark::CommandEnd { exit_code: Some(7) }]
         );
     }
 
@@ -282,7 +313,7 @@ mod tests {
         // sequence is consumed correctly).
         assert_eq!(
             scan(&[b"\x1b]133;D\x1b[31m\x1b]133;D;3\x07"]),
-            vec![PromptMark::CommandEnd { exit_code: Some(3) }]
+            vec![OscMark::CommandEnd { exit_code: Some(3) }]
         );
     }
 
@@ -290,7 +321,7 @@ mod tests {
     fn d_code_with_extra_params_takes_first() {
         assert_eq!(
             scan(&[b"\x1b]133;D;9;aid=42\x07"]),
-            vec![PromptMark::CommandEnd { exit_code: Some(9) }]
+            vec![OscMark::CommandEnd { exit_code: Some(9) }]
         );
     }
 }
