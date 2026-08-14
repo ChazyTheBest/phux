@@ -65,4 +65,31 @@ cp "$root/skills/phux-mcp/SKILL.md" "$tmp/phux-mcp.expected"
 check_binary phux "$root/target/debug/phux" "$tmp/phux.expected" '--skill=quick ls'
 check_binary phux-mcp "$root/target/debug/phux-mcp" "$tmp/phux-mcp.expected" '--skill --schema'
 
-echo 'skill contract: phux and phux-mcp verified'
+# The ergonomic launcher must be a transparent exec boundary: exact discovery
+# bytes, live stdio transport, and no phux config/socket initialization first.
+HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/xdg" PHUX_SOCKET="$tmp/dead.sock" \
+  "$root/target/debug/phux" mcp --skill > "$tmp/launcher.skill" 2> "$tmp/launcher.stderr"
+[ ! -s "$tmp/launcher.stderr" ]
+cmp "$tmp/launcher.skill" "$tmp/phux-mcp.expected"
+
+"$root/target/debug/phux" mcp --schema > "$tmp/launcher.schema"
+"$root/target/debug/phux-mcp" --schema > "$tmp/direct.schema"
+cmp "$tmp/launcher.schema" "$tmp/direct.schema"
+
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | "$root/target/debug/phux" mcp > "$tmp/launcher.rpc" 2> "$tmp/launcher.stderr"
+[ ! -s "$tmp/launcher.stderr" ]
+grep -q '"tools"' "$tmp/launcher.rpc"
+grep -q '"phux_ls"' "$tmp/launcher.rpc"
+
+mkdir -p "$tmp/solo"
+cp "$root/target/debug/phux" "$tmp/solo/phux"
+set +e
+PATH=/usr/bin:/bin "$tmp/solo/phux" mcp --skill > "$tmp/missing.out" 2> "$tmp/missing.err"
+code=$?
+set -e
+[ "$code" -eq 127 ]
+[ ! -s "$tmp/missing.out" ]
+grep -q 'reinstall phux' "$tmp/missing.err"
+
+echo 'skill contract: phux, phux-mcp, and phux mcp verified'

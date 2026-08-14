@@ -5,15 +5,18 @@ description: Drive phux through its installed MCP stdio adapter. Covers live sch
 
 # Driving phux through MCP
 
-`phux-mcp` is a stdio MCP server. Configure an MCP host to launch `phux-mcp`
-with no arguments. `--skill` and `--schema` are standalone discovery endpoints,
-not server arguments.
+`phux mcp` is the installed entry point for the stdio MCP server. Configure an
+MCP host to launch `phux` with `mcp` as its first argument. The launcher
+replaces itself with the bundled `phux-mcp` implementation, preserving stdio,
+signals, and status. Direct `phux-mcp` configurations remain valid.
+`--skill` and `--schema` are standalone discovery endpoints, not server
+arguments.
 
 Inside MCP, the live `tools/list` catalog is authoritative. Outside an MCP
 session, run:
 
 ```sh
-phux-mcp --schema
+phux mcp --schema
 ```
 
 It prints the exact same tool descriptor array, including every current
@@ -65,7 +68,7 @@ input lane is server-scoped. A paste inserts text; it does not submit it.
 
 ## Tool inventory
 
-Read exact arguments from `tools/list` or `phux-mcp --schema`.
+Read exact arguments from `tools/list` or `phux mcp --schema`.
 
 **Read and observe:** `phux_ls`, `phux_snapshot`, `phux_wait`, `phux_watch`,
 `phux_agent_list`, `phux_agent_show`, `phux_agent_explain`, `phux_agent_wait`.

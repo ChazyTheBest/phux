@@ -154,6 +154,7 @@ pub(crate) mod kill;
 pub(crate) mod launch;
 pub(crate) mod logs;
 pub(crate) mod ls;
+pub(crate) mod mcp;
 pub(crate) mod new;
 pub(crate) mod pair;
 pub(crate) mod partial;
@@ -246,6 +247,7 @@ pub(crate) const fn socketless_verb(command: &Command) -> Option<&'static str> {
         Command::Relay { .. } => Some("relay"),
         Command::Pair { .. } => Some("pair"),
         Command::Completion { .. } => Some("completion"),
+        Command::Mcp { .. } => Some("mcp"),
         Command::Skill { .. } => Some("skill"),
         Command::Logs { .. } => Some("logs"),
         Command::GenReferenceDocs { .. } => Some("gen-reference-docs"),
@@ -1520,6 +1522,23 @@ pub(crate) enum Command {
         /// Shell dialect to generate for.
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
+    },
+
+    /// Run the bundled MCP stdio adapter.
+    ///
+    /// This is a transparent launcher for the separate MCP companion
+    /// binary. All arguments are forwarded unchanged. With no arguments it
+    /// serves MCP over stdin/stdout; discovery modes include `--skill`,
+    /// `--schema`, `--help`, and `--version`.
+    #[command(disable_help_flag = true, disable_version_flag = true)]
+    Mcp {
+        /// Arguments forwarded unchanged to the MCP companion.
+        #[arg(
+            value_name = "ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        args: Vec<std::ffi::OsString>,
     },
 
     /// Print the agent skill this binary ships with, on stdout.

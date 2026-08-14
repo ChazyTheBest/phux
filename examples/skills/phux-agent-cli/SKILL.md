@@ -23,7 +23,7 @@ To expose the same surface to Claude Code, install phux so `phux-mcp` is on
 claude mcp add phux -- phux-mcp
 ```
 
-Other MCP hosts use the `phux-mcp` executable with stdio transport; registration
+Other MCP hosts use `phux mcp` with stdio transport; registration
 does not start the phux server.
 
 ## Invariants: keep the human and the wire honest
@@ -201,8 +201,8 @@ is forwarded to that pane.
 
 ## 6. MCP parity
 
-The installed `phux-mcp --skill` guide and live `tools/list` catalog are the
-authority; `phux-mcp --schema` prints that catalog offline. The orchestration
+The installed `phux mcp --skill` guide and live `tools/list` catalog are the
+authority; `phux mcp --schema` prints that catalog offline. The orchestration
 mappings are direct:
 
 | CLI | MCP tool | Bound/safety rule |

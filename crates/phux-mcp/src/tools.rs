@@ -958,7 +958,7 @@ mod tests {
         }
         for rule in [
             "tools/list",
-            "phux-mcp --schema",
+            "phux mcp --schema",
             "finite timeout",
             "level read",
             "observed transition",

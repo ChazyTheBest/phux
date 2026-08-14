@@ -71,14 +71,15 @@ phux snapshot .                       # read the screen
 phux agent explain .                  # what is the agent in this pane doing?
 ```
 
-There's an MCP server too (`phux-mcp`), so agent hosts get the same verbs
-as tools. Start at [Agents](./docs/consumers/agents.md).
+There's an MCP server too (`phux mcp`), so agent hosts get the same verbs as
+tools. It transparently launches the bundled `phux-mcp` companion binary.
+Start at [Agents](./docs/consumers/agents.md).
 
 ```sh
 phux --skill=quick          # installed CLI operating guide
 phux --capabilities --json # versions, commands, schemas, MCP availability
-phux-mcp --skill            # installed MCP operating guide
-phux-mcp --schema           # exact live tools/list input schemas
+phux mcp --skill            # installed MCP operating guide
+phux mcp --schema           # exact live tools/list input schemas
 ```
 
 ## How it works

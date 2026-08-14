@@ -57,6 +57,7 @@ mod output;
 
 mod capabilities;
 mod commands;
+mod companion;
 mod deprecations;
 mod exit_codes;
 mod refdocs;
@@ -85,6 +86,7 @@ mod help_inventory;
         ATTACH / SERVE\n  \
           attach     Attach to a session (interactive)\n  \
           server     Run a server in the foreground\n  \
+          mcp        Run the bundled MCP stdio adapter\n  \
           host       Register the machines phux talks to: remotes and satellites\n  \
           service    Keep a server running across logout and reboot\n  \
           update     Update phux to the latest release, keeping sessions alive\n  \
@@ -460,6 +462,13 @@ fn json_output_requested() -> bool {
 )]
 pub fn run() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // Recognize the canonical launcher spelling before clap so every trailing
+    // byte belongs to the companion, including names that overlap root flags
+    // today or are introduced by the MCP binary in a future release.
+    if args.first().is_some_and(|arg| arg == "mcp") {
+        return commands::mcp::run(&args[1..]);
+    }
+
     let wants_capabilities = args.iter().any(|arg| arg == "--capabilities");
     let wants_json = args.iter().any(|arg| arg == "--json");
     if wants_capabilities && wants_json {
@@ -518,6 +527,12 @@ pub fn run() -> ExitCode {
             "phux: `phux {verb}` never dials a server, so --socket has no effect here; drop it"
         );
         return ExitCode::from(2);
+    }
+
+    // The launcher must be transparent: replace this process before tracing,
+    // config, socket, or TTY setup can alter the MCP stdio contract.
+    if let Some(Command::Mcp { args }) = &cli.command {
+        return commands::mcp::run(args);
     }
 
     // Refuse every alt-screen path before telemetry, dialing, server spawn,
@@ -906,6 +921,8 @@ pub fn run() -> ExitCode {
             json,
         }) => commands::pair::run_pair(tokens, cert, qr, host, name, json),
         Some(Command::Completion { shell }) => commands::completion::run_completion(shell),
+        // Returned above, before process-global setup.
+        Some(Command::Mcp { .. }) => ExitCode::FAILURE,
         Some(Command::Skill { scope }) => skill::run(scope),
         Some(Command::Worktree(action)) => commands::worktree::run_worktree(&action, socket),
         Some(Command::Doctor { json }) => commands::doctor::run_doctor(json, socket),

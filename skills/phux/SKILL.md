@@ -580,6 +580,7 @@ binary, so nothing is invisible to you.
 | `phux doctor` | diagnose the install: config, socket, server, plugins, shims |
 | `phux logs` | where the logs live, or tail one |
 | `phux --skill` | print this file (`phux skill` is equivalent) |
+| `phux mcp` | run the bundled MCP stdio adapter; forwards `--skill`, `--schema`, help, and future arguments |
 
 **Act**
 

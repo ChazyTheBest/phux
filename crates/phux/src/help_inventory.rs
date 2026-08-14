@@ -132,6 +132,7 @@ phux kill
 phux launch
 phux logs
 phux ls
+phux mcp
 phux move-pane
 phux new
 phux pair

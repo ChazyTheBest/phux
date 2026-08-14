@@ -68,7 +68,7 @@ The agent surfaces nest:
 All three are unprivileged consumers
 ([ADR-0017](../../ADR/0017-tui-not-protocol-privileged.md)); none holds a
 protocol-level privilege. The wire underneath stays additive and versioned,
-normative under [`../spec/`](../spec/). Installing `phux-mcp` does not make its
+normative under [`../spec/`](../spec/). Installing the MCP companion does not make its
 tools visible to a host; see [Registering with a host](./mcp.md#registering-with-a-host)
 for the Claude Code command and generic stdio configuration.
 
@@ -662,10 +662,11 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
 - **`phux --capabilities --json`** — socketless installed-build discovery:
   phux and wire versions, every visible command path from the live parser,
   skill scopes, CLI JSON contract versions (including intentional unversioned
-  results and streams), and actual sibling/PATH discovery of `phux-mcp`. It
-  reports compile-time capability, not negotiated running-server state; use
-  `status --json` for that. Its MCP entry points to `phux-mcp --schema`, the
-  authoritative tool input catalog.
+  results and streams), and actual sibling/PATH discovery of the `phux-mcp`
+  companion. It reports compile-time capability, not negotiated running-server
+  state; use
+  `status --json` for that. Its MCP launcher is `phux mcp`, and
+  `phux mcp --schema` prints the authoritative tool input catalog.
 - **`phux doctor [--json]`** — inspect the installation, including the
   on-disk Claude shim schema. A stale shim is a warning, not a failed doctor
   run, and the remedy is to rerun `phux agent install-claude`.

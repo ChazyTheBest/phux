@@ -326,10 +326,14 @@ install. The MCP adapter is its own bundled binary:
 ```sh
 phux --skill=quick          # installed CLI guide
 phux --capabilities --json # build, command, schema, and MCP discovery
-phux-mcp --skill            # installed MCP guide
-phux-mcp --schema           # exact tools/list input schemas
-phux-mcp                    # JSON-RPC over stdio; wire it into your MCP client
+phux mcp --skill            # installed MCP guide
+phux mcp --schema           # exact tools/list input schemas
+phux mcp                    # JSON-RPC over stdio; wire it into your MCP client
 ```
+
+`phux mcp` replaces itself with the separately packaged `phux-mcp` companion,
+preferring the executable beside `phux` and then searching `PATH`. Existing
+host configurations that invoke `phux-mcp` directly remain supported.
 
 Tool catalog and JSON contracts: [`consumers/mcp.md`](./consumers/mcp.md). The
 plain-CLI version of the same surface: [`consumers/agents.md`](./consumers/agents.md).

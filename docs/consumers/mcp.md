@@ -6,14 +6,14 @@ last-reviewed: 2026-08-14
 
 # The phux MCP adapter
 
-**TL;DR.** This doc covers what is MCP-specific in `phux-mcp`: the live
+**TL;DR.** This doc covers what is MCP-specific in `phux mcp`: the live
 JSON-RPC stdio tools spanning inspection, execution, session lifecycle,
 agent identity, existing-pane layout, and bounded plugin/workspace operations;
 the stdio transport and lifecycle; target resolution; and the `tools/call`
 envelope.
-The installed, binary-matched operating guide is `phux-mcp --skill`; exact
+The installed, binary-matched operating guide is `phux mcp --skill`; exact
 tool inputs come from live `tools/list` or the identical offline
-`phux-mcp --schema` catalog. The structured shapes the tools return and the selector grammar are the
+`phux mcp --schema` catalog. The structured shapes the tools return and the selector grammar are the
 shared agent surface and live in their owning docs; this file links them. The
 canonical orchestration loop and safety boundaries are compiled into the
 adapter rather than copied from a checkout example.
@@ -22,26 +22,28 @@ adapter rather than copied from a checkout example.
 
 ## Registering with a host
 
-Installing phux puts `phux-mcp` on `PATH`, but does not register it with an
-MCP host. Start phux first so the server is running (`phux` starts it when
+Installing phux puts both release binaries on `PATH`, but does not register MCP
+with a host. Start phux first so the server is running (`phux` starts it when
 needed), then register the stdio adapter with Claude Code:
 
 ```sh
-claude mcp add phux -- phux-mcp
+claude mcp add phux -- phux mcp
 ```
 
-`phux-mcp` does not auto-start the phux server, and neither does the
+`phux mcp` does not auto-start the phux server, and neither does the
 `phux_new` tool. Leave the server running while the host calls tools such as
 `phux_ls`.
 
-For another MCP host, select its stdio transport and use `phux-mcp` with no
-arguments. Hosts that use the common MCP server configuration shape can use:
+For another MCP host, select its stdio transport and use `phux mcp` with no
+adapter arguments. Hosts that use the common MCP server configuration shape
+can use:
 
 ```json
 {
   "mcpServers": {
     "phux": {
-      "command": "phux-mcp"
+      "command": "phux",
+      "args": ["mcp"]
     }
   }
 }
@@ -54,7 +56,8 @@ The adapter connects to the default phux socket. For a non-default socket, set
 {
   "mcpServers": {
     "phux": {
-      "command": "phux-mcp",
+      "command": "phux",
+      "args": ["mcp"],
       "env": {
         "PHUX_SOCKET": "/absolute/path/to/phux.sock"
       }
@@ -74,9 +77,9 @@ Before registration, inspect the installed binary without a server, config
 read, or JSON-RPC handshake:
 
 ```sh
-phux-mcp --skill
-phux-mcp --schema
-phux-mcp --help
+phux mcp --skill
+phux mcp --schema
+phux mcp --help
 ```
 
 `--skill` is the compiled operating guide. `--schema` is the exact MCP Tool
@@ -84,6 +87,10 @@ descriptor array returned by live `tools/list`, including each `inputSchema`;
 it is not a catalog of tool output schemas. These are standalone modes and do
 not belong in the host's normal server command. `phux --capabilities --json`
 reports whether this companion is discoverable beside phux or on `PATH`.
+The launcher replaces itself with `phux-mcp`, preserving stdio, signals, and
+exit status. Direct `phux-mcp` registrations remain valid compatibility entry
+points; keeping the implementation separate avoids linking MCP server machinery
+into every CLI invocation.
 
 ## 0. What this is, what this isn't
 
@@ -196,12 +203,12 @@ names its shape and links there.
 
 ### 3.0 Reading the catalog without a session
 
-`phux-mcp --schema` prints the same array `tools/list` returns, as a
+`phux mcp --schema` prints the same array `tools/list` returns, as a
 standalone pretty-printed JSON document, and exits:
 
 ```sh
-phux-mcp --schema | jq -r '.[].name'
-phux-mcp --schema > phux-tools.json
+phux mcp --schema | jq -r '.[].name'
+phux mcp --schema > phux-tools.json
 ```
 
 It needs neither a running phux server nor a JSON-RPC handshake: the
@@ -209,7 +216,8 @@ catalog is a compile-time constant of the binary, so the tool surface is
 readable before anything is wired up. Useful for pinning the surface in a
 test, diffing it across releases, or generating a client.
 
-The flag lives on `phux-mcp` rather than as `phux api schema` because this
+The flag is owned by the MCP companion and forwarded by `phux mcp`, rather
+than living at `phux api schema`, because this
 binary already owns the schemas. Exposing them from the main `phux` binary
 would mean either duplicating them — after which they drift — or linking
 the whole MCP stack into every `phux ls`.

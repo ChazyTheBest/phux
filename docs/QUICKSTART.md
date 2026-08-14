@@ -90,7 +90,7 @@ execute a one-shot command and return its output and exit code directly.
 The release includes two agent-facing surfaces:
 
 - The `phux` CLI for direct shell calls and scripts.
-- `phux-mcp`, a JSON-RPC stdio adapter for MCP clients.
+- `phux mcp`, which launches the bundled JSON-RPC stdio adapter for MCP clients.
 
 Start with the CLI guide for selectors, safe input, events, and result shapes:
 [`consumers/agents.md`](./consumers/agents.md). Use
@@ -101,8 +101,8 @@ Useful first commands:
 ```sh
 phux --skill=quick
 phux --capabilities --json
-phux-mcp --skill
-phux-mcp --schema
+phux mcp --skill
+phux mcp --schema
 phux ls --json
 phux snapshot --json .
 phux watch --json .

@@ -28,6 +28,7 @@ TTY, and most accept `--json` for clean, scriptable output.
 ATTACH / SERVE
   attach     Attach to a session (interactive)
   server     Run a server in the foreground
+  mcp        Run the bundled MCP stdio adapter
   host       Register the machines phux talks to: remotes and satellites
   service    Keep a server running across logout and reboot
   update     Update phux to the latest release, keeping sessions alive
@@ -1345,6 +1346,24 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `phux mcp`
+
+```text
+Run the bundled MCP stdio adapter.
+
+This is a transparent launcher for the separate MCP companion binary. All arguments are forwarded unchanged. With no arguments it serves MCP over stdin/stdout; discovery modes include `--skill`, `--schema`, `--help`, and `--version`.
+
+Usage: phux mcp [OPTIONS] [ARGS]...
+
+Arguments:
+  [ARGS]...
+          Arguments forwarded unchanged to the MCP companion
+
+Options:
+      --socket <PATH>
+          Override the UDS path of the server to dial. Defaults to `$PHUX_SOCKET`, else `$XDG_RUNTIME_DIR/phux/phux.sock` (or `/tmp/phux-$USER/phux.sock` if `XDG_RUNTIME_DIR` isn't set)
 ```
 
 ## `phux move-pane`
