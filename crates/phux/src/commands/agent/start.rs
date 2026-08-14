@@ -17,12 +17,12 @@
 //!
 //! # What "ready" means here, and what it deliberately does not
 //!
-//! **Not `state == idle`.** Not one of the five shipped detection manifests
-//! declares a positive `idle` rule — `idle` is the fail-safe fallthrough, so
-//! it is equally true of a half-painted TUI, a crashed agent, and a pane where
-//! nothing ever launched. Ready is instead **the first detector publication
-//! after submit**, which is an observed *transition* off the `unknown` this
-//! verb binds before typing anything. That predicate already has a home:
+//! **Not `state == idle`.** Most idle results are the fail-safe fallthrough,
+//! though Claude can now publish positive idle evidence through OSC 9;4. A
+//! pre-existing idle level still says nothing about this invocation. Ready is
+//! instead **the first detector publication after submit**, which is an
+//! observed *transition* off the `unknown` this verb binds before typing
+//! anything. That predicate already has a home:
 //! [`phux_client::agent_wait::wait_for_agent_state`] (ADR-0076 point 5)
 //! *seeds* its baseline and never evaluates it, so this file composes against
 //! it rather than carrying a second copy of the same plumbing.
