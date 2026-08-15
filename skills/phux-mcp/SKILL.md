@@ -40,6 +40,8 @@ Read, act, observe under a finite bound, then verify with another read.
    `Enter` for multiline input, and `phux_agent_prompt` for an agent turn.
 5. Observe with `phux_wait`, bounded `phux_watch`, or `phux_agent_wait`.
 6. Re-read state. A watcher ending or a quiet pane is not completion.
+7. When something is wrong rather than merely slow, ask `phux_status` or
+   `phux_doctor` before guessing. Both are read-only.
 
 Prefer returned direct selectors such as `@7` and `host/@7` for writes. Session
 names and `#tags` can select sets. `.` means the focused session. `%name` is
@@ -72,6 +74,16 @@ Read exact arguments from `tools/list` or `phux mcp --schema`.
 
 **Read and observe:** `phux_ls`, `phux_snapshot`, `phux_wait`, `phux_watch`,
 `phux_agent_list`, `phux_agent_show`, `phux_agent_explain`, `phux_agent_wait`.
+
+**Diagnose:** `phux_status` (one server: running, pid, uptime, protocol,
+sessions, log paths) and `phux_doctor` (the whole install: config, socket,
+server, server-health, plugins, shim, logs). Both are read-only and start
+nothing. A stopped server and a failed check are answers, not tool errors:
+branch on `running` and on `ok` plus each check's `status`, never on whether
+the call succeeded. `phux_doctor` check names repeat — read every
+`server-health` row, because a crash-loop, a legacy supervisor unit, and
+version skew co-occur. A null `pid` on a running server is a peer-credential
+gap, not a stopped server. Relay a `hint`; do not run it.
 
 **Create and act:** `phux_new`, `phux_launch`, `phux_spawn`, `phux_run`,
 `phux_send_keys`, `phux_paste`, `phux_ask`, `phux_signal`, `phux_tag`,

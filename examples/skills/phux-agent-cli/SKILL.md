@@ -220,6 +220,8 @@ mappings are direct:
 | `signal` | `phux_signal` | destructive signals require `confirm: true` |
 | `agent` | `phux_agent_list`, `phux_agent_show`, `phux_agent_explain`, `phux_agent_set`, `phux_agent_clear`, `phux_agent_wait`, `phux_agent_send_keys`, `phux_agent_prompt`, `phux_agent_answer`, `phux_agent_start` | one strict tool per lifecycle operation |
 | `workspace` | `phux_workspace` | inspect/save/restore only |
+| `status --json` | `phux_status` | read-only; never auto-starts a server, and `running: false` is a document, not a tool error |
+| `doctor --json` | `phux_doctor` | read-only; `ok: false` is a document, and `server-health` repeats one row per condition |
 
 The remaining tools cover send-keys, kill, tags, rename, plugin actions, and
 plugin workspace profiles. `tools/list` is authoritative. Every parity schema

@@ -38,6 +38,7 @@ mod agent_tools;
 mod ask_tool;
 mod cli_adapter;
 mod cli_tools;
+mod diagnostic_tools;
 mod jsonrpc;
 mod plugin_action;
 mod plugin_workspace;
@@ -582,7 +583,7 @@ mod tests {
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#).unwrap();
         let resp = handle_request(req).await.expect("tools/list replies");
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 32);
+        assert_eq!(tools.len(), 34);
         assert!(tools.iter().any(|t| t["name"] == json!("phux_ls")));
         assert!(tools.iter().any(|t| t["name"] == json!("phux_paste")));
         assert!(tools.iter().any(|t| t["name"] == json!("phux_new")));
@@ -622,6 +623,10 @@ mod tests {
                 .iter()
                 .any(|t| t["name"] == json!("phux_plugin_workspace"))
         );
+        // The diagnostics: an agent that can act on the server can now also
+        // ask whether it is healthy, without shelling out past MCP.
+        assert!(tools.iter().any(|t| t["name"] == json!("phux_status")));
+        assert!(tools.iter().any(|t| t["name"] == json!("phux_doctor")));
     }
 
     #[tokio::test]

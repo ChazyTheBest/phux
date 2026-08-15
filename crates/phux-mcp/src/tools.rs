@@ -218,9 +218,11 @@ pub(crate) fn catalog() -> Value {
     ]);
     // The `phux_agent_*` family is appended rather than inlined because it
     // is a list that grows one entry per agent verb, and each entry freezes
-    // its own argument shape (ADR-0071 point 7(b)).
+    // its own argument shape (ADR-0071 point 7(b)). The diagnostics follow
+    // for the same reason.
     if let Value::Array(entries) = &mut tools {
         entries.extend(crate::agent_tools::schemas());
+        entries.extend(crate::diagnostic_tools::schemas());
     }
     tools
 }
@@ -253,6 +255,9 @@ pub(crate) async fn dispatch(name: &str, args: &Value) -> Result<Value, ToolErro
         "phux_plugin_action" => crate::plugin_action::call(args).await,
         "phux_plugin_workspace" => crate::plugin_workspace::call(args),
         agent if crate::agent_tools::owns(agent) => crate::agent_tools::call(agent, args).await,
+        diagnostic if crate::diagnostic_tools::owns(diagnostic) => {
+            crate::diagnostic_tools::call(diagnostic, args).await
+        }
         other => Err(ToolError::new(format!("unknown tool: {other}"))),
     }
 }
@@ -941,6 +946,8 @@ mod tests {
                 "phux_agent_prompt",
                 "phux_agent_answer",
                 "phux_agent_start",
+                "phux_status",
+                "phux_doctor",
             ]
         );
         for tool in arr {

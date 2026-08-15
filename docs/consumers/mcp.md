@@ -534,6 +534,80 @@ registry mutation handle credentials; plugin installation and config editing
 mutate local trust configuration. Those remain intentionally outside the
 model-facing tool set.
 
+### 3.33 `phux_status`
+
+Reports the server behind one socket. Read-only, and it never auto-starts a
+server — asking whether a server is running may not create one.
+
+| Param | Type | Required | Meaning |
+|---|---|---|---|
+| `socket` | string | no | Override the UDS path of the server to diagnose (see §2). |
+
+Result: the canonical versioned `phux status --json` document:
+`{ "schema_version": 1, "running", "pid", "socket", "since_unix_secs",
+"protocol": { "major", "minor", "patch" }, "clients", "sessions": [ { "name",
+"windows", "attached_clients" } ], "satellite_terminals", "unreachable",
+"logs": { "server", "client_dir" } }`.
+
+**A stopped server is an answer, not an error.** `phux status --json` exits
+non-zero with no server running and still prints
+`{ "running": false, ... }` on stdout, embedding `error` (`code`, `message`)
+and `remedy` from the shared error vocabulary of
+[`agents.md`](./agents.md) §5.3. The tool returns that document rather than
+failing, so branch on `running`, never on whether the call succeeded. The
+`isError` path is reserved for a real failure — the server hung up mid-probe
+— where the CLI leaves stdout empty and puts one JSON error object on stderr.
+
+**A null `pid` is not "no server".** The pid comes from the socket's peer
+credentials, not from the server, so a platform that exposes none reports
+`running: true` with `pid: null`. `running` is the only field that answers
+the liveness question.
+
+`unreachable` is always present; empty means the fleet view is complete.
+
+### 3.34 `phux_doctor`
+
+Runs every phux health check and returns the whole verdict. This executes
+`phux doctor --json`, so the tool and the command can never disagree about
+whether an install is healthy — there is one implementation of each check,
+not two.
+
+| Param | Type | Required | Meaning |
+|---|---|---|---|
+| `socket` | string | no | Override the UDS path of the server to diagnose (see §2). Only the socket and server checks follow it; the rest describe the machine the adapter runs on. |
+
+Result: the canonical versioned `phux doctor --json` document:
+`{ "schema_version": 1, "ok", "failed", "checks": [ { "name", "status",
+"detail", "hint" } ] }`, where `status` is `pass`, `warn`, or `fail` and
+`hint` is present exactly when there is something to do.
+
+**A failing check is an answer, not an error.** The CLI exits non-zero when
+any check failed and the tool still returns the document, so branch on `ok`
+and on each check's `status`.
+
+**Check names are not unique — read every row.** `server-health` reports one
+row per condition that holds: a crash-loop (the server restarted repeatedly
+inside the start-history window of
+[ADR-0080](../../ADR/0080-socket-lifecycle-and-instance-isolation.md)), a
+legacy supervisor unit that restarts on every exit unthrottled, and version
+skew between the running server and this binary. Those co-occur more than
+they don't, because a legacy unit is exactly what turns a dying server into a
+crash-loop, so a consumer that reads only the first `server-health` row
+reports a misleadingly clean bill of health.
+
+**`warn` is not `pass`.** A check that could not run is not a check that
+passed; a stopped server warns rather than failing, because that is a normal
+state and not a broken install.
+
+The tool is read-only and starts nothing — a diagnostic that repairs things
+is a diagnostic nobody can trust to describe the system. The remedies a
+`hint` names (`phux service reconcile`, `phux upgrade`) rewrite supervisor
+units and hand over a running server on the human's machine, so a hint is
+something to relay, not something the adapter runs. There is deliberately no
+repair tool and no log-*reading* tool: both documents report the log paths,
+and turning an MCP tool into a file reader is the surface
+[ADR-0077](../../ADR/0077-agent-read-surface.md) point 1 already declined.
+
 ### Composing the tools safely
 
 The canonical sequence is `phux_ls` → `phux_new` → placed `phux_launch`,
@@ -543,6 +617,12 @@ edits → `phux_run`/`phux_send_keys` or fused `phux_agent_prompt` → bounded
 an exact one with `phux_agent_answer` → re-read state. Serialize topology writes because layout metadata is
 last-write-wins. No tool in this sequence moves a human's local focus, stores
 remote credentials, grants a persistent input lease, or schedules future work.
+
+When a step in that sequence fails in a way the tool's own result does not
+explain — a connection that will not open, a pane that never appears, a
+server that answers one call and not the next — `phux_status` and
+`phux_doctor` are the reads that answer why, and neither of them changes
+anything.
 
 ---
 
@@ -589,7 +669,9 @@ sparse per-cell `cells` array populated.
 The MCP tools are name-for-name adapters over the CLI agent surface. The base
 set maps `phux_ls`, `snapshot`, `send_keys`, `run`, `wait`, `new`, `kill`,
 `watch`, and `ask` to their hyphenated CLI verbs. The parity table in §3 maps
-launch/spawn/signal/tag/rename/agent/layout/workspace name-for-name.
+launch/spawn/signal/tag/rename/agent/layout/workspace name-for-name, and
+`phux_status` / `phux_doctor` (§3.33–3.34) map to `phux status --json` and
+`phux doctor --json`.
 `phux_plugin_action` maps to `phux config run`; `phux_plugin_workspace` reads
 the same plugin manifest workspace profile. CLI-subprocess tools consume the
 canonical JSON directly; in-process tools reuse the same `phux-client` or

@@ -35,6 +35,13 @@ pub(crate) struct CliAdapter {
 #[derive(Debug)]
 pub(crate) struct CliOutput {
     pub(crate) stdout: String,
+    /// The child's stderr, kept for the [`Self::stdout`]-is-empty case under
+    /// an *allowed* non-zero exit. The failure path below already turns
+    /// stderr into the error message; a verb whose non-zero exit is
+    /// sometimes a result and sometimes a failure (`phux status`, `phux
+    /// doctor`) has to make that call itself, and it needs the same line to
+    /// do it with.
+    pub(crate) stderr: String,
 }
 
 impl CliAdapter {
@@ -157,7 +164,7 @@ impl CliAdapter {
                 message.to_owned()
             }));
         }
-        Ok(CliOutput { stdout })
+        Ok(CliOutput { stdout, stderr })
     }
 }
 
