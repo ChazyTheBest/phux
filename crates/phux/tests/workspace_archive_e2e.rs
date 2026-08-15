@@ -98,8 +98,40 @@ impl ServerGuard {
     }
 }
 
+/// How long the fake agent's `/bin/sh` gets to be forked, exec'd, scheduled
+/// and to paint its first line (phux-dnhf).
+///
+/// This is an AMBIENT budget, not a subject budget. Nothing about the archive
+/// contract is being measured while it runs — only whether the machine got
+/// around to running a shell script. phux-m64c measured a freshly spawned
+/// `/bin/sh` taking 7.8 seconds to execute its first instruction on a loaded
+/// developer box, and this test's own 5s budget is what timed out ("wait timed
+/// out after 34 polls", exit 124) during a fleet-load bisect that then blamed
+/// an innocent commit. Generous here costs nothing: `phux wait` returns the
+/// instant its condition holds, so the passing path is unchanged and only the
+/// failing path waits longer — and when it does fail, it fails against a
+/// budget that names the environment instead of the feature.
+const AGENT_PAINT_BUDGET_SECS: &str = "60";
+
+/// How long a *specific* line is then given to appear, once the agent has
+/// proved it is painting at all.
+///
+/// This is the SUBJECT budget and is deliberately short and deliberately
+/// unchanged: the fake agent writes all of its lines in one burst, so once the
+/// first has landed the rest are already there. A timeout at this stage means
+/// the restored argv is genuinely wrong, which is exactly what this test
+/// exists to catch.
+const AGENT_LINE_BUDGET_SECS: &str = "5";
+
+/// Poll until `selector` is gone from `socket`'s registry.
+///
+/// Ambient budget, for the same reason as [`AGENT_PAINT_BUDGET_SECS`]: every
+/// iteration forks a whole `phux` process, so what this deadline mostly buys
+/// is process startup rather than anything about the reap. It is a
+/// precondition of the save that follows, never the subject of an assertion.
 fn wait_for_terminal_absent(socket: &str, selector: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let budget = Duration::from_secs(60);
+    let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         let (code, _, _) = ServerGuard::run(&["snapshot", "--json", "--socket", socket, selector]);
         if code != 0 {
@@ -107,7 +139,7 @@ fn wait_for_terminal_absent(socket: &str, selector: &str) {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("{selector} was still present five seconds after kill");
+    panic!("{selector} was still present {budget:?} after kill");
 }
 
 #[test]
@@ -235,12 +267,15 @@ fn workspace_restore_starts_archived_command_process() {
             .any(|name| name == "restored-proc")
     );
 
+    // Ambient budget: the marker is unique to this restore, so there is no
+    // wrong-content failure mode to keep on a tight clock — the only way this
+    // wait can expire is the machine not running the restored pane's command.
     let (code, _stdout, stderr) = ServerGuard::run(&[
         "wait",
         "--until",
         &marker,
         "--timeout",
-        "5",
+        AGENT_PAINT_BUDGET_SECS,
         "--socket",
         &socket_arg,
         "restored-proc",
@@ -368,12 +403,33 @@ fn native_agent_session_is_replayed_after_pane_restart_and_rejects_stale_ownersh
     assert_eq!(launch["integration"], "restore-agent");
     let launched_id = launch["terminal_id"].as_u64().expect("terminal id");
     let launched_selector = format!("@{launched_id}");
+    // Two waits, not one, and the split is the point (phux-dnhf). The first
+    // pays for the ambient cost of getting a shell script running at all; the
+    // second measures the only thing this step is actually about — that the
+    // fresh launch passed `--new`. Collapsing them into a single 5s budget is
+    // what made this test look like a hard regression under fleet load.
+    let (code, _, stderr) = ServerGuard::run(&[
+        "wait",
+        "--until",
+        "FAKE_AGENT_ARGS=",
+        "--timeout",
+        AGENT_PAINT_BUDGET_SECS,
+        "--socket",
+        &source_socket,
+        &launched_selector,
+    ]);
+    assert_eq!(
+        code, 0,
+        "the fake agent never painted at all within {AGENT_PAINT_BUDGET_SECS}s; \
+         the machine did not schedule the plugin's shell script, which is an \
+         environment problem and not an archive-contract failure: {stderr}"
+    );
     let (code, _, stderr) = ServerGuard::run(&[
         "wait",
         "--until",
         "FAKE_AGENT_ARGS=--new",
         "--timeout",
-        "5",
+        AGENT_LINE_BUDGET_SECS,
         "--socket",
         &source_socket,
         &launched_selector,
@@ -450,12 +506,30 @@ fn native_agent_session_is_replayed_after_pane_restart_and_rejects_stale_ownersh
             .any(|name| name == "agent-restart")
     );
     let resume_marker = format!("FAKE_AGENT_ARGS=--resume {native_id}");
+    // Same split as the fresh launch: ambient budget for the restored pane's
+    // shell to run, subject budget for the argv it was handed.
+    let (code, _, stderr) = ServerGuard::run(&[
+        "wait",
+        "--until",
+        "FAKE_AGENT_ARGS=",
+        "--timeout",
+        AGENT_PAINT_BUDGET_SECS,
+        "--socket",
+        &dest_socket,
+        "agent-restart",
+    ]);
+    assert_eq!(
+        code, 0,
+        "the restored agent never painted at all within {AGENT_PAINT_BUDGET_SECS}s; \
+         the machine did not schedule the plugin's shell script, which is an \
+         environment problem and not an archive-contract failure: {stderr}"
+    );
     let (code, _, stderr) = ServerGuard::run(&[
         "wait",
         "--until",
         &resume_marker,
         "--timeout",
-        "5",
+        AGENT_LINE_BUDGET_SECS,
         "--socket",
         &dest_socket,
         "agent-restart",
@@ -471,7 +545,7 @@ fn native_agent_session_is_replayed_after_pane_restart_and_rejects_stale_ownersh
         "--until",
         &format!("FAKE_AGENT_CWD={}", plugin_cwd.display()),
         "--timeout",
-        "5",
+        AGENT_LINE_BUDGET_SECS,
         "--socket",
         &dest_socket,
         "agent-restart",

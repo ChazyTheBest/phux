@@ -5370,6 +5370,20 @@ mod tests {
     /// must give a foreground job in a process group distinct from the shell a
     /// chance to flush before it dies. This reproduces interactive job-control
     /// topology rather than testing a shell and child that share one group.
+    ///
+    /// **This test is load-sensitive by construction and cannot be made
+    /// otherwise from inside the test** (phux-axos). Everything BEFORE the
+    /// hangup is fenced by the `armed` barrier below, so no amount of
+    /// scheduling delay can reorder it. What remains is the assertion itself:
+    /// the trap handler has to run inside [`PANE_KILL_GRACE`], which is a
+    /// **500ms product budget**, not a test constant. Under starvation a shell
+    /// can miss that window while the product behaves exactly as designed.
+    /// Lengthening the grace to suit the test would change shipped behavior,
+    /// and no barrier can fence a window the product itself defines — so the
+    /// mitigation lives in `.config/nextest.toml`, which gives this test
+    /// `threads-required = 'num-cpus'` to clear the runner's own pool. That
+    /// cannot clear load from OUTSIDE the runner; a failure here on a box
+    /// running several concurrent builds says something about the box.
     #[tokio::test(flavor = "current_thread")]
     async fn pane_kill_lets_foreground_process_flush_before_death() {
         use portable_pty::CommandBuilder;
@@ -5416,33 +5430,51 @@ mod tests {
                 let master = std::sync::Arc::clone(&pty.master);
                 let run = tokio::task::spawn_local(actor.run());
 
-                let foreground_group =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                        loop {
-                            let group = master.lock().expect("master lock").process_group_leader();
-                            if let Some(group) = group
-                                && group != shell_group
-                            {
-                                break group;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        }
-                    })
-                    .await
-                    .expect("foreground job must acquire a distinct process group");
-                assert_ne!(foreground_group, shell_group);
-
-                // Wait for the trap to be armed before signalling. This is
-                // the synchronization the test was missing; the process-group
-                // check above proves the job exists, not that it can handle a
-                // signal yet.
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                // ONE barrier, not two deadlines (phux-axos). `armed` is
+                // written by the inner shell AFTER `trap`, and the inner
+                // shell is the process the outer shell's `set -m` put in its
+                // own group at exec — so the file existing implies BOTH
+                // preconditions this test needs, and implies them in the only
+                // order they can happen in. There used to be a separate 2s
+                // poll for the distinct process group ahead of this wait;
+                // that deadline bought nothing (the `armed` wait strictly
+                // dominates it) and cost a second way to fail for reasons
+                // that are not the subject.
+                //
+                // The budget is deliberately generous and deliberately NOT
+                // the subject's. What it covers is two `/bin/sh` processes
+                // being forked, exec'd and scheduled — ambient work whose
+                // cost is unbounded in machine load (phux-m64c measured a
+                // freshly spawned `/bin/sh` taking 7.8s to run its first
+                // instruction on a loaded box). The thing under test is what
+                // `shutdown_pty` does AFTERWARDS, and it keeps its own budget
+                // below. A pane that never arms fails here, against its own
+                // number, with a message that names the environment rather
+                // than blaming the flush path.
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
                     while !armed.exists() {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 })
                 .await
-                .expect("foreground job must install its SIGHUP trap");
+                .expect(
+                    "foreground job never installed its SIGHUP trap: the fixture shells did not \
+                     get scheduled, which is an environment problem (machine load), not a \
+                     failure of the flush-before-death path this test covers",
+                );
+
+                // Now that the job is armed, the PTY's foreground group is
+                // settled and can be read once instead of polled for.
+                let foreground_group = master
+                    .lock()
+                    .expect("master lock")
+                    .process_group_leader()
+                    .expect("an armed foreground job has a process group");
+                assert_ne!(
+                    foreground_group, shell_group,
+                    "the fixture must reproduce interactive job-control topology: a foreground \
+                     job in a group distinct from the shell's",
+                );
 
                 // Kill the pane. The actor's shutdown runs SIGHUP + grace.
                 token.cancel();

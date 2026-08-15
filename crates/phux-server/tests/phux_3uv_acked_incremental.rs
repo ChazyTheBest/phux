@@ -71,14 +71,26 @@ fn acked_incremental_converges_and_seq_is_monotonic() {
     run_local(async {
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("phux.sock");
+        let go = tmp.path().join("go");
 
-        // Give the test time to attach before the marker is printed, so the
-        // marker lands strictly as a post-attach live delta rather than in
-        // the snapshot. Attach completes in well under 100 ms; 0.5 s keeps
-        // margin for a loaded 2-core CI runner.
+        // BARRIER, not a timing bet (phux-285q). The marker must land as a
+        // post-attach live delta rather than inside the bootstrap snapshot,
+        // and the seed used to buy that with `sleep 0.5` — a bet that attach
+        // plus bootstrap finish inside half a second. Under a loaded pool
+        // they do not, the marker lands in the snapshot instead, and the
+        // "bootstrap must not carry the marker" assertion below fails while
+        // saying nothing about the acked-incremental loop. That is how this
+        // test flaked three times, on three unrelated branches.
+        //
+        // The seed now waits for a file THIS TEST creates once it has drained
+        // `BOOTSTRAP_READY`, so the snapshot is provably already taken before
+        // the marker can be printed. No amount of scheduling delay can
+        // reorder that. The poll forks a `sleep` per iteration rather than
+        // spinning, so a starved machine is not made worse by the waiting.
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.arg("-c");
-        cmd.arg("sleep 0.5; printf PHUX3UVACKMARKER; sleep 30");
+        cmd.arg("until [ -e \"$PHUX_TEST_GO\" ]; do sleep 0.05; done; printf PHUX3UVACKMARKER; sleep 30");
+        cmd.env("PHUX_TEST_GO", &go);
 
         let (shutdown_tx, server_handle) =
             spawn_server_with_seed_cmd(socket_path.clone(), "default", cmd);
@@ -93,8 +105,8 @@ fn acked_incremental_converges_and_seq_is_monotonic() {
             "expected Attached",
         );
 
-        // Drain the bootstrap. It must NOT carry the marker (printed only
-        // after the 0.5s sleep, i.e. after attach + prime).
+        // Drain the bootstrap. It must NOT carry the marker — the seed is
+        // still blocked on the `go` file, which nothing has created yet.
         let (snap_tb, begin) = recv_typed(&mut stream).await;
         assert_eq!(snap_tb, TYPE_BOOTSTRAP_BEGIN);
         assert!(matches!(begin, FrameKind::BootstrapBegin { .. }));
@@ -105,6 +117,11 @@ fn acked_incremental_converges_and_seq_is_monotonic() {
         assert_eq!(count_occurrences(&payload, MARKER), 0);
         let (_, ready) = recv_typed(&mut stream).await;
         assert!(matches!(ready, FrameKind::BootstrapReady { .. }));
+
+        // Release the seed. Everything after this point is provably a live
+        // delta: the snapshot above was already on the wire before the file
+        // the seed is waiting on existed.
+        std::fs::write(&go, b"go").unwrap();
 
         // Phase 1: wait for the marker to land as a live TERMINAL_OUTPUT
         // delta. Capture its terminal_id + seq for the ack, and assert the

@@ -4,6 +4,34 @@
 default:
     @just --list
 
+# Bound every daemon the test lanes can AUTO-SPAWN (phux-whhd, phux-nbam).
+#
+# A test that spawns `phux server` itself passes `--exit-after-idle 600` as
+# its survives-a-SIGKILLed-runner backstop, on top of a `Drop` guard. The
+# auto-spawn path can do neither on its own: `maybe_auto_spawn_server`
+# deliberately orphans a daemonised child, and the last-pane self-exit is
+# armed only once a client has attached, so a daemon nobody attached to never
+# exits by itself. Kill a test process before its `Drop` guard runs — a
+# cancelled agent run, a reaped job — and what leaks is immortal.
+#
+# Not hypothetical: three such daemons were found alive on a developer box
+# three days after the runs that started them, each still holding a PTY on a
+# `tempfile` socket whose directory had long since been removed.
+#
+# `PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE` is the opt-in seam phux-nbam added for
+# exactly this, and it stays off in production on purpose: ADR-0063 pins that
+# an unattended server stays up, so making auto-spawn finite by default would
+# change the multiplexer contract. Applying it here — on the test lanes only,
+# not as a `justfile`-wide `export` that would also reach `install-dev`,
+# `rebuild` and the `cargo run` recipes — bounds the harness without touching
+# what a developer's own server does.
+#
+# 600s is far longer than any gap between a test's client connections, so the
+# backstop can only fire once the harness is already gone. `idle_exit_e2e`
+# drives both the set and the unset case and `env_remove`s it for the latter,
+# so inheriting it here does not weaken that coverage.
+AUTO_SPAWN_BACKSTOP := "PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE=600"
+
 # Scaffold a commented starter config into a worktree-local XDG dir
 # (./.phux-xdg) so you can test config changes without touching your real
 # ~/.config/phux. Re-run freely: `phux config init` refuses to clobber.
@@ -93,7 +121,7 @@ precommit: fmt lint docs-gen test e2e
 # Feature-gated code still compiles under `lint` and `doc` (--all-features).
 # Verified: the test list is identical with and without --all-features.
 test:
-    cargo nextest run --workspace
+    {{AUTO_SPAWN_BACKSTOP}} cargo nextest run --workspace
 
 # Fast e2e lane — gates every PR (the `e2e` step in ci.yml). Covers the
 # headless agent-surface contract (`run_wait_e2e`), the ADR-0040 agent
@@ -149,10 +177,10 @@ test:
 e2e:
     # first_five_minutes_e2e copies both release payload binaries into a fresh prefix.
     cargo build -p phux-mcp
-    cargo nextest run --workspace --run-ignored all \
+    {{AUTO_SPAWN_BACKSTOP}} cargo nextest run --workspace --run-ignored all \
       --test-threads=1 --retries=2 \
       -E 'binary_id(phux::run_wait_e2e) + binary_id(phux::agent_record_e2e) + binary_id(phux::spatial_e2e) + binary_id(phux::rec_e2e) + binary_id(phux::resize_e2e) + binary_id(phux::play_e2e) + binary_id(phux::idle_exit_e2e) + binary_id(phux::plugin_agent_bench_e2e) + binary_id(phux::upgrade_e2e) + binary_id(phux::workspace_archive_e2e) + binary_id(phux::failure_ux_e2e) + binary_id(phux::first_five_minutes_e2e)'
-    cargo nextest run --workspace --run-ignored ignored-only \
+    {{AUTO_SPAWN_BACKSTOP}} cargo nextest run --workspace --run-ignored ignored-only \
       --test-threads=1 --retries=2 \
       -E 'binary_id(phux-server::perf_latency) + binary_id(phux-server::perf_colored_output)'
 
@@ -266,7 +294,7 @@ shellcheck:
 
 # Stable-cargo test for environments without nextest.
 test-cargo:
-    cargo test --workspace --all-features
+    {{AUTO_SPAWN_BACKSTOP}} cargo test --workspace --all-features
 
 # Dependency hygiene: licenses, advisories, bans.
 deny:

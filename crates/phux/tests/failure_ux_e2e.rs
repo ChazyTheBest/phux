@@ -208,6 +208,16 @@ impl ServerGuard {
     }
 }
 
+/// Does this `phux ls --json` session entry say a client is attached to the
+/// scenario session? The counter is the server's own view, incremented when
+/// it processes `ATTACH` (see `AttachedClient::wait_until_painting`).
+fn is_attached_work_session(session: &serde_json::Value) -> bool {
+    session["name"] == SESSION
+        && session["attached_clients"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+}
+
 /// Run a command to completion, returning `(exit_code, stdout, stderr)`.
 fn run_captured(cmd: &mut Command) -> (i32, String, String) {
     let out = cmd.output().expect("run phux command");
@@ -293,24 +303,70 @@ impl AttachedClient {
         }
     }
 
-    /// Wait until the client has painted at least one byte, then a settle
-    /// pause so the handshake + keybinding resolver install completes
-    /// before the test injects keystrokes (same discipline as `spatial_e2e`).
-    fn wait_until_painting(&mut self) {
+    /// Block until this client is a registered observer of `SESSION`.
+    ///
+    /// This used to be "wait for one painted byte, then sleep 500ms", and the
+    /// sleep was the load-dependent seam (phux-hhn2). A painted byte proves
+    /// only that `phux attach` reached its terminal setup — it is emitted
+    /// before the socket is even dialled — so the 500ms was the entire barrier,
+    /// and it is a bet rather than a fact. When it lost, the scenario's
+    /// stimulus (a `send-keys` that kills the last pane) landed on a server
+    /// this client had not attached to yet, and the failure said nothing at all
+    /// about the behavior under test.
+    ///
+    /// The replacement is a real barrier, on the server's side of the wire:
+    /// `phux ls --json` reports `attached_clients`, and that counter only
+    /// increments once the server has processed this connection's `ATTACH`.
+    /// `ls` is a command that carries a reply, so its exit is proof of
+    /// delivery, not merely of sending — the distinction the phux-5wxp
+    /// taxonomy is built around. Once it reads non-zero, every later frame
+    /// this session emits has somewhere to go.
+    ///
+    /// Polling by connecting is safe here (it is not the shape-4 hazard):
+    /// nothing in these scenarios measures an idle lifetime, and the harness
+    /// server's `--exit-after-idle` is ten minutes.
+    fn wait_until_attached(&mut self, server: &ServerGuard, iso: &Isolation) {
         let deadline = Instant::now() + CLIENT_DEADLINE;
         while Instant::now() < deadline {
-            if !self.output.lock().expect("output lock").is_empty() {
-                std::thread::sleep(Duration::from_millis(500));
-                assert!(
-                    self.child.try_wait().expect("client try_wait").is_none(),
-                    "attach client exited before the scenario ran; output:\n{}",
-                    self.output_text(),
-                );
+            assert!(
+                self.child.try_wait().expect("client try_wait").is_none(),
+                "attach client exited before the scenario ran; output:\n{}",
+                self.output_text(),
+            );
+            let (code, stdout, _stderr) = run_captured(&mut server.cmd(iso, &["ls", "--json"]));
+            if code == 0
+                && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&stdout)
+                && doc["sessions"]
+                    .as_array()
+                    .is_some_and(|sessions| sessions.iter().any(is_attached_work_session))
+            {
                 return;
             }
             std::thread::sleep(POLL);
         }
-        panic!("attach client painted nothing within {CLIENT_DEADLINE:?}");
+        panic!(
+            "attach client never registered as attached to {SESSION} within \
+             {CLIENT_DEADLINE:?}; output:\n{}",
+            self.output_text(),
+        );
+    }
+
+    /// The residual pause the two keystroke-injecting scenarios still need,
+    /// kept separate from [`Self::wait_until_attached`] so it is obvious what
+    /// it does and does not cover.
+    ///
+    /// [`Self::wait_until_attached`] proves the SERVER has this client
+    /// registered. It says nothing about the client's own stdin reader, and a
+    /// keystroke written into the attach PTY before that reader exists is
+    /// simply dropped. There is no observable barrier for a client-local
+    /// install — nothing crosses the wire — so this stays a pause, and it is
+    /// named for what it is rather than hidden inside a wait helper.
+    ///
+    /// Scenarios that drive the pane through the SERVER (`phux send-keys`) do
+    /// not need this and must not call it: their stimulus is ordered behind a
+    /// command the server replies to.
+    fn settle_for_local_keystrokes() {
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -376,25 +432,34 @@ fn broken_config_makes_server_start_loud() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     iso.apply(&mut cmd);
-    let mut child = cmd.spawn().expect("spawn phux server");
+    // Owned by a guard, not a bare `Child` (phux-whhd). The assertion below
+    // says "killing it" on the regression path, and nothing was: this test
+    // held a plain `std::process::Child`, whose `Drop` does NOT kill. If the
+    // audited regression ever came back — a server that starts normally on a
+    // broken config — the very run that caught it would have leaked the daemon
+    // it caught. `ServerProcess::drop` SIGKILLs a survivor and unlinks the
+    // socket, so the failing path cleans up after itself.
+    let mut server =
+        common::ServerProcess::from_child(cmd.spawn().expect("spawn phux server"), socket);
 
     // Poll rather than block on `.output()`: the audited regression is a
     // server that starts NORMALLY on a broken config, and that regression
     // would hang a blocking wait for the whole idle backstop.
     let deadline = Instant::now() + SOCKET_DEADLINE;
     let status = loop {
-        if let Some(status) = child.try_wait().expect("server try_wait") {
+        if let Some(status) = server.child_mut().try_wait().expect("server try_wait") {
             break status;
         }
         assert!(
             Instant::now() < deadline,
             "server with a broken config did not exit within {SOCKET_DEADLINE:?} \
-             (the audited silent-start regression); killing it",
+             (the audited silent-start regression)",
         );
         std::thread::sleep(POLL);
     };
     let mut stderr = String::new();
-    child
+    server
+        .child_mut()
         .stderr
         .take()
         .expect("piped stderr")
@@ -467,7 +532,8 @@ fn malformed_chord_keeps_detach_alive() {
     let server = ServerGuard::start(&iso);
 
     let mut client = AttachedClient::start(&server, &iso);
-    client.wait_until_painting();
+    client.wait_until_attached(&server, &iso);
+    AttachedClient::settle_for_local_keystrokes();
 
     // The default prefix (C-a) then `d`: detach must still resolve.
     client.send(b"\x01d");
@@ -491,7 +557,7 @@ fn last_pane_death_surfaces_its_exit_status() {
     let server = ServerGuard::start(&iso);
 
     let mut client = AttachedClient::start(&server, &iso);
-    client.wait_until_painting();
+    client.wait_until_attached(&server, &iso);
 
     // Kill the seed pane's shell with a distinctive status. The exit code
     // must ride TERMINAL_CLOSED to the client and come out in the
@@ -523,7 +589,7 @@ fn server_sigkill_shows_the_reconnect_indicator() {
     let mut server = ServerGuard::start(&iso);
 
     let mut client = AttachedClient::start(&server, &iso);
-    client.wait_until_painting();
+    client.wait_until_attached(&server, &iso);
 
     // Crash the server for real. SIGKILL runs no shutdown handler and
     // leaves the socket file behind — the audited case that used to be
