@@ -1,7 +1,7 @@
 ---
 audience: contributors
 stability: evolving
-last-reviewed: 2026-08-12
+last-reviewed: 2026-08-15
 ---
 
 # Ratification brief — the agent-surface batch (0075 / 0076 / 0077 / 0078)
@@ -30,7 +30,14 @@ describes as shipped is not.
 ## 1. What the tree actually does
 
 Verified by reading code, not ADR prose. Citations are file:line in this
-worktree.
+worktree, and drift by a line or two as the tree moves; the symbol names are
+the durable part.
+
+Re-verified against `main` at `69289db4` (protocol `0.8.0`) on 2026-08-15. The
+headline finding is unchanged and remains the reason this batch is not a
+formality: `resolve_with_tags` still answers `Selector::Agent` with
+`Vec::new()`, so ADR-0075's `%name` still resolves to nothing in production
+while ADR-0071 point 6 and two consumer docs describe it as live surface.
 
 | ADR | Claim | Tree | Verdict |
 |---|---|---|---|
@@ -40,7 +47,7 @@ worktree.
 | 0076 | `agent prompt` on `APPLY_INPUT`, satellite refused, `--wait` edge-gated | `crates/phux/src/commands/agent/prompt.rs`, `crates/phux-client/src/agent_prompt.rs:520`, `:814`, `:830` | **shipped and wired** |
 | 0076 pt 5 | no level fast path, ever | `EdgeTracker::new` records the baseline and never evaluates it (`crates/phux-client/src/agent_wait.rs:198-213`, `:219-246`); three tests pin it | **ADR and code agree** |
 | 0077 | four additive `ScreenState` keys, `SCHEMA_VERSION` 3, `wait` unwraps | `crates/phux-core/src/screen.rs:38`, `:302`, `:318`, `:325`, `:335`, `:371`; `crates/phux-client/src/wait.rs:283` | **shipped**; already `Accepted` |
-| 0078 | `snapshot --transcript`, `request_transcript`, a capability bit | zero code. `ServerFeature::KNOWN` is `AcknowledgedInput`, `FileUpload`, `MoveTerminal`, `TerminalReply`, `Shutdown` (`crates/phux-protocol/src/caps.rs:835`) | **nothing built**; `docs/consumers/agents.md:694` already says so |
+| 0078 | `snapshot --transcript`, `request_transcript`, a capability bit | zero code. `request_transcript` and `--transcript` appear nowhere in `crates/` or `docs/`. `ServerFeature::KNOWN` has since grown to seven bits — `AcknowledgedInput`, `FileUpload`, `MoveTerminal`, `TerminalReply`, `Shutdown`, `SpawnInitialSize`, `ReportAgentState` (`crates/phux-protocol/src/caps.rs`) — and none of them is 0078's | **nothing built**; `docs/consumers/agents.md:694` already says so |
 
 The consequence for the batch is that this is mostly a ratification of shipped
 surface, with one exception (0075) that is a commitment to build and one (0078)
