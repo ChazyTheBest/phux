@@ -4,23 +4,26 @@
 //! attach loop can `tokio::select!` over the server's frames concurrently
 //! with stdin and signal sources. Both directions share the SPEC §5
 //! framing: a four-byte big-endian length header followed by the type byte
-//! and payload, capped at [`MAX_FRAME_LEN`].
+//! and payload.
 //!
-//! Decoding lives in [`phux_protocol::wire`] — this module owns only the
-//! byte-level reassembly. Errors funnel into [`super::outcome::AttachError`].
+//! Neither the framing rule nor the decoding lives here: SPEC §5 framing is
+//! owned by [`phux_protocol::wire::framing`] and body decoding by
+//! [`phux_protocol::wire`], so this module owns only the transport plumbing
+//! that feeds them. Errors funnel into [`super::outcome::AttachError`].
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use phux_protocol::PROTOCOL_VERSION;
 use phux_protocol::caps::{
     BootstrapLimits, BootstrapProfile, BootstrapProfileKind, ClientCapabilities, Layer, LayerSet,
     ServerFeatureSet,
 };
 use phux_protocol::wire::frame::{
-    Command, CommandResult, ErrorCode, FrameKind, MAX_FRAME_LEN, MoveResult, Scope, SpawnResult,
+    Command, CommandResult, ErrorCode, FrameKind, MoveResult, Scope, SpawnResult,
 };
+use phux_protocol::wire::framing;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -30,9 +33,6 @@ use super::quic;
 pub use super::quic::{CertTrust, QuicDial};
 use super::ws;
 pub use super::ws::WsDial;
-
-/// Number of bytes in the SPEC §5 length prefix.
-const LENGTH_PREFIX: usize = 4;
 
 /// How an attach should reach its server.
 ///
@@ -1158,21 +1158,16 @@ impl WsReader {
         let Some(frame) = self.inner.recv_message().await? else {
             return Err(AttachError::Disconnected);
         };
-        if frame.len() < LENGTH_PREFIX || frame.len() > LENGTH_PREFIX + MAX_FRAME_LEN as usize {
-            return Err(AttachError::Protocol(format!(
-                "server sent WebSocket frame with out-of-range length {}",
-                frame.len()
-            )));
-        }
-        let (decoded, rest) = FrameKind::decode_with_limits(&frame, self.bootstrap_limits)
+        // One binary message is exactly one frame: `check_frame` rejects an
+        // out-of-range length and a message size that disagrees with the
+        // length it declares, so the decode below cannot leave a tail.
+        framing::check_frame(&frame).map_err(|err| {
+            AttachError::Protocol(format!("server sent a malformed WebSocket frame: {err}"))
+        })?;
+        let (decoded, _rest) = FrameKind::decode_with_limits(&frame, self.bootstrap_limits)
             .map_err(|err| {
                 AttachError::Protocol(format!("server sent undecodable frame: {err:?}"))
             })?;
-        if !rest.is_empty() {
-            return Err(AttachError::Protocol(
-                "server sent trailing bytes after WebSocket frame".to_owned(),
-            ));
-        }
         Ok(decoded)
     }
 }
@@ -1187,25 +1182,14 @@ fn decode_buffered(
     buf: &mut BytesMut,
     bootstrap_limits: BootstrapLimits,
 ) -> Result<Option<FrameKind>, AttachError> {
-    if buf.len() < LENGTH_PREFIX {
+    let Some(framed) = framing::split_frame(buf)
+        .map_err(|err| AttachError::Protocol(format!("server sent a malformed frame: {err}")))?
+    else {
+        // Prefix or body still in flight — wait for more bytes.
         return Ok(None);
-    }
-    let mut header = [0u8; LENGTH_PREFIX];
-    header.copy_from_slice(&buf[..LENGTH_PREFIX]);
-    let body_len = u32::from_be_bytes(header);
-    if !(1..=MAX_FRAME_LEN).contains(&body_len) {
-        return Err(AttachError::Protocol(format!(
-            "server sent frame with out-of-range length {body_len}",
-        )));
-    }
-    let frame_len = LENGTH_PREFIX + body_len as usize;
-    if buf.len() < frame_len {
-        // Body still in flight — wait for more bytes.
-        return Ok(None);
-    }
-    let (frame, _rest) = FrameKind::decode_with_limits(&buf[..frame_len], bootstrap_limits)
+    };
+    let (frame, _rest) = FrameKind::decode_with_limits(&framed, bootstrap_limits)
         .map_err(|err| AttachError::Protocol(format!("server sent undecodable frame: {err:?}")))?;
-    buf.advance(frame_len);
     Ok(Some(frame))
 }
 

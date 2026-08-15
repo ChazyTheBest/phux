@@ -96,8 +96,8 @@ use phux_protocol::wire::info::SessionSnapshot;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-/// Number of bytes in the SPEC §5 length prefix.
-const LENGTH_PREFIX: usize = 4;
+use phux_protocol::wire::framing::{self, LENGTH_PREFIX_LEN as LENGTH_PREFIX};
+
 const FIXTURE_STREAM_ID: StreamId =
     StreamId::new(1).expect("fixture stream identifier is non-zero");
 const FIXTURE_BOOTSTRAP_ID: BootstrapId =
@@ -715,11 +715,7 @@ impl FrameLink {
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(err) => panic!("scripted server failed reading a frame header: {err}"),
         }
-        let body_len =
-            usize::try_from(u32::from_be_bytes(header)).expect("frame length fits usize");
-        let mut encoded = Vec::with_capacity(LENGTH_PREFIX + body_len);
-        encoded.extend_from_slice(&header);
-        encoded.resize(LENGTH_PREFIX + body_len, 0);
+        let mut encoded = framing::frame_buffer(header).expect("client sent a valid frame header");
         self.stream
             .read_exact(&mut encoded[LENGTH_PREFIX..])
             .await

@@ -7,12 +7,17 @@
 //! complete encoded frames, so the per-client dispatch loop in [`crate::runtime`]
 //! and the `FrameKind` codec are transport-agnostic and reused verbatim.
 //!
+//! The §5 rule itself is not restated here: every reader below defers to
+//! [`phux_protocol::wire::framing`], which owns it.
+//!
 //! Wire contract per transport:
 //! * **UDS** — frames are length-prefixed on the byte stream, exactly as today.
 //! * **WebSocket** — one binary message carries one complete encoded frame
 //!   (the 4-byte length prefix is included, so the same `FrameKind::decode`
-//!   path works on both ends). Text/ping/pong frames are ignored; a Close
-//!   message is EOF.
+//!   path works on both ends). "Exactly one" is enforced: a message whose size
+//!   disagrees with the `length` it declares is malformed, not a batch, since
+//!   §5 defines no second framing layer. Text/ping/pong frames are ignored; a
+//!   Close message is EOF.
 
 #![allow(
     clippy::future_not_send,
@@ -40,9 +45,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
-use phux_protocol::wire::frame::MAX_FRAME_LEN;
-
-const LENGTH_PREFIX: usize = 4;
+use phux_protocol::wire::framing::{self, LENGTH_PREFIX_LEN as LENGTH_PREFIX};
 pub(crate) const WS_REJECTION_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Read side of a client connection: yields one complete encoded frame (length
@@ -116,17 +119,7 @@ impl FrameReader for UdsReader {
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(err) => return Err(err),
         }
-        let body_len = u32::from_be_bytes(self.header);
-        if !(1..=MAX_FRAME_LEN).contains(&body_len) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized or empty frame",
-            ));
-        }
-        let body_len = body_len as usize;
-        let mut framed = BytesMut::with_capacity(LENGTH_PREFIX + body_len);
-        framed.extend_from_slice(&self.header);
-        framed.resize(LENGTH_PREFIX + body_len, 0);
+        let mut framed = framing::frame_buffer(self.header)?;
         self.reader.read_exact(&mut framed[LENGTH_PREFIX..]).await?;
         Ok(Some(framed))
     }
@@ -367,13 +360,13 @@ impl FrameReader for WsReader {
             match self.rx.next().await {
                 None | Some(Ok(Message::Close(_))) => return Ok(None),
                 Some(Ok(Message::Binary(data))) => {
-                    let len = data.len();
-                    if len < LENGTH_PREFIX || len > LENGTH_PREFIX + MAX_FRAME_LEN as usize {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "websocket frame out of bounds",
-                        ));
-                    }
+                    // One binary message carries exactly one frame — SPEC §5
+                    // has no second framing layer, so a message that declares
+                    // a length disagreeing with its own size is malformed,
+                    // not a batch. Checking it here rather than tolerating a
+                    // non-empty decode tail keeps the WebSocket path as strict
+                    // as the stream transports.
+                    framing::check_frame(&data)?;
                     return Ok(Some(BytesMut::from(&data[..])));
                 }
                 Some(Err(err)) => return Err(io::Error::other(err)),
@@ -722,6 +715,37 @@ mod tests {
         assert_eq!(peer.uid, 0);
         assert_eq!(peer.pid, None);
         assert_eq!(peer.exe_path, None);
+    }
+
+    /// SPEC §5 has no second framing layer, so a binary message declaring a
+    /// `length` that disagrees with its own size is malformed. Before
+    /// phux-nwpw the WebSocket reader bounds-checked only the message's total
+    /// size, and the dispatch loop's ignored decode tail silently dropped the
+    /// surplus — this pins the rejection.
+    #[tokio::test]
+    async fn websocket_message_with_trailing_bytes_is_rejected() {
+        let (listener, addr, token_hex, _tokens) = token_listener().await;
+
+        // Declares a 3-byte body but carries five: two bytes past the frame.
+        let overlong: Vec<u8> = vec![0, 0, 0, 3, 0xde, 0xad, 0xbe, 0xff, 0xff];
+
+        let server = async {
+            let (mut reader, _writer, _peer) = listener.accept().await.unwrap();
+            reader.read_frame().await
+        };
+        let client = async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let (mut ws, _resp) =
+                tokio_tungstenite::client_async(bearer_request(addr, &token_hex), tcp)
+                    .await
+                    .expect("valid token must upgrade");
+            ws.send(Message::Binary(overlong)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        let (got, ()) = tokio::join!(server, client);
+        let err = got.expect_err("a message longer than the frame it declares is malformed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     async fn refused_handshake(

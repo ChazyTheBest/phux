@@ -2989,11 +2989,10 @@ mod fatal_preflight_close_tests {
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(error) => return Err(error),
         }
-        let body_len = u32::from_be_bytes(header) as usize;
-        let mut framed = BytesMut::with_capacity(4 + body_len);
-        framed.extend_from_slice(&header);
-        framed.resize(4 + body_len, 0);
-        reader.read_exact(&mut framed[4..]).await?;
+        let mut framed = phux_protocol::wire::framing::frame_buffer(header)?;
+        reader
+            .read_exact(&mut framed[phux_protocol::wire::framing::LENGTH_PREFIX_LEN..])
+            .await?;
         FrameKind::decode(&framed)
             .map(|(frame, _)| Some(frame))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))

@@ -13,6 +13,8 @@ pub mod encode;
 pub mod error;
 pub mod field;
 pub mod frame;
+pub mod framing;
 pub mod info;
 
 pub use error::DecodeError;
+pub use framing::{FramingError, LENGTH_PREFIX_LEN};

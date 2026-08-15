@@ -1491,22 +1491,9 @@ async fn ssh_exit_reason(
 /// `FrameKind::decode` expects) off the front of `buf`, or `None` when
 /// the buffer holds only a partial frame.
 fn split_buffered_frame(buf: &mut bytes::BytesMut) -> Result<Option<Vec<u8>>, String> {
-    use phux_protocol::wire::frame::MAX_FRAME_LEN;
-    const LENGTH_PREFIX: usize = 4;
-    if buf.len() < LENGTH_PREFIX {
-        return Ok(None);
-    }
-    let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if !(1..=MAX_FRAME_LEN).contains(&body_len) {
-        return Err(format!(
-            "satellite sent frame with out-of-range length {body_len}"
-        ));
-    }
-    let total = LENGTH_PREFIX + body_len as usize;
-    if buf.len() < total {
-        return Ok(None);
-    }
-    Ok(Some(buf.split_to(total).to_vec()))
+    phux_protocol::wire::framing::split_frame(buf)
+        .map(|framed| framed.map(|framed| framed.to_vec()))
+        .map_err(|err| format!("satellite sent a malformed frame: {err}"))
 }
 
 /// Drain `reader` to EOF (or error), retaining only the last `max`

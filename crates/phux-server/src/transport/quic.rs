@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use phux_protocol::policy::{PeerIdentity, TransportType};
-use phux_protocol::wire::frame::MAX_FRAME_LEN;
+use phux_protocol::wire::framing;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -148,17 +148,7 @@ impl FrameReader for QuicReader {
             // Clean stream finish at a frame boundary: end of connection.
             return Ok(None);
         }
-        let body_len = u32::from_be_bytes(self.header);
-        if !(1..=MAX_FRAME_LEN).contains(&body_len) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized or empty frame",
-            ));
-        }
-        let body_len = body_len as usize;
-        let mut framed = BytesMut::with_capacity(LENGTH_PREFIX + body_len);
-        framed.extend_from_slice(&self.header);
-        framed.resize(LENGTH_PREFIX + body_len, 0);
+        let mut framed = framing::frame_buffer(self.header)?;
         if !read_exact_quic(&mut self.recv, &mut framed[LENGTH_PREFIX..]).await? {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

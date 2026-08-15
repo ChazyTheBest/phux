@@ -595,15 +595,10 @@ impl Client {
     pub(crate) fn queue_frame(&mut self, kind: &FrameKind) -> Result<(), BridgeError> {
         let mut encoded = bytes::BytesMut::new();
         kind.encode(&mut encoded);
-        let body_len = encoded
-            .len()
-            .checked_sub(4)
-            .ok_or_else(|| BridgeError::engine("protocol encoder produced a truncated frame"))?;
-        if body_len > phux_protocol::wire::frame::MAX_FRAME_LEN as usize {
-            return Err(BridgeError::invalid(
-                "outbound frame exceeds the protocol length limit",
-            ));
-        }
+        // The encoder owns the length prefix; this asserts the frame it
+        // produced is emittable under SPEC §5 before it leaves the bridge.
+        phux_protocol::wire::framing::check_frame(&encoded)
+            .map_err(|err| BridgeError::invalid(format!("outbound frame is unframeable: {err}")))?;
         self.outgoing.push(encoded.to_vec());
         Ok(())
     }
