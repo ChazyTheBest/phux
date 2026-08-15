@@ -1216,6 +1216,12 @@ pub(super) fn handle_server_frame<W: super::RenderSink>(
                     Ok(FrameOutcome {
                         layout_replaced: true,
                         layout_get_answered: true,
+                        // phux-e9fd: the persisted layout just replaced the
+                        // single-pane bootstrap, so every leaf's rect moved.
+                        // Without the reflow each restored pane keeps the
+                        // attach-time winsize the server derived from the
+                        // outer viewport and paints a row short.
+                        reflow_panes: true,
                         attach_panes,
                         ..FrameOutcome::default()
                     })
@@ -1279,6 +1285,11 @@ pub(super) fn handle_server_frame<W: super::RenderSink>(
                         *focused_pane = workspace.active_window().and_then(|ls| ls.focus.clone());
                         Ok(FrameOutcome {
                             layout_replaced: true,
+                            // phux-e9fd: a peer's topology change reshapes our
+                            // tiles too. The peer sized the PTYs against ITS
+                            // content rect, which is only ours when both
+                            // clients run the same viewport and chrome.
+                            reflow_panes: true,
                             attach_panes,
                             ..FrameOutcome::default()
                         })

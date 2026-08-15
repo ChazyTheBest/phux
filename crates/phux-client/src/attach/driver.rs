@@ -1941,6 +1941,35 @@ async fn main_loop<W: super::RenderSink>(
             .unwrap_or(AttachEnd::Detached { reason: None });
         return Ok(detached_loop_exit(end, false));
     }
+    // phux-e9fd: size every bootstrap pane's PTY to the rect this client will
+    // actually paint it into, before anything else runs.
+    //
+    // The server sizes each pane from the ATTACH viewport
+    // (`apply_attach_viewport`), which is the client's OUTER terminal —
+    // chrome included. The client paints panes into `content_rect`, which is
+    // one row shorter whenever a status bar is docked. Without this call the
+    // mirror is a row taller than the rect it is clipped into, so the pane's
+    // bottom line is never painted and the bar looks like it overwrote it.
+    // The self-heal users notice — resize, split, toggle the sidebar — is
+    // just the first reflow that DID emit `TERMINAL_RESIZE`.
+    //
+    // The server side already defers the off-by-one here in as many words
+    // ("the client's concern via the post-attach `TERMINAL_RESIZE` reflow
+    // path"); this is that path, and until now nothing called it. An empty
+    // `prev_rects` makes `compute_reflow` report every leaf as changed — its
+    // documented first-attach rule — so each pane is sized exactly once.
+    emit_view_reflow(
+        conn,
+        &workspace,
+        zoomed.as_ref(),
+        &HashMap::new(),
+        content_rect(
+            viewport_dims,
+            status_bar.as_ref().map(StatusBarPainter::position),
+            sidebar,
+        ),
+    )
+    .await?;
     vcs.apply_snapshot(outcome.pane_cwds);
     if let Some((list, focused)) = outcome.sessions {
         sessions = list;
@@ -3507,10 +3536,12 @@ async fn main_loop<W: super::RenderSink>(
                 predict.set_viewport(predict_cols, predict_rows);
                 conn.send(&viewport_resize_frame(viewport)).await?;
 
-                // Multi-pane: emit one TERMINAL_RESIZE per leaf whose
-                // (w, h) actually changed so the server ioctls TIOCSWINSZ
-                // on each PTY. Single-pane: skip the reflow math entirely
-                // (no per-leaf wire emissions to make).
+                // Emit one TERMINAL_RESIZE per leaf whose (w, h) actually
+                // changed so the server ioctls TIOCSWINSZ on each PTY. This
+                // covers the single-pane case too — `Workspace::single` seeds
+                // a one-leaf tree, so the `tree.is_some()` guard only skips a
+                // workspace with no panes at all, and a lone pane still needs
+                // sizing to the chrome-inset content rect.
                 if let Some(ls) = workspace.render_window(zoomed.as_ref())
                     && ls.tree.is_some()
                 {
@@ -4323,10 +4354,14 @@ fn view_rects(
         .unwrap_or_default()
 }
 
-/// On a pane-zoom or sidebar toggle, emit one `TERMINAL_RESIZE` per pane whose
-/// dimensions changed between the pre-toggle view and the new content view.
-/// Reuses the close/SIGWINCH reflow path so each PTY's winsize tracks the
-/// on-screen geometry. Sent before repainting, mirroring the other reflow sites.
+/// Emit one `TERMINAL_RESIZE` per pane whose dimensions differ between
+/// `prev_rects` and the new content view. Reuses the close/SIGWINCH reflow
+/// path so each PTY's winsize tracks the on-screen geometry. Sent before
+/// repainting, mirroring the other reflow sites.
+///
+/// Called on a pane-zoom or sidebar toggle with the pre-toggle rects, and once
+/// at attach with an empty map — which `compute_reflow` reads as "every leaf is
+/// new", seeding each PTY at the rect it is painted into (phux-e9fd).
 async fn emit_view_reflow(
     conn: &mut Connection,
     workspace: &Workspace,

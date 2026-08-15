@@ -10,6 +10,12 @@
 //! ever disagree — a clamped dimension, a resize the actor dropped — this
 //! lane fails and the unit lane does not.
 //!
+//! The same read-back is what proves the attach path's chrome reservation
+//! (phux-e9fd): a real `phux attach` in a pseudoterminal must leave the pane's
+//! grid one row SHORT of the PTY, because the client spends that row on the
+//! status bar. Only `GET_SCREEN` can tell "the PTY agreed to 23 rows" from
+//! "the PTY is 24 rows and the client paints over the last one".
+//!
 //! Harness discipline follows `rec_e2e.rs`: a real `phux server` child on a
 //! private UDS at the root of `/tmp` (macOS caps `sun_path` at 104 bytes and
 //! these are usually run by hand from a deep worktree), each verb its own
@@ -21,10 +27,13 @@
 
 mod common;
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 /// Idle lifetime for this file's harness server, as a backstop UNDER the
 /// `Drop` kill (ADR-0063). The guard is still the primary cleanup; it cannot
@@ -135,6 +144,117 @@ impl ServerGuard {
             snapshot["rows"].as_u64().expect("snapshot rows"),
         )
     }
+}
+
+/// The PTY the attached client in this file's chrome test runs in.
+const ATTACH_PTY: (u16, u16) = (100, 24);
+
+/// How long an attach gets to hand the server its post-chrome pane size.
+const ATTACH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A real `phux attach` running in a pseudoterminal, killed on drop.
+///
+/// Nothing is typed into it: the whole point is what the client does on its
+/// own between `ATTACH` and the first idle frame.
+struct AttachedClient {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    _config: tempfile::TempDir,
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl AttachedClient {
+    /// Attach to `server` through a `cols x rows` PTY under an empty
+    /// `XDG_CONFIG_HOME`, so the client runs on the embedded `default.toml` —
+    /// which ships a bottom `[status]` bar. That default is load-bearing here:
+    /// with no bar there is no reserved row and nothing to get wrong.
+    fn start(server: &ServerGuard, (cols, rows): (u16, u16)) -> Self {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open attach PTY");
+        let config = tempfile::tempdir().expect("isolated config dir");
+        let mut command = CommandBuilder::new(PHUX);
+        command.args([
+            "attach",
+            "--socket",
+            server.socket.to_str().expect("UTF-8 socket"),
+            SESSION,
+        ]);
+        command.env("SHELL", "/bin/sh");
+        command.env("TERM", "xterm-256color");
+        command.env("RUST_LOG", "off");
+        command.env("XDG_CONFIG_HOME", config.path());
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn attached TUI");
+        drop(pair.slave);
+
+        // Drain the paint stream so a full PTY buffer can never backpressure
+        // the client into stalling before it emits its reflow.
+        let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        std::thread::spawn(move || {
+            let mut bytes = [0u8; 8192];
+            while let Ok(read) = reader.read(&mut bytes) {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            _config: config,
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns a real phux server and an attached PTY client; run via `just e2e`."]
+fn attach_sizes_the_pane_to_the_viewport_minus_the_status_bar() {
+    // phux-e9fd. The server sizes each pane from `ATTACH.viewport`, which is
+    // the client's OUTER terminal — status bar included. The client paints
+    // panes into the content rect, one row shorter. Nothing reconciled the
+    // two at attach, so the pane's bottom line lived on a row the client
+    // never painted and the bar appeared to have eaten it. It "fixed itself"
+    // on the next resize/split/sidebar toggle purely because those paths do
+    // emit `TERMINAL_RESIZE`.
+    let server = ServerGuard::start();
+    assert_eq!(
+        server.pane_size(),
+        NO_TTY_DEFAULT,
+        "the seeded pane must start at the no-TTY default, or the assertion \
+         below could pass without the attach doing anything"
+    );
+
+    let _client = AttachedClient::start(&server, ATTACH_PTY);
+
+    let (cols, rows) = ATTACH_PTY;
+    let want = (u64::from(cols), u64::from(rows) - 1);
+    let deadline = Instant::now() + ATTACH_DEADLINE;
+    let mut seen = server.pane_size();
+    while Instant::now() < deadline && seen != want {
+        std::thread::sleep(POLL);
+        seen = server.pane_size();
+    }
+    assert_eq!(
+        seen, want,
+        "an attached client on a {cols}x{rows} PTY reserves one row for the \
+         status bar, so the pane's real grid must settle at {want:?}. Seeing \
+         {rows} rows means the client never sent the post-attach \
+         TERMINAL_RESIZE: the PTY is a row taller than the rect the client \
+         paints into, so the shell's bottom line renders into a row that is \
+         clipped away and the bar looks like it overwrote it."
+    );
 }
 
 #[test]
