@@ -53,5 +53,3 @@ not as design of record.
 Code is the implementation; these documents are the intended design. If
 they diverge, file an issue. Either the code drifted or the design did.
 Both happen; the response is to reconcile, not to let either rot.
-</content>
-</invoke>

@@ -65,7 +65,7 @@ The wire is **asymmetric**:
   forwards the byte stream produced by each Terminal's PTY (after
   canonical parsing into the server's `libghostty_vt::Terminal` for
   state ownership, and after per-client capability downsampling — see
-  §5 Version negotiation and [L1.md](./L1.md)).
+  §6 Version negotiation and [L1.md](./L1.md)).
 - **Client → Server (input events):** structured `KeyEvent`,
   `MouseEvent`, `FocusEvent`, paste, and viewport messages — never raw
   VT bytes ([input.md](./input.md)).

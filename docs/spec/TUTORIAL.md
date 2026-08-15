@@ -30,7 +30,7 @@ Client sends (frame type 0x01):
   HELLO {
     client_name: "phux-tui",       // field 1
     protocol_major: 0,             // field 2
-    protocol_minor: 7,             // field 3
+    protocol_minor: 8,             // field 3
     protocol_patch: 0,             // field 4
     client_caps: {                 // field 5
       color: TrueColor,
@@ -51,7 +51,7 @@ Client sends (frame type 0x01):
 Server replies (frame type 0x80):
   HELLO_OK {
     protocol_major: 0,             // field 1
-    protocol_minor: 7,             // field 2
+    protocol_minor: 8,             // field 2
     protocol_patch: 0,             // field 3
     server_caps: {                 // field 4
       layers: 0x05,
@@ -69,7 +69,7 @@ Server replies (frame type 0x80):
 
 **Wire shape:** see [proto.md §6.1](./proto.md). Key pieces:
 
-- `major.minor` must equal `0.7`; a `0.6` peer is rejected before session
+- `major.minor` must equal `0.8`; a `0.7` peer is rejected before session
   state. Patch differences are compatible, and the server returns its current
   patch.
 - `layers` is intersected once for the connection. `0x01` is L1 only and
@@ -353,5 +353,3 @@ For the conceptual picture, read [CONCEPTS.md](../CONCEPTS.md) and the ADRs that
 - [ADR-0013: libghostty bytes on the wire](../../ADR/0013-libghostty-bytes-on-wire.md)
 - [ADR-0016: terminal ID as wire primary](../../ADR/0016-terminal-id-as-wire-primary.md)
 - [ADR-0030: engine-delegated wire and projection consumers](../../ADR/0030-engine-delegated-wire-and-projection-consumers.md)
-</content>
-</invoke>
