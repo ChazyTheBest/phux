@@ -373,6 +373,41 @@ phux: the running server is 0.13.0, this binary is 0.14.0 — upgrading it in pl
 `phux doctor` reports the same skew if you want to check without
 attaching.
 
+### Putting a server that is already running under supervision
+
+`phux service install` refuses while a server holds the socket, because
+the supervised process would fail to bind on every start and retry
+forever. `phux service install --adopt` is the way past that refusal
+without stopping anything
+([ADR-0088](../ADR/0088-adopting-a-live-server-into-supervision.md)):
+
+```
+$ phux service install --adopt
+phux service armed (nothing was stopped).
+  unit    ~/Library/LaunchAgents/com.phux.server.plist
+  panes   untouched — the running server was not signalled
+```
+
+The unit is written from your flags exactly as a plain install writes it,
+and then **armed** rather than loaded — the file is on disk and the init
+system is committed to it, but nothing has been started. Supervision
+takes over at whichever comes first: the next login or reboot, or the
+first `phux` command after the running server exits, which starts the
+supervised server instead of auto-spawning an unsupervised one.
+
+What `--adopt` deliberately does **not** do is put the currently running
+process under restart supervision. Nothing can: launchd has no way to
+place an existing process under a job, and systemd's scope units track
+processes without restarting them. Adoption therefore transfers the
+supervision, not the process — the panes survive because the running
+server is never touched, not because they are handed over. `phux service
+status` reports `state armed` while an adoption is pending, and `phux
+service uninstall` cancels it.
+
+Over a socket with nothing listening, `--adopt` is an ordinary install.
+The flag means "never stop a running server to install", so it is always
+safe to pass.
+
 ## Service-managed pane environment
 
 `phux service install` (ADR-0055) runs the server under launchd or

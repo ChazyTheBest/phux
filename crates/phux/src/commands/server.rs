@@ -572,10 +572,22 @@ pub(crate) fn maybe_auto_spawn_server(
     // server is its own lifecycle now. The OS reaps it when it exits.
     let _child = cmd.spawn()?;
 
-    // Wait for the server to *accept*, not merely for the socket file to
-    // appear. The file exists for a window before the listener is ready, and
-    // a caller that returns on `exists()` hands the user a connection refused
-    // it cannot explain (phux-zomb.1).
+    wait_until_accepting(socket_path, "auto-spawned server", &log_path)
+}
+
+/// Block until `socket_path` accepts, or the auto-spawn deadline passes.
+///
+/// Waiting on *accept* rather than on the socket file existing is the whole
+/// point: the file exists for a window before the listener is ready, and a
+/// caller that returns on `exists()` hands the user a connection refused it
+/// cannot explain (phux-zomb.1).
+///
+/// Shared by the two paths that can put a server there — the forked daemon and
+/// a service unit the init system was just asked to start — so neither can
+/// drift into returning early. `what` names the one that is being waited on,
+/// because "the auto-spawned server did not accept" is a misleading thing to
+/// print about a supervised start.
+fn wait_until_accepting(socket_path: &Path, what: &str, log_path: &Path) -> std::io::Result<()> {
     let deadline = Instant::now() + AUTO_SPAWN_SOCKET_TIMEOUT;
     loop {
         if socket::probe(socket_path) == SocketState::Live {
@@ -585,7 +597,7 @@ pub(crate) fn maybe_auto_spawn_server(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "auto-spawned server did not accept on {} within {:?} (see {})",
+                    "{what} did not accept on {} within {:?} (see {})",
                     socket_path.display(),
                     AUTO_SPAWN_SOCKET_TIMEOUT,
                     log_path.display(),
@@ -653,6 +665,28 @@ pub(crate) fn ensure_server(
             error = %err,
             "could not remove stale socket entry",
         );
+    }
+
+    // The socket is free and something has to fill it. If an `--adopt` install
+    // armed a unit for exactly this socket, the supervisor gets first refusal:
+    // this is the moment the hand-over it was armed for becomes possible, and
+    // forking our own daemon here would take the socket the unit is waiting
+    // for and leave the adoption pending forever (ADR-0088).
+    //
+    // Only ever diverts on a *pending* adoption. A host with an ordinary
+    // installed unit still auto-spawns, because reviving a server the user
+    // stopped on purpose would contradict ADR-0080.
+    if matches!(
+        super::service::complete_pending_adoption(socket_path, quiet),
+        super::service::Handover::Started
+    ) {
+        let result = wait_until_accepting(
+            socket_path,
+            "the supervised server",
+            &phux_server::telemetry::server_log_path(),
+        );
+        drop(guard);
+        return result;
     }
 
     let result = maybe_auto_spawn_server(socket_path, session, seed_command, quiet);

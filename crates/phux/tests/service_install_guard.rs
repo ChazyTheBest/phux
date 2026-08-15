@@ -17,13 +17,15 @@
 //!
 //! Stopping the incumbent instead would be worse — it owns live panes and
 //! their in-flight shells and agents — so the correct behaviour is to refuse
-//! and say so. Moving a running server under supervision without losing its
-//! panes is phux-m3ot, and needs mechanism phux does not have yet.
+//! and say so. `--adopt` (ADR-0088, phux-m3ot) is the way past the refusal
+//! that costs neither: it writes the unit and arms it rather than loading it,
+//! so nothing binds twice and nothing is stopped. Its test lives here too,
+//! because it is the same guard viewed from the other side.
 //!
-//! These tests drive the REAL compiled binary against a REAL socket. Nothing
-//! is installed: the refusal is asserted to happen *before* any unit is
-//! written, which is the whole point — an install that fails after writing
-//! would leave the loop behind.
+//! These tests drive the REAL compiled binary against a REAL socket. In the
+//! refusal tests nothing is installed: the refusal is asserted to happen
+//! *before* any unit is written, which is the whole point — an install that
+//! fails after writing would leave the loop behind.
 //!
 //! # Do not let these tests reach a real install
 //!
@@ -44,6 +46,13 @@
 //! Do not "simplify" this by letting the install proceed and cleaning up
 //! afterwards. There is no cleanup for a `launchctl bootout` that killed
 //! someone's panes.
+//!
+//! The `--adopt` test is the one that does write a unit, and it is safe for
+//! the same two reasons inverted: it writes into the sandboxed `HOME`, and
+//! `--adopt` never runs `bootout`, `bootstrap`, or `enable --now`. The only
+//! init-system call it can make is `systemctl --user enable` *without*
+//! `--now`, against a unit search path that `XDG_CONFIG_HOME` has already
+//! redirected into the tempdir.
 
 #![allow(clippy::expect_used, clippy::panic, reason = "tests")]
 
@@ -84,10 +93,18 @@ fn unit_paths_under(home: &Path) -> [std::path::PathBuf; 4] {
 
 /// Redirect a child `phux` at a sandboxed home, so nothing it writes can
 /// land in the developer's real one. See this module's header.
+///
+/// `XDG_STATE_HOME` is redirected for the same reason as the other two, and it
+/// is load-bearing for `--adopt`: that path writes an adoption marker into the
+/// state directory, and a marker in the *developer's real* state directory
+/// would make their next cold `phux` try to bootstrap a service unit
+/// (ADR-0088). Sandboxing the state dir keeps the marker inside the tempdir
+/// that is deleted with the test.
 fn sandboxed(home: &Path) -> Command {
     let mut cmd = Command::new(PHUX);
     cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"));
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"));
     cmd
 }
 
@@ -212,4 +229,95 @@ fn print_still_renders_while_a_server_holds_the_socket() {
             unit.display()
         );
     }
+}
+
+/// The way past the refusal that costs neither the panes nor a crash-loop
+/// (phux-m3ot, ADR-0088).
+///
+/// Three properties, and all three are the point:
+///
+///   1. **The unit is written.** Unlike every other test here, `--adopt`
+///      commits the supervision — so this asserts the file exists rather than
+///      that it does not.
+///   2. **The incumbent is untouched.** No signal, no `bootout`, no
+///      `enable --now`; the server that held the socket before the install
+///      still answers on it afterwards, with its panes.
+///   3. **The output does not claim more than it did.** An adopt install that
+///      printed the ordinary "phux service installed." banner would leave the
+///      user believing their running server is now restart-supervised, which
+///      is the one wrong belief this path exists to prevent — no supervisor
+///      can adopt a pid it did not start.
+#[test]
+fn adopt_installs_over_a_live_server_without_stopping_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("phux.sock");
+
+    let out = Command::new(PHUX)
+        .args(["new", "--session", "incumbent", "--json", "--socket"])
+        .arg(&socket)
+        .output()
+        .expect("run phux new");
+    assert!(
+        out.status.success(),
+        "phux new must start a server.\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(wait_until_accepting(&socket), "server must be up");
+    let mut server = common::AutoSpawnedServer::new(PHUX, socket.clone());
+    server.capture_pid();
+    let _cleanup = Cleanup {
+        _server: server,
+        _dir: dir,
+    };
+
+    let home = tempfile::tempdir().expect("sandboxed home");
+    let install = sandboxed(home.path())
+        .args(["service", "install", "--adopt", "--socket"])
+        .arg(&socket)
+        .output()
+        .expect("run phux service install --adopt");
+
+    let stdout = String::from_utf8_lossy(&install.stdout);
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        install.status.success(),
+        "--adopt must succeed over a live server.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // (2) first, because it is the criterion the whole bead exists for: a
+    // regression that stops the incumbent must fail here even if everything
+    // else about the install is right.
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the incumbent server must still be accepting after an adopt install.\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // (1) Exactly one unit, and it is the one for this build's platform and
+    // profile. Filtering the same list the refusal tests assert *empty* keeps
+    // both directions reading against one definition of "a unit was written".
+    let written: Vec<_> = unit_paths_under(home.path())
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
+    assert_eq!(
+        written.len(),
+        1,
+        "--adopt must write exactly one unit, under the sandboxed home; found {written:?}"
+    );
+
+    // (3) The banner has to say what did not happen, not just what did.
+    assert!(
+        stdout.contains("armed"),
+        "the adopt banner must say the unit is armed rather than installed.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("panes"),
+        "the adopt banner must account for the running panes.\nstdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("phux service installed."),
+        "an adopt install must not print the ordinary install banner, which reads as \
+         'your running server is supervised now'.\nstdout: {stdout}"
+    );
 }

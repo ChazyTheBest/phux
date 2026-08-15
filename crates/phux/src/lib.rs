@@ -941,8 +941,21 @@ pub fn run() -> ExitCode {
                 listen,
                 restore,
                 hub,
+                adopt,
                 print,
-            } => commands::service::run_install(quic, listen, restore, socket, hub, print),
+            } => commands::service::run_install(
+                quic,
+                listen,
+                restore,
+                socket,
+                hub,
+                if adopt {
+                    commands::service::Takeover::Adopt
+                } else {
+                    commands::service::Takeover::Refuse
+                },
+                print,
+            ),
             commands::ServiceAction::Reconcile { print } => commands::service::run_reconcile(print),
             commands::ServiceAction::Uninstall => commands::service::run_uninstall(),
             commands::ServiceAction::Status => commands::service::run_status(),

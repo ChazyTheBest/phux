@@ -2167,6 +2167,11 @@ Options:
       --hub
           Run the supervised server as a federation hub. The service loads enabled `[[satellites]]` entries and keeps their links connected across login, logout, and reboot
 
+      --adopt
+          Never stop a running server to install. When one is live, write the unit and arm it instead of loading it, so the incumbent keeps its panes and the supervisor takes over the next time a server starts.
+
+          Without this, an install over a live server is refused, because loading the unit would supervise a process that cannot bind the socket. With it, nothing is stopped and nothing crash-loops. The running process itself is never adopted: neither launchd nor systemd can restart-supervise a process it did not start.
+
       --print
           Print the unit (and the restore wrapper) to stdout without writing or loading anything
 

@@ -1032,6 +1032,27 @@ fn dry_run_text(manager: Option<Manager>, plan: &ServicePlan) -> String {
     text
 }
 
+/// What an install is allowed to do about a server that already holds the
+/// socket.
+///
+/// A two-variant enum rather than an `adopt: bool` because the two answers are
+/// not "do the thing / skip the thing" — they are two different installs, and
+/// the difference (load the unit now versus arm it for later) is the whole of
+/// ADR-0088. A named type keeps that legible at the call site and stops the
+/// flag reading as an optional embellishment on one behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Takeover {
+    /// Refuse the install. A supervised server cannot bind a socket the
+    /// incumbent holds, and the unit would retry a failing start forever
+    /// (phux-67wg). The default, and the only safe default: the alternative
+    /// silently changes what `install` means based on invisible state.
+    Refuse,
+    /// Write and arm the unit without loading it (`--adopt`). Nothing is
+    /// stopped, nothing binds twice, and supervision begins the next time a
+    /// server starts.
+    Adopt,
+}
+
 /// `phux service install` — write the unit and hand it to the init system.
 ///
 /// Idempotent: an existing unit is reconciled (unloaded, rewritten, reloaded)
@@ -1043,6 +1064,7 @@ pub(crate) fn run_install(
     restore: bool,
     socket: Option<PathBuf>,
     hub: bool,
+    takeover: Takeover,
     print: bool,
 ) -> ExitCode {
     // `--quic` arrives pre-validated as a `SocketAddr` (the same type
@@ -1103,17 +1125,24 @@ pub(crate) fn run_install(
     // nothing is killing the server; it is refusing to start (phux-67wg).
     //
     // Stopping the incumbent here would be worse: it owns live panes and
-    // their in-flight shells and agents. Moving a running server under
-    // supervision without losing them is phux-m3ot, and needs mechanism phux
-    // does not have yet. So this refuses and says what to do.
-    if socket::probe(&plan.socket_path) == SocketState::Live {
+    // their in-flight shells and agents. `--adopt` is the way past this
+    // without either cost — it writes the unit and arms it rather than
+    // loading it, so nothing binds twice and nothing is stopped (ADR-0088).
+    let incumbent_live = socket::probe(&plan.socket_path) == SocketState::Live;
+    if incumbent_live && takeover == Takeover::Refuse {
         eprintln!(
             "phux service: a server is already running on {}\n\
              \n\
              Installing now would supervise a server that cannot bind that socket, and the\n\
              unit would retry a failing start every {RESTART_THROTTLE_SECS}s indefinitely.\n\
              \n\
-             Stop the running server first, then re-run this command. Note that stopping it\n\
+             To install without stopping it, re-run with --adopt: the unit is written and\n\
+             armed instead of loaded, the running server keeps its panes, and supervision\n\
+             takes over the next time a server starts.\n\
+             \n\
+             \x20   phux service install --adopt\n\
+             \n\
+             Stopping the running server first and re-running plainly also works, but it\n\
              ends its panes and their processes:\n\
              \n\
              \x20   phux ls --socket {}    # see what would be lost\n",
@@ -1152,6 +1181,34 @@ pub(crate) fn run_install(
         return ExitCode::FAILURE;
     }
 
+    // The adoption path diverges here and only here: same plan, same rendered
+    // unit, same bytes on disk — what changes is that the unit is *armed*
+    // rather than *loaded*, because loading it now is precisely what would
+    // crash-loop against the incumbent's socket (ADR-0088).
+    if incumbent_live {
+        // A failed arming is a *partial* result, not a failure: the unit is
+        // written and the phux-side hand-over below still works, because that
+        // asks the init system to start the unit directly rather than relying
+        // on it being wanted at login. Only the login/reboot trigger is lost,
+        // and saying that beats discarding an otherwise-correct install.
+        if let Err(err) = arm_unit(manager) {
+            eprintln!(
+                "phux service: note: the unit is written, but the init system would not record\n\
+                 it as wanted at login ({err}). Supervision still takes over the next time a\n\
+                 server starts; it will not come up by itself after a reboot until this is\n\
+                 resolved."
+            );
+        }
+        if let Err(err) = mark_adoption_pending(&unit_path) {
+            // The unit is armed and correct; only the automatic hand-over is
+            // lost. Say so and keep the success, because the state on disk is
+            // exactly what was asked for.
+            eprintln!("phux service: note: {err}");
+        }
+        report_adopt(manager, &plan, &unit_path);
+        return ExitCode::SUCCESS;
+    }
+
     match reload(manager, &plan, &unit_path) {
         Ok(()) => {}
         Err(err) => {
@@ -1160,8 +1217,281 @@ pub(crate) fn run_install(
         }
     }
 
+    // An install that actually loaded the unit supersedes any armed one: the
+    // supervisor owns the server from here, so there is nothing left pending.
+    clear_adoption_pending();
+
     report_install(manager, &plan, &unit_path);
     ExitCode::SUCCESS
+}
+
+/// Put the unit in front of the init system *without* starting it.
+///
+/// The whole of `--adopt` rests on this being a real capability rather than a
+/// simulation of one, and on both platforms it is — for the same reason, from
+/// opposite directions:
+///
+/// - **launchd** bootstraps every plist in `~/Library/LaunchAgents` when the
+///   user's GUI domain comes up. Writing the file *is* arming it; the job is
+///   loaded at the next login with no further action. There is deliberately no
+///   command to run here.
+/// - **systemd** needs the `WantedBy=` symlink, which is what `enable` writes.
+///   `enable` *without* `--now` is the arming: the unit is wanted by
+///   `default.target` and starts at the next login, and nothing starts now.
+///
+/// `reload` is the same two operations with the start included. Splitting them
+/// is what lets an install decline to bind a socket somebody else is holding
+/// while still committing the supervision.
+fn arm_unit(manager: Manager) -> Result<(), String> {
+    match manager {
+        Manager::Launchd => Ok(()),
+        Manager::Systemd => {
+            run_tool(
+                "systemctl",
+                &["--user".to_owned(), "daemon-reload".to_owned()],
+            )?;
+            run_tool(
+                "systemctl",
+                &["--user".to_owned(), "enable".to_owned(), systemd_unit()],
+            )
+        }
+    }
+}
+
+/// Ask the init system to start the armed unit now.
+///
+/// The counterpart to [`arm_unit`]: everything `reload` does that arming
+/// deliberately left out. Called when the incumbent has gone and the socket is
+/// free, never while it is held.
+fn start_armed_unit(manager: Manager, unit_path: &Path) -> Result<(), String> {
+    match manager {
+        Manager::Launchd => run_tool(
+            "launchctl",
+            &[
+                "bootstrap".to_owned(),
+                format!("gui/{}", uid()),
+                path_string(unit_path),
+            ],
+        ),
+        Manager::Systemd => run_tool(
+            "systemctl",
+            &["--user".to_owned(), "start".to_owned(), systemd_unit()],
+        ),
+    }
+}
+
+/// Where an armed-but-unloaded unit is recorded, profile-scoped with every
+/// other piece of per-instance state (ADR-0080).
+///
+/// A file rather than an inference. "A unit is installed but the init system
+/// was never asked to load it" is not observable after the fact: an armed unit
+/// and a unit whose supervised server was deliberately stopped look identical
+/// on disk and identical to `launchctl print`. Recording the state that was
+/// *entered* removes the guess, and gives `phux service status` something
+/// truthful to report instead of a shrug.
+fn adoption_marker_path() -> PathBuf {
+    phux_server::telemetry::state_dir().join("service-adopt-pending")
+}
+
+/// Record that `unit_path` is armed and waiting for the incumbent to exit.
+fn mark_adoption_pending(unit_path: &Path) -> Result<(), String> {
+    let marker = adoption_marker_path();
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    }
+    std::fs::write(&marker, format!("{}\n", unit_path.display())).map_err(|err| {
+        format!(
+            "unit armed, but {} could not be written ({err}), so the hand-over will not happen \
+             on its own",
+            marker.display()
+        )
+    })
+}
+
+/// Forget a pending adoption. Best-effort: a marker that outlives its unit
+/// costs one wasted `unit_path.exists()` on a cold start, which is cheaper
+/// than failing a command over a file nobody reads directly.
+fn clear_adoption_pending() {
+    let _ = std::fs::remove_file(adoption_marker_path());
+}
+
+/// The armed unit waiting to supervise `socket_path`, if there is one.
+///
+/// Three conditions, all required, because the consequence of a false positive
+/// is starting a *different* instance's server:
+///
+/// 1. a marker exists — an `--adopt` install happened and has not completed;
+/// 2. the unit it names is still on disk — an `uninstall` between then and now
+///    revokes the adoption, and a marker whose unit is gone is swept here
+///    rather than retried forever;
+/// 3. the unit's own socket is the socket the caller wants. `unit_socket_override`
+///    reads it out of the unit exactly as `reconcile` does, so "the unit that
+///    supervises this socket" means one thing across the codebase. A unit for
+///    another profile, or for an operator's `--socket` override, is not an
+///    answer to this question and is left alone.
+fn armed_unit_for(socket_path: &Path) -> Option<(Manager, PathBuf)> {
+    if !adoption_marker_path().exists() {
+        return None;
+    }
+    let manager = Manager::host()?;
+    let Ok(unit_path) = manager.unit_path(profile_suffix().as_deref()) else {
+        return None;
+    };
+    let Ok(body) = std::fs::read_to_string(&unit_path) else {
+        // The unit is gone; the adoption cannot complete and must not be
+        // retried on every cold start for the rest of the host's life.
+        clear_adoption_pending();
+        return None;
+    };
+    unit_supervises(manager, &body, socket_path).then_some((manager, unit_path))
+}
+
+/// Does `body` describe a unit whose server would bind `socket_path`?
+///
+/// Split out and pure so the socket-match guard is testable against real
+/// rendered units. It is the guard that keeps a pending adoption from
+/// diverting an unrelated instance's cold start, and "unrelated" is exactly
+/// what a unit for another profile or another `--socket` override is.
+fn unit_supervises(manager: Manager, body: &str, socket_path: &Path) -> bool {
+    unit_socket_override(manager, body).unwrap_or_else(phux_server::runtime::default_socket_path)
+        == socket_path
+}
+
+/// Outcome of trying to complete an armed adoption from the auto-spawn path.
+pub(crate) enum Handover {
+    /// The init system was asked to start the unit and accepted. The caller
+    /// must wait for the socket rather than spawning its own server: two
+    /// processes racing for one socket is how phux-67wg's crash-loop starts.
+    Started,
+    /// Nothing was started — no armed unit, or the init system refused. The
+    /// caller proceeds with an ordinary auto-spawn, and the adoption stays
+    /// pending for the next cold start.
+    NotTaken,
+}
+
+/// Complete an armed adoption if one is pending for `socket_path`.
+///
+/// This is what makes `--adopt` a hand-over rather than a note-to-self. The
+/// incumbent has exited (the caller only reaches here after a probe found
+/// nothing accepting), so the socket is free and the supervisor can finally
+/// take it — which has to happen *here*, in the auto-spawn path, because
+/// otherwise the very next `phux` invocation forks a fresh unsupervised server
+/// and the host is back exactly where it started, armed unit and all.
+///
+/// Deliberately not a general "prefer the supervisor when a unit exists" rule.
+/// That would resurrect a server the user stopped on purpose, contradicting
+/// ADR-0080's "a deliberately stopped server stays stopped". Only a *pending
+/// adoption* diverts, and only once.
+/// `quiet` carries the auto-spawn path's `--json` contract: under it, stderr
+/// holds the error document and nothing else, so the hand-over narrates
+/// itself only when a human is reading.
+pub(crate) fn complete_pending_adoption(socket_path: &Path, quiet: bool) -> Handover {
+    let Some((manager, unit_path)) = armed_unit_for(socket_path) else {
+        return Handover::NotTaken;
+    };
+    match start_armed_unit(manager, &unit_path) {
+        Ok(()) => {
+            // Cleared on the *request* succeeding, not on the socket coming
+            // up. The unit is loaded now either way, so a second attempt would
+            // be a no-op at best; if the supervised server cannot start, that
+            // is a crash-loop for `phux doctor` to report, not something to
+            // re-trigger on every invocation.
+            clear_adoption_pending();
+            if !quiet {
+                eprintln!(
+                    "phux: handing this server over to {} — the unit armed by `phux service \
+                     install --adopt` is now live",
+                    match manager {
+                        Manager::Launchd => "launchd",
+                        Manager::Systemd => "systemd",
+                    }
+                );
+            }
+            Handover::Started
+        }
+        Err(err) => {
+            // Nothing was started, so falling through to an ordinary spawn is
+            // safe and keeps the user in a terminal. The marker stays: the
+            // next cold start tries again.
+            if !quiet {
+                eprintln!(
+                    "phux: could not start the armed service unit ({err}); starting a server"
+                );
+            }
+            Handover::NotTaken
+        }
+    }
+}
+
+/// Report an `--adopt` install: what was written, what was deliberately not
+/// done, and when supervision actually begins.
+///
+/// The one thing this must never do is print "installed" and stop. An adopt
+/// install leaves the host in a state no other command produces — a live
+/// unsupervised server and a unit that is committed but not yet in force —
+/// and a user who does not know that will read the ordinary install banner as
+/// "my running server is supervised now", which is the single wrong belief
+/// this whole path exists to prevent.
+fn report_adopt(manager: Manager, plan: &ServicePlan, unit_path: &Path) {
+    outln!("phux service armed (nothing was stopped).");
+    outln!("  unit    {}", unit_path.display());
+    outln!("  binary  {}", plan.binary.display());
+    if let Some(profile) = profile_suffix() {
+        outln!("  profile {profile}");
+    }
+    if let Some(quic) = &plan.quic {
+        outln!("  quic    {quic}");
+    }
+    if let Some(listen) = &plan.listen {
+        outln!("  ws      {listen}");
+    }
+    outln!("  logs    {}", plan.log.display());
+    outln!("  panes   untouched — the running server was not signalled");
+    outln!();
+    outln!(
+        "The server on {} keeps running exactly as it was: same process, same panes,\n\
+         same shells and agents. It is NOT supervised — neither launchd nor systemd can\n\
+         restart-manage a process it did not start, so no command could have made it so\n\
+         without replacing it.",
+        plan.socket_path.display()
+    );
+    outln!();
+    outln!("Supervision takes over at whichever of these comes first:");
+    outln!();
+    let at_login = match manager {
+        Manager::Launchd => "when launchd bootstraps the unit above",
+        Manager::Systemd => "when systemd starts the unit it now wants",
+    };
+    outln!("  * your next login or reboot, {at_login};");
+    outln!(
+        "  * the next `phux` command after that server exits, which starts the supervised\n\
+         \x20   one instead of forking an unsupervised replacement."
+    );
+    outln!();
+    outln!(
+        "To hand over now, at the cost of the running panes and their in-flight shells\n\
+         and agents (`phux ls` shows what would be lost):"
+    );
+    outln!();
+    outln!("    phux kill --server");
+    match manager {
+        Manager::Launchd => outln!(
+            "    launchctl bootstrap gui/{} {}",
+            uid(),
+            unit_path.display()
+        ),
+        Manager::Systemd => outln!("    systemctl --user start {}", systemd_unit()),
+    }
+
+    if let Some(profile) = profile_suffix() {
+        outln!();
+        outln!(
+            "This unit is scoped to the `{profile}` profile — its own label, socket and\n\
+             state. It does not supervise, replace, or interfere with a default-profile\n\
+             server. Set PHUX_PROFILE={profile} to reach the server it starts."
+        );
+    }
 }
 
 /// Write the unit file (and the wrapper, when `--restore` is on), creating
@@ -1400,6 +1730,14 @@ pub(crate) fn run_uninstall() -> ExitCode {
         outln!("Removed {}", wrapper.display());
     }
 
+    // Revoke any armed adoption. Without this, uninstalling between the
+    // `--adopt` and the hand-over would leave a marker pointing at a unit the
+    // user just deleted, and the next cold start would try to load it.
+    if adoption_marker_path().exists() {
+        clear_adoption_pending();
+        outln!("Cancelled the pending adoption; nothing will take this socket over.");
+    }
+
     if manager == Manager::Systemd {
         let _ = run_tool(
             "systemctl",
@@ -1439,6 +1777,21 @@ pub(crate) fn run_status() -> ExitCode {
         return ExitCode::FAILURE;
     }
     outln!("unit  {}", unit_path.display());
+
+    // An armed unit is the one state the init system cannot describe: to
+    // `launchctl print` an unloaded job and a never-installed one are the same
+    // absence, and phux is the only thing that knows the difference is
+    // deliberate and temporary.
+    if adoption_marker_path().exists() {
+        outln!("state armed — installed with --adopt and waiting for the running server to exit");
+        outln!();
+        outln!(
+            "The server holding this unit's socket is unsupervised and keeps its panes.\n\
+             Supervision begins at the next login, or at the first `phux` command after\n\
+             that server exits. `phux service uninstall` cancels it."
+        );
+        outln!();
+    }
 
     // Delegate liveness to the init system rather than guessing from a pid
     // file phux does not write.
@@ -1693,11 +2046,11 @@ fn config_home_from(
 mod tests {
     use super::{
         Manager, RESTART_THROTTLE_SECS, Reconcile, SERVICE_MANAGED_ENV, START_LIMIT_BURST,
-        ServicePlan, config_home_from, dry_run_text, home_dir_from, launchd_label_for,
+        ServicePlan, arm_unit, config_home_from, dry_run_text, home_dir_from, launchd_label_for,
         launchd_policy_lines, reconcile_unit, render_launchd_plist, render_systemd_unit,
         render_unit, render_wrapper_script, resolve_plan, sh_quote, systemd_escape,
         systemd_policy_lines, systemd_quote, systemd_unit_for, systemd_unquote,
-        unit_socket_override, xml_escape, xml_unescape,
+        unit_socket_override, unit_supervises, xml_escape, xml_unescape,
     };
     use std::path::PathBuf;
 
@@ -2545,6 +2898,77 @@ WantedBy=default.target
         assert!(
             !render_systemd_unit(&plan).contains(&ambient_path),
             "systemd unit captured the process's ambient PATH"
+        );
+    }
+
+    /// The socket-match guard behind a pending adoption (ADR-0088).
+    ///
+    /// The hand-over diverts a cold start away from an ordinary auto-spawn, so
+    /// a false positive starts a *different* instance's server on a socket it
+    /// was never meant to own. The guard is asserted against units this
+    /// generator actually renders — both managers, both with and without a
+    /// `--socket` override — rather than against hand-written fixtures, so it
+    /// cannot pass while disagreeing with what install writes.
+    #[test]
+    fn only_the_unit_that_owns_this_socket_completes_an_adoption() {
+        let overridden = PathBuf::from("/tmp/custom/phux.sock");
+        let plan = resolve_plan(None, None, false, Some(overridden.clone()), false)
+            .expect("resolve_plan with a socket override");
+
+        for manager in [Manager::Launchd, Manager::Systemd] {
+            let body = render_unit(manager, &plan);
+            assert!(
+                unit_supervises(manager, &body, &overridden),
+                "{manager:?}: a unit carrying PHUX_SOCKET must match that socket"
+            );
+            assert!(
+                !unit_supervises(manager, &body, &PathBuf::from("/tmp/somewhere-else.sock")),
+                "{manager:?}: a unit for another socket must not complete this adoption"
+            );
+        }
+
+        // No override: the unit names no socket, so the match is against the
+        // path the supervised server would resolve. `reconcile` reads it the
+        // same way, which is the point of sharing `unit_socket_override`.
+        let default = resolve_plan(None, None, false, None, false).expect("resolve_plan");
+        for manager in [Manager::Launchd, Manager::Systemd] {
+            let body = render_unit(manager, &default);
+            assert!(
+                unit_supervises(manager, &body, &default.socket_path),
+                "{manager:?}: a default-socket unit must match the resolved default"
+            );
+            assert!(
+                !unit_supervises(manager, &body, &overridden),
+                "{manager:?}: a default-socket unit must not claim an overridden socket"
+            );
+        }
+    }
+
+    /// Arming and loading must stay two operations.
+    ///
+    /// `--adopt`'s entire safety property is that the unit reaches disk in the
+    /// exact bytes a plain install would write, and that the init system is
+    /// *not* asked to start it. A refactor that folded `arm_unit` back into
+    /// `reload` would restore phux-67wg's crash-loop while every rendering
+    /// test kept passing, because the bytes are identical either way. This
+    /// pins the one difference that matters: arming never starts anything.
+    ///
+    /// launchd needs no command at all (a plist in `~/Library/LaunchAgents` is
+    /// armed by existing), which is why arming it is infallible and asserted
+    /// here rather than shelled out to a `launchctl` this test must not run.
+    #[test]
+    fn arming_a_launchd_unit_runs_no_command() {
+        arm_unit(Manager::Launchd)
+            .expect("arming a launchd unit is writing the file, which the caller already did");
+
+        // And the armed file has to be one that actually starts a server when
+        // launchd finally bootstraps it. `RunAtLoad` is what makes "the unit
+        // is on disk" equivalent to "the unit is armed" on macOS; without it,
+        // an adopt install would commit supervision that never begins.
+        let plan = resolve_plan(None, None, false, None, false).expect("resolve_plan");
+        assert!(
+            render_launchd_plist(&plan).contains("<key>RunAtLoad</key>\n  <true/>"),
+            "an armed plist must still start the server at bootstrap"
         );
     }
 }
