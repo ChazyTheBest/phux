@@ -46,6 +46,9 @@ pub mod sgr;
 #[cfg(feature = "server")]
 pub mod kitty_replay;
 
+#[cfg(feature = "server")]
+pub mod render_pool;
+
 pub use caps::{
     ACKNOWLEDGED_INPUT, BootstrapCapabilities, BootstrapCodec, BootstrapLimits, BootstrapProfile,
     BootstrapProfileKind, BootstrapProfileSet, BootstrapStreamProfile, ClientCapabilities,

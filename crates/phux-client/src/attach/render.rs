@@ -24,13 +24,17 @@
 use std::io::{self, Write};
 
 use libghostty_vt::{
-    RenderState, Terminal as GhosttyTerminal,
-    render::{CellIterator, CursorVisualStyle, Dirty, RowIterator, Snapshot},
+    Terminal as GhosttyTerminal,
+    render::{CursorVisualStyle, Dirty, Snapshot},
     screen::CellWide,
     style::{RgbColor, Style, StyleColor, Underline},
 };
 use phux_core::screen::{CellColor, CellStyle, CursorState, RenderedFrame};
-use phux_protocol::{kitty_replay, sgr::write_reset_and_sgr};
+use phux_protocol::{
+    kitty_replay,
+    render_pool::{RenderPool, RenderWalk},
+    sgr::write_reset_and_sgr,
+};
 
 /// Errors the renderer can surface.
 #[derive(Debug, thiserror::Error)]
@@ -62,13 +66,21 @@ pub use crate::render::overlay::selection::SelectionRect;
 
 /// Per-pane render scaffolding.
 ///
-/// Owns the libghostty render iterators so they're reused across frames
+/// Owns a [`RenderPool`] — the libghostty render trio plus the
+/// geometry-change rebuild — so the iterators are reused across frames
 /// instead of reallocated each tick.
+///
+/// The pool owns allocation and geometry only. This renderer's dirty policy —
+/// clear each row it drew, then clear the snapshot-level bit — stays here,
+/// because the other walkers of a libghostty grid in this workspace
+/// legitimately use different ones (ADR-0086).
 #[derive(Debug)]
 pub struct TerminalRenderer<'alloc> {
-    state: RenderState<'alloc>,
-    rows: RowIterator<'alloc>,
-    cells: CellIterator<'alloc>,
+    /// Pooled render state + row/cell iterators. Rebuilt when the pane's
+    /// grid changes dimensions (`phux-5pyx`) — the server's snapshot
+    /// synthesizer has done this since that bead; this renderer inherited it
+    /// by adopting the shared pool.
+    pool: RenderPool<'alloc>,
     kitty_placements: libghostty_vt::kitty::graphics::PlacementIterator<'alloc>,
     /// Last-seen authoritative cursor position (outer-viewport coords:
     /// pane-local cursor plus [`Self::last_origin`]). Updated at the end of
@@ -103,9 +115,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
     /// not per frame.
     pub fn new() -> Result<Self, RenderError> {
         Ok(Self {
-            state: RenderState::new()?,
-            rows: RowIterator::new()?,
-            cells: CellIterator::new()?,
+            pool: RenderPool::new()?,
             kitty_placements: libghostty_vt::kitty::graphics::PlacementIterator::new()?,
             last_cursor: None,
             last_cursor_local: None,
@@ -212,17 +222,21 @@ impl<'alloc> TerminalRenderer<'alloc> {
         row: u16,
         col: u16,
     ) -> Result<Option<Vec<char>>, RenderError> {
-        let snapshot = self.state.update(terminal)?;
+        let RenderWalk {
+            snapshot,
+            rows,
+            cells,
+        } = self.pool.begin(terminal)?;
         let rows_total = snapshot.rows()?;
         let cols_total = snapshot.cols()?;
         if row >= rows_total || col >= cols_total {
             return Ok(None);
         }
-        let mut row_iter = self.rows.update(&snapshot)?;
+        let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
         while let Some(this_row) = row_iter.next() {
             if row_index == row {
-                let mut cell_iter = self.cells.update(this_row)?;
+                let mut cell_iter = cells.update(this_row)?;
                 cell_iter.select(col)?;
                 return Ok(Some(cell_iter.graphemes()?));
             }
@@ -338,7 +352,11 @@ impl<'alloc> TerminalRenderer<'alloc> {
     ) -> Result<Option<CursorState>, RenderError> {
         let (ox, oy) = origin;
         let (clip_cols, clip_rows) = clip;
-        let snapshot = self.state.update(terminal)?;
+        let RenderWalk {
+            snapshot,
+            rows,
+            cells,
+        } = self.pool.begin(terminal)?;
         // Clip to the render rect, mirroring `render_at_inner`: a
         // server-authoritative mirror may transiently exceed the client's
         // layout rect during a resize handshake; confine the walk so a wider
@@ -346,14 +364,14 @@ impl<'alloc> TerminalRenderer<'alloc> {
         let rows_total = snapshot.rows()?.min(clip_rows);
         let cols_total = snapshot.cols()?.min(clip_cols);
 
-        let mut row_iter = self.rows.update(&snapshot)?;
+        let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
         while let Some(row) = row_iter.next() {
             if row_index >= rows_total {
                 break;
             }
             let mut col: u16 = 0;
-            let mut cell_iter = self.cells.update(row)?;
+            let mut cell_iter = cells.update(row)?;
             while let Some(cell) = cell_iter.next() {
                 if col >= cols_total {
                     break;
@@ -451,7 +469,11 @@ impl<'alloc> TerminalRenderer<'alloc> {
         // echoes, and the pane stays at this origin even on a clean (no-op)
         // render.
         self.last_origin = origin;
-        let snapshot = self.state.update(terminal)?;
+        let RenderWalk {
+            snapshot,
+            rows,
+            cells,
+        } = self.pool.begin(terminal)?;
         let dirty = if force_full {
             Dirty::Full
         } else {
@@ -482,7 +504,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
 
         // Walk rows. Under `Dirty::Full` paint every row; under
         // `Dirty::Partial` skip rows whose per-row dirty bit is clear.
-        let mut row_iter = self.rows.update(&snapshot)?;
+        let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
         // Clip to the render rect: a server-authoritative mirror may be
         // larger than the client's layout rect during a resize handshake;
@@ -508,7 +530,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
                 // each cell is emitted with its real style — see `SelectionRect`.
                 let selection = self.selection;
                 let mut col: u16 = 0;
-                let mut cell_iter = self.cells.update(row)?;
+                let mut cell_iter = cells.update(row)?;
                 while let Some(cell) = cell_iter.next() {
                     if col >= cols_total {
                         break;
@@ -947,7 +969,10 @@ fn emit_cursor_style(
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
-    use libghostty_vt::{Terminal as GhosttyTerminal, TerminalOptions};
+    use libghostty_vt::{
+        RenderState, Terminal as GhosttyTerminal, TerminalOptions,
+        render::{CellIterator, RowIterator},
+    };
 
     /// The core copy-mode fix: with a selection set, the renderer emits the
     /// real pane content and reverse-videos (SGR 7) the selected cells — no
@@ -1064,6 +1089,56 @@ mod tests {
             max_scrollback: 100,
         })
         .expect("Terminal::new")
+    }
+
+    /// ADR-0086: the renderer's pooled render state is rebuilt when the pane's
+    /// grid changes dimensions, so a post-resize paint serves the live grid
+    /// rather than the pooled cache's pre-resize row bodies (`phux-5pyx`).
+    ///
+    /// The server's snapshot synthesizer has had this since `phux-5pyx`; the
+    /// client renderer inherited it by adopting the shared `RenderPool`, and
+    /// before that adoption it had no equivalent. Like the server's
+    /// counterpart this is a forward-looking contract lock, not a
+    /// fails-without-the-fix guard: the original staleness is a
+    /// timing-dependent shared-dirty-bit race with no deterministic
+    /// single-threaded repro.
+    #[test]
+    fn pooled_render_state_is_rebuilt_after_a_geometry_change() {
+        let mut t = fresh(10, 2);
+        t.vt_write(b"AA");
+        let mut renderer = TerminalRenderer::new().expect("renderer");
+
+        let mut before: Vec<u8> = Vec::new();
+        let _ = renderer
+            .render_at_full(&t, &mut before, (0, 0), (10, 2))
+            .expect("first paint");
+        assert_eq!(
+            renderer.pool.last_dims(),
+            Some((10, 2)),
+            "the first walk records the live dims"
+        );
+
+        // Grow the grid and overwrite row 0, then race a walk through a
+        // SEPARATE render state that consumes the terminal's per-row dirty
+        // bits — the shape that leaves a pooled cache serving stale rows.
+        t.resize(10, 4, 0, 0).expect("resize");
+        t.vt_write(b"\x1b[1;1HZZ");
+        let _ = read_grid(&t, 10, 4);
+
+        let mut after: Vec<u8> = Vec::new();
+        let _ = renderer
+            .render_at_full(&t, &mut after, (0, 0), (10, 4))
+            .expect("post-resize paint");
+        assert_eq!(
+            renderer.pool.last_dims(),
+            Some((10, 4)),
+            "the pool tracks the new dims"
+        );
+        let painted = String::from_utf8_lossy(&after);
+        assert!(
+            painted.contains("ZZ"),
+            "post-resize paint must serve the fresh 'ZZ', not the stale cache, got {painted:?}"
+        );
     }
 
     #[test]

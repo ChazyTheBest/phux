@@ -35,6 +35,7 @@ use phux_core::screen::{
 };
 use phux_protocol::{
     kitty_replay,
+    render_pool::{RenderPool, RenderWalk},
     sgr::{write_reset_and_sgr, write_reset_and_sgr_unresolved},
 };
 
@@ -154,15 +155,21 @@ impl std::io::Write for BoundedSnapshotBytes {
 
 /// Pooled per-pane snapshot scaffolding.
 ///
-/// Owns the libghostty render iterators ([`RenderState`], [`RowIterator`],
-/// [`CellIterator`]) so the synthesis path reuses them across attaches
-/// instead of reallocating each time. The free [`synthesize`] function is
-/// the one-shot wrapper.
+/// Owns a [`RenderPool`] — the libghostty render trio ([`RenderState`],
+/// [`RowIterator`], [`CellIterator`]) plus the geometry-change rebuild — so
+/// the synthesis path reuses them across attaches instead of reallocating
+/// each time. The free [`synthesize`] function is the one-shot wrapper.
+///
+/// The pool owns allocation and geometry only; every dirty-bit decision stays
+/// here, because this type alone holds three *different* policies
+/// ([`Self::mark_synced`] clears both levels, [`Self::synthesize_incremental`]
+/// deliberately clears neither, and the per-tick reference diff bypasses the
+/// bits entirely). See ADR-0086.
 #[derive(Debug)]
 pub struct SnapshotSynthesizer<'alloc> {
-    render_state: RenderState<'alloc>,
-    rows: RowIterator<'alloc>,
-    cells: CellIterator<'alloc>,
+    /// Pooled render state + row/cell iterators, rebuilt on a geometry
+    /// change (`phux-5pyx`; the rebuild now lives in [`RenderPool::begin`]).
+    pool: RenderPool<'alloc>,
     /// phux-ahk.2: per-tick rendered row bodies, shared across all
     /// consumers of this pane. [`Self::prepare_tick`] renders every row
     /// ONCE into these buffers; each consumer's [`Self::diff_consumer`]
@@ -181,54 +188,17 @@ pub struct SnapshotSynthesizer<'alloc> {
     /// diff only when that consumer's reference disagrees with the live
     /// alt-screen state.
     tick_screen_toggle: Vec<u8>,
-    /// phux-5pyx: the `(cols, rows)` the pooled `render_state` last walked,
-    /// so a resize can be detected and the pool rebuilt. libghostty's per-row
-    /// dirty bits live on the `Terminal` and are cleared by whichever
-    /// `RenderState` reads a row first; after a `TERMINAL_RESIZE` raced a
-    /// fresh-state walk (the `GET_SCREEN` path, which goes fresh per call for
-    /// exactly this reason), the pooled cache reports the new dims yet keeps
-    /// returning the pre-resize row bodies. Rebuilding the pool on a dims
-    /// change hands the next walk a clean cache. `None` until the first walk.
-    last_dims: Option<(u16, u16)>,
 }
 
 impl<'alloc> SnapshotSynthesizer<'alloc> {
     /// Allocate a fresh pool of render iterators. Do this once per pane.
     pub fn new() -> Result<Self, SynthesisError> {
         Ok(Self {
-            render_state: RenderState::new()?,
-            rows: RowIterator::new()?,
-            cells: CellIterator::new()?,
+            pool: RenderPool::new()?,
             tick_rows: Vec::new(),
             tick_epilogue: Vec::new(),
             tick_screen_toggle: Vec::new(),
-            last_dims: None,
         })
-    }
-
-    /// Rebuild the pooled `render_state` + iterators when `terminal`'s
-    /// dimensions have changed since the last pooled walk (phux-5pyx).
-    ///
-    /// Every pooled-state path ([`Self::prepare_tick`],
-    /// [`Self::synthesize_incremental`], [`Self::mark_synced`]) calls this
-    /// immediately before `self.render_state.update`. After a resize the pooled
-    /// cache can serve stale row bodies (see [`Self::last_dims`]); a fresh pool
-    /// has no prior cache, so its first `update` observes every row as it is now —
-    /// the same root fix the fresh-per-call `GET_SCREEN` path
-    /// ([`Self::screen_state_with_scrollback`]) uses, scoped here to the rare
-    /// resize tick instead of every call.
-    fn refresh_pool_on_resize(
-        &mut self,
-        terminal: &GhosttyTerminal<'alloc, '_>,
-    ) -> Result<(), SynthesisError> {
-        let live = (terminal.cols()?, terminal.rows()?);
-        if self.last_dims != Some(live) {
-            self.render_state = RenderState::new()?;
-            self.rows = RowIterator::new()?;
-            self.cells = CellIterator::new()?;
-            self.last_dims = Some(live);
-        }
-        Ok(())
     }
 
     /// Walk `terminal`'s viewport and emit a VT byte sequence that
@@ -525,7 +495,7 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
             .map(ToOwned::to_owned);
 
         // Fresh render state + iterators per call, NOT the pooled
-        // `self.render_state`/`self.rows`/`self.cells`. The pooled state
+        // `self.pool`. The pooled state
         // can serve stale rows: after a `TERMINAL_RESIZE` raced an
         // attach/resync snapshot (which walks the grid through its own
         // fresh state), the pooled cache reported the new dims yet kept
@@ -730,14 +700,13 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
         &mut self,
         terminal: &GhosttyTerminal<'alloc, '_>,
     ) -> Result<(), SynthesisError> {
-        self.refresh_pool_on_resize(terminal)?;
-        let snapshot = self.render_state.update(terminal)?;
+        let RenderWalk { snapshot, rows, .. } = self.pool.begin(terminal)?;
         let rows_n = snapshot.rows()?;
         // Walk rows and clear each dirty bit. The row-level clear is
         // separate from the snapshot-level clear — see render.h's "Dirty
         // Tracking" section: both must be reset to bring this consumer
         // back to Clean on the next `update`.
-        let mut row_iter = self.rows.update(&snapshot)?;
+        let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
         while let Some(row) = row_iter.next() {
             if row_index >= rows_n {
@@ -777,8 +746,11 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
         &mut self,
         terminal: &GhosttyTerminal<'alloc, '_>,
     ) -> Result<SnapshotBytes, SynthesisError> {
-        self.refresh_pool_on_resize(terminal)?;
-        let snapshot = self.render_state.update(terminal)?;
+        let RenderWalk {
+            snapshot,
+            rows,
+            cells,
+        } = self.pool.begin(terminal)?;
         let cols = snapshot.cols()?;
         let rows_n = snapshot.rows()?;
 
@@ -802,14 +774,14 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
                 emit_screen_mode(&mut out, terminal)?;
 
                 let mut prev_style: Option<Pen> = None;
-                let mut row_iter = self.rows.update(&snapshot)?;
+                let mut row_iter = rows.update(&snapshot)?;
                 let mut row_index: u16 = 0;
                 while let Some(row) = row_iter.next() {
                     if row_index >= rows_n {
                         break;
                     }
                     write_cup(&mut out, row_index, 0);
-                    let mut cell_iter = self.cells.update(row)?;
+                    let mut cell_iter = cells.update(row)?;
                     while let Some(cell) = cell_iter.next() {
                         emit_cell(cell, &mut out, &mut prev_style)?;
                     }
@@ -830,7 +802,7 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
                 // rows is unchanged.
                 let mut out: Vec<u8> = Vec::with_capacity(usize::from(cols) * usize::from(rows_n));
                 let mut prev_style: Option<Pen> = None;
-                let mut row_iter = self.rows.update(&snapshot)?;
+                let mut row_iter = rows.update(&snapshot)?;
                 let mut row_index: u16 = 0;
                 while let Some(row) = row_iter.next() {
                     if row_index >= rows_n {
@@ -841,7 +813,7 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
                         continue;
                     }
                     write_cup(&mut out, row_index, 0);
-                    let mut cell_iter = self.cells.update(row)?;
+                    let mut cell_iter = cells.update(row)?;
                     while let Some(cell) = cell_iter.next() {
                         emit_cell(cell, &mut out, &mut prev_style)?;
                     }
@@ -947,8 +919,11 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
         terminal: &GhosttyTerminal<'alloc, '_>,
     ) -> Result<(u16, u16, ReferenceCursorMode), SynthesisError> {
         let _span = tracing::debug_span!("prepare_tick").entered();
-        self.refresh_pool_on_resize(terminal)?;
-        let snapshot = self.render_state.update(terminal)?;
+        let RenderWalk {
+            snapshot,
+            rows,
+            cells,
+        } = self.pool.begin(terminal)?;
         let cols = snapshot.cols()?;
         let rows_n = snapshot.rows()?;
 
@@ -970,7 +945,7 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
         // ticks regardless of neighbouring rows.
         {
             let tick_rows = &mut self.tick_rows;
-            let mut row_iter = self.rows.update(&snapshot)?;
+            let mut row_iter = rows.update(&snapshot)?;
             let mut row_index: usize = 0;
             while let Some(row) = row_iter.next() {
                 if row_index >= rows_usize {
@@ -978,7 +953,7 @@ impl<'alloc> SnapshotSynthesizer<'alloc> {
                 }
                 let body = &mut tick_rows[row_index];
                 let mut prev_style: Option<Pen> = None;
-                let mut cell_iter = self.cells.update(row)?;
+                let mut cell_iter = cells.update(row)?;
                 while let Some(cell) = cell_iter.next() {
                     emit_cell(cell, body, &mut prev_style)?;
                 }
@@ -1787,7 +1762,11 @@ mod tests {
             synth.tick_rows.iter().any(|b| b.contains(&b'Z')),
             "post-resize tick must serve the fresh 'ZZ', not the stale cache"
         );
-        assert_eq!(synth.last_dims, Some((10, 4)), "pool tracks the live dims");
+        assert_eq!(
+            synth.pool.last_dims(),
+            Some((10, 4)),
+            "pool tracks the live dims"
+        );
     }
 
     /// phux-9q5f: a scrollback-bearing snapshot, applied to a fresh client
