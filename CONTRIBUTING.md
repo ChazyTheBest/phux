@@ -106,6 +106,28 @@ red build in one of them, the answer is on the runner, not on your machine.
   checks, install-surface drift, formula generation, and a `phux-protocol`
   package dry-run.
 
+### Gates that are local-only, and why
+
+The mirror image of the list above: these have no CI equivalent, on purpose,
+because the thing they check does not exist on a runner.
+
+- **Release-milestone label coverage** (`just milestone-check`,
+  `scripts/check-milestone-labels.mjs`). Asserts that every non-closed bead
+  carries exactly one of `rc-1.0` / `post-1.0`, so that "what is left for
+  1.0" — which is a label query — cannot silently undercount. It queries the
+  live Dolt store through `bd`. CI has no store to query: `.beads/dolt/` and
+  `.beads/embeddeddolt/` are gitignored, and the tracked
+  `.beads/issues.jsonl` is a passive export that is also deliberately
+  scrubbed, so it is neither current nor complete by design. A check reading
+  it could pass while the store has unlabelled beads and fail on records the
+  store no longer has, which is why the JSONL fallback does not exist. Run it
+  at session close; it is advisory. **Failure modes, all deliberate:** no
+  `bd` on PATH or no local store prints `SKIPPED` and exits 0 without
+  claiming anything about labels; an unlabelled or double-labelled bead exits
+  1 and names it. Every run prints the store path, the record counts it read,
+  and the export it did not read, so the verdict is never separable from its
+  provenance.
+
 ## Additional expectations
 
 - **Test what you change.** Protocol changes need `proptest` roundtrip

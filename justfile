@@ -358,6 +358,22 @@ font-check:
 e2e-lane-check:
     bash scripts/check-e2e-lanes.sh
 
+# Release-milestone label coverage in the beads tracker: every non-closed bead
+# carries exactly one of `rc-1.0` / `post-1.0`, so "what is left for 1.0" — a
+# label query — cannot silently undercount (phux-i7vu, phux-axdt).
+#
+# DELIBERATELY NOT IN `ci`. This queries the live Dolt store through `bd`; a
+# CI checkout has no store (`.beads/embeddeddolt/` is gitignored) and the
+# tracked `.beads/issues.jsonl` is a passive, deliberately scrubbed export, so
+# the only CI-shaped implementation would be one that reads a snapshot and is
+# wrong in both directions. Advisory and local: run it at session close. It
+# skips with exit 0 when there is no store, and never prints a verdict about
+# labels it could not read. See the header of the script for the full argument.
+
+# Every non-closed bead carries exactly one of rc-1.0 / post-1.0 — advisory, local-only.
+milestone-check:
+    node scripts/check-milestone-labels.mjs
+
 # Everything CI must pass, minus the lanes that need a real server (see
 # `ci-full`). This is the inner-loop bar: everything here is deterministic
 # and machine-independent, so a green run predicts a green `check` job.
