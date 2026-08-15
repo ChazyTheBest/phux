@@ -705,6 +705,17 @@ the address explicitly. Only the default profile auto-binds — a port is
 global to the host, so a `dev`-profile server would otherwise race the
 installed one (see [ADR-0080](./../ADR/0080-socket-lifecycle-and-instance-isolation.md)).
 
+The auto-bound listener comes up **shortly after** the server starts serving,
+not before it. Detecting the overlay address means running the `tailscale`
+CLI, and the server's startup path is not allowed to block on a subprocess:
+sessions, panes, and the UDS accept loop are live first, and detection then
+runs off-thread and binds the remote ports when it answers. A wedged
+`tailscaled` therefore costs a late remote listener (bounded at two seconds,
+after which detection falls back to the route heuristic), never a late
+server. Explicitly configured `--listen` / `--quic` addresses need no
+detection and are bound before the first session exists, so a client that was
+told an address can always connect to it.
+
 The explicit form, for a host with no detectable overlay:
 
 ```sh

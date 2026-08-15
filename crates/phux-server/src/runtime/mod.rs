@@ -492,6 +492,16 @@ pub struct ServerRuntime {
     /// Raw `--connect HOST:PORT` override, retained only so graceful upgrade
     /// can reconstruct the same CLI surface.
     connect_override: Option<String>,
+    /// Source of the host's overlay addresses for the auto-bound remote
+    /// listener (ADR-0081). Defaults to [`phux_config::overlay::detect`].
+    ///
+    /// A plain function pointer, and deliberately *not* called anywhere on
+    /// the startup path (phux-90j5): it is handed to
+    /// [`serve_auto_overlay_listeners`], which runs it on a blocking thread
+    /// after the accept loops are already live. Tests override it via
+    /// [`Self::overlay_detect`] to stand in for a slow or wedged
+    /// `tailscale`.
+    overlay_detect: fn() -> Vec<std::net::IpAddr>,
 }
 
 impl ServerRuntime {
@@ -509,7 +519,26 @@ impl ServerRuntime {
             satellites: Vec::new(),
             connectors: Vec::new(),
             connect_override: None,
+            overlay_detect: phux_config::overlay::detect,
         }
+    }
+
+    /// Override the overlay-address source used by the auto-bound remote
+    /// listener (ADR-0081).
+    ///
+    /// The only reason this seam is public: the property the auto-listen
+    /// path exists to guarantee — that a server
+    /// serves clients *without waiting* for overlay detection — can only be
+    /// asserted against a detector the test controls the timing of. The
+    /// production default shells out to `tailscale`, whose latency is a
+    /// property of the developer's machine (installed and healthy: ~90ms;
+    /// wedged: the 2s deadline; absent: a fast UDP route probe), and a test
+    /// that turns on whether a VPN client happens to be installed proves
+    /// nothing. See `tests/overlay_startup.rs`.
+    #[must_use]
+    pub const fn overlay_detect(mut self, detect: fn() -> Vec<std::net::IpAddr>) -> Self {
+        self.overlay_detect = detect;
+        self
     }
 
     /// Resume from a graceful upgrade (ADR-0032): read the handoff state blob
@@ -804,6 +833,11 @@ impl ServerRuntime {
         // inside the accept setup.
         #[cfg(feature = "webtransport")]
         let webtransport_addr_override = self.wt_addr;
+        // Overlay-address source for the auto-bound remote listener
+        // (ADR-0081). Captured as a function pointer and *not* called here:
+        // see `serve_auto_overlay_listeners` for why calling it anywhere on
+        // this path is the defect phux-90j5 removed.
+        let overlay_detect = self.overlay_detect;
         // Wire the policy engine from config into shared state.
         if let Some(engine) = self.cfg.policy_engine.clone() {
             state.with_mut(|s| s.set_policy_engine(engine));
@@ -906,6 +940,46 @@ impl ServerRuntime {
                     );
                 }
 
+                // Explicitly configured listeners are resolved BEFORE the
+                // session tree exists (phux-90j5). Nothing here is allowed
+                // to cost real time — every address is a flag or an
+                // environment variable already in memory, and the binds are
+                // local — but the ordering is what matters: any cost that
+                // ever lands between "the pane exists" and "the accept loop
+                // runs" is a window in which a live pane's clock is
+                // advancing against a server nobody can reach. That window
+                // is what produced the phux-5wxp flake family, so the
+                // startup path is arranged so it cannot reopen.
+                //
+                // The one input that genuinely cannot be resolved for free
+                // — the detected overlay address, which shells out to
+                // `tailscale` — is not resolved here at all; see
+                // `serve_auto_overlay_listeners` below.
+
+                // Optionally also accept WebSocket connections (phux-486.4) so
+                // browser consumers (`phux-web`) can speak the identical wire.
+                // Opt-in via `phux server --listen <ADDR>` or the `PHUX_WS_ADDR`
+                // environment variable (e.g. "127.0.0.1:8787"); UDS is always
+                // on. The flag wins when both are set.
+                let ws_addr = ws_addr_override.or_else(|| env_socket_addr("PHUX_WS_ADDR"));
+                let ws_listener = match ws_addr {
+                    Some(addr) => build_ws_listener(addr).await,
+                    None => None,
+                };
+                // Optionally also accept QUIC connections (phux-y8v6, ADR-0007).
+                // Opt-in via `phux server --quic <ADDR>` or `PHUX_QUIC_ADDR`;
+                // QUIC carries the identical frames over a TLS 1.3 stream.
+                let quic_addr = quic_addr_override.or_else(|| env_socket_addr("PHUX_QUIC_ADDR"));
+                let quic_listener = quic_addr.and_then(build_quic_listener);
+                // Optionally also accept WebTransport connections (phux-0wmf):
+                // HTTP/3 over QUIC, the browser's QUIC-class door (`phux-web`
+                // dials it, falling back to WebSocket). Opt-in via
+                // `phux server --webtransport <ADDR>` or `PHUX_WT_ADDR`.
+                #[cfg(feature = "webtransport")]
+                let webtransport_listener = webtransport_addr_override
+                    .or_else(|| env_socket_addr("PHUX_WT_ADDR"))
+                    .and_then(build_wt_listener);
+
                 // Graceful-upgrade resume (ADR-0032): rebuild the whole
                 // session tree from the handoff blob, re-adopting each pane's
                 // inherited PTY. Runs inside the LocalSet so the rebuilt pane
@@ -965,54 +1039,26 @@ impl ServerRuntime {
                         );
                     }
                 }
-                // The overlay address (if any) is shared by the WS and QUIC
-                // auto-listeners below. `get_or_insert_with` makes it lazy
-                // *and* memoized: `phux_config::overlay::detect()` shells out
-                // to the `tailscale` CLI (~140ms, phux-c6g6) and must run at
-                // most once per start, only when both the disable switch and
-                // the profile gate leave it relevant, and not at all when an
-                // explicit `--listen`/`--quic` flag or env var already
-                // answers both ports.
-                let mut auto_overlay_ip: Option<Option<std::net::IpAddr>> = None;
-                let mut auto_overlay_ip = || {
-                    *auto_overlay_ip.get_or_insert_with(|| {
-                        resolve_auto_overlay_ip(
-                            auto_overlay_gate_open(
-                                std::env::var_os(DISABLE_AUTO_LISTEN_ENV).is_some(),
-                                phux_config::instance::is_default_profile(),
-                            ),
-                            phux_config::overlay::detect,
-                        )
-                    })
+                // The auto-bound overlay listener (ADR-0081) is the only
+                // startup input that has to ask the outside world a
+                // question, so it is not asked here: the ports it would
+                // claim are handed to `serve_auto_overlay_listeners`, which
+                // joins the accept set as a peer of the real accept loops
+                // and does its detection and binding after they are already
+                // serving.
+                let auto_overlay_ports = AutoOverlayPorts {
+                    ws: ws_addr.is_none(),
+                    quic: quic_addr.is_none(),
                 };
-
-                // Optionally also accept WebSocket connections (phux-486.4) so
-                // browser consumers (`phux-web`) can speak the identical wire.
-                // Opt-in via `phux server --listen <ADDR>` or the `PHUX_WS_ADDR`
-                // environment variable (e.g. "127.0.0.1:8787"); UDS is always
-                // on. The flag wins when both are set.
-                let ws_addr = ws_addr_override
-                    .or_else(|| env_socket_addr("PHUX_WS_ADDR"))
-                    .or_else(|| auto_overlay_ip().map(|ip| SocketAddr::new(ip, DEFAULT_WS_PORT)));
-                let ws_listener = match ws_addr {
-                    Some(addr) => build_ws_listener(addr).await,
-                    None => None,
-                };
-                // Optionally also accept QUIC connections (phux-y8v6, ADR-0007).
-                // Opt-in via `phux server --quic <ADDR>` or `PHUX_QUIC_ADDR`;
-                // QUIC carries the identical frames over a TLS 1.3 stream.
-                let quic_addr = quic_addr_override
-                    .or_else(|| env_socket_addr("PHUX_QUIC_ADDR"))
-                    .or_else(|| auto_overlay_ip().map(|ip| SocketAddr::new(ip, DEFAULT_QUIC_PORT)));
-                let quic_listener = quic_addr.and_then(build_quic_listener);
-                // Optionally also accept WebTransport connections (phux-0wmf):
-                // HTTP/3 over QUIC, the browser's QUIC-class door (`phux-web`
-                // dials it, falling back to WebSocket). Opt-in via
-                // `phux server --webtransport <ADDR>` or `PHUX_WT_ADDR`.
-                #[cfg(feature = "webtransport")]
-                let webtransport_listener = webtransport_addr_override
-                    .or_else(|| env_socket_addr("PHUX_WT_ADDR"))
-                    .and_then(build_wt_listener);
+                // Both gates are evaluated here, on cheap inputs (an
+                // environment lookup and the profile name), and the *answer*
+                // is what travels — never a detection result. `overlay_detect`
+                // moves as a function pointer, uncalled.
+                let auto_overlay_gate = auto_overlay_ports.any()
+                    && auto_overlay_gate_open(
+                        std::env::var_os(DISABLE_AUTO_LISTEN_ENV).is_some(),
+                        phux_config::instance::is_default_profile(),
+                    );
 
                 // UDS is always on; WS and QUIC are additive. Each transport's
                 // accept loop runs until the root token cancels. The first
@@ -1050,6 +1096,19 @@ impl ServerRuntime {
                         Some(input_lane_handle.clone()),
                     )));
                 }
+                // The auto-bound overlay listener joins the set as a future
+                // that has not detected anything yet. Its first poll happens
+                // below, concurrently with every accept loop above — so the
+                // server is already serving UDS clients while `tailscale` is
+                // still being asked.
+                accepts.push(Box::pin(serve_auto_overlay_listeners(
+                    auto_overlay_gate,
+                    auto_overlay_ports,
+                    overlay_detect,
+                    state.clone(),
+                    root_token.clone(),
+                    input_lane_handle.clone(),
+                )));
                 let (mut result, _index, remaining) =
                     futures_util::future::select_all(accepts).await;
                 if result.is_err() {
@@ -1156,12 +1215,146 @@ fn resolve_auto_overlay_ip(
     detect().into_iter().next()
 }
 
+/// Which of the two auto-bound overlay ports are still unclaimed by explicit
+/// configuration. A `--listen`/`--quic` flag or `PHUX_WS_ADDR`/
+/// `PHUX_QUIC_ADDR` answers its port outright, and the auto-listener must not
+/// contend with the address the operator actually asked for.
+#[derive(Debug, Clone, Copy)]
+struct AutoOverlayPorts {
+    /// The WebSocket port ([`DEFAULT_WS_PORT`]) is unclaimed.
+    ws: bool,
+    /// The QUIC port ([`DEFAULT_QUIC_PORT`]) is unclaimed.
+    quic: bool,
+}
+
+impl AutoOverlayPorts {
+    /// Whether an overlay address would be used for anything at all. When
+    /// neither port is free, detection has no consumer and must not run.
+    const fn any(self) -> bool {
+        self.ws || self.quic
+    }
+}
+
+/// Detect the overlay address and serve the auto-bound remote listeners
+/// (ADR-0081) — as a peer of the other accept loops, never ahead of them
+/// (phux-90j5).
+///
+/// **Why this is a future in the accept set rather than a step in startup.**
+/// Overlay detection shells out to the `tailscale` CLI, and that subprocess
+/// used to be waited on *between* the pre-seeded pane starting its shell and
+/// the accept loop first running — a window in which a live pane's clock is
+/// advancing against a server no client can reach. That is the exact shape
+/// behind the phux-5wxp flake family, and it is invisible on CI, which has no
+/// `tailscale` binary and so degrades to a fast UDP route probe.
+///
+/// Measured on a 14-core developer machine with Tailscale installed, server
+/// start to `HELLO_OK`, comparing the two placements of the same detector:
+///
+/// | detector             | on the startup path | behind the accept set |
+/// |----------------------|--------------------:|----------------------:|
+/// | real `tailscale ip`  |              ~94ms  |                 ~7ms  |
+/// | wedged `tailscaled`  |             ~2.01s  |                 ~7ms  |
+///
+/// The wedged row is the point: a startup that waits is bounded only by
+/// [`phux_config::overlay`]'s own deadline, whereas one that does not wait is
+/// bounded by nothing outside the process. (phux-c6g6 measured ~286ms for the
+/// stall when the pre-memoization code called `detect` twice.)
+///
+/// phux-c6g6 fixed the half of this where detection ran even with the gates
+/// closed (`&detect()` passed as an argument is evaluated before the callee
+/// can consult the gate — a kill switch that pays the cost and discards the
+/// answer). This is the other half: when the gates are *open*, detection is
+/// legitimate and still must not be on the critical path. It is therefore
+/// pushed behind the accept loops entirely, and moved off the runtime thread
+/// with `spawn_blocking` — a current-thread runtime that blocks in a
+/// subprocess wait blocks every accept loop with it, so being "concurrent"
+/// on paper is not enough.
+///
+/// Startup latency consequently does not depend on whether `tailscale` exists
+/// or how slowly it answers; a wedged tailscaled costs a late listener, not a
+/// late server. `tests/overlay_startup.rs` pins that.
+///
+/// The listener still exists before anyone asks for it, which is what
+/// ADR-0081 decided: a device is paired by running `phux pair` and scanning a
+/// QR, seconds later. Nothing about the address, the gating, or the
+/// `PHUX_NO_AUTO_LISTEN` opt-out changes here — only when the work happens.
+///
+/// Returns without ever completing early: when there is no overlay to bind,
+/// it parks on cancellation instead of resolving, so the enclosing
+/// `select_all` still treats a first completion as "an accept loop ended".
+async fn serve_auto_overlay_listeners(
+    gate_open: bool,
+    ports: AutoOverlayPorts,
+    detect: fn() -> Vec<std::net::IpAddr>,
+    state: SharedState,
+    root_token: CancellationToken,
+    input_lane: input_lane::InputLaneHandle,
+) -> Result<(), ServerError> {
+    // `spawn_blocking` is what takes the subprocess wait off the runtime
+    // thread. The gate is re-applied inside `resolve_auto_overlay_ip`, which
+    // is the single place that decides whether `detect` runs at all.
+    let detected = tokio::select! {
+        () = root_token.cancelled() => return Ok(()),
+        joined = tokio::task::spawn_blocking(move || resolve_auto_overlay_ip(gate_open, detect)) => {
+            joined.unwrap_or_else(|err| {
+                warn!(error = %err, "overlay detection task failed; no auto-bound remote listener");
+                None
+            })
+        }
+    };
+
+    let ws_listener = match detected.filter(|_| ports.ws) {
+        Some(ip) => build_ws_listener(SocketAddr::new(ip, DEFAULT_WS_PORT)).await,
+        None => None,
+    };
+    let quic_listener = detected
+        .filter(|_| ports.quic)
+        .and_then(|ip| build_quic_listener(SocketAddr::new(ip, DEFAULT_QUIC_PORT)));
+
+    let mut accepts: Vec<AcceptLoopFuture<'_>> = Vec::new();
+    if let Some(ws) = &ws_listener {
+        accepts.push(Box::pin(accept_loop(
+            ws,
+            state.clone(),
+            root_token.clone(),
+            Some(input_lane.clone()),
+        )));
+    }
+    if let Some(quic) = &quic_listener {
+        accepts.push(Box::pin(accept_loop(
+            quic,
+            state.clone(),
+            root_token.clone(),
+            Some(input_lane.clone()),
+        )));
+    }
+    if accepts.is_empty() {
+        debug!("no auto-bound overlay listener; nothing detected or nothing to bind");
+        root_token.cancelled().await;
+        return Ok(());
+    }
+
+    // Same joining discipline as the startup accept set: the first fatal
+    // result cancels the rest, and every remaining loop is still joined so
+    // its client tasks can flush SERVER_SHUTDOWN.
+    let (mut result, _index, remaining) = futures_util::future::select_all(accepts).await;
+    if result.is_err() {
+        root_token.cancel();
+    }
+    for tail in futures_util::future::join_all(remaining).await {
+        if result.is_ok() && tail.is_err() {
+            result = tail;
+        }
+    }
+    result
+}
+
 /// [`auto_overlay_gate_open`] plus the port, so the gating matrix is
 /// testable without a tailnet, a profile, or process-global env mutation.
-/// Test-only: the production path memoizes the overlay lookup once across
-/// both the WS and QUIC ports instead of taking it as a per-call argument
-/// (phux-c6g6), so this per-port composition only exists for the unit tests
-/// below.
+/// Test-only: production resolves the overlay address exactly once, in
+/// [`serve_auto_overlay_listeners`], and applies it to whichever of the two
+/// ports is still unclaimed — so this per-port composition only exists for
+/// the unit tests below.
 #[cfg(test)]
 fn auto_overlay_addr_from(
     disabled: bool,

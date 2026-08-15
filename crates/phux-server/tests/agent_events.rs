@@ -22,18 +22,26 @@
 //! the bet does not produce a flaky assertion, it produces a permanently
 //! failing one.
 //!
-//! That bet loses **deterministically on any machine with the `tailscale`
-//! CLI on `$PATH`**. `ServerRuntime::run_async` pre-seeds the pane (which
-//! starts the seed shell's clock) and only *then* computes its optional
-//! WebSocket and QUIC listen addresses. Each of those calls
+//! That bet lost **deterministically on any machine with the `tailscale`
+//! CLI on `$PATH`**. `ServerRuntime::run_async` pre-seeded the pane (which
+//! starts the seed shell's clock) and only *then* computed its optional
+//! WebSocket and QUIC listen addresses. Each of those called
 //! `phux_config::overlay::detect()`, which shells out to `tailscale ip -4`
 //! — roughly 150ms per call, twice, synchronously, on the server's
-//! current-thread runtime, before the accept loop ever runs. The client
-//! cannot be served for ~300-400ms, by which time the seed has already
+//! current-thread runtime, before the accept loop ever ran. The client
+//! could not be served for ~300-400ms, by which time the seed had already
 //! spoken. CI has no `tailscale` binary, so `detect()` degrades to a fast
-//! UDP route probe, no stall occurs, and the same code passes there. A
+//! UDP route probe, no stall occurred, and the same code passed there. A
 //! test whose outcome turns on whether a VPN client happens to be
 //! installed is a test nobody can trust.
+//!
+//! The startup path no longer works that way — phux-c6g6 stopped detection
+//! running behind closed gates, and phux-90j5 moved the open-gate case off
+//! the startup path entirely (`runtime::serve_auto_overlay_listeners`,
+//! `tests/overlay_startup.rs`). The barrier below is kept regardless, and
+//! the history is kept with it: what makes these tests trustworthy is that
+//! they do not depend on server-startup latency being small, not that it
+//! currently is.
 //!
 //! These tests are made **independent** of that dependency rather than
 //! skipped when it is present. Nothing here is about overlay networking or
