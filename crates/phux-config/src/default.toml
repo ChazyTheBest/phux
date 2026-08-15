@@ -450,3 +450,28 @@ right = [
 # enabled = false
 # width = 20
 # position = "left"
+
+# Responsive-chrome breakpoints. The chrome adapts to small terminals
+# around three thresholds; these move them without moving the behaviour.
+# Shipped values shown, each derived from content rather than from a
+# round number (docs/consumers/tui.md section 4.5 has the arithmetic).
+#
+# `compact-cols` / `compact-rows`: at or below these a viewport is
+# column- or row-starved, and overlays go full-bleed on that axis
+# instead of floating. The axes are judged independently, because a
+# short wide terminal and a narrow tall one want opposite things. Raise
+# them for full-bleed pickers on a roomier terminal; lower them to keep
+# floating modals on a small one.
+#
+# `min-pane-cols`: the narrowest pane area worth tiling into. The
+# `[sidebar]` strip is not reserved below `[sidebar] width` + this, so
+# lowering it keeps the strip on a narrower terminal.
+#
+# All three are plain counts with no reserved values: 0 disables a
+# threshold, a very large value pins the opposite, and both are
+# legitimate configurations rather than errors.
+#
+# [chrome]
+# compact-cols = 64
+# compact-rows = 18
+# min-pane-cols = 40

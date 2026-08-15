@@ -33,10 +33,10 @@ use super::plugin_panes::{HostedPlacement, PluginPaneEntry};
 use crate::layout::{Direction, SplitDir, Workspace};
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::{Overlay, PredictionState};
-use crate::render::Theme;
 use crate::render::overlay::{
     ContextMenu, HelpOverlay, OverlayOutcome, OverlayState, PromptOverlay, SelectItem, SelectList,
 };
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// Mutable context the input-dispatch path needs to update on a chord
 /// that resolves to a layout action (phux-4li.5). Bundles the items
@@ -179,6 +179,14 @@ pub(super) struct DispatchCtx<'a> {
     /// before flipping a flag whose effect the driver would then fold
     /// away — see the `toggle-sidebar` arm of [`run_action`].
     pub sidebar_width: u16,
+    /// phux-huhi: the attach's `[chrome]` breakpoints. `toggle-sidebar`
+    /// consults [`ChromeBreakpoints::min_pane_cols`] for the same
+    /// "would this actually change anything?" arithmetic the driver's
+    /// [`sidebar_reservation`] fold uses, so the keypress and the layout
+    /// cannot disagree about whether the strip fits.
+    ///
+    /// [`sidebar_reservation`]: crate::attach::paint::sidebar_reservation
+    pub chrome: ChromeBreakpoints,
     /// phux-foz.9: the window index of each sidebar agents-section row, in
     /// display order — the same list the strip painter rendered from
     /// ([`crate::render::chrome::sidebar::SidebarPainter::agent_windows`]).
@@ -2699,7 +2707,7 @@ fn run_action(
             // able to reclaim the columns.
             let width = ctx.sidebar_width;
             if !*ctx.sidebar_enabled
-                && ctx.viewport.0 < width.saturating_add(crate::attach::paint::MIN_PANE_COLS)
+                && ctx.viewport.0 < width.saturating_add(ctx.chrome.min_pane_cols)
             {
                 effects.bell = true;
                 return effects;
@@ -3443,6 +3451,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -4011,6 +4020,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -4082,6 +4092,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -4188,6 +4199,7 @@ mod tests {
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
                 sidebar_width: 20,
+                chrome: ChromeBreakpoints::default(),
                 sidebar_agents: &[],
                 bar: None,
                 status_bar: None,
@@ -4357,6 +4369,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -4803,6 +4816,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5290,6 +5304,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5382,6 +5397,7 @@ mod tests {
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
                 sidebar_width: 20,
+                chrome: ChromeBreakpoints::default(),
                 sidebar_agents: &[],
                 bar: None,
                 status_bar: None,
@@ -5562,6 +5578,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5692,6 +5709,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -5877,6 +5895,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -6082,6 +6101,7 @@ mod tests {
             }),
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: Some(crate::render::chrome::status_bar::Position::Bottom),
             status_bar: None,
@@ -6302,6 +6322,7 @@ mod tests {
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
                 sidebar_width: 20,
+                chrome: ChromeBreakpoints::default(),
                 sidebar_agents: &[],
                 bar: Some(position),
                 status_bar: with_painter.then_some(&painter),
@@ -6626,6 +6647,7 @@ mod tests {
                 sidebar: None,
                 sidebar_enabled: &mut sidebar_enabled,
                 sidebar_width: 20,
+                chrome: ChromeBreakpoints::default(),
                 sidebar_agents: &[],
                 bar: None,
                 status_bar: None,
@@ -7111,6 +7133,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,
@@ -7347,6 +7370,7 @@ mod tests {
             sidebar: None,
             sidebar_enabled: &mut sidebar_enabled,
             sidebar_width: 20,
+            chrome: ChromeBreakpoints::default(),
             sidebar_agents: &[],
             bar: None,
             status_bar: None,

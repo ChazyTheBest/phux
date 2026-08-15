@@ -28,7 +28,7 @@ use ratatui::layout::Rect;
 use super::help::{action_label, is_indexed_select_window};
 use super::widgets::{ChordRow, ChordSection, KeyChordTable, Modal, centered_panel};
 use super::{OverlayCommand, RenderOverlay};
-use crate::render::Theme;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// Which-key popup: prefix-table continuations as `key  action` rows.
 ///
@@ -44,6 +44,8 @@ pub struct WhichKeyOverlay {
     rows: Vec<(String, String)>,
     /// Color slots snapshotted from the active [`Theme`] at construction.
     theme: Theme,
+    /// phux-huhi: `[chrome]` thresholds, stamped by `OverlayState::push`.
+    breakpoints: ChromeBreakpoints,
 }
 
 impl WhichKeyOverlay {
@@ -70,6 +72,7 @@ impl WhichKeyOverlay {
             prefix: cfg.prefix.clone(),
             rows,
             theme: *theme,
+            breakpoints: ChromeBreakpoints::default(),
         }
     }
 }
@@ -114,7 +117,11 @@ impl RenderOverlay for WhichKeyOverlay {
     fn bounds(&self, area: Rect) -> Option<Rect> {
         // Same floating-modal shape as help, slightly smaller: ~60% of
         // the viewport, min 36x8, clamped to the outer rect.
-        Some(centered_panel(area, 6, 36, 8))
+        Some(centered_panel(area, 6, 36, 8, self.breakpoints))
+    }
+
+    fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+        self.breakpoints = bp;
     }
 
     fn handle_key(&mut self, _key: &KeyEvent) -> OverlayCommand {

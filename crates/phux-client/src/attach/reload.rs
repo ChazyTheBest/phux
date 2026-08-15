@@ -22,8 +22,8 @@ use phux_config::{Config, KeybindingsCfg};
 
 use super::plugin_actions::{self, PluginActionEntry};
 use super::plugin_panes::{self, PluginPaneEntry};
-use crate::render::Theme;
 use crate::render::chrome::status_bar::StatusBarPainter;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// The full set of config-derived driver state a reload replaces.
 ///
@@ -38,6 +38,10 @@ pub(super) struct ReloadedConfig {
     pub resolver: Resolver,
     /// Chrome + overlay color theme.
     pub theme: Theme,
+    /// phux-huhi: `[chrome]` responsive breakpoints. Swapped alongside the
+    /// theme, so `phux config reload` moves the compact thresholds and the
+    /// sidebar-yield floor without a re-attach.
+    pub chrome: ChromeBreakpoints,
     /// Status-bar painter, or `None` when the config composes an empty
     /// bar (the driver then reclaims the bar row).
     pub status_bar: Option<StatusBarPainter>,
@@ -163,6 +167,7 @@ fn build(cfg: &Config) -> Result<ReloadedConfig, String> {
         keybindings,
         resolver,
         theme,
+        chrome: ChromeBreakpoints::from_cfg(&cfg.chrome),
         status_bar,
         plugin_actions,
         plugin_panes,
@@ -194,6 +199,7 @@ pub(super) fn reload_in_place(
     keybindings_snapshot: &mut Option<KeybindingsCfg>,
     resolver: &mut Option<Resolver>,
     theme: &mut Theme,
+    chrome: &mut ChromeBreakpoints,
     status_bar: &mut Option<StatusBarPainter>,
     plugin_actions: &mut Vec<PluginActionEntry>,
     plugin_panes: &mut Vec<PluginPaneEntry>,
@@ -204,6 +210,7 @@ pub(super) fn reload_in_place(
     *keybindings_snapshot = Some(new.keybindings);
     *resolver = Some(new.resolver);
     *theme = new.theme;
+    *chrome = new.chrome;
     *status_bar = new.status_bar;
     *plugin_actions = new.plugin_actions;
     *plugin_panes = new.plugin_panes;
@@ -283,6 +290,11 @@ mod tests {
             ..Theme::default()
         };
         let old_theme = theme;
+        let mut chrome = ChromeBreakpoints {
+            compact_cols: 99,
+            ..ChromeBreakpoints::DEFAULT
+        };
+        let old_chrome = chrome;
         let mut status_bar = None;
         let mut plugin_actions = vec![];
         let mut plugin_panes = vec![];
@@ -295,6 +307,7 @@ mod tests {
             &mut keybindings,
             &mut resolver,
             &mut theme,
+            &mut chrome,
             &mut status_bar,
             &mut plugin_actions,
             &mut plugin_panes,
@@ -308,6 +321,7 @@ mod tests {
         assert!(keybindings.is_some());
         assert!(resolver.is_none());
         assert_eq!(theme, old_theme);
+        assert_eq!(chrome, old_chrome, "breakpoints must not be half-applied");
         assert!(status_bar.is_none());
         assert!(plugin_actions.is_empty());
         assert!(plugin_panes.is_empty());
@@ -460,6 +474,7 @@ mod tests {
         let mut keybindings = None;
         let mut resolver = None;
         let mut theme = Theme::default();
+        let mut chrome = ChromeBreakpoints::DEFAULT;
         let mut status_bar = None;
         let mut plugin_actions = vec![];
         let mut plugin_panes = vec![];
@@ -473,6 +488,10 @@ mod tests {
 
             [keybindings.prefix-table]
             Y = "toggle-zoom"
+
+            [chrome]
+            compact-cols = 100
+            min-pane-cols = 30
             "#,
         );
         reload_in_place(
@@ -480,6 +499,7 @@ mod tests {
             &mut keybindings,
             &mut resolver,
             &mut theme,
+            &mut chrome,
             &mut status_bar,
             &mut plugin_actions,
             &mut plugin_panes,
@@ -495,5 +515,10 @@ mod tests {
         );
         assert!(resolver.is_some(), "resolver must be rebuilt");
         assert_eq!(which_key_delay, Duration::from_millis(150));
+        // phux-huhi: `[chrome]` rides the same atomic swap as the theme,
+        // and an unset key keeps its shipped default rather than zeroing.
+        assert_eq!(chrome.compact_cols, 100);
+        assert_eq!(chrome.min_pane_cols, 30);
+        assert_eq!(chrome.compact_rows, ChromeBreakpoints::DEFAULT.compact_rows);
     }
 }

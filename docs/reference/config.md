@@ -24,6 +24,7 @@ The configuration surface of `~/.config/phux/config.toml`. The loader layers you
 | `[keybindings]` | Prefix chord, the prefix-table and global binding maps, and the which-key popup knobs. |
 | `[status]` | Status-bar composition: widget lists for the left, center, and right slots, plus which outer-terminal row the bar reserves. |
 | `[sidebar]` | The window sidebar: off by default; width in columns and the edge it docks to when enabled. |
+| `[chrome]` | Responsive-chrome breakpoints: the column and row counts at which overlays go full-bleed and the sidebar yields its columns back to the panes. |
 | `[[hooks.<event>]]` | Event hooks: per event name, an array of `when` predicates each paired with an action to run on match. |
 | `[[plugins]]` | Declarative plugin manifests composed into this config; each entry names a `phux-plugin.toml` path and an enabled flag. |
 | `[[satellites]]` | Federation satellites a hub routes to: name, endpoint, token-file path, and certificate pin (ADR-0038). |
@@ -38,6 +39,9 @@ Every scalar knob with its shipped default, serialized from the schema itself. K
 
 | Key | Default |
 |---|---|
+| `chrome.compact-cols` | `64` |
+| `chrome.compact-rows` | `18` |
+| `chrome.min-pane-cols` | `40` |
 | `defaults.cwd-inheritance` | `"inherit-focused"` |
 | `defaults.history-limit` | `50000` |
 | `defaults.mouse` | `true` |
@@ -510,4 +514,29 @@ right = [
 # enabled = false
 # width = 20
 # position = "left"
+
+# Responsive-chrome breakpoints. The chrome adapts to small terminals
+# around three thresholds; these move them without moving the behaviour.
+# Shipped values shown, each derived from content rather than from a
+# round number (docs/consumers/tui.md section 4.5 has the arithmetic).
+#
+# `compact-cols` / `compact-rows`: at or below these a viewport is
+# column- or row-starved, and overlays go full-bleed on that axis
+# instead of floating. The axes are judged independently, because a
+# short wide terminal and a narrow tall one want opposite things. Raise
+# them for full-bleed pickers on a roomier terminal; lower them to keep
+# floating modals on a small one.
+#
+# `min-pane-cols`: the narrowest pane area worth tiling into. The
+# `[sidebar]` strip is not reserved below `[sidebar] width` + this, so
+# lowering it keeps the strip on a narrower terminal.
+#
+# All three are plain counts with no reserved values: 0 disables a
+# threshold, a very large value pins the opposite, and both are
+# legitimate configurations rather than errors.
+#
+# [chrome]
+# compact-cols = 64
+# compact-rows = 18
+# min-pane-cols = 40
 ```

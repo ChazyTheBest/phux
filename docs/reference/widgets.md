@@ -59,6 +59,12 @@ Options:
 - `prefix` — string, optional — literal text prepended verbatim to the formatted output.
 - `max-len` (also spelled `max_len`) — integer `> 0`, optional — truncate the session name itself to this many characters (prefix and format literals not counted); no ellipsis.
 
+## `spacer`
+
+Elastic blank space. Takes no width of its own and then absorbs an even share of whatever columns the row has left over, so the widgets on either side of it are pushed apart. Renders nothing on a row with no room to spare, which makes it the first thing to yield on a narrow terminal rather than something that has to be configured away. Style it (`style = { bg = ... }`) to paint the gap rather than leave it blank.
+
+No kind-specific options.
+
 ## `switch`
 
 A clickable chip that opens the agent-fleet switcher (the same overlay `prefix A` opens). Every cell of the chip, padding included, is a click target. Pair it with `max-cols` to surface it only on terminals too narrow for the sidebar and the full tab strip.

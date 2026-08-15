@@ -550,21 +550,18 @@ pub(super) struct SidebarReservation {
     pub width: u16,
 }
 
-/// The narrowest pane area worth tiling into.
-///
-/// Half a classic 80-column terminal, and about where an editor, a diff,
-/// or an agent's output stops being readable rather than merely cramped.
-pub(super) const MIN_PANE_COLS: u16 = 40;
-
 /// Fold the sidebar's on/off state and geometry into the per-frame
 /// reservation, yielding the strip when the terminal cannot afford it.
 ///
 /// The strip costs its `width` columns off every pane, permanently. On a
 /// 60-column terminal a 20-column strip is a third of the screen spent on
 /// a list of window names, and the panes it is meant to help you navigate
-/// between are the ones paying for it. Below `width + MIN_PANE_COLS` the
+/// between are the ones paying for it. Below `width + min_pane_cols` the
 /// reservation therefore folds to `None` and the panes get the whole
 /// viewport back.
+///
+/// `min_pane_cols` is [`crate::render::ChromeBreakpoints::min_pane_cols`] —
+/// the shipped 40 unless `[chrome]` moved it (phux-huhi).
 ///
 /// This is the single place the decision is made, so every layout site —
 /// panes, dividers, reflow, mouse hit-testing, the strip painter itself —
@@ -575,8 +572,9 @@ pub(super) fn sidebar_reservation(
     enabled: bool,
     width: u16,
     edge: SidebarEdge,
+    min_pane_cols: u16,
 ) -> Option<SidebarReservation> {
-    (enabled && outer_cols >= width.saturating_add(MIN_PANE_COLS))
+    (enabled && outer_cols >= width.saturating_add(min_pane_cols))
         .then_some(SidebarReservation { edge, width })
 }
 
@@ -688,6 +686,8 @@ pub(super) fn bar_inset(outer: (u16, u16), sidebar: Option<SidebarReservation>) 
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::render::ChromeBreakpoints;
+
     fn published_kernel(
         terminals: &[TerminalId],
         cols: u16,
@@ -764,9 +764,10 @@ mod tests {
     /// would leave 30 columns of actual work.
     #[test]
     fn the_sidebar_yields_when_it_would_starve_the_panes() {
-        let res = |cols| sidebar_reservation(cols, true, 20, SidebarEdge::Left);
+        let min_pane_cols = ChromeBreakpoints::DEFAULT.min_pane_cols;
+        let res = |cols| sidebar_reservation(cols, true, 20, SidebarEdge::Left, min_pane_cols);
 
-        // 20 + MIN_PANE_COLS(40) = 60 is the threshold.
+        // 20 + min-pane-cols(40) = 60 is the threshold.
         assert_eq!(res(59), None, "50-col terminal cannot afford the strip");
         assert_eq!(
             res(60),
@@ -779,27 +780,54 @@ mod tests {
 
         // A narrower strip is affordable sooner — the rule is about what
         // is left for the panes, not about a fixed terminal size.
-        assert!(sidebar_reservation(50, true, 10, SidebarEdge::Left).is_some());
+        assert!(sidebar_reservation(50, true, 10, SidebarEdge::Left, min_pane_cols).is_some());
 
         // Disabled stays disabled at every width.
         for cols in [0u16, 60, 200] {
             assert_eq!(
-                sidebar_reservation(cols, false, 20, SidebarEdge::Left),
+                sidebar_reservation(cols, false, 20, SidebarEdge::Left, min_pane_cols),
                 None
             );
         }
+    }
+
+    /// phux-huhi: `[chrome] min-pane-cols` moves the yield threshold. The
+    /// motivating case is a 55-column terminal whose owner would rather
+    /// keep the strip than the columns it costs.
+    #[test]
+    fn a_lowered_min_pane_cols_keeps_the_sidebar_on_a_narrow_terminal() {
+        // Shipped: 20 + 40 = 60, so 55 columns yields the strip.
+        assert_eq!(
+            sidebar_reservation(55, true, 20, SidebarEdge::Left, 40),
+            None
+        );
+        // Configured down to 30: 20 + 30 = 50, so 55 keeps it.
+        assert_eq!(
+            sidebar_reservation(55, true, 20, SidebarEdge::Left, 30),
+            Some(SidebarReservation {
+                edge: SidebarEdge::Left,
+                width: 20
+            })
+        );
+        // And a raised floor takes it away from a terminal that used to
+        // afford it.
+        assert_eq!(
+            sidebar_reservation(70, true, 20, SidebarEdge::Left, 60),
+            None
+        );
     }
 
     /// However narrow the terminal, the panes are never handed a
     /// zero-width or negative content rect by a sidebar that overran it.
     #[test]
     fn a_reserved_sidebar_always_leaves_a_usable_content_rect() {
+        let min_pane_cols = ChromeBreakpoints::DEFAULT.min_pane_cols;
         for cols in 0u16..=120 {
-            let sidebar = sidebar_reservation(cols, true, 20, SidebarEdge::Left);
+            let sidebar = sidebar_reservation(cols, true, 20, SidebarEdge::Left, min_pane_cols);
             let rect = content_rect((cols, 24), Some(Position::Bottom), sidebar);
             if sidebar.is_some() {
                 assert!(
-                    rect.w >= MIN_PANE_COLS,
+                    rect.w >= min_pane_cols,
                     "cols={cols} left only {} pane columns",
                     rect.w
                 );

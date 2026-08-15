@@ -62,8 +62,8 @@ use ratatui::text::{Line, Span};
 
 use super::widgets::{Modal, centered_panel, paint_scrollbar, scroll_into_view};
 use super::{OverlayCommand, RenderOverlay};
-use crate::render::Theme;
 use crate::render::clip_text;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// Blank columns held between a row's label and its secondary. One is
 /// enough to read them as separate facts; more just costs the secondary
@@ -230,6 +230,8 @@ pub struct SelectList {
     /// `PageUp`/`PageDown` can move by a real screenful. Zero until the
     /// first render (page keys then fall back to a single row).
     page: Cell<usize>,
+    /// phux-huhi: `[chrome]` thresholds, stamped by `OverlayState::push`.
+    breakpoints: ChromeBreakpoints,
 }
 
 impl SelectList {
@@ -247,6 +249,7 @@ impl SelectList {
             live_key: None,
             scroll: Cell::new(0),
             page: Cell::new(0),
+            breakpoints: ChromeBreakpoints::default(),
         };
         // The first row may be a header (grouped pickers always open on
         // one); start the cursor on the first selectable row instead.
@@ -422,8 +425,8 @@ impl SelectList {
 
     /// The modal rect: 60% of the viewport, min 30x10, clamped to the
     /// outer rect (like the help overlay, but a touch narrower).
-    fn modal_area(outer: Rect) -> Rect {
-        centered_panel(outer, 6, 30, 10)
+    fn modal_area(outer: Rect, bp: ChromeBreakpoints) -> Rect {
+        centered_panel(outer, 6, 30, 10, bp)
     }
 
     /// Rows available to the list inside `modal_area`, once the borders, the
@@ -564,7 +567,7 @@ impl SelectList {
 
 impl RenderOverlay for SelectList {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let modal_area = Self::modal_area(area);
+        let modal_area = Self::modal_area(area, self.breakpoints);
         let indices = self.filtered_indices();
         // Body width is the modal interior minus the 1-cell border on
         // each side.
@@ -597,7 +600,11 @@ impl RenderOverlay for SelectList {
     }
 
     fn bounds(&self, area: Rect) -> Option<Rect> {
-        Some(Self::modal_area(area))
+        Some(Self::modal_area(area, self.breakpoints))
+    }
+
+    fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+        self.breakpoints = bp;
     }
 
     fn refresh_items(&mut self, key: &str, items: &[SelectItem]) -> bool {

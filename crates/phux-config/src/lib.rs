@@ -45,13 +45,13 @@ pub use layer::{
 pub use remote::RemoteConfigEntry;
 pub use satellite::SatelliteConfigEntry;
 pub use schema::{
-    Action, Config, CwdInheritance, DefaultsCfg, ExperimentalCfg, HookEntry, KeybindingsCfg,
-    ParamAction, SidebarCfg, SidebarPosition, StatusCfg, StatusPosition, ThemeCfg, Widget,
-    WidgetSpec, WindowSize,
+    Action, ChromeCfg, Config, CwdInheritance, DefaultsCfg, ExperimentalCfg, HookEntry,
+    KeybindingsCfg, ParamAction, SidebarCfg, SidebarPosition, StatusCfg, StatusPosition, ThemeCfg,
+    Widget, WidgetSpec, WindowSize,
 };
 pub use widget::{
-    Cell, CellStyle, SessionNameWidget, StatusBar, StatusWidget, TextWidget, TimeWidget,
-    WidgetCells, WidgetContext, WidgetError, WidgetFactory, WidgetRegistry, WindowInfo,
+    Cell, CellStyle, SessionNameWidget, SpacerWidget, StatusBar, StatusWidget, TextWidget,
+    TimeWidget, WidgetCells, WidgetContext, WidgetError, WidgetFactory, WidgetRegistry, WindowInfo,
     WindowsWidget, row_to_string,
 };
 

@@ -26,7 +26,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
-use crate::render::Theme;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// A centered, bordered modal box: themed border + centered title, a body
 /// of pre-built [`Line`]s, and an optional dimmed footer line.
@@ -219,31 +219,15 @@ pub fn centered(outer: Rect, frac_num: u16, min_w: u16, min_h: u16) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// Viewport width at or below which the chrome is *column-starved*: a
-/// floating box's margins stop reading as composition and start reading
-/// as columns you cannot use.
-///
-/// 64 is chosen from the content, not from a round number: a 60% box in
-/// 64 columns is 38 wide, and once its two border columns and the two-
-/// column indent of a nested picker row are taken out, 34 remain — under
-/// the width at which a `session/window` pair plus its branch stays
-/// legible. Wider than this and the margins are affordable.
-pub const COMPACT_COLS: u16 = 64;
-
-/// Viewport height at or below which the chrome is *row-starved*.
-///
-/// A 60% box in 18 rows is 10 tall; the shared modal chrome (border,
-/// query line and its blank, footer and its blank) spends 6 of them, so
-/// four rows of an actual list survive. Below that a picker shows less
-/// than a page and scrolling replaces reading.
-pub const COMPACT_ROWS: u16 = 18;
-
 /// Whether `outer` is starved on either axis — the one breakpoint the
 /// whole chrome shares, so "compact" means the same thing to the status
 /// bar, the sidebar, and every overlay.
+///
+/// `bp` is the per-attach snapshot of `[chrome]` (phux-huhi); pass
+/// [`ChromeBreakpoints::default`] where there is no config to consult.
 #[must_use]
-pub const fn is_compact(outer: Rect) -> bool {
-    outer.width <= COMPACT_COLS || outer.height <= COMPACT_ROWS
+pub const fn is_compact(outer: Rect, bp: ChromeBreakpoints) -> bool {
+    bp.is_col_starved(outer.width) || bp.is_row_starved(outer.height)
 }
 
 /// [`centered`], going full-bleed on whichever axis is starved.
@@ -259,14 +243,23 @@ pub const fn is_compact(outer: Rect) -> bool {
 /// (a bottom-docked split, say) is row-starved but not column-starved: it
 /// wants full height and a centered width, not a stretched-out list of
 /// two-word rows.
+///
+/// `bp` carries the thresholds, so a user who moved them in `[chrome]`
+/// moves this decision with them.
 #[must_use]
-pub fn centered_panel(outer: Rect, frac_num: u16, min_w: u16, min_h: u16) -> Rect {
+pub fn centered_panel(
+    outer: Rect,
+    frac_num: u16,
+    min_w: u16,
+    min_h: u16,
+    bp: ChromeBreakpoints,
+) -> Rect {
     let mut r = centered(outer, frac_num, min_w, min_h);
-    if outer.width <= COMPACT_COLS {
+    if bp.is_col_starved(outer.width) {
         r.x = outer.x;
         r.width = outer.width;
     }
-    if outer.height <= COMPACT_ROWS {
+    if bp.is_row_starved(outer.height) {
         r.y = outer.y;
         r.height = outer.height;
     }
@@ -785,10 +778,14 @@ mod tests {
     /// `centered`: the box floats and the panes stay visible around it.
     #[test]
     fn a_roomy_viewport_keeps_the_modal_floating() {
+        let bp = ChromeBreakpoints::DEFAULT;
         let outer = Rect::new(0, 0, 120, 40);
-        assert!(!is_compact(outer));
-        assert_eq!(centered_panel(outer, 6, 30, 10), centered(outer, 6, 30, 10));
-        let r = centered_panel(outer, 6, 30, 10);
+        assert!(!is_compact(outer, bp));
+        assert_eq!(
+            centered_panel(outer, 6, 30, 10, bp),
+            centered(outer, 6, 30, 10)
+        );
+        let r = centered_panel(outer, 6, 30, 10, bp);
         assert!(r.x > outer.x && r.y > outer.y);
         assert!(r.width < outer.width && r.height < outer.height);
     }
@@ -798,9 +795,48 @@ mod tests {
     /// modal chrome leave two rows of actual content.
     #[test]
     fn a_starved_viewport_makes_the_modal_full_bleed() {
+        let bp = ChromeBreakpoints::DEFAULT;
         let outer = Rect::new(0, 0, 50, 14);
-        assert!(is_compact(outer));
-        assert_eq!(centered_panel(outer, 6, 30, 10), outer);
+        assert!(is_compact(outer, bp));
+        assert_eq!(centered_panel(outer, 6, 30, 10, bp), outer);
+    }
+
+    /// phux-huhi: the breakpoint is the caller's, not a constant. The same
+    /// 80x30 viewport floats under the shipped thresholds and goes
+    /// full-bleed under a `[chrome]` that raised them — which is the whole
+    /// point of the knob for someone who wants full-bleed pickers on a
+    /// roomier terminal.
+    #[test]
+    fn a_raised_breakpoint_moves_where_full_bleed_starts() {
+        let outer = Rect::new(0, 0, 80, 30);
+        let shipped = ChromeBreakpoints::DEFAULT;
+        assert!(!is_compact(outer, shipped));
+        assert_ne!(centered_panel(outer, 6, 30, 10, shipped), outer);
+
+        let roomy = ChromeBreakpoints {
+            compact_cols: 100,
+            compact_rows: 40,
+            ..ChromeBreakpoints::DEFAULT
+        };
+        assert!(is_compact(outer, roomy));
+        assert_eq!(centered_panel(outer, 6, 30, 10, roomy), outer);
+    }
+
+    /// The mirror case: a user on a small terminal who would rather keep
+    /// floating modals lowers the thresholds and gets them back.
+    #[test]
+    fn a_lowered_breakpoint_keeps_a_small_viewport_floating() {
+        let outer = Rect::new(0, 0, 50, 14);
+        let tight = ChromeBreakpoints {
+            compact_cols: 30,
+            compact_rows: 8,
+            ..ChromeBreakpoints::DEFAULT
+        };
+        assert!(!is_compact(outer, tight));
+        assert_eq!(
+            centered_panel(outer, 6, 30, 10, tight),
+            centered(outer, 6, 30, 10)
+        );
     }
 
     /// The axes are decided independently: a short, wide viewport wants
@@ -808,15 +844,16 @@ mod tests {
     /// entries.
     #[test]
     fn each_axis_goes_full_bleed_on_its_own() {
+        let bp = ChromeBreakpoints::DEFAULT;
         // Wide but short.
         let short = Rect::new(0, 0, 160, 12);
-        let r = centered_panel(short, 6, 30, 10);
+        let r = centered_panel(short, 6, 30, 10, bp);
         assert_eq!((r.y, r.height), (short.y, short.height), "full height");
         assert!(r.width < short.width, "width still floats: {r:?}");
 
         // Narrow but tall.
         let narrow = Rect::new(0, 0, 40, 60);
-        let r = centered_panel(narrow, 6, 30, 10);
+        let r = centered_panel(narrow, 6, 30, 10, bp);
         assert_eq!((r.x, r.width), (narrow.x, narrow.width), "full width");
         assert!(r.height < narrow.height, "height still floats: {r:?}");
     }
@@ -828,7 +865,7 @@ mod tests {
     fn full_bleed_stays_inside_an_inset_outer_rect() {
         // 60-col viewport with a 20-col left sidebar ⇒ content x∈[20, 60).
         let content = Rect::new(20, 0, 40, 14);
-        let r = centered_panel(content, 6, 30, 10);
+        let r = centered_panel(content, 6, 30, 10, ChromeBreakpoints::DEFAULT);
         assert_eq!(r, content);
         assert_eq!(r.x, 20, "must not paint over the sidebar strip");
     }

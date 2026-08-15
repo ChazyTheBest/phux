@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 
 use super::widgets::{Modal, centered_panel};
 use super::{OverlayCommand, RenderOverlay};
-use crate::render::Theme;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// A single-line text-input modal that commits to an action.
 #[derive(Debug, Clone)]
@@ -36,6 +36,8 @@ pub struct PromptOverlay {
     /// Color slots snapshotted from the active [`Theme`] at construction.
     /// Captured (not borrowed) so the overlay stays `'static`.
     theme: Theme,
+    /// phux-huhi: `[chrome]` thresholds, stamped by `OverlayState::push`.
+    breakpoints: ChromeBreakpoints,
 }
 
 impl PromptOverlay {
@@ -50,6 +52,7 @@ impl PromptOverlay {
             arg_key: arg_key.to_owned(),
             input: initial.to_owned(),
             theme: *theme,
+            breakpoints: ChromeBreakpoints::default(),
         }
     }
 
@@ -104,12 +107,12 @@ impl PromptOverlay {
 
     /// A small centered modal: 60% width (min 20), fixed 3 rows (border
     /// + one input line).
-    fn modal_area(outer: Rect) -> Rect {
+    fn modal_area(outer: Rect, bp: ChromeBreakpoints) -> Rect {
         // Reuse the shared centering for width/x, then pin height to 3
         // rows (border + one input line) and re-center vertically against
         // that fixed height — the fraction-based height a `Modal`-style
         // box would otherwise get is wrong for a one-line prompt.
-        let wide = centered_panel(outer, 6, 20, 3);
+        let wide = centered_panel(outer, 6, 20, 3, bp);
         let h = 3.min(outer.height);
         let y = outer.y + (outer.height.saturating_sub(h)) / 2;
         Rect::new(wide.x, y, wide.width, h)
@@ -118,7 +121,7 @@ impl PromptOverlay {
 
 impl RenderOverlay for PromptOverlay {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let modal_area = Self::modal_area(area);
+        let modal_area = Self::modal_area(area, self.breakpoints);
         // Input line + a reverse-video cursor block so the caret is
         // visible without driving the host terminal cursor (the overlay
         // paint hides it).
@@ -130,7 +133,11 @@ impl RenderOverlay for PromptOverlay {
     }
 
     fn bounds(&self, area: Rect) -> Option<Rect> {
-        Some(Self::modal_area(area))
+        Some(Self::modal_area(area, self.breakpoints))
+    }
+
+    fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+        self.breakpoints = bp;
     }
 
     fn handle_key(&mut self, key: &KeyEvent) -> OverlayCommand {

@@ -20,10 +20,13 @@
 //! (ADR-0020 replaced `scripts/check-ratatui-boundary.sh` with the crate
 //! split in phux-0fv). See epic `phux-5ke` and `ADR-0020`.
 
+pub mod breakpoints;
 pub mod chrome;
 pub mod overlay;
 mod sgr;
 pub mod theme;
+
+pub use breakpoints::ChromeBreakpoints;
 
 /// Color-preserving SGR emitter for chrome painted outside the ratatui-buffer
 /// path (the driver's copy-mode status strip).

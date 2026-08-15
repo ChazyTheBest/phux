@@ -35,7 +35,7 @@ use super::widgets::{
     ChordRow, ChordSection, KeyChordTable, Modal, centered_panel, paint_scrollbar,
 };
 use super::{OverlayCommand, RenderOverlay};
-use crate::render::Theme;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// One row in the help table: a chord (or chord sequence) and the
 /// action it resolves to. `chord_text` already includes the prefix
@@ -122,6 +122,8 @@ pub struct HelpOverlay {
     /// `PageUp` / `PageDown` can move by a real screenful. Zero until the
     /// first render (page keys then fall back to a single row).
     page: Cell<usize>,
+    /// phux-huhi: `[chrome]` thresholds, stamped by `OverlayState::push`.
+    breakpoints: ChromeBreakpoints,
 }
 
 impl HelpOverlay {
@@ -192,6 +194,7 @@ impl HelpOverlay {
             theme: *theme,
             scroll: Cell::new(0),
             page: Cell::new(0),
+            breakpoints: ChromeBreakpoints::default(),
         }
     }
 
@@ -296,7 +299,11 @@ impl RenderOverlay for HelpOverlay {
 
     fn bounds(&self, area: Rect) -> Option<Rect> {
         // ~70% of the viewport, min 40x10, clamped to the outer rect.
-        Some(centered_panel(area, 7, 40, 10))
+        Some(centered_panel(area, 7, 40, 10, self.breakpoints))
+    }
+
+    fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+        self.breakpoints = bp;
     }
 
     fn handle_key(&mut self, key: &KeyEvent) -> OverlayCommand {

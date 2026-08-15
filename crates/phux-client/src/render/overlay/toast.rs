@@ -17,7 +17,7 @@ use ratatui::text::Line;
 
 use super::widgets::{Modal, centered_panel};
 use super::{OverlayCommand, RenderOverlay};
-use crate::render::Theme;
+use crate::render::{ChromeBreakpoints, Theme};
 
 /// A dismiss-on-any-key notice modal.
 #[derive(Debug)]
@@ -27,6 +27,8 @@ pub struct ToastOverlay {
     /// Snapshotted (copied) at construction so the overlay stays `'static`.
     theme: Theme,
     passthrough: bool,
+    /// phux-huhi: `[chrome]` thresholds, stamped by `OverlayState::push`.
+    breakpoints: ChromeBreakpoints,
 }
 
 impl ToastOverlay {
@@ -38,6 +40,7 @@ impl ToastOverlay {
             lines,
             theme: *theme,
             passthrough: false,
+            breakpoints: ChromeBreakpoints::default(),
         }
     }
 
@@ -49,6 +52,7 @@ impl ToastOverlay {
             lines,
             theme: *theme,
             passthrough: true,
+            breakpoints: ChromeBreakpoints::default(),
         }
     }
 }
@@ -70,7 +74,11 @@ impl RenderOverlay for ToastOverlay {
 
     fn bounds(&self, area: Rect) -> Option<Rect> {
         // ~60% of the viewport, min 40x8, clamped to the outer rect.
-        Some(centered_panel(area, 6, 40, 8))
+        Some(centered_panel(area, 6, 40, 8, self.breakpoints))
+    }
+
+    fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+        self.breakpoints = bp;
     }
 
     fn handle_key(&mut self, _key: &KeyEvent) -> OverlayCommand {

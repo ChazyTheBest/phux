@@ -115,6 +115,7 @@ amends / extends) are hand-curated from each ADR's body.
 | [0084](./0084-starting-an-agent-in-an-existing-shell.md) | Starting an agent in an existing shell | Accepted (separates in-place, shell-evaluated startup from [0042](./0042-launch-executor.md)'s direct-argv pane creation; positive OSC 133 prompt evidence gates submission, detector publication supplies identity, and possible delivery retains the bound name) |
 | [0085](./0085-hook-sourced-agent-state.md) | Hook-sourced agent state is detector evidence | Accepted (adds capability-gated `REPORT_AGENT_STATE`: hooks publish immediate working/blocked/done edges through the detector without writing a state declaration that disables self-healing) |
 | [0086](./0086-shared-render-pool.md) | The pooled libghostty render trio lives in `phux-protocol` | Accepted (one `RenderPool` owns the `RenderState`/`RowIterator`/`CellIterator` trio and the `phux-5pyx` rebuild-on-resize, behind the existing `server` feature; dirty-bit policy stays at the call sites, which deliberately differ) |
+| [0087](./0087-elastic-status-bar-space.md) | Elastic status-bar space is row-wide slack, not slot layout | Proposed (defines the `spacer` widget frozen by [0071](./0071-what-phux-1-0-commits-to.md): paid from the row's leftover width, split evenly, zero on an overflowing row — rather than giving `[status]` slots a two-pass width budget) |
 
 ## When to write an ADR
 

@@ -30,6 +30,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
+use crate::render::ChromeBreakpoints;
+
 pub mod copy_mode;
 pub mod help;
 pub mod menu;
@@ -147,6 +149,18 @@ pub trait RenderOverlay {
         false
     }
 
+    /// phux-huhi: adopt the attach-wide `[chrome]` breakpoints.
+    ///
+    /// [`OverlayState::push`] calls this on every overlay as it is stacked,
+    /// so a modal picks the thresholds up from the one place that read the
+    /// config instead of each construction site threading them. Overlays
+    /// that lay themselves out with [`centered_panel`] store the value and
+    /// hand it back to `centered_panel`; every other overlay ignores it,
+    /// which is why this defaults to a no-op rather than being required.
+    ///
+    /// [`centered_panel`]: widgets::centered_panel
+    fn set_breakpoints(&mut self, _bp: ChromeBreakpoints) {}
+
     /// phux-wrnm: `true` for an overlay that hover-tracks the pointer with
     /// no button held (the context menu). The driver upgrades the outer
     /// terminal's mouse reporting from button-event (`?1002h`) to
@@ -251,21 +265,43 @@ pub struct OverlayState {
     /// Bottom-to-top overlay stack. The last element is the top — it
     /// receives input and is painted last (on top of the others).
     stack: Vec<Box<dyn RenderOverlay>>,
+    /// phux-huhi: the attach's `[chrome]` breakpoints, stamped onto every
+    /// overlay as it is pushed. One seam rather than a parameter on every
+    /// overlay constructor — the driver sets it once
+    /// ([`Self::set_breakpoints`]) and pushes stay unchanged everywhere.
+    breakpoints: ChromeBreakpoints,
 }
 
 impl std::fmt::Debug for OverlayState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OverlayState")
             .field("depth", &self.stack.len())
+            .field("breakpoints", &self.breakpoints)
             .finish()
     }
 }
 
 impl OverlayState {
-    /// Empty state — no overlay active.
+    /// Empty state — no overlay active, shipped breakpoints.
     #[must_use]
     pub const fn new() -> Self {
-        Self { stack: Vec::new() }
+        Self {
+            stack: Vec::new(),
+            breakpoints: ChromeBreakpoints::DEFAULT,
+        }
+    }
+
+    /// phux-huhi: adopt the attach's `[chrome]` breakpoints.
+    ///
+    /// Called by the driver once the config is loaded, before any overlay
+    /// can be pushed. Already-stacked overlays are re-stamped too, so a
+    /// `phux config reload` that moves a threshold reaches an open modal on
+    /// its next paint rather than only the next one opened.
+    pub fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+        self.breakpoints = bp;
+        for overlay in &mut self.stack {
+            overlay.set_breakpoints(bp);
+        }
     }
 
     /// `true` when at least one overlay is active (capturing input +
@@ -355,7 +391,12 @@ impl OverlayState {
 
     /// Push `overlay` onto the top of the stack. It becomes the input
     /// target and is painted last (above any overlays beneath it).
-    pub fn push(&mut self, overlay: Box<dyn RenderOverlay>) {
+    ///
+    /// The overlay is stamped with the attach's `[chrome]` breakpoints on
+    /// the way in (phux-huhi), so every construction site gets the
+    /// configured thresholds without naming them.
+    pub fn push(&mut self, mut overlay: Box<dyn RenderOverlay>) {
+        overlay.set_breakpoints(self.breakpoints);
         self.stack.push(overlay);
     }
 
@@ -843,6 +884,68 @@ mod tests {
         let mut buf = Vec::new();
         s.paint(&mut buf, (80, 24)).expect("paint");
         assert!(buf.is_empty());
+    }
+
+    /// phux-huhi: an overlay that records the breakpoints handed to it, so
+    /// the stamping seam can be asserted without a real modal.
+    #[derive(Default)]
+    struct BreakpointProbe {
+        seen: Option<ChromeBreakpoints>,
+    }
+    impl RenderOverlay for BreakpointProbe {
+        fn render(&self, _area: Rect, _buf: &mut Buffer) {}
+        fn handle_key(&mut self, _key: &KeyEvent) -> OverlayCommand {
+            OverlayCommand::Stay
+        }
+        fn set_breakpoints(&mut self, bp: ChromeBreakpoints) {
+            self.seen = Some(bp);
+        }
+        fn bounds(&self, _area: Rect) -> Option<Rect> {
+            // Encode the seen thresholds so the test can read them back
+            // through the `&dyn` the stack stores.
+            self.seen
+                .map(|bp| Rect::new(0, 0, bp.compact_cols, bp.compact_rows))
+        }
+    }
+
+    /// `push` stamps the state's breakpoints onto the overlay: that is the
+    /// one seam that spares every construction site from naming them.
+    #[test]
+    fn push_stamps_the_configured_breakpoints() {
+        let mut s = OverlayState::new();
+        s.set_breakpoints(ChromeBreakpoints {
+            compact_cols: 100,
+            compact_rows: 40,
+            min_pane_cols: 30,
+        });
+        s.push(Box::new(BreakpointProbe::default()));
+        assert_eq!(
+            s.active_bounds(Rect::new(0, 0, 200, 60)),
+            Some(Rect::new(0, 0, 100, 40)),
+        );
+    }
+
+    /// A reload re-stamps overlays that are ALREADY open, so a modal on
+    /// screen when the config changes reflows on its next paint instead of
+    /// holding the thresholds it was born with.
+    #[test]
+    fn set_breakpoints_reaches_an_already_stacked_overlay() {
+        let mut s = OverlayState::new();
+        s.push(Box::new(BreakpointProbe::default()));
+        assert_eq!(
+            s.active_bounds(Rect::new(0, 0, 200, 60)),
+            Some(Rect::new(0, 0, 64, 18)),
+            "the shipped defaults until told otherwise",
+        );
+        s.set_breakpoints(ChromeBreakpoints {
+            compact_cols: 100,
+            compact_rows: 40,
+            min_pane_cols: 30,
+        });
+        assert_eq!(
+            s.active_bounds(Rect::new(0, 0, 200, 60)),
+            Some(Rect::new(0, 0, 100, 40)),
+        );
     }
 
     /// A bounded overlay that paints a sentinel OUTSIDE its bounds (at the

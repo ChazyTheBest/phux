@@ -41,6 +41,10 @@ pub struct Config {
     #[serde(default)]
     pub sidebar: SidebarCfg,
 
+    /// Responsive-chrome breakpoints (`[chrome]`).
+    #[serde(default)]
+    pub chrome: ChromeCfg,
+
     /// Event hooks (`[[hooks.<name>]]`).
     ///
     /// Keyed by hook name (e.g. `pane-exit`, `after-new-pane`); each
@@ -472,6 +476,75 @@ pub enum SidebarPosition {
     Left,
     /// Dock on the right.
     Right,
+}
+
+// ---------------------------------------------------------------------------
+// [chrome]
+// ---------------------------------------------------------------------------
+
+/// `[chrome]` — the responsive-chrome breakpoints (phux-huhi).
+///
+/// The chrome adapts to small terminals around a handful of column and row
+/// thresholds (`docs/consumers/tui.md` §4.5). The shipped numbers are
+/// derived from content — the width at which a picker row stays legible,
+/// the height at which a modal still shows a page of list — but "legible"
+/// depends on the terminal, the font, and what the user is willing to
+/// trade. These keys move the thresholds without moving the behaviour.
+///
+/// All three are plain column/row counts with no reserved values: `0`
+/// disables a threshold (nothing is ever compact on that axis; the
+/// sidebar never yields) and a very large value pins the opposite
+/// (everything is compact). Both extremes are legitimate configurations,
+/// so none of them is an error.
+///
+/// Consumed by the TUI's chrome layer, which folds them into its own
+/// breakpoint value once per frame and threads it to every layout site;
+/// kept as plain config data here (ADR-0020: `phux-config` carries no
+/// render types).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ChromeCfg {
+    /// Viewport width at or below which the chrome is *column-starved*:
+    /// overlays go full-bleed horizontally rather than floating. Default
+    /// `64`.
+    #[serde(default = "default_compact_cols")]
+    pub compact_cols: u16,
+
+    /// Viewport height at or below which the chrome is *row-starved*:
+    /// overlays go full-bleed vertically. Judged independently of
+    /// [`Self::compact_cols`], because a short wide terminal and a narrow
+    /// tall one want opposite things. Default `18`.
+    #[serde(default = "default_compact_rows")]
+    pub compact_rows: u16,
+
+    /// The narrowest pane area worth tiling into, in columns. The
+    /// `[sidebar]` strip is not reserved at all below
+    /// `sidebar.width + min-pane-cols`, so the panes it exists to help you
+    /// move between keep the columns. Default `40`.
+    #[serde(default = "default_min_pane_cols")]
+    pub min_pane_cols: u16,
+}
+
+impl Default for ChromeCfg {
+    fn default() -> Self {
+        Self {
+            compact_cols: default_compact_cols(),
+            compact_rows: default_compact_rows(),
+            min_pane_cols: default_min_pane_cols(),
+        }
+    }
+}
+
+const fn default_compact_cols() -> u16 {
+    64
+}
+
+const fn default_compact_rows() -> u16 {
+    18
+}
+
+const fn default_min_pane_cols() -> u16 {
+    40
 }
 
 /// A status-bar widget.

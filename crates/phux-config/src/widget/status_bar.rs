@@ -52,18 +52,39 @@ impl Slot {
         Ok(Self { widgets })
     }
 
-    fn render(&self, ctx: &WidgetContext<'_>) -> Vec<Cell> {
+    /// Render the slot at its natural width, paying each elastic widget
+    /// out of `slack` (phux-be1m).
+    ///
+    /// Only reached on a row that fits; `slack` is empty (and every widget
+    /// therefore content-sized) whenever the bar declares no `spacer`, so
+    /// this is byte-identical to the pre-spacer composer for every existing
+    /// config.
+    fn render(&self, ctx: &WidgetContext<'_>, slack: &mut Slack) -> Vec<Cell> {
         let mut out: Vec<Cell> = Vec::new();
         for w in &self.widgets {
-            let WidgetCells { cells } = w.render(ctx);
+            let WidgetCells { cells } = if w.elastic(ctx) {
+                w.render_within(ctx, slack.take())
+            } else {
+                w.render(ctx)
+            };
             out.extend(cells);
         }
         out
     }
 
     /// The width this slot wants if nothing constrains it.
+    ///
+    /// An elastic widget renders nothing from [`StatusWidget::render`], so
+    /// it contributes zero here by construction — which is exactly the
+    /// property that lets the fitting pass measure the row *before* the
+    /// spacers are paid.
     fn natural_width(&self, ctx: &WidgetContext<'_>) -> usize {
         self.widgets.iter().map(|w| w.render(ctx).len()).sum()
+    }
+
+    /// How many elastic widgets this slot has on this row.
+    fn elastic_count(&self, ctx: &WidgetContext<'_>) -> usize {
+        self.widgets.iter().filter(|w| w.elastic(ctx)).count()
     }
 
     /// Render the slot into at most `budget` cells.
@@ -101,6 +122,51 @@ impl Slot {
         // anyway so a third-party widget cannot corrupt the row geometry.
         out.truncate(budget);
         out
+    }
+}
+
+/// The row's leftover columns, being paid out to elastic widgets in
+/// reading order (phux-be1m).
+///
+/// Split evenly; the first `remainder` claimants get one column more, so
+/// two spacers on an odd slack differ by one column rather than the row
+/// ending a cell short. [`Self::NONE`] is the no-spacer case and hands out
+/// nothing, which is what keeps a bar without a `spacer` composing exactly
+/// as it did before this existed.
+#[derive(Debug, Clone, Copy)]
+struct Slack {
+    /// Base share every remaining claimant gets.
+    per: usize,
+    /// Claimants still owed one extra column.
+    remainder: usize,
+}
+
+impl Slack {
+    /// Nothing to hand out.
+    const NONE: Self = Self {
+        per: 0,
+        remainder: 0,
+    };
+
+    /// Divide `total` columns among `claimants` elastic widgets.
+    const fn split(total: usize, claimants: usize) -> Self {
+        if claimants == 0 {
+            return Self::NONE;
+        }
+        Self {
+            per: total / claimants,
+            remainder: total % claimants,
+        }
+    }
+
+    /// The next claimant's share.
+    const fn take(&mut self) -> usize {
+        if self.remainder > 0 {
+            self.remainder -= 1;
+            self.per + 1
+        } else {
+            self.per
+        }
     }
 }
 
@@ -217,6 +283,33 @@ impl StatusBar {
     /// degrade on their own terms — the composer never cuts cells it does
     /// not understand.
     ///
+    /// ## Elastic space (`spacer`, phux-be1m)
+    ///
+    /// A `spacer` has no content and no natural width, so it is invisible
+    /// to all of the above: the row is measured, and fitted, exactly as if
+    /// the spacer were not there. Only on a row that *fits* is the leftover
+    /// width — `width` minus the three slots' natural widths and the center
+    /// gutters — split evenly across every spacer in the bar, in reading
+    /// order (left slot, then center, then right), with the remainder going
+    /// to the earliest ones.
+    ///
+    /// Three consequences worth stating, because they are the contract and
+    /// not accidents of the implementation:
+    ///
+    /// 1. **Slack is row-wide, not slot-wide.** A spacer in the left slot
+    ///    is paid out of the same pool as one in the right, so
+    ///    `left = ["windows", spacer, "cwd"]` pushes `cwd` up against the
+    ///    right slot rather than against some notional left-slot boundary,
+    ///    which is not a thing this layout has.
+    /// 2. **A bar with a spacer has no room left for the center slot.**
+    ///    The spacers consume the gap the center is centered in; a config
+    ///    that wants a centered widget should use the center slot instead
+    ///    of spacers, which is what the center slot is for.
+    /// 3. **Spacers yield first.** The moment the row overflows there is no
+    ///    slack, so every spacer renders zero cells and the narrowing
+    ///    policy above runs on the real widgets untouched. A spacer can
+    ///    never push content off a narrow terminal.
+    ///
     /// [`StatusWidget::render_within`]: crate::widget::StatusWidget::render_within
     #[must_use]
     pub fn render(&self, ctx: &WidgetContext<'_>, width: u16) -> Vec<Cell> {
@@ -274,12 +367,22 @@ impl StatusBar {
         );
 
         // Everything fits with a blank column either side of the center:
-        // no policy needed.
-        if ln + cn + rn + center_gutters(cn) <= width {
+        // no narrowing policy needed. What is left over is the row's
+        // slack, and any `spacer` widgets split it (phux-be1m). With no
+        // spacers the split hands out nothing and this is the original
+        // content-sized render.
+        let claimed = ln + cn + rn + center_gutters(cn);
+        if claimed <= width {
+            let mut slack = Slack::split(
+                width - claimed,
+                self.left.elastic_count(ctx)
+                    + self.center.elastic_count(ctx)
+                    + self.right.elastic_count(ctx),
+            );
             return (
-                self.left.render(ctx),
-                self.center.render(ctx),
-                self.right.render(ctx),
+                self.left.render(ctx, &mut slack),
+                self.center.render(ctx, &mut slack),
+                self.right.render(ctx, &mut slack),
             );
         }
 
@@ -774,5 +877,178 @@ mod tests {
         let row = bar.render(&ctx_with("main"), 20);
         let s = row_to_string(&row);
         assert_eq!(s, "main            YEAR");
+    }
+
+    // -----------------------------------------------------------------
+    // `spacer` — elastic space (phux-be1m)
+    // -----------------------------------------------------------------
+
+    /// A literal `text` widget, so a spacer's effect on its neighbours is
+    /// readable as a string rather than inferred from cell counts.
+    fn text(value: &str) -> Widget {
+        spec("text", &[("value", toml::Value::String(value.to_owned()))])
+    }
+
+    /// The motivating case: a spacer between two widgets in ONE slot
+    /// pushes them to the two ends of the row.
+    #[test]
+    fn a_spacer_pushes_its_neighbours_to_the_ends_of_the_row() {
+        let cfg = StatusCfg {
+            left: vec![text("AA"), spec("spacer", &[]), text("ZZ")],
+            ..Default::default()
+        };
+        let reg = WidgetRegistry::with_builtins();
+        let bar = StatusBar::build(&cfg, &reg).unwrap();
+        assert_eq!(row_to_string(&bar.render(&ctx_with(""), 10)), "AA      ZZ");
+        // Same config, wider terminal: the gap grows, the content does not
+        // move relative to the edges.
+        assert_eq!(
+            row_to_string(&bar.render(&ctx_with(""), 20)),
+            "AA                ZZ"
+        );
+    }
+
+    /// Slack is shared across the whole row, not per slot: a left-slot
+    /// spacer pushes its neighbour up against the right slot.
+    #[test]
+    fn slack_is_split_across_slots_not_within_one() {
+        let cfg = StatusCfg {
+            left: vec![text("AA"), spec("spacer", &[]), text("BB")],
+            right: vec![text("ZZ")],
+            ..Default::default()
+        };
+        let reg = WidgetRegistry::with_builtins();
+        let bar = StatusBar::build(&cfg, &reg).unwrap();
+        assert_eq!(
+            row_to_string(&bar.render(&ctx_with(""), 12)),
+            "AA      BBZZ"
+        );
+    }
+
+    /// Two spacers split the slack evenly, and an odd column goes to the
+    /// earlier one rather than being dropped — the row is always exactly
+    /// `width` cells and the content lands where the arithmetic says.
+    #[test]
+    fn two_spacers_split_the_slack_with_the_remainder_going_first() {
+        let cfg = StatusCfg {
+            left: vec![
+                text("A"),
+                spec("spacer", &[]),
+                text("B"),
+                spec("spacer", &[]),
+                text("C"),
+            ],
+            ..Default::default()
+        };
+        let reg = WidgetRegistry::with_builtins();
+        let bar = StatusBar::build(&cfg, &reg).unwrap();
+        // width 10, content 3 ⇒ slack 7 ⇒ 4 then 3.
+        assert_eq!(row_to_string(&bar.render(&ctx_with(""), 10)), "A    B   C");
+        // width 11 ⇒ slack 8 ⇒ 4 and 4.
+        assert_eq!(row_to_string(&bar.render(&ctx_with(""), 11)), "A    B    C");
+    }
+
+    /// A spacer yields before any real content does: once the row
+    /// overflows there is no slack, and the narrowing policy runs exactly
+    /// as it would have without the spacer.
+    #[test]
+    fn a_spacer_renders_nothing_on_a_full_row() {
+        let reg = WidgetRegistry::with_builtins();
+        let with_spacer = StatusBar::build(
+            &StatusCfg {
+                left: vec![text("AAAA"), spec("spacer", &[]), text("ZZZZ")],
+                ..Default::default()
+            },
+            &reg,
+        )
+        .unwrap();
+        let without = StatusBar::build(
+            &StatusCfg {
+                left: vec![text("AAAA"), text("ZZZZ")],
+                ..Default::default()
+            },
+            &reg,
+        )
+        .unwrap();
+        // Exactly full: no slack, so the two are identical.
+        assert_eq!(
+            row_to_string(&with_spacer.render(&ctx_with(""), 8)),
+            row_to_string(&without.render(&ctx_with(""), 8)),
+        );
+        // Overflowing: still identical — the spacer costs nothing and the
+        // trailing widget yields on its own terms.
+        assert_eq!(
+            row_to_string(&with_spacer.render(&ctx_with(""), 6)),
+            row_to_string(&without.render(&ctx_with(""), 6)),
+        );
+    }
+
+    /// A bar with no spacer composes exactly as it did before elastic
+    /// space existed — the leftover columns stay blank padding rather than
+    /// being handed to anybody.
+    #[test]
+    fn a_bar_without_a_spacer_is_unchanged() {
+        let cfg = StatusCfg {
+            left: vec![text("AA")],
+            right: vec![text("ZZ")],
+            ..Default::default()
+        };
+        let reg = WidgetRegistry::with_builtins();
+        let bar = StatusBar::build(&cfg, &reg).unwrap();
+        assert_eq!(row_to_string(&bar.render(&ctx_with(""), 10)), "AA      ZZ");
+    }
+
+    /// `min-cols` gates a spacer like any other widget, and a gated-out
+    /// spacer claims no share: at the narrow width the row pads as if the
+    /// spacer were absent, and the OTHER spacer takes the whole slack.
+    #[test]
+    fn a_gated_out_spacer_claims_no_slack() {
+        let cfg = StatusCfg {
+            left: vec![
+                text("A"),
+                spec("spacer", &[("min-cols", toml::Value::Integer(20))]),
+                text("B"),
+                spec("spacer", &[]),
+                text("C"),
+            ],
+            ..Default::default()
+        };
+        let reg = WidgetRegistry::with_builtins();
+        let bar = StatusBar::build(&cfg, &reg).unwrap();
+        // At 10 the gated spacer is absent: the surviving one takes all 7.
+        assert_eq!(row_to_string(&bar.render(&ctx_with(""), 10)), "AB       C");
+        // At 20 both are live and split 17 as 9 + 8.
+        assert_eq!(
+            row_to_string(&bar.render(&ctx_with(""), 20)),
+            "A         B        C"
+        );
+    }
+
+    /// A styled spacer paints its gap: the blanks are unstyled at the
+    /// widget, so the registry's `style` decorator fills them in. This is
+    /// how a user draws a colored bar rather than a hole.
+    #[test]
+    fn a_styled_spacer_carries_its_style_into_the_gap() {
+        let mut style = toml::map::Map::new();
+        style.insert("bg".to_owned(), toml::Value::String("#123456".to_owned()));
+        let cfg = StatusCfg {
+            left: vec![
+                text("A"),
+                spec("spacer", &[("style", toml::Value::Table(style))]),
+                text("B"),
+            ],
+            ..Default::default()
+        };
+        let reg = WidgetRegistry::with_builtins();
+        let bar = StatusBar::build(&cfg, &reg).unwrap();
+        let row = bar.render(&ctx_with(""), 6);
+        let gap = &row[1..5];
+        assert!(
+            gap.iter().all(|c| c
+                .style
+                .as_ref()
+                .is_some_and(|s| s.bg.as_deref() == Some("#123456"))),
+            "the spacer's own style must reach the blanks it paints",
+        );
     }
 }

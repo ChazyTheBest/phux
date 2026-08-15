@@ -82,6 +82,7 @@ use crate::layout::Workspace;
 use crate::layout_ops::LAYOUT_KEY;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::{Overlay, PredictionState, PredictiveConfig};
+use crate::render::ChromeBreakpoints;
 use crate::render::chrome::sidebar::{AgentEntry, SidebarPainter, attention_rank};
 use crate::render::chrome::status_bar::{Notice, StatusBarPainter};
 use crate::render::overlay::OverlayState;
@@ -772,6 +773,13 @@ pub async fn run_headless_rendered(
     // `None`, keeping the rendered frame byte-identical to the pre-sidebar one.
     let headless_cfg = phux_config::loader::load().ok();
     let sidebar_cfg = headless_cfg.as_ref().map(|c| c.sidebar.clone());
+    // phux-huhi: the same `[chrome]` thresholds a live attach folds in, so a
+    // rendered snapshot yields the sidebar at the width the user configured.
+    let headless_chrome = headless_cfg
+        .as_ref()
+        .map_or_else(ChromeBreakpoints::default, |c| {
+            ChromeBreakpoints::from_cfg(&c.chrome)
+        });
     let sidebar = sidebar_cfg.as_ref().and_then(|c| {
         sidebar_reservation(
             viewport_dims.0,
@@ -781,6 +789,7 @@ pub async fn run_headless_rendered(
                 SidebarPosition::Right => SidebarEdge::Right,
                 SidebarPosition::Left => SidebarEdge::Left,
             },
+            headless_chrome.min_pane_cols,
         )
     });
     let sidebar_theme = headless_cfg
@@ -1742,6 +1751,16 @@ async fn main_loop<W: super::RenderSink>(
         Some(SidebarPosition::Right) => SidebarEdge::Right,
         _ => SidebarEdge::Left,
     };
+    // phux-huhi: the responsive-chrome thresholds, snapshotted from
+    // `[chrome]` beside the theme and the sidebar geometry. One value for the
+    // whole attach: the sidebar-yield fold below, the `toggle-sidebar`
+    // refusal in `input_dispatch`, and every overlay's `centered_panel` read
+    // this, so "compact" cannot mean two things on the same frame.
+    let mut chrome_breakpoints = loaded_cfg
+        .as_ref()
+        .map_or_else(ChromeBreakpoints::default, |c| {
+            ChromeBreakpoints::from_cfg(&c.chrome)
+        });
     // The strip painter, themed like the status bar. Fed `window_infos` from
     // the same snapshot that drives the tab strip; caches so an unchanged
     // repaint emits nothing.
@@ -1752,6 +1771,10 @@ async fn main_loop<W: super::RenderSink>(
     // route to the overlay (no pane forwarding) and pane stdout flushes
     // are suppressed (ADR-0020 §Decision invariant 5).
     let mut overlays = OverlayState::new();
+    // phux-huhi: stamp the configured breakpoints once, before anything can
+    // be pushed. `OverlayState::push` hands them to each overlay from here,
+    // so no overlay construction site names a threshold.
+    overlays.set_breakpoints(chrome_breakpoints);
     // phux-oih5.16: one client-local return point for attention navigation.
     // Cycling never overwrites it; return consumes it. It is deliberately
     // absent from Workspace/L3 metadata and resets on re-attach.
@@ -1886,6 +1909,7 @@ async fn main_loop<W: super::RenderSink>(
         sidebar_enabled,
         sidebar_width,
         sidebar_edge,
+        chrome_breakpoints.min_pane_cols,
     );
     let outcome = handle_server_frame(
         &mut engine_kernel,
@@ -2064,6 +2088,7 @@ async fn main_loop<W: super::RenderSink>(
             sidebar_enabled,
             sidebar_width,
             sidebar_edge,
+            chrome_breakpoints.min_pane_cols,
         );
         // phux-npb3: capture follows focus. Re-derive the outer-terminal
         // mouse-tracking DECSET from the focused pane's opt-out state every
@@ -2314,6 +2339,7 @@ async fn main_loop<W: super::RenderSink>(
                     sidebar,
                     sidebar_enabled: &mut sidebar_enabled,
                     sidebar_width,
+                    chrome: chrome_breakpoints,
                     sidebar_agents: &sidebar_agent_rows,
                     bar: status_bar.as_ref().map(StatusBarPainter::position),
                     status_bar: status_bar.as_ref(),
@@ -2344,7 +2370,7 @@ async fn main_loop<W: super::RenderSink>(
                 // `sidebar_enabled`. Re-fold it into the reservation so the
                 // reflow + repaint below tile into the NEW content rect this
                 // iteration rather than waiting a frame.
-                let sidebar = sidebar_reservation(viewport_dims.0, sidebar_enabled, sidebar_width, sidebar_edge);
+                let sidebar = sidebar_reservation(viewport_dims.0, sidebar_enabled, sidebar_width, sidebar_edge, chrome_breakpoints.min_pane_cols);
                 // phux-eb0: a committed `switch-session` ends this loop so
                 // the outer driver re-attaches. Return BEFORE any repaint
                 // — the new session's ATTACHED + snapshot will repaint.
@@ -2449,6 +2475,7 @@ async fn main_loop<W: super::RenderSink>(
                         &mut keybindings_snapshot,
                         &mut resolver,
                         &mut theme,
+                        &mut chrome_breakpoints,
                         &mut status_bar,
                         &mut sidebar_painter,
                         &mut plugin_actions,
@@ -3040,6 +3067,7 @@ async fn main_loop<W: super::RenderSink>(
                                 &mut keybindings_snapshot,
                                 &mut resolver,
                                 &mut theme,
+                                &mut chrome_breakpoints,
                                 &mut status_bar,
                                 &mut sidebar_painter,
                                 &mut plugin_actions,
@@ -3264,6 +3292,7 @@ async fn main_loop<W: super::RenderSink>(
                     sidebar,
                     sidebar_enabled: &mut sidebar_enabled,
                     sidebar_width,
+                    chrome: chrome_breakpoints,
                     sidebar_agents: &sidebar_agent_rows,
                     bar: status_bar.as_ref().map(StatusBarPainter::position),
                     status_bar: status_bar.as_ref(),
@@ -3293,7 +3322,7 @@ async fn main_loop<W: super::RenderSink>(
                 // phux-4h5a: re-fold a `toggle-sidebar` flip into the
                 // reservation, same as the stdin arm, so the same-iteration
                 // repaint tiles into the new content rect.
-                let sidebar = sidebar_reservation(viewport_dims.0, sidebar_enabled, sidebar_width, sidebar_edge);
+                let sidebar = sidebar_reservation(viewport_dims.0, sidebar_enabled, sidebar_width, sidebar_edge, chrome_breakpoints.min_pane_cols);
                 // phux-eb0: same switch-on-commit check as the stdin arm.
                 // A bare-ESC flush can carry the final chord of a
                 // `<leader> a` selection committed via Enter.
@@ -3390,6 +3419,7 @@ async fn main_loop<W: super::RenderSink>(
                         &mut keybindings_snapshot,
                         &mut resolver,
                         &mut theme,
+                        &mut chrome_breakpoints,
                         &mut status_bar,
                         &mut sidebar_painter,
                         &mut plugin_actions,
@@ -4357,6 +4387,7 @@ fn handle_config_reload<W: super::RenderSink>(
     keybindings_snapshot: &mut Option<phux_config::KeybindingsCfg>,
     resolver: &mut Option<phux_config::keybind::Resolver>,
     theme: &mut crate::render::Theme,
+    chrome: &mut ChromeBreakpoints,
     status_bar: &mut Option<StatusBarPainter>,
     sidebar_painter: &mut SidebarPainter,
     plugin_actions: &mut Vec<PluginActionEntry>,
@@ -4382,6 +4413,7 @@ fn handle_config_reload<W: super::RenderSink>(
         keybindings_snapshot,
         resolver,
         theme,
+        chrome,
         status_bar,
         plugin_actions,
         plugin_panes,
@@ -4390,6 +4422,9 @@ fn handle_config_reload<W: super::RenderSink>(
     ) {
         Ok(()) => {
             tracing::info!("config reloaded in place");
+            // phux-huhi: the new `[chrome]` thresholds reach the overlay
+            // stack immediately, including any modal already open.
+            overlays.set_breakpoints(*chrome);
             // Fresh painters carry the new theme and start cache-cold so
             // the repaint below recolors the whole chrome. The attention
             // chip color rides the theme (phux-foz.1).

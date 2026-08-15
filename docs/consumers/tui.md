@@ -634,6 +634,12 @@ left   = [{ kind = "windows" }]
 center = [{ kind = "help-hints" }]
 right  = ["session-name", { kind = "time", format = " %H:%M" }]
 
+# Responsive-chrome breakpoints (section 4.5). Shipped values shown.
+[chrome]
+compact-cols  = 64
+compact-rows  = 18
+min-pane-cols = 40
+
 [[plugins]]
 manifest = "/path/to/plugin/phux-plugin.toml"
 enabled = true
@@ -1271,7 +1277,12 @@ What changes:
   still stops at the sidebar's edge.
 - **The status bar changes shape.** See §8.4.1: the tab strip collapses
   around the active tab, hints drop whole, and the shipped lineup trades
-  the session name and clock for a clickable `switch` chip.
+  the session name and clock for a clickable `switch` chip. The bar's
+  own shape change is *not* driven by the breakpoint below — it is the
+  per-widget `min-cols` / `max-cols` in the shipped `[status]`, which is
+  ordinary config you own and edit. They happen to be set to 64/65 so the
+  two agree out of the box; if you move `[chrome] compact-cols`, move
+  them too.
 - **List rows are laid out to the exact interior width.** A row's
   secondary column (a branch, a cwd, a bound chord) yields before its
   label does, and text that does not fit is cut with a trailing `…`
@@ -1283,6 +1294,44 @@ What changes:
   those widths rather than flipping a flag with no visible effect —
   turning the strip *off* is always allowed, so shrinking a terminal
   never traps you. The fleet switcher is the navigation surface there.
+
+#### Moving the breakpoints: `[chrome]`
+
+The three numbers above are defaults, not laws. "Legible" depends on
+your terminal, your font, and what you are willing to trade, so each is
+a key:
+
+```toml
+[chrome]
+compact-cols  = 64   # at or below this width, overlays go full-bleed
+compact-rows  = 18   # at or below this height, overlays go full-bleed
+min-pane-cols = 40   # narrowest pane area worth tiling into; the
+                     # sidebar is not reserved below
+                     # `[sidebar] width` + this
+```
+
+Raise `compact-cols` if you want full-bleed pickers on a terminal phux
+considers roomy; lower it if you would rather keep floating modals on a
+small one. Lower `min-pane-cols` to keep the sidebar on a narrower
+terminal — the strip still costs its columns, you are just saying you
+would rather have it than them.
+
+All three are plain counts with no reserved values. `0` disables a
+threshold (nothing is ever compact on that axis; the sidebar never
+yields), and a very large one pins the opposite. Both are legitimate, so
+neither is an error. The axes stay independent whatever you set: a
+viewport is compact on width and height separately.
+
+`[chrome]` governs the overlay geometry and the sidebar yield. It does
+**not** reach into `[status]`: the shipped bar's shape change at 64
+columns is per-widget `min-cols` / `max-cols` in your own config (§8.4.1),
+deliberately, because a status bar is a lineup you compose rather than a
+behaviour phux imposes. Changing `compact-cols` without editing those
+leaves the bar switching shape at the old width.
+
+`[chrome]` is read once per attach and swapped whole by `phux config
+reload` (§4.3), including for a modal that is already open — it reflows
+on its next paint rather than keeping the thresholds it was born with.
 
 ---
 
@@ -2054,7 +2103,8 @@ timed-out run keeps the last good output.
 - `exec` widgets re-render every `interval`. The client batches
   re-renders to once per frame (max ~60 Hz).
 - Slot contents render left-to-right with no implicit separator. Use
-  `text` widgets for separators.
+  `text` widgets for separators, and `spacer` widgets for gaps that grow
+  with the terminal (§8.4.2).
 
 ### 8.4.1 How the bar narrows
 
@@ -2104,6 +2154,42 @@ slot carries the session name and clock; at or below it, those give way
 to a clickable `switch` chip that opens the fleet dashboard — the same
 overlay `prefix A` opens, which on a small terminal opens full-screen
 (§4.4.1).
+
+### 8.4.2 Elastic space: the `spacer` widget
+
+Every other widget is sized by what it has to say. A `spacer` is the
+exception: it has no content, takes no width of its own, and then
+absorbs the columns nothing else claimed.
+
+```toml
+[status]
+left = [{ kind = "windows" }, { kind = "spacer" }, "session-name"]
+```
+
+That puts the tab strip hard left and the session name hard right, at
+every terminal width, without using a second slot.
+
+Three rules, worth knowing before you build a bar around one:
+
+1. **Slack is row-wide, not slot-wide.** Every spacer in the bar — left,
+   center, or right slot — splits the same leftover width evenly, in
+   reading order, with the odd column going to the earlier ones. There
+   is no such thing as "the left slot's own width" for a spacer to
+   expand into; slots are placed against the row, not sized.
+2. **A bar with a spacer has no room left for the center slot.** The
+   spacers eat the gap the center slot is centered in. If you want
+   something centered, use `center` — that is what it is for.
+3. **Spacers yield first.** They are paid out of slack, and a row that
+   overflows has none, so on a narrow terminal every spacer renders zero
+   cells and §8.4.1's narrowing runs on your real widgets untouched. A
+   spacer can never push content off the screen, which is what makes it
+   safe to leave in a config you also use over SSH from a phone.
+
+A spacer takes no options. Give it a `style` table to paint the gap
+(`{ kind = "spacer", style = { bg = "#1e1e2e" } }`) instead of leaving
+it blank, and `min-cols` / `max-cols` to gate it by terminal width like
+any other widget — a gated-out spacer claims no share of the slack. For
+a gap that does *not* grow, use a `text` widget of spaces.
 
 ### 8.5 What the status bar is not
 

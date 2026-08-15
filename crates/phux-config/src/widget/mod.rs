@@ -33,6 +33,7 @@ pub use widgets::exec::{ExecFeed, ExecWidget};
 pub use widgets::exit_status::ExitWidget;
 pub use widgets::help_hints::HelpHintsWidget;
 pub use widgets::session_name::SessionNameWidget;
+pub use widgets::spacer::SpacerWidget;
 pub use widgets::switch::SwitchWidget;
 pub use widgets::text::TextWidget;
 pub use widgets::time::TimeWidget;
@@ -320,6 +321,27 @@ pub trait StatusWidget: Send + Sync + fmt::Debug + 'static {
         self.render(ctx).clipped(budget)
     }
 
+    /// phux-be1m: `true` for a widget whose width is *elastic* — it has no
+    /// content of its own and instead absorbs the row's leftover columns.
+    ///
+    /// The `spacer` kind is the only such widget, and the whole vocabulary
+    /// of the composer's fitting pass is built on the opposite assumption
+    /// (a widget is content-sized; the row is what has to give), so this
+    /// is a narrow, explicit opt-in rather than a general layout system.
+    /// See [`StatusBar::render`] for what an elastic widget is promised:
+    /// nothing at all when the row is full, and an even share of the
+    /// leftover columns when it is not.
+    ///
+    /// Takes `ctx` because visibility is width-conditional: a `spacer`
+    /// gated out by `min-cols` / `max-cols` is not elastic on that row, it
+    /// is simply absent, and must not claim a share it would then not
+    /// paint.
+    ///
+    /// [`StatusBar::render`]: crate::widget::StatusBar::render
+    fn elastic(&self, _ctx: &WidgetContext<'_>) -> bool {
+        false
+    }
+
     /// Optional poll interval. `None` ⇒ this widget needs no time-based
     /// repaint and is redrawn only when the status bar repaints for
     /// other reasons (session-name change, layout change, …). `Some(d)`
@@ -435,6 +457,7 @@ pub const BUILTIN_WIDGET_SPECS: &[&WidgetKindSpec] = &[
     &widgets::exit_status::SPEC,
     &widgets::help_hints::SPEC,
     &widgets::session_name::SPEC,
+    &widgets::spacer::SPEC,
     &widgets::switch::SPEC,
     &widgets::text::SPEC,
     &widgets::time::SPEC,
@@ -525,6 +548,10 @@ impl StatusWidget for Styled {
         cells
     }
 
+    fn elastic(&self, ctx: &WidgetContext<'_>) -> bool {
+        self.inner.elastic(ctx)
+    }
+
     fn poll_interval(&self) -> Option<Duration> {
         self.inner.poll_interval()
     }
@@ -570,6 +597,12 @@ impl StatusWidget for ColRange {
         } else {
             WidgetCells { cells: Vec::new() }
         }
+    }
+
+    /// A gated-out widget is not elastic: it claims no share of the slack
+    /// on a row where it paints nothing.
+    fn elastic(&self, ctx: &WidgetContext<'_>) -> bool {
+        self.visible(ctx) && self.inner.elastic(ctx)
     }
 
     fn poll_interval(&self) -> Option<Duration> {
@@ -641,6 +674,7 @@ impl WidgetRegistry {
         r.register("help-hints", widgets::help_hints::factory);
         r.register("time", widgets::time::factory);
         r.register("session-name", widgets::session_name::factory);
+        r.register("spacer", widgets::spacer::factory);
         r.register("switch", widgets::switch::factory);
         r.register("text", widgets::text::factory);
         r.register("windows", widgets::windows::factory);

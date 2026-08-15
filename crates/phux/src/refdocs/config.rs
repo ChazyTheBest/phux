@@ -68,6 +68,13 @@ const SECTIONS: &[Section] = &[
                   the edge it docks to when enabled.",
     },
     Section {
+        key: "chrome",
+        header: "[chrome]",
+        summary: "Responsive-chrome breakpoints: the column and row counts \
+                  at which overlays go full-bleed and the sidebar yields \
+                  its columns back to the panes.",
+    },
+    Section {
         key: "hooks",
         header: "[[hooks.<event>]]",
         summary: "Event hooks: per event name, an array of `when` \
