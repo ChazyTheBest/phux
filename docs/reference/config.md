@@ -318,8 +318,7 @@ which-key-delay-ms = 400
 "K" = { action = "resize-pane", direction = "up",    amount = 5 }
 "L" = { action = "resize-pane", direction = "right", amount = 5 }
 
-# Show the help overlay: a centered modal listing every keybinding. Esc
-# or ? again dismisses it.
+# Open the same fuzzy commands-and-help finder as `command-palette`.
 "?" = "show-help"
 
 # Live config reload (phux-foz.5): re-reads this file (full layered

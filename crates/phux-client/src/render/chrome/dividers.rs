@@ -46,9 +46,9 @@ use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect as RataRect;
 
 use crate::attach::multi_pane::PaneLayout;
-use crate::render::overlay::help::HardcodedBinding;
+use crate::render::overlay::HardcodedBinding;
 
-/// The divider drag-resize table for the help overlay's `Mouse & menus`
+/// The divider drag-resize table for handler-adjacency tests
 /// section (phux-i0e8.10.3).
 ///
 /// COLOCATED with the divider layer: the drag

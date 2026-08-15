@@ -129,10 +129,8 @@ impl KeyChord {
     /// same logical modifiers once the event's `mods` are masked to
     /// the chord modifier set (lock and side bits ignored).
     ///
-    /// This is the comparison the help-overlay dismiss path wants: feed
-    /// it the chord parsed from the user's `show-help` binding and the
-    /// live event, and dismiss on a match rather than on a hardcoded
-    /// `F1`.
+    /// This comparison is useful anywhere a configured chord must be matched
+    /// against a structured event without hardcoding a physical key.
     #[must_use]
     pub fn matches_event(self, ev: &KeyEvent) -> bool {
         matches!(ev.action, KeyAction::Press)

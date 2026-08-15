@@ -1,13 +1,13 @@
 //! Reusable themed overlay primitives (phux-ahv.5).
 //!
-//! Overlays ([`help`], [`prompt`], and future ones like a command palette)
-//! share two visual building blocks:
+//! Overlays ([`prompt`], the action finder, and pickers) share two visual
+//! building blocks:
 //!
 //! - [`Modal`] — a centered bordered box with a title, body, and optional
 //!   footer, styled through [`Theme`] slots (`border`, `accent`, `dim`).
 //!   Built on ratatui [`Block`] + [`Paragraph`].
-//! - [`KeyChordTable`] — the chord/description columns the help overlay
-//!   shows, grouped into titled sections and column-aligned across
+//! - [`KeyChordTable`] — chord/description columns used by which-key,
+//!   grouped into titled sections and column-aligned across
 //!   section boundaries. Styled through the `chord`, `action`, and
 //!   `section_header` slots.
 //!
@@ -15,7 +15,6 @@
 //! paint path. They own (copy) their [`Theme`] so the overlay that holds
 //! them stays `'static`.
 //!
-//! [`help`]: super::help
 //! [`prompt`]: super::prompt
 //! [`Block`]: ratatui::widgets::Block
 //! [`Paragraph`]: ratatui::widgets::Paragraph
@@ -373,7 +372,7 @@ impl ChordSection {
     }
 }
 
-/// The chord/description table the help overlay shows.
+/// A grouped chord/description table used by key-discovery overlays.
 ///
 /// Renders sections top-to-bottom (blank spacer between them), each with a
 /// bold [`Theme::section_header`] heading, then its rows with the chord

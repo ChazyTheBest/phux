@@ -31,7 +31,7 @@ The **Palette** column is the command-palette section the action is offered unde
 | `rename-session` | Session | `name?` (bare opens an interactive prompt) | Rename the current session (interactive prompt) |
 | `focus-direction` | Pane | `direction` = `left` \| `right` \| `up` \| `down` | Move focus to the pane on the left |
 | `resize-pane` | Pane | `direction` = `left` \| `right` \| `up` \| `down`; `amount` (cells) | Grow the focused pane to the left |
-| `show-help` | View |  | Show the keybindings help overlay |
+| `show-help` | — |  | Open the fuzzy commands and help finder |
 | `getting-started` | View |  | Getting started: detach, return, and command discovery |
 | `copy-mode` | — |  | Enter copy-mode on the focused pane (scrollback navigation, selection, yank) |
 | `detach` | View |  | Detach this client from the session |
@@ -40,7 +40,7 @@ The **Palette** column is the command-palette section the action is offered unde
 | `last-pane` | Pane |  | Jump back to the previously focused pane |
 | `toggle-zoom` | Pane |  | Zoom the focused pane to fill the window (toggle) |
 | `toggle-sidebar` | View |  | Show or hide the window sidebar (toggle) |
-| `command-palette` | — |  | Open the command palette |
+| `command-palette` | — |  | Open the fuzzy commands and help finder |
 | `context-menu` | Pane |  | Open the context menu for the focused pane (ADR-0058) |
 | `window-picker` | Window |  | Pick a window from all sessions (grouped) |
 | `session-picker` | Session |  | Pick a session from a filterable list |
@@ -60,7 +60,8 @@ The **Palette** column is the command-palette section the action is offered unde
 
 Why the dash rows have no palette entry:
 
-- `command-palette` — opening the palette from the palette is noise.
+- `command-palette` — it is an entry alias for the finder, so listing it inside the finder would recurse.
+- `show-help` — it is an entry alias for the same finder as `command-palette`, so listing it would duplicate that surface.
 - `select-window` — parameterized by `index`, which the palette has no UI to collect; the window picker is the surface for "jump to window N".
 - `switch-session` — requires a `name` arg supplied by the session picker (or the fleet's foreign rows), so a bare palette row would have no target to act on.
 - `copy-mode` — a modal input surface entered from its keybinding, not a one-shot command the palette can commit.

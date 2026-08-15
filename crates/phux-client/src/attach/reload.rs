@@ -31,7 +31,7 @@ use crate::render::{ChromeBreakpoints, Theme};
 /// comes from the same freshly-validated [`Config`], or (on any error)
 /// none of the driver's existing state is touched.
 pub(super) struct ReloadedConfig {
-    /// Plugin-merged keybindings snapshot (help overlay, palette chords,
+    /// Plugin-merged keybindings snapshot (action-finder chords,
     /// which-key rows).
     pub keybindings: KeybindingsCfg,
     /// Keybind resolver built from [`Self::keybindings`].

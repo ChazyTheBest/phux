@@ -1,4 +1,4 @@
-//! Overlay layer — modals, help, command palette.
+//! Overlay layer — modals, action finder, and pickers.
 //!
 //! An overlay is a chrome-layer widget that takes over the outer terminal
 //! while it's active: input is captured (no keystrokes reach the focused
@@ -10,12 +10,10 @@
 //!
 //! [`OverlayState`] carries a *stack* of overlays. The top of the stack
 //! captures input ([`RenderOverlay::handle_key`]); rendering walks the
-//! stack bottom-up so stacked overlays compose (e.g. a command palette
-//! painted on top of an open help modal). A single active overlay is the
+//! stack bottom-up so stacked overlays compose. A single active overlay is the
 //! one-element case — the common path is unchanged from a UX standpoint.
 //!
 //! Submodules:
-//! - [`help`] — keybindings reference modal (phux-5ke.4)
 //! - [`prompt`] — single-line text-input modal (phux-ahv.1)
 //! - [`widgets`] — reusable themed primitives ([`Modal`], [`KeyChordTable`])
 //!
@@ -33,7 +31,6 @@ use ratatui::style::Color;
 use crate::render::ChromeBreakpoints;
 
 pub mod copy_mode;
-pub mod help;
 pub mod menu;
 pub mod prompt;
 pub mod select_list;
@@ -43,7 +40,6 @@ pub mod which_key;
 pub mod widgets;
 
 pub use copy_mode::CopyModeOverlay;
-pub use help::HelpOverlay;
 pub use menu::{ContextMenu, MenuRow};
 pub use prompt::PromptOverlay;
 pub use select_list::{SelectItem, SelectList};
@@ -54,6 +50,16 @@ pub use select_list::{SelectItem, SelectList};
 pub use selection::{CopyRequest, SelectionGrab, SelectionMode, SelectionRect};
 pub use toast::ToastOverlay;
 pub use which_key::WhichKeyOverlay;
+
+/// One driver-owned, non-rebindable interaction kept beside its handler so
+/// adjacency tests can prevent discovery text from drifting from behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct HardcodedBinding {
+    /// Literal key, mouse gesture, or clickable label.
+    pub chord: &'static str,
+    /// What the gesture does.
+    pub action: &'static str,
+}
 
 /// Test double: a [`RenderOverlay`] that records every key handed to it and
 /// never dismisses, so a test can assert exactly which keystrokes reached

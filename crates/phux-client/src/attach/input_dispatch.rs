@@ -34,7 +34,7 @@ use crate::layout::{Direction, SplitDir, Workspace};
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::{Overlay, PredictionState};
 use crate::render::overlay::{
-    ContextMenu, HelpOverlay, OverlayOutcome, OverlayState, PromptOverlay, SelectItem, SelectList,
+    ContextMenu, OverlayOutcome, OverlayState, PromptOverlay, SelectItem, SelectList,
 };
 use crate::render::{ChromeBreakpoints, Theme};
 
@@ -99,16 +99,15 @@ pub(super) struct DispatchCtx<'a> {
     pub expected_closes: &'a mut HashSet<TerminalId>,
     /// phux-5ke.4: overlay stack. When non-empty the dispatcher routes
     /// key events to the active overlay (no resolver, no predict, no
-    /// pane forwarding) and the `show-help` action pushes onto it.
+    /// pane forwarding) and discovery actions push onto it.
     pub overlays: &'a mut OverlayState,
-    /// phux-5ke.4: snapshot of the on-disk keybindings, captured at
-    /// driver start. The help overlay reads this to render the modal
-    /// body. `None` when config load failed (overlay still pushes but
-    /// shows "no bindings configured").
+    /// Snapshot of the on-disk keybindings, captured at driver start.
+    /// The action finder uses it to show each live chord. `None` when
+    /// config load failed (rows then show as unbound).
     pub keybindings: Option<&'a phux_config::KeybindingsCfg>,
     /// phux-ahv.4: chrome + overlay color theme, resolved from
     /// `[theme]` config at driver start. Overlays snapshot it at
-    /// construction (`show-help`, `rename-window`) so their painted
+    /// construction (action finder, `rename-window`) so their painted
     /// colors flow from a single source of truth.
     pub theme: &'a Theme,
     /// phux-4li.20: the server's session graph, cached from the latest
@@ -1892,6 +1891,22 @@ pub enum ReattachTarget {
 /// they are the same set by construction, and the test enforces it.
 pub use phux_config::vocab::ACTION_NAMES;
 
+/// Open the single fuzzy discovery surface. `show-help` and
+/// `command-palette` are entry aliases so users never have to choose between
+/// a reference modal and an executable finder.
+fn push_action_finder(ctx: &mut DispatchCtx<'_>) {
+    let items = super::action_registry::palette_items(
+        ctx.keybindings,
+        ctx.plugin_actions,
+        ctx.plugin_panes,
+    );
+    ctx.overlays.push(Box::new(SelectList::new(
+        "commands & help",
+        items,
+        ctx.theme,
+    )));
+}
+
 /// Dispatch a resolved action against the driver's context.
 ///
 /// Returns the [`ActionEffects`] the caller needs to apply. The function
@@ -2261,19 +2276,7 @@ fn run_action(
             // exactly the state the reload replaces.
             effects.reload_config = true;
         }
-        "show-help" => {
-            // phux-5ke.4: push the help overlay. The chord is consumed —
-            // the bound key never reaches the pane (and it wouldn't make
-            // sense to: F1 / `?` are typically reserved for the active
-            // application, but the resolver matched, so the user's
-            // intent was "open phux help"). Idempotent: pushing while
-            // already active just replaces (debug-logged).
-            let overlay = ctx.keybindings.map_or_else(
-                || HelpOverlay::from_config(&phux_config::KeybindingsCfg::default(), ctx.theme),
-                |kb| HelpOverlay::from_config(kb, ctx.theme),
-            );
-            ctx.overlays.push(Box::new(overlay));
-        }
+        "show-help" | "command-palette" => push_action_finder(ctx),
         "getting-started" => {
             ctx.overlays
                 .push(Box::new(crate::render::overlay::ToastOverlay::passthrough(
@@ -2294,24 +2297,6 @@ fn run_action(
                 pane_rect.h,
             ));
             ctx.overlays.push(overlay);
-        }
-        "command-palette" => {
-            // phux-ahv.8: push the command palette. It lists every action
-            // the registry knows about, annotated with its currently-bound
-            // chord from the live keybindings snapshot. Choosing a row
-            // commits that action's `ResolvedAction`, which flows back
-            // through this same `run_action` — keybinds and the palette
-            // share one dispatch path (the architectural invariant).
-            let items = super::action_registry::palette_items(
-                ctx.keybindings,
-                ctx.plugin_actions,
-                ctx.plugin_panes,
-            );
-            ctx.overlays.push(Box::new(SelectList::new(
-                "command palette",
-                items,
-                ctx.theme,
-            )));
         }
         "context-menu" => {
             // phux-wrnm (ADR-0058): the keyboard route to the pane menu, and
@@ -4498,17 +4483,18 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_action_pushes_overlay() {
-        let mut workspace = Workspace::single(tid(1));
-        let (effects, overlays) = run_capturing(&bare_action("command-palette"), &mut workspace);
-        assert!(
-            overlays.is_active(),
-            "command-palette should push the palette overlay"
-        );
-        assert_eq!(overlays.depth(), 1);
-        // No layout mutation — opening the palette doesn't touch windows.
-        assert!(!effects.layout_mutated);
-        assert!(!effects.bell);
+    fn help_and_command_palette_are_action_finder_aliases() {
+        for action in ["show-help", "command-palette"] {
+            let mut workspace = Workspace::single(tid(1));
+            let (effects, overlays) = run_capturing(&bare_action(action), &mut workspace);
+            assert!(
+                overlays.is_active(),
+                "{action} should push the action finder"
+            );
+            assert_eq!(overlays.depth(), 1);
+            assert!(!effects.layout_mutated);
+            assert!(!effects.bell);
+        }
     }
 
     #[test]

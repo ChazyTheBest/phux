@@ -1733,16 +1733,9 @@ async fn main_loop<W: super::RenderSink>(
     // Load failures fall back to an empty bar so a malformed config
     // never blocks attach — the user still gets a working pane mirror.
     let mut status_bar = build_status_bar_painter();
-    // phux-5ke.4: keybindings snapshot for the help overlay. Cached so
-    // pressing the help binding doesn't trigger a synchronous config
-    // reload (which could surface IO errors under user fingers); on
-    // load failure the help modal still works, just showing "no
-    // bindings configured".
-    // phux-ahv.4: load the config once and split out both the
-    // keybindings snapshot (help overlay) and the color theme (chrome +
-    // overlays). On load failure both fall back to defaults — the help
-    // modal shows "no bindings" and chrome paints with the built-in
-    // palette.
+    // Cache the keybindings so opening discovery surfaces never performs
+    // config I/O under user fingers. Load the config once and split out the
+    // keybindings snapshot and color theme; failures fall back to defaults.
     let loaded_cfg = phux_config::loader::load().ok();
     // phux-r82.5 / phux-r82.7: snapshot the enabled plugins' manifests once
     // at driver start (same policy as the keybindings snapshot — no config
@@ -1957,7 +1950,7 @@ async fn main_loop<W: super::RenderSink>(
     // pending-prefix state (`<prefix>` pressed, continuation awaited) for
     // `which_key_delay` without a follow-up chord, the loop pushes a
     // which-key overlay listing the prefix-table continuations. Config
-    // comes from the same `[keybindings]` snapshot the help overlay uses;
+    // comes from the same `[keybindings]` snapshot the action finder uses;
     // with no loaded config there is no resolver (and so no prefix to
     // hesitate on), so the popup is naturally inert. `None` ⇔ not armed.
     // Same anchored-deadline pattern as `esc_deadline`: the deadline is
@@ -5882,10 +5875,7 @@ mod tests {
         // A modal already up: no push (would stack over user input).
         let pending = pending_resolver();
         let mut overlays = OverlayState::new();
-        overlays.push(Box::new(crate::render::overlay::HelpOverlay::from_config(
-            &cfg.keybindings,
-            &theme,
-        )));
+        overlays.push(palette_overlay());
         assert!(!push_which_key_overlay(
             &mut overlays,
             Some(&pending),
@@ -7547,7 +7537,7 @@ mod tests {
     }
 
     /// phux-foz.10: every bounded (floating) overlay kind shares the same
-    /// base-frame path, so which-key, help, prompts, pickers, and toasts
+    /// base-frame path, so which-key, prompts, pickers, and toasts
     /// must all keep the sidebar visible too.
     #[test]
     fn all_floating_overlays_keep_sidebar_visible() {
@@ -7569,12 +7559,6 @@ mod tests {
             (
                 "which-key",
                 Box::new(crate::render::overlay::WhichKeyOverlay::from_config(
-                    &wk_cfg, &theme,
-                )),
-            ),
-            (
-                "help",
-                Box::new(crate::render::overlay::HelpOverlay::from_config(
                     &wk_cfg, &theme,
                 )),
             ),

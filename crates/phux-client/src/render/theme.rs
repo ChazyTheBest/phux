@@ -20,7 +20,7 @@
 //! - [`border`] — modal borders.
 //! - [`title`] — alias slot for window/section titles distinct from
 //!   `accent` when a theme wants them to diverge.
-//! - [`section_header`] — section headings inside the help modal.
+//! - [`section_header`] — section headings inside grouped discovery surfaces.
 //! - [`error`] — error / alarm text.
 //! - [`sidebar_section`] — the sidebar's muted `spaces` / `agents`
 //!   section headers (phux-foz.9).
@@ -78,7 +78,7 @@ pub struct Theme {
     /// Window / section titles where a theme wants them distinct from
     /// `accent`. Defaults to the same value as `accent`.
     pub title: Color,
-    /// Section headings inside the help modal.
+    /// Section headings inside grouped discovery surfaces.
     pub section_header: Color,
     /// Error / alarm text.
     pub error: Color,

@@ -1434,10 +1434,14 @@ dispatcher and the palette are test-pinned to, so it cannot drift from
 the binary; regenerate with `just docs-gen` after changing the action
 surface.
 
-### 5.5 Command palette and pickers
+### 5.5 Commands, help, and pickers
 
-`command-palette` (`C-a :`) opens a filterable overlay listing every
-action, each annotated with its currently-bound chord. Rows are grouped
+`command-palette` (`C-a :`) and `show-help` (`C-a ?`) are two entry aliases
+for one filterable **commands & help** overlay. There is no separate help
+modal to choose or learn: either chord opens the executable action catalog,
+with every action annotated by its currently-bound chord. The two entry
+actions are omitted from inside the finder because selecting either would
+only reopen the surface already in front of you. Rows are grouped
 under dim category headers — **Pane**, **Window**, **Session**, **View** —
 when the query is empty; as you type, the headers fall away and the
 matches are ranked best-first by a scored fuzzy match (contiguous runs,
@@ -1566,7 +1570,7 @@ secondaries `dim`, hot rows `attention`.
 Press the prefix and hesitate, and a small floating panel lists every
 prefix-table continuation — key on the left, action on the right — built
 from your live bindings (rebinds included; it is the same config snapshot
-the help overlay reads). The numeric window-jump keys collapse into a
+the action finder reads). The numeric window-jump keys collapse into a
 single `0-9` row.
 
 The popup is display-only and never captures input:
@@ -2618,36 +2622,13 @@ Discoverability: the default status bar keeps the highest-value prefix
 affordances visible without consuming pane space. If the prefix is
 rebound, the `help-hints` widget renders the configured prefix.
 
-Beyond that, two client-rendered overlays teach the bindings themselves
-(the TUI owns its chrome — nothing here is server-rendered):
+Beyond that, two client-rendered discovery behaviors teach the bindings
+themselves (the TUI owns its chrome — nothing here is server-rendered):
 
-- `C-a ?` opens the **help modal**, a centered reference listing every
-  prefix-table and global binding, followed by three built-in sections
-  covering the driver-owned interactions no keybinding table describes:
-  **Copy mode** (the in-overlay selection keys — arrows, `Tab` mode
-  cycle, the one-shot grab keys, mouse drag), **Mouse & menus** (the
-  right-click context menus and their in-menu navigation, divider
-  drag-to-resize, and the sidebar's click targets, labelled with the
-  same `+ new` / `= menu` affordance strings the sidebar paints), and
-  **Panels & dashboards**, which advertises the window sidebar (off by
-  default) and the agent-fleet dashboard with their `toggle-sidebar` /
-  `agent-fleet` chords resolved from the active config — a rebind shows
-  the rebound chord, an unbound action says `unbound`. The built-in
-  rows are sourced from tables colocated with the implementing modules
-  and held in lockstep by per-module tests, so the modal cannot
-  advertise a gesture that has no handler. A table taller than the
-  modal scrolls —
-  arrows / `j` / `k` / `C-n` / `C-p` step a row, `PageUp` / `PageDown` a
-  screenful, `Home` / `End` jump to the ends, the wheel scrolls a detent,
-  and an overflowing table paints a scrollbar in the right border column
-  (the window is counted in wrapped display rows, so long action labels
-  that fold onto a second row are budgeted for). Esc (or `?` again)
-  dismisses it. The footer's dismiss hint resolves your `show-help`
-  binding from the global table first, then the prefix table; a
-  prefix-table binding (the shipped default) is echoed — and matched —
-  as its bare key (`Press ? or Esc to close`), because the prefix
-  resolver is bypassed while the modal is up, so the bare key is the
-  literal keystroke that closes it.
+- `C-a ?` and `C-a :` open the same **commands & help** finder described in
+  §5.5. Type any part of an action or its live chord, move through ranked
+  matches with the standard list controls, and press Enter to run it through
+  the normal dispatcher. Esc dismisses it.
 - Press `C-a` and *hesitate*, and the **which-key popup** appears after
   `which-key-delay-ms` (default 600 ms), listing the available prefix
   continuations. Any key dismisses it and executes normally; Esc cancels

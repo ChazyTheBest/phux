@@ -14,14 +14,14 @@ use phux_protocol::input::mouse::{MouseAction, MouseButton, MouseEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::help::HardcodedBinding;
+use super::HardcodedBinding;
 use super::{
     CopyRequest, OverlayCommand, RenderOverlay, SelectionGrab, SelectionMode, SelectionRect,
 };
 
 const WHEEL_SCROLL_LINES: isize = 3;
 
-/// Copy-mode's key table for the help overlay's `Copy mode` section
+/// Copy-mode's key table for handler-adjacency tests
 /// (phux-i0e8.10.3).
 ///
 /// COLOCATED with the `handle_key` / `handle_mouse`

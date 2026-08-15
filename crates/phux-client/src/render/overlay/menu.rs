@@ -47,12 +47,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::help::HardcodedBinding;
+use super::HardcodedBinding;
 use super::widgets::Modal;
 use super::{OverlayCommand, RenderOverlay};
 use crate::render::Theme;
 
-/// The context-menu gesture table for the help overlay's `Mouse & menus`
+/// The context-menu gesture table for handler-adjacency tests
 /// section (phux-i0e8.10.3).
 ///
 /// COLOCATED with the [`ContextMenu`] handlers
@@ -840,7 +840,7 @@ mod tests {
     /// the real [`ContextMenu`] handler. The `right-click` open gesture is
     /// dispatcher-owned (ADR-0058 arms in `attach::input_dispatch`, held
     /// by its phux-wrnm tests), so its check here is that the row exists —
-    /// the help overlay's own render test asserts it reaches the screen.
+    /// the adjacency test asserts each documented gesture has a handler.
     #[test]
     fn help_table_matches_handler_arms() {
         let mut saw_right_click = false;

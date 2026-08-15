@@ -1,7 +1,7 @@
 //! Canonical action registry (phux-ahv.8).
 //!
-//! The command palette and the help overlay both need a human-facing
-//! catalogue of the actions the dispatcher can run. That catalogue must
+//! The fuzzy commands-and-help finder needs a human-facing catalogue of the
+//! actions the dispatcher can run. That catalogue must
 //! not drift from what [`run_action`](super::input_dispatch) actually
 //! handles — a palette entry for an action the dispatcher ignores is a
 //! dead command, and an action the dispatcher handles but the palette
@@ -305,13 +305,6 @@ pub const REGISTRY: &[ActionSpec] = &[
         args: &[],
     },
     ActionSpec {
-        name: "show-help",
-        category: Category::View,
-        description: "Show the keybindings help overlay",
-        params: "",
-        args: &[],
-    },
-    ActionSpec {
         name: "getting-started",
         category: Category::View,
         description: "Getting started: detach, return, and command discovery",
@@ -395,9 +388,15 @@ pub struct NonPaletteAction {
 pub const NON_PALETTE_ACTIONS: &[NonPaletteAction] = &[
     NonPaletteAction {
         name: "command-palette",
-        description: "Open the command palette",
+        description: "Open the fuzzy commands and help finder",
         params: "",
-        reason: "opening the palette from the palette is noise",
+        reason: "it is an entry alias for the finder, so listing it inside the finder would recurse",
+    },
+    NonPaletteAction {
+        name: "show-help",
+        description: "Open the fuzzy commands and help finder",
+        params: "",
+        reason: "it is an entry alias for the same finder as `command-palette`, so listing it would duplicate that surface",
     },
     NonPaletteAction {
         name: "select-window",
@@ -754,6 +753,16 @@ mod tests {
         let names: BTreeSet<&str> = REGISTRY.iter().map(|spec| spec.name).collect();
         assert!(names.contains("next-attention"));
         assert!(names.contains("return-from-attention"));
+    }
+
+    #[test]
+    fn finder_entry_aliases_are_not_recursive_rows() {
+        let registered: BTreeSet<&str> = REGISTRY.iter().map(|spec| spec.name).collect();
+        let omitted: BTreeSet<&str> = NON_PALETTE_ACTIONS.iter().map(|spec| spec.name).collect();
+        for name in ["show-help", "command-palette"] {
+            assert!(!registered.contains(name));
+            assert!(omitted.contains(name));
+        }
     }
 
     #[test]

@@ -15,17 +15,15 @@
 //! can never eat or delay a chord; it is a pure display layer over the
 //! resolver's pending state.
 //!
-//! Rows are built from the same [`KeybindingsCfg`] snapshot the help
-//! overlay uses, so user rebinds (and removed defaults) are reflected
-//! exactly. Numeric window-jump bindings collapse into a single
-//! `0-9  select window by number` row, matching the help overlay.
+//! Rows are built from the live [`KeybindingsCfg`] snapshot, so user
+//! rebinds (and removed defaults) are reflected exactly. Numeric
+//! window-jump bindings collapse into a single `0-9` row.
 
-use phux_config::KeybindingsCfg;
+use phux_config::{Action, KeybindingsCfg};
 use phux_protocol::input::key::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::help::{action_label, is_indexed_select_window};
 use super::widgets::{ChordRow, ChordSection, KeyChordTable, Modal, centered_panel};
 use super::{OverlayCommand, RenderOverlay};
 use crate::render::{ChromeBreakpoints, Theme};
@@ -51,8 +49,8 @@ pub struct WhichKeyOverlay {
 impl WhichKeyOverlay {
     /// Build the popup from a config snapshot, styled with `theme`.
     ///
-    /// Sources the SAME data as the help overlay ([`KeybindingsCfg`]),
-    /// so rebound keys show the user's actual bindings. The numeric
+    /// Sources the live [`KeybindingsCfg`], so rebound keys show the user's
+    /// actual bindings. The numeric
     /// `select-window { index }` keys collapse into one row.
     #[must_use]
     pub fn from_config(cfg: &KeybindingsCfg, theme: &Theme) -> Self {
@@ -75,6 +73,34 @@ impl WhichKeyOverlay {
             breakpoints: ChromeBreakpoints::default(),
         }
     }
+}
+
+fn action_label(action: &Action) -> String {
+    match action {
+        Action::Bare(name) => name.clone(),
+        Action::Parameterized(p) if p.args.is_empty() => p.action.clone(),
+        Action::Parameterized(p) => {
+            let args = p
+                .args
+                .iter()
+                .map(|(key, value)| {
+                    let value = value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned);
+                    format!("{key}={value}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({args})", p.action)
+        }
+    }
+}
+
+fn is_indexed_select_window(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Parameterized(p) if p.action == "select-window" && p.args.contains_key("index")
+    )
 }
 
 /// Collapse the numeric window-jump keys into a single `0-9` row (or a

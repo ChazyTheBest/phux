@@ -424,7 +424,7 @@ impl SelectList {
     }
 
     /// The modal rect: 60% of the viewport, min 30x10, clamped to the
-    /// outer rect (like the help overlay, but a touch narrower).
+    /// outer rect.
     fn modal_area(outer: Rect, bp: ChromeBreakpoints) -> Rect {
         centered_panel(outer, 6, 30, 10, bp)
     }
@@ -485,8 +485,7 @@ impl SelectList {
     }
 
     /// A dim, non-selectable section-header row, styled with the theme's
-    /// `section_header` slot (the same slot the help modal uses for its
-    /// headings).
+    /// `section_header` slot shared by grouped discovery surfaces.
     fn header_line(&self, item: &SelectItem) -> Line<'static> {
         Line::from(Span::styled(
             item.label.clone(),

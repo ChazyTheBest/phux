@@ -42,7 +42,7 @@ use crate::agent_meta::AgentMetaState;
 use crate::layout::Rect;
 use crate::render::Theme;
 use crate::render::clip_text;
-use crate::render::overlay::help::HardcodedBinding;
+use crate::render::overlay::HardcodedBinding;
 
 /// Label of the "create" affordance row (phux-fce4).
 ///
@@ -73,7 +73,7 @@ pub const AGENTS_EMPTY: &str = "no agents";
 /// (phux-foz.9). Clicking it runs `toggle-sidebar`.
 pub const COLLAPSE_GLYPH: &str = "‹";
 
-/// The sidebar's click-target table for the help overlay's
+/// The sidebar's click-target table for handler-adjacency tests.
 /// `Mouse & menus` section (phux-i0e8.10.3).
 ///
 /// COLOCATED with [`hit_test`]
