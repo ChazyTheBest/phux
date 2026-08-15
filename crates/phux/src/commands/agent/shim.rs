@@ -903,6 +903,15 @@ mod tests {
         use std::io::Read as _;
         use std::sync::{Arc, Mutex};
 
+        /// The `phux` subcommands the wrapper dispatched, one per line.
+        fn phux_calls(phux_log: &Path) -> Vec<String> {
+            std::fs::read_to_string(phux_log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
         fn write_script(path: &Path, body: &str) {
             std::fs::write(path, body).expect("write fixture script");
             let mut perms = std::fs::metadata(path)
@@ -928,6 +937,24 @@ mod tests {
             let mut command = CommandBuilder::new(wrapper);
             command.env("SHELL", "/bin/sh");
             command.env("TERM", "xterm-256color");
+            // The wrapper branches on the phux environment it is launched
+            // under, and `CommandBuilder` inherits ours. Running this suite
+            // from inside a phux pane exports `PHUX_TERMINAL_ID`, which sends
+            // the OUTER wrapper straight down the in-session branch: it execs
+            // the real Claude, exits with its status, and never reaches the
+            // `phux new` launch, the sentinel, or the diagnostics this test
+            // reads. The status and the invocation count still looked right,
+            // so the failure surfaced as an empty pty capture — a fixture
+            // that had quietly stopped exercising its own scenario.
+            //
+            // `PHUX_AGENT_PHUX_BIN` is the same hazard one step further out:
+            // it overrides the fake `phux` these scenarios are built on.
+            //
+            // Cleared here rather than in the harness so every scenario below
+            // gets the environment it names, and only that.
+            for key in ["PHUX_TERMINAL_ID", "PHUX_AGENT_PHUX_BIN"] {
+                command.env_remove(key);
+            }
             for (key, value) in envs {
                 command.env(key, value);
             }
@@ -985,6 +1012,12 @@ mod tests {
         let wrapper = dir.path().join("claude");
         let settings = dir.path().join("claude-hooks.json");
         let log = dir.path().join("real-claude.log");
+        // Every `phux` dispatch the wrapper makes. Claude's own invocation
+        // count cannot distinguish "launched through a phux session" from
+        // "exec'd directly", because both run it exactly once — which is how
+        // an environment that skipped the launch path entirely still satisfied
+        // scenario A. This log is the difference.
+        let phux_log = dir.path().join("fake-phux.log");
 
         // Stands in for the real `claude`: records that it ran, then exits
         // with a caller-controlled status (simulating either a clean exit
@@ -1002,15 +1035,30 @@ mod tests {
         // like the real subcommand would.
         write_script(
             &fake_phux,
-            "#!/bin/sh\nset -u\nif [ \"${FAKE_PHUX_LAUNCH_FAIL:-0}\" = \"1\" ]; then\n  exit 3\nfi\nshift 4\nexec \"$@\"\n",
+            &format!(
+                "#!/bin/sh\nset -u\nprintf '%s\\n' \"$1\" >> {phux_log}\nif [ \"${{FAKE_PHUX_LAUNCH_FAIL:-0}}\" = \"1\" ]; then\n  exit 3\nfi\nshift 4\nexec \"$@\"\n",
+                phux_log = sh_quote_path(&phux_log),
+            ),
         );
         let rendered = render_wrapper(&real, &fake_phux, &wrapper, &settings).unwrap();
         write_script(&wrapper, &rendered);
 
         // Scenario A: the session runs and Claude exits cleanly.
+        //
+        // The `phux new` assertion is what keeps the rest of this scenario
+        // honest. Its other checks are a zero status, one Claude invocation,
+        // and two absent diagnostics — every one of which a wrapper that
+        // skipped phux entirely and exec'd Claude directly also satisfies.
         std::fs::write(&log, b"").unwrap();
+        std::fs::write(&phux_log, b"").unwrap();
         let (status, output) = run_on_pty(&wrapper, &[("FAKE_CLAUDE_EXIT", "0")]);
         assert_eq!(status, 0, "clean session exit; output:\n{output}");
+        assert_eq!(
+            phux_calls(&phux_log),
+            vec!["new".to_owned()],
+            "the wrapper must launch Claude THROUGH a phux session, not exec \
+             it directly; output:\n{output}"
+        );
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().lines().count(),
             1,
@@ -1026,10 +1074,16 @@ mod tests {
         // fix must propagate the real exit status and must NOT invoke
         // Claude a second time.
         std::fs::write(&log, b"").unwrap();
+        std::fs::write(&phux_log, b"").unwrap();
         let (status, output) = run_on_pty(&wrapper, &[("FAKE_CLAUDE_EXIT", "17")]);
         assert_eq!(
             status, 17,
             "mid-session crash status must propagate; output:\n{output}"
+        );
+        assert_eq!(
+            phux_calls(&phux_log),
+            vec!["new".to_owned()],
+            "the crash must be a crash of the phux-launched session; output:\n{output}"
         );
         assert!(output.contains("phux session ended abnormally"), "{output}");
         assert!(!output.contains("launch failed"), "{output}");
@@ -1043,6 +1097,7 @@ mod tests {
         // marker stamped) — falling back to a direct, real Claude exactly
         // once is still correct here.
         std::fs::write(&log, b"").unwrap();
+        std::fs::write(&phux_log, b"").unwrap();
         let (status, output) = run_on_pty(
             &wrapper,
             &[("FAKE_PHUX_LAUNCH_FAIL", "1"), ("FAKE_CLAUDE_EXIT", "0")],
@@ -1050,6 +1105,12 @@ mod tests {
         assert_eq!(
             status, 0,
             "pre-launch failure falls back to direct Claude; output:\n{output}"
+        );
+        assert_eq!(
+            phux_calls(&phux_log),
+            vec!["new".to_owned()],
+            "the fallback must follow a launch that was actually ATTEMPTED, \
+             and must not retry it; output:\n{output}"
         );
         assert!(output.contains("phux launch failed"), "{output}");
         assert!(!output.contains("abnormally"), "{output}");
