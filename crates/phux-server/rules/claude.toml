@@ -27,11 +27,32 @@ binaries = ["claude", "claude-code"]
 # --- Title rules (highest-value, cheapest signal) ---------------------------
 
 # While Claude Code is busy, it writes an ANIMATED prefix glyph into the OSC 0
-# title, alternating between U+2802 (BRAILLE DOTS-2) and U+2810 (BRAILLE
-# DOTS-5) every ~960 ms. When it is NOT busy the prefix is the static U+2733
-# (EIGHT SPOKED ASTERISK). The title is therefore a direct, structural,
-# no-substring statement by the agent about whether it is working — and it
-# flips the instant the turn starts or ends.
+# title. When it is NOT busy the prefix is the static U+2733 (EIGHT SPOKED
+# ASTERISK). The title is therefore a direct, structural, no-substring
+# statement by the agent about whether it is working — and it flips the
+# instant the turn starts or ends.
+#
+# THE BUSY GLYPH SET IS VERSION-DRIFTING, so this rule matches a SET, not a
+# pair. 2.1.207 alternated U+2802 (BRAILLE DOTS-2) / U+2810 (BRAILLE DOTS-5)
+# every ~960 ms. By 2.1.228 the busy prefix is U+25D0 (CIRCLE WITH LEFT HALF
+# BLACK) / U+25D1 (CIRCLE WITH RIGHT HALF BLACK) — a different pair entirely,
+# so the braille-only regex this rule shipped with matched NOTHING on 2.1.228
+# and the highest-priority working signal was silently dead there.
+#
+# VERIFIED for 2.1.228 against the committed raw-byte capture
+# `research/2026-08-12-osc-9-4-claude-code/claude-title-enabled.rawcap`, whose
+# twelve OSC 0 titles contain exactly three distinct prefixes: U+2733 (quiet),
+# U+25D0 and U+25D1 (busy). No braille appears in that capture. The 2.1.207
+# braille pair is KEPT rather than replaced: it was verified against a real
+# CLI too, phux does not pin the user's Claude Code version, and a stale
+# alternative in a character class costs one branch and no false positives —
+# neither glyph occurs at the head of an ordinary window title.
+#
+# This drift is the reason the two backstops below exist and matter: it was
+# caught only because `osc-progress-working` and `screen-status-elapsed-
+# backstop` still proved `working` on 2.1.228 while this rule did not. The
+# tests for this rule use synthetic title constants, so they were green
+# throughout and could not have caught it — only a fresh capture could.
 #
 # The static U+2733 is deliberately NOT given an `idle` rule: it means "not
 # busy", which covers BOTH idle and waiting-on-a-permission-dialog. Asserting
@@ -43,7 +64,7 @@ id = "title-busy-spinner"
 state = "working"
 priority = 100
 region = "title"
-match = { line-regex = "^[⠂⠐]" }
+match = { line-regex = "^[⠂⠐◐◑]" }
 
 # Claude Code 2.1.227/228 emits OSC 9;4 independently of OSC 0 titles: `4;3;`
 # when a turn starts and `4;0;` when it ends, including when
@@ -174,10 +195,27 @@ match = { contains = "showing detailed transcript" }
 # now `screen-status-elapsed-backstop` above, once the elapsed-status line
 # was captured.
 #
-# Still not written: a positive `idle` rule (phux-w7z2.28, RULED AGAINST) and
-# any of the 16 kinds phux-w7z2.21 lists with no manifest at all. Neither has
-# a captured screen to verify a rule against in this environment — no CLI for
-# any of them is installed or authenticated here, and phux-7p8 already
-# tracks gemini specifically as the smallest slice of that capture work. A
-# rule matching a screen nobody has captured is a guess, and ADR-0046's
-# Tradeoffs already record what that costs.
+# Still not written: a positive `idle` rule DERIVED FROM THE SCREEN OR THE
+# TITLE. That is what phux-w7z2.28 ruled against, and it stays ruled against
+# for the reasons above — live claude chrome is byte-identical idle vs
+# working, and the quiet U+2733 title means "not busy", which covers a
+# permission dialog too.
+#
+# `osc-progress-idle` above is NOT a counter-example to that ruling, and the
+# distinction is the whole reason it was allowed to ship. It reads neither the
+# screen nor the title: it reads OSC 9;4, a channel on which the CLI makes an
+# EXPLICIT, POSITIVE statement that the turn's progress indicator was removed.
+# The two objections to a screen idle rule both fail against it — there is no
+# ambiguity with a permission dialog (a dialog does not clear progress), and
+# it cannot fire alongside its own `working` twin, because the `osc-progress`
+# region carries exactly one latest payload, so `4;3;` and `4;0;` are mutually
+# exclusive within a single evaluation. That last property is what makes its
+# `visible-idle = true` safe: the working -> idle hold exists to debounce the
+# AMBIGUOUS case (the screen stopped saying "working" without saying "idle"),
+# and here the agent said "idle" outright.
+#
+# Also still not written: any of the 16 kinds phux-w7z2.21 lists with no
+# manifest at all, plus gemini (phux-7p8). No CLI for any of them is installed
+# or authenticated in this environment, so none has a captured screen to
+# verify a rule against. A rule matching a screen nobody has captured is a
+# guess, and ADR-0046's Tradeoffs already record what that costs.

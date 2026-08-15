@@ -1113,6 +1113,86 @@ match = { contains = "x" }
         );
     }
 
+    /// `docs/spec/L3.md` §3.7 states the reference server's per-state rule
+    /// counts as fact. This test makes that statement falsifiable.
+    ///
+    /// The counts are load-bearing, not decorative: the spec's whole
+    /// level-versus-edge ruling rests on how few states the shipped manifests
+    /// positively assert, so a manifest gaining or losing a state-bearing rule
+    /// silently turns a normative rationale into a false one. That already
+    /// happened once — the paragraph claimed "five `working` ... and zero
+    /// `idle`" for some time after the manifests had moved to eight and one.
+    ///
+    /// If this fails, the fix is to update the sentence in `docs/spec/L3.md`
+    /// to match the manifests, and to re-read the surrounding paragraph: a new
+    /// `idle` or `done` rule may invalidate its reasoning, not just its
+    /// arithmetic.
+    #[test]
+    fn the_spec_paragraph_reports_the_real_manifest_rule_counts() {
+        fn count(state: &str) -> usize {
+            super::BUILTIN_MANIFESTS
+                .iter()
+                .map(|(_, text)| {
+                    let spec: ManifestSpec = toml::from_str(text).expect("builtin parses");
+                    spec.rules
+                        .iter()
+                        .filter(|rule| rule.state.as_deref() == Some(state))
+                        .count()
+                })
+                .sum()
+        }
+        fn word(n: usize) -> String {
+            const WORDS: [&str; 21] = [
+                "zero",
+                "one",
+                "two",
+                "three",
+                "four",
+                "five",
+                "six",
+                "seven",
+                "eight",
+                "nine",
+                "ten",
+                "eleven",
+                "twelve",
+                "thirteen",
+                "fourteen",
+                "fifteen",
+                "sixteen",
+                "seventeen",
+                "eighteen",
+                "nineteen",
+                "twenty",
+            ];
+            WORDS
+                .get(n)
+                .map_or_else(|| n.to_string(), |w| (*w).to_owned())
+        }
+
+        let expected = format!(
+            "declare {} `working` rules, {} `blocked` rules, exactly {} `idle` rule and {} \
+             `done` rules between them.",
+            word(count("working")),
+            word(count("blocked")),
+            word(count("idle")),
+            word(count("done")),
+        );
+
+        let spec_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec/L3.md");
+        let spec = std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", spec_path.display()));
+        // The sentence wraps across lines in the source; compare on collapsed
+        // whitespace so re-flowing the paragraph is not a spurious failure.
+        let flattened = spec.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flattened.contains(&expected),
+            "docs/spec/L3.md §3.7 no longer matches the shipped manifests.\n\
+             expected it to contain: {expected}",
+        );
+    }
+
     // --- Parameterized regions (phux-w7z2.17) -------------------------------
 
     /// A windowed region is a distinct `HashMap` key, so two rules naming
@@ -1603,10 +1683,19 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         )
     }
 
-    /// The title Claude Code writes while BUSY: an animated braille prefix
-    /// (U+2802 / U+2810, alternating ~960 ms) ahead of the title text.
+    /// The title Claude Code writes while BUSY: an animated prefix glyph
+    /// ahead of the title text, alternating ~960 ms.
+    ///
+    /// The glyph PAIR is version-dependent, which is why there are four of
+    /// these and not two. 2.1.207 animates braille (U+2802 / U+2810); 2.1.228
+    /// animates half-filled circles (U+25D0 / U+25D1). The manifest matches
+    /// the union, so both versions read as `working`.
     const CLAUDE_TITLE_BUSY_A: &str = "\u{2802} phux";
     const CLAUDE_TITLE_BUSY_B: &str = "\u{2810} phux";
+    /// 2.1.228's busy pair, taken from the committed raw capture
+    /// `research/2026-08-12-osc-9-4-claude-code/claude-title-enabled.rawcap`.
+    const CLAUDE_TITLE_BUSY_C: &str = "\u{25D0} phux";
+    const CLAUDE_TITLE_BUSY_D: &str = "\u{25D1} phux";
     /// The title it writes when NOT busy: a static U+2733. Note this covers
     /// idle AND waiting-on-a-dialog alike, which is exactly why the manifest
     /// gives it no rule.
@@ -1646,10 +1735,25 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
         assert_eq!(blocked.matched.as_deref(), Some("prompt-permission-dialog"));
     }
 
-    /// Both animation frames of the busy title read as `working`.
+    /// Every animation frame of the busy title, ACROSS BOTH KNOWN GLYPH SETS,
+    /// reads as `working`.
+    ///
+    /// The 2.1.228 pair (C/D) is a regression pin, not a nicety. The rule
+    /// originally matched braille alone, verified against 2.1.207; by 2.1.228
+    /// Claude Code had switched to half-filled circles and the highest-
+    /// priority working rule matched nothing at all. Nothing failed: these
+    /// tests build titles from the same constants the rule was written for,
+    /// so they stayed green while the real CLI drifted out from under them.
+    /// Only a fresh capture caught it, and only the two lower-priority
+    /// backstops kept `working` detectable meanwhile.
     #[test]
     fn claude_busy_title_is_working() {
-        for title in [CLAUDE_TITLE_BUSY_A, CLAUDE_TITLE_BUSY_B] {
+        for title in [
+            CLAUDE_TITLE_BUSY_A,
+            CLAUDE_TITLE_BUSY_B,
+            CLAUDE_TITLE_BUSY_C,
+            CLAUDE_TITLE_BUSY_D,
+        ] {
             let got = claude_eval(title, &claude_idle_screen());
             assert_eq!(
                 got.state,
@@ -1658,6 +1762,69 @@ match = { all = [ { contains = "prompt" }, { not = { contains = "pager" } } ] }
             );
             assert_eq!(got.matched.as_deref(), Some("title-busy-spinner"));
         }
+    }
+
+    /// The busy-title rule is checked against REAL CAPTURED BYTES, not against
+    /// this module's own constants.
+    ///
+    /// Every other title test in this file builds its input from
+    /// `CLAUDE_TITLE_BUSY_*`, so it can only ever prove the rule agrees with
+    /// what phux believes Claude Code emits. That is precisely how the 2.1.228
+    /// glyph change went unnoticed: belief and rule matched each other while
+    /// both had drifted off the CLI. This test closes that loop by replaying
+    /// the OSC 0 titles out of a committed raw-byte capture, so the rule is
+    /// answerable to evidence the CLI actually produced.
+    ///
+    /// It asserts the capture's titles partition cleanly: a quiet prefix that
+    /// must assert nothing, and busy prefixes that must all read `working`.
+    #[test]
+    fn every_busy_title_in_the_committed_capture_reads_as_working() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../research/2026-08-12-osc-9-4-claude-code/claude-title-enabled.rawcap");
+        let raw = std::fs::read_to_string(&capture).unwrap_or_else(|e| {
+            panic!(
+                "the busy-title rule's only real evidence is {}: {e}. If this \
+                 capture is being removed, re-verify `title-busy-spinner` \
+                 against a fresh one rather than deleting this test.",
+                capture.display(),
+            )
+        });
+
+        let mut titles: Vec<&str> = raw
+            .split("\u{1b}]0;")
+            .skip(1)
+            .filter_map(|rest| rest.split('\u{7}').next())
+            .filter(|t| !t.is_empty())
+            .collect();
+        titles.sort_unstable();
+        titles.dedup();
+        assert!(
+            titles.len() >= 3,
+            "expected the capture to hold a quiet title and both busy frames, got {titles:?}",
+        );
+
+        let mut busy = 0_usize;
+        let mut quiet = 0_usize;
+        for title in titles {
+            let got = claude_eval(title, &claude_idle_screen());
+            if title.starts_with('\u{2733}') {
+                quiet += 1;
+                assert_eq!(
+                    got.state, None,
+                    "the quiet title must assert nothing: {title:?}",
+                );
+            } else {
+                busy += 1;
+                assert_eq!(
+                    got.state,
+                    Some(DetectedState::Working),
+                    "a busy title from the real capture must read as working: {title:?}",
+                );
+                assert_eq!(got.matched.as_deref(), Some("title-busy-spinner"));
+            }
+        }
+        assert!(busy >= 2, "expected both busy animation frames, got {busy}");
+        assert!(quiet >= 1, "expected the quiet title, got {quiet}");
     }
 
     /// THE most important property of this manifest. The quiet title (U+2733)
