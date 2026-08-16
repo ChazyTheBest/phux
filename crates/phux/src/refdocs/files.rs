@@ -113,7 +113,10 @@ pub(crate) fn page() -> Page {
            TLS pair auto-provisioned for remote consumers (ADR-0031); \
            `PHUX_WS_TLS_CERT` / `PHUX_WS_TLS_KEY` substitute an \
            operator-supplied pair. A complete pair is never \
-           regenerated, so the pinned fingerprint stays stable.\n\
+           regenerated, so the pinned fingerprint stays stable -- which \
+           also means its subjectAltName set is fixed at generation \
+           (ADR-0091); `phux doctor` reports whether it names the \
+           address phux advertises.\n\
          - `remote-tokens` is the pairing-token store the server reads \
            and `phux pair` appends to; `PHUX_WS_TOKENS` moves it.\n\n\
          ## Design intent (not yet implemented)\n\n\

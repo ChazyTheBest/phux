@@ -1465,12 +1465,15 @@ async fn build_ws_listener(addr: SocketAddr) -> Option<crate::transport::WsListe
     let operator_cert = cert_env.is_some() || key_env.is_some();
     let cert_path = cert_env.unwrap_or_else(crate::transport::tls::default_cert_path);
     let key_path = key_env.unwrap_or_else(crate::transport::tls::default_key_path);
+    let advertised = crate::transport::tls::advertised_for_bind(addr);
     if !operator_cert
-        && let Err(err) = crate::transport::tls::ensure_self_signed(&cert_path, &key_path)
+        && let Err(err) =
+            crate::transport::tls::ensure_self_signed_for(&cert_path, &key_path, &advertised)
     {
         error!(error = %err, "failed to provision self-signed certificate; WebSocket disabled");
         return None;
     }
+    warn_if_cert_omits_bind(&cert_path, &advertised, "wss");
     let acceptor = match crate::transport::tls::acceptor_from_pem(&cert_path, &key_path) {
         Ok(acceptor) => acceptor,
         Err(err) => {
@@ -1508,6 +1511,40 @@ async fn build_ws_listener(addr: SocketAddr) -> Option<crate::transport::WsListe
             warn!(addr = %addr, error = %err, "failed to bind secure WebSocket; UDS only");
             None
         }
+    }
+}
+
+/// Log, do not fail, when the persisted certificate does not name the address
+/// this listener binds (phux-q9a0, ADR-0091).
+///
+/// Every phux consumer pins the SHA-256 fingerprint and ignores the server name
+/// entirely, so an uncovered address breaks nothing phux ships — it breaks a
+/// third-party client that trusts the certificate and then validates the name.
+/// And it cannot be repaired here: widening the SANs means a new certificate,
+/// which means a new fingerprint, which un-pairs every paired device. So this
+/// reports and moves on, and `phux doctor`'s `remote-cert` check is the durable
+/// surface that says the same thing with the remedy attached.
+///
+/// Costs one certificate parse per listener build — never on the startup path.
+fn warn_if_cert_omits_bind(cert_path: &Path, advertised: &[String], transport: &str) {
+    let uncovered = match crate::transport::tls::uncovered_names(cert_path, advertised) {
+        Ok(uncovered) => uncovered,
+        Err(err) => {
+            // Unreadable here means the acceptor/endpoint build below fails
+            // with the same error and reports it properly; do not double-report.
+            debug!(error = %err, "could not check certificate name coverage");
+            return;
+        }
+    };
+    if !uncovered.is_empty() {
+        warn!(
+            transport,
+            addresses = %uncovered.join(", "),
+            cert = %cert_path.display(),
+            "certificate does not name this listener's address; fingerprint-pinning \
+             consumers are unaffected, but a client that validates the server name \
+             will refuse the handshake -- run `phux doctor` for the remedy"
+        );
     }
 }
 
@@ -1549,12 +1586,15 @@ fn build_quic_listener(addr: SocketAddr) -> Option<crate::transport::quic::QuicL
     let operator_cert = cert_env.is_some() || key_env.is_some();
     let cert_path = cert_env.unwrap_or_else(crate::transport::tls::default_cert_path);
     let key_path = key_env.unwrap_or_else(crate::transport::tls::default_key_path);
+    let advertised = crate::transport::tls::advertised_for_bind(addr);
     if !operator_cert
-        && let Err(err) = crate::transport::tls::ensure_self_signed(&cert_path, &key_path)
+        && let Err(err) =
+            crate::transport::tls::ensure_self_signed_for(&cert_path, &key_path, &advertised)
     {
         error!(error = %err, "failed to provision self-signed certificate; QUIC disabled");
         return None;
     }
+    warn_if_cert_omits_bind(&cert_path, &advertised, "quic");
 
     let tokens = if secure {
         let tokens_path = std::env::var_os("PHUX_WS_TOKENS")
@@ -1623,12 +1663,15 @@ fn build_wt_listener(addr: SocketAddr) -> Option<crate::transport::webtransport:
     let operator_cert = cert_env.is_some() || key_env.is_some();
     let cert_path = cert_env.unwrap_or_else(crate::transport::tls::default_cert_path);
     let key_path = key_env.unwrap_or_else(crate::transport::tls::default_key_path);
+    let advertised = crate::transport::tls::advertised_for_bind(addr);
     if !operator_cert
-        && let Err(err) = crate::transport::tls::ensure_self_signed(&cert_path, &key_path)
+        && let Err(err) =
+            crate::transport::tls::ensure_self_signed_for(&cert_path, &key_path, &advertised)
     {
         error!(error = %err, "failed to provision self-signed certificate; WebTransport disabled");
         return None;
     }
+    warn_if_cert_omits_bind(&cert_path, &advertised, "webtransport");
 
     let tokens = if secure {
         let tokens_path = std::env::var_os("PHUX_WS_TOKENS")

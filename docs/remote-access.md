@@ -282,7 +282,7 @@ ADR-0057, building on
 
 ## Troubleshooting
 
-Failures fall into three classes, and the symptom tells you which one you have.
+Failures fall into a few classes, and the symptom tells you which one you have.
 
 - **No route / connection timed out / connection refused.** An overlay
   problem, not a phux problem. Check `tailscale status` (both peers listed and
@@ -304,6 +304,23 @@ Failures fall into three classes, and the symptom tells you which one you have.
   re-prints the persisted certificate's fingerprint without contacting the
   running server — and compare. Do not "fix" a mismatch by dropping the flag:
   the pin is what closes the trust-on-first-use MITM window.
+- **Certificate name mismatch** (`IP address mismatch`, `NotValidForName`,
+  `ERR_CERT_COMMON_NAME_INVALID`) from a client that validates the server name
+  — `curl --cacert`, a browser with the certificate trusted, `openssl s_client
+  -verify_ip`. `phux attach` and the mobile app never hit this: they pin the
+  fingerprint and ignore the name. The certificate's subjectAltName is fixed
+  when it is generated ([ADR-0091](../ADR/0091-certificate-names-the-advertised-address.md)),
+  so one minted before phux learned to name the overlay address claims only
+  loopback and always will. `phux doctor` reports it as `remote-cert` and prints
+  the remedy. Widening it means a **new certificate and a new fingerprint**,
+  which un-pairs every paired device; do it deliberately or not at all:
+
+  ```sh
+  rm ~/.local/state/phux/remote-cert.pem ~/.local/state/phux/remote-key.pem
+  phux pair            # regenerates, naming the address it advertises
+  ```
+
+  then re-pair every device against the new fingerprint.
 - **MagicDNS name does not resolve.** MagicDNS may be disabled on the tailnet,
   or the client OS resolver is not wired up; fall back to the `100.x` IP from
   `tailscale status`. The pin is on the fingerprint, not the hostname, so

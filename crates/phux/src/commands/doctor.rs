@@ -112,7 +112,12 @@ pub(crate) fn run_doctor(json: bool, socket: Option<PathBuf>) -> ExitCode {
     // once, and per phux-67wg they co-occur more than they don't. See
     // `check_server_health`'s doc comment.
     checks.extend(check_server_health());
-    checks.extend([check_plugins(), check_agent_shim(), check_logs()]);
+    checks.extend([
+        check_plugins(),
+        check_agent_shim(),
+        check_remote_cert(),
+        check_logs(),
+    ]);
 
     if json {
         return report_json(&checks);
@@ -749,6 +754,113 @@ fn check_logs() -> Check {
     )
 }
 
+/// Does the remote-consumer certificate name the address phux advertises?
+///
+/// This check exists because the answer is fixed at generation time and can
+/// never be corrected in place (phux-q9a0, ADR-0091). SANs are chosen when the
+/// certificate is minted; widening them means a new certificate, which means a
+/// new SHA-256 fingerprint, which un-pairs every device that pinned the old
+/// one. So a certificate generated before phux learned to name the overlay
+/// address stays narrow for as long as it exists, and nothing else on the
+/// system would ever say so — the server keeps working, `phux pair` keeps
+/// printing a link, and only a third-party client that validates the server
+/// name ever sees the mismatch. That silent, install-time, one-command-remedy
+/// shape is exactly doctor's remit.
+///
+/// `Warn`, never `Fail`: every phux consumer pins the fingerprint and ignores
+/// the name (`phux-dial`'s `CertTrust`, and phux-mobile's verifier), so the
+/// documented pairing flow works end to end on a narrow certificate. Calling
+/// that a failure would turn doctor's exit code red on installs where nothing
+/// is broken.
+fn check_remote_cert() -> Check {
+    let operator_cert = std::env::var_os("PHUX_WS_TLS_CERT").is_some()
+        || std::env::var_os("PHUX_WS_TLS_KEY").is_some();
+    let cert = std::env::var_os("PHUX_WS_TLS_CERT").map_or_else(
+        phux_server::transport::tls::default_cert_path,
+        PathBuf::from,
+    );
+    let key = std::env::var_os("PHUX_WS_TLS_KEY")
+        .map_or_else(phux_server::transport::tls::default_key_path, PathBuf::from);
+    // Same source of truth `phux pair` and the auto-listener use (ADR-0037).
+    // Doctor is an interactive diagnostic, so paying for the detection
+    // shell-out here is fine — it is the startup path that must not.
+    let advertised: Vec<String> = phux_config::overlay::detect()
+        .into_iter()
+        .map(phux_server::transport::tls::san_name)
+        .collect();
+    remote_cert_check(&cert, &key, &advertised, operator_cert)
+}
+
+/// The pure half of [`check_remote_cert`], so every branch is testable against
+/// a temp dir without a tailnet or a mutated environment.
+fn remote_cert_check(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    advertised: &[String],
+    operator_cert: bool,
+) -> Check {
+    let source = if operator_cert {
+        "operator-supplied"
+    } else {
+        "auto-provisioned"
+    };
+    if !cert.exists() {
+        return Check::warn(
+            "remote-cert",
+            format!("no {source} certificate at {}", cert.display()),
+            "run `phux pair` — it provisions the certificate and mints a device token",
+        );
+    }
+    if advertised.is_empty() {
+        return Check::warn(
+            "remote-cert",
+            format!(
+                "{source} certificate at {}; no overlay address detected, so its \
+                 coverage of a routable address cannot be checked",
+                cert.display()
+            ),
+            "nothing to do unless you expected an overlay: check `tailscale ip -4`",
+        );
+    }
+    match phux_server::transport::tls::uncovered_names(cert, advertised) {
+        Err(err) => Check::fail(
+            "remote-cert",
+            format!("cannot read {}: {err}", cert.display()),
+            "the remote listener will not start; remove the unreadable file and \
+             re-run `phux pair`",
+        ),
+        Ok(uncovered) if uncovered.is_empty() => Check::pass(
+            "remote-cert",
+            format!(
+                "{source} certificate at {} names {}",
+                cert.display(),
+                advertised.join(", ")
+            ),
+        ),
+        Ok(uncovered) => Check::warn(
+            "remote-cert",
+            format!(
+                "{source} certificate at {} does not name {} — fingerprint-pinning \
+                 devices are unaffected, but a client that validates the server name \
+                 (a browser, or curl --cacert) will refuse the handshake",
+                cert.display(),
+                uncovered.join(", ")
+            ),
+            if operator_cert {
+                "reissue the certificate with those addresses in its subjectAltName".to_owned()
+            } else {
+                format!(
+                    "regenerating is the only fix and it rotates the pinned fingerprint, \
+                     un-pairing every paired device: `rm {} {} && phux pair`, then re-pair \
+                     each device",
+                    cert.display(),
+                    key.display()
+                )
+            },
+        ),
+    }
+}
+
 /// [`check_logs`] against explicit paths, so tests can drive it against a
 /// temp dir instead of the real environment.
 fn check_logs_at(state_dir: &std::path::Path, server_log: &std::path::Path) -> Check {
@@ -866,6 +978,69 @@ fn report_json(checks: &[Check]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `remote-cert` check is the durable surface for a certificate that
+    /// cannot be corrected in place (phux-q9a0, ADR-0091), so every branch
+    /// has to say something a user can act on.
+    #[test]
+    fn remote_cert_reports_coverage_without_ever_repairing_it() {
+        use phux_server::transport::tls::{cert_fingerprint, ensure_self_signed};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("remote-cert.pem");
+        let key = dir.path().join("remote-key.pem");
+        let overlay = ["100.64.0.2".to_owned()];
+
+        // Nothing provisioned yet: a warning that names the one command that
+        // fixes it, never a failure (not having paired is a normal state).
+        let check = remote_cert_check(&cert, &key, &overlay, false);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.hint.expect("hint").contains("phux pair"));
+
+        ensure_self_signed(&cert, &key).expect("provision");
+        let fingerprint = cert_fingerprint(&cert).expect("fingerprint");
+
+        // A narrow certificate warns and hands over the exact remediation,
+        // including the fact that it un-pairs devices.
+        let check = remote_cert_check(&cert, &key, &overlay, false);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "pinning consumers still work, so this is not a failed install"
+        );
+        assert!(check.detail.contains("100.64.0.2"));
+        let hint = check.hint.expect("hint");
+        assert!(hint.contains("un-pairing every paired device"), "{hint}");
+        assert!(hint.contains(&cert.display().to_string()), "{hint}");
+        assert!(hint.contains(&key.display().to_string()), "{hint}");
+
+        // An operator-supplied certificate gets a remedy aimed at their CA,
+        // not an `rm` of a file phux does not own.
+        let hint = remote_cert_check(&cert, &key, &overlay, true)
+            .hint
+            .expect("hint");
+        assert!(hint.contains("subjectAltName"), "{hint}");
+        assert!(!hint.contains("rm "), "{hint}");
+
+        // Nothing detected: not checkable, therefore not a pass.
+        assert_eq!(
+            remote_cert_check(&cert, &key, &[], false).status,
+            Status::Warn
+        );
+
+        // A certificate that does name the address passes.
+        let wide_cert = dir.path().join("wide-cert.pem");
+        let wide_key = dir.path().join("wide-key.pem");
+        phux_server::transport::tls::ensure_self_signed_for(&wide_cert, &wide_key, &overlay)
+            .expect("provision wide");
+        let check = remote_cert_check(&wide_cert, &wide_key, &overlay, false);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.hint.is_none(), "a pass has nothing to remedy");
+
+        // Doctor mutates nothing: the narrow certificate is byte-identical,
+        // and so is the fingerprint every paired device pinned.
+        assert_eq!(cert_fingerprint(&cert).expect("fingerprint"), fingerprint);
+    }
 
     /// An over-long socket path is the failure this check exists for: the
     /// symptom is an unexplained connect timeout, and nobody guesses

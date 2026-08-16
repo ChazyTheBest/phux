@@ -103,6 +103,70 @@ fn resolve_server_url(
     })
 }
 
+/// Every server name this pairing run advertises, in the shape a TLS
+/// certificate SAN and a rustls `ServerName` both take: the host of the
+/// connect-link URL first, then each detected overlay address.
+///
+/// The link host is derived with [`WsTarget::parse`] — the same parser the
+/// dialer uses to pick its TLS server name — so a certificate minted from this
+/// list names exactly what a client will ask for, brackets stripped from a v6
+/// literal and no port. Overlay addresses are included beyond the link host
+/// because `phux pair` prints them all under "dial one of these from the
+/// device", and an address phux tells you to dial is an address its
+/// certificate should claim.
+///
+/// A URL that will not parse contributes nothing rather than erroring: this
+/// feeds a best-effort SAN list, and pairing must still mint a token on a host
+/// whose `--host` value is odd.
+fn advertised_names(server_url: Option<&str>, overlay: &[IpAddr]) -> Vec<String> {
+    use phux_client::attach::ws::WsTarget;
+
+    let mut names: Vec<String> = server_url
+        .and_then(|url| WsTarget::parse(url).ok())
+        .map(|target| target.server_name)
+        .into_iter()
+        .collect();
+    for addr in overlay {
+        let name = phux_server::transport::tls::san_name(*addr);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Warn when the certificate whose fingerprint is about to be printed does not
+/// name the address the link is about to advertise (phux-q9a0, ADR-0091).
+///
+/// Printed here because this is where the mismatch becomes user-visible: the
+/// link, the fingerprint, and the address all leave the machine together. The
+/// remedy is deliberately an explicit operator action — deleting the pair is
+/// the only way to widen the SANs, and it rotates the fingerprint every already
+/// paired device pins, so phux will not do it on anyone's behalf.
+fn warn_on_uncovered_names(cert: &std::path::Path, key: &std::path::Path, advertised: &[String]) {
+    let Ok(uncovered) = phux_server::transport::tls::uncovered_names(cert, advertised) else {
+        // Unreadable certificate: the fingerprint read alongside this already
+        // reported it. Nothing to add.
+        return;
+    };
+    if uncovered.is_empty() {
+        return;
+    }
+    eprintln!(
+        "phux pair: warning: this certificate does not name {} — a device that pins \
+         the fingerprint above is unaffected, but a client that validates the server \
+         name (a browser, or curl --cacert) will refuse the handshake.",
+        uncovered.join(", ")
+    );
+    eprintln!(
+        "phux pair: warning: widening it means a NEW certificate and a NEW fingerprint, \
+         which un-pairs every already-paired device. To do it deliberately: rm {} {} \
+         && phux pair, then re-pair every device.",
+        cert.display(),
+        key.display()
+    );
+}
+
 /// Render `payload` as a Unicode half-block QR string (`Dense1x2`, two module
 /// rows per glyph row) with a quiet zone, or an error message on the rare
 /// encode failure (payload beyond QR's ~2.9 KB byte capacity).
@@ -149,10 +213,33 @@ pub(crate) fn run_pair(
     let key = std::env::var_os("PHUX_WS_TLS_KEY")
         .map_or_else(phux_server::transport::tls::default_key_path, PathBuf::from);
 
+    // Address resolution comes FIRST, before the certificate is provisioned,
+    // because SANs can only be chosen at generation time (phux-q9a0,
+    // ADR-0091). This is the one place that knows the address the link will
+    // advertise, so it is the one place that can name it in the certificate.
+    //
+    // Best-effort (ADR-0037): `detect` is infallible by construction — it
+    // returns an empty vec when nothing is detected — so this block can
+    // never affect the exit code.
+    let overlay = phux_config::overlay::detect();
+
+    // phux-onbd: fall back to the port the server auto-binds on the overlay
+    // address when `PHUX_WS_ADDR` is unset. Without this, pairing on an
+    // otherwise perfectly working host printed "--qr needs a server address"
+    // and left the user to discover a port number and pass `--host` by hand —
+    // while the server was already listening on exactly that address.
+    let ws_addr = std::env::var("PHUX_WS_ADDR").ok().or_else(|| {
+        (!overlay.is_empty()).then(|| format!(":{}", phux_server::runtime::DEFAULT_WS_PORT))
+    });
+    let server_url = resolve_server_url(host.as_deref(), &overlay, ws_addr.as_deref());
+    let advertised = advertised_names(server_url.as_deref(), &overlay);
+
     // Provision the self-signed cert at the default paths if it isn't there yet,
     // so the fingerprint below is the one the server will actually present. An
     // operator-supplied cert is used as-is, never generated over.
-    if !operator_cert && let Err(err) = phux_server::transport::tls::ensure_self_signed(&cert, &key)
+    if !operator_cert
+        && let Err(err) =
+            phux_server::transport::tls::ensure_self_signed_for(&cert, &key, &advertised)
     {
         eprintln!("phux pair: warning: could not provision certificate: {err}");
     }
@@ -189,11 +276,8 @@ pub(crate) fn run_pair(
             None
         }
     };
+    warn_on_uncovered_names(&cert, &key, &advertised);
 
-    // Best-effort (ADR-0037): `detect` is infallible by construction — it
-    // returns an empty vec when nothing is detected — so this block can
-    // never affect the exit code.
-    let overlay = phux_config::overlay::detect();
     if !json && !overlay.is_empty() {
         outln!("Overlay network addresses (dial one of these from the device):");
         for addr in &overlay {
@@ -204,17 +288,9 @@ pub(crate) fn run_pair(
 
     // The one-tap link (and its QR form) carries the token — it is as much
     // a secret as the token line above, shown once on the same terminal.
-    //
-    // phux-onbd: fall back to the port the server auto-binds on the overlay
-    // address when `PHUX_WS_ADDR` is unset. Without this, pairing on an
-    // otherwise perfectly working host printed "--qr needs a server address"
-    // and left the user to discover a port number and pass `--host` by hand —
-    // while the server was already listening on exactly that address.
-    let ws_addr = std::env::var("PHUX_WS_ADDR").ok().or_else(|| {
-        (!overlay.is_empty()).then(|| format!(":{}", phux_server::runtime::DEFAULT_WS_PORT))
-    });
-    let link = resolve_server_url(host.as_deref(), &overlay, ws_addr.as_deref())
-        .map(|url| build_connect_link(&url, name.as_deref(), fingerprint.as_deref(), &token));
+    let link = server_url
+        .as_deref()
+        .map(|url| build_connect_link(url, name.as_deref(), fingerprint.as_deref(), &token));
 
     if json {
         return print_pair_json(
@@ -321,7 +397,10 @@ fn pair_document(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_connect_link, pair_document, percent_encode, render_qr, resolve_server_url};
+    use super::{
+        advertised_names, build_connect_link, pair_document, percent_encode, render_qr,
+        resolve_server_url,
+    };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::Path;
 
@@ -447,6 +526,47 @@ mod tests {
         assert_eq!(
             resolve_server_url(None, &v6, Some("0.0.0.0:8787")),
             Some("wss://[::1]:8787".to_owned())
+        );
+    }
+
+    /// The SAN list must be exactly what a client will ask for: the link's
+    /// host with no scheme, no port, and no v6 brackets (phux-q9a0).
+    #[test]
+    fn advertised_names_are_the_hosts_a_client_verifies() {
+        let overlay = [IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))];
+
+        // The link host leads, and the overlay address it was derived from
+        // does not repeat.
+        assert_eq!(
+            advertised_names(Some("wss://100.64.0.2:8787"), &overlay),
+            vec!["100.64.0.2"]
+        );
+
+        // A `--host` name is carried alongside every detected overlay address:
+        // `phux pair` prints them all as dialable, so all of them belong in
+        // the certificate.
+        assert_eq!(
+            advertised_names(Some("wss://mini.tail-net.ts.net:8787"), &overlay),
+            vec!["mini.tail-net.ts.net", "100.64.0.2"]
+        );
+
+        // v6 arrives bracketed in a URL and must be unbracketed in a SAN.
+        let v6 = [IpAddr::V6(Ipv6Addr::LOCALHOST)];
+        assert_eq!(
+            advertised_names(Some("wss://[fd7a:115c:a1e0::1]:8787"), &v6),
+            vec!["fd7a:115c:a1e0::1", "::1"]
+        );
+
+        // No link at all: still name whatever was detected, since the operator
+        // may dial it by hand.
+        assert_eq!(advertised_names(None, &overlay), vec!["100.64.0.2"]);
+        assert!(advertised_names(None, &[]).is_empty());
+
+        // A URL that will not parse contributes nothing rather than poisoning
+        // the list — pairing still has a token to mint.
+        assert_eq!(
+            advertised_names(Some("not a url"), &overlay),
+            ["100.64.0.2"]
         );
     }
 
