@@ -270,6 +270,16 @@ the protocol epic):
    git branch -d <branch-name>
    ```
 
+Shared registries are where disjoint-file merges bite: two wave-3 branches
+each created a different ADR-0086 with zero git conflicts, and a wave-2
+branch re-added a manifest key its sibling had just deleted. For ADRs the
+defense is the index row — every ADR adds its row to `ADR/README.md` at
+its numeric position (see docs/CONVENTIONS.md §"The index row"), so a
+same-number claim becomes a textual conflict at rebase and a
+`just docs-check` failure either way. For any other shared registry,
+rebase onto the integration branch and re-run the relevant gate before
+declaring a branch done.
+
 ## Observability: CI itself
 
 CI reports where its own minutes go, and keeps nothing (ADR-0082). Where to

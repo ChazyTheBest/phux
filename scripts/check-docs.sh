@@ -17,6 +17,9 @@
 #                           four blessed forms
 #   - adr-number-unique   : no two files under ADR/ share the same
 #                           leading NNNN number
+#   - adr-index-sync      : every ADR/NNNN-*.md has exactly one row in
+#                           ADR/README.md's index, every row resolves to
+#                           its file, and rows ascend numerically
 #   - spec-version-sync   : docs/spec/CHANGELOG.md head version agrees
 #                           with phux-protocol's PROTOCOL_VERSION
 #                           (skipped while the SPEC split is in flight)
@@ -46,6 +49,7 @@ ALL_GATES=(
     dead-link
     adr-status
     adr-number-unique
+    adr-index-sync
     spec-version-sync
     impl-status
 )
@@ -565,6 +569,85 @@ gate_adr_number_unique() {
 }
 
 # ---------------------------------------------------------------------------
+# Gate 5c: adr-index-sync
+# ---------------------------------------------------------------------------
+
+# Every ADR has exactly one row in ADR/README.md's index, inserted at its
+# numeric position. The row is deliberately a collision point for parallel
+# branches: two branches that each claim the same ADR number either conflict
+# textually on the index row at rebase, or — if the merge somehow slides
+# through — fail here. Without the row, git sees two disjoint new files and
+# reports zero conflicts (it happened: wave 3 produced two different
+# ADR-0086 files, silently). Three checks, bidirectional:
+#
+#   1. every ADR/NNNN-*.md file has exactly one index row for its number
+#   2. every index row's link resolves to a real file whose name starts
+#      with the row's number
+#   3. row numbers are strictly ascending down the table
+
+gate_adr_index_sync() {
+    if [[ ! -d "$ROOT/ADR" ]]; then
+        return
+    fi
+    local readme="$ROOT/ADR/README.md"
+    if [[ ! -f "$readme" ]]; then
+        violate adr-index-sync "$readme" \
+            "ADR/README.md not found — the ADR index is required"
+        return
+    fi
+
+    # Collect index rows: `| [NNNN](./NNNN-slug.md) | ... |`.
+    local line num target prev=""
+    local -A row_target=()
+    local -A row_count=()
+    local row_re='^\|[[:space:]]*\[([0-9]{4})\]\(\./([^)]+)\)'
+    while IFS= read -r line; do
+        [[ "$line" =~ $row_re ]] || continue
+        num="${BASH_REMATCH[1]}"
+        target="${BASH_REMATCH[2]}"
+
+        row_count[$num]=$(( ${row_count[$num]:-0} + 1 ))
+        if [[ "${row_count[$num]}" -gt 1 ]]; then
+            violate adr-index-sync "$readme" \
+                "index has more than one row for ADR number $num"
+        else
+            row_target[$num]="$target"
+        fi
+
+        if [[ ! -f "$ROOT/ADR/$target" ]]; then
+            violate adr-index-sync "$readme" \
+                "index row $num links to ./$target, which does not exist"
+        elif [[ "$target" != "$num-"* ]]; then
+            violate adr-index-sync "$readme" \
+                "index row $num links to ./$target, whose filename does not start with $num-"
+        fi
+
+        if [[ -n "$prev" ]] && (( 10#$num <= 10#$prev )); then
+            violate adr-index-sync "$readme" \
+                "index row $num appears after row $prev — rows must ascend numerically (insert each new ADR's row at its numeric position)"
+        fi
+        prev="$num"
+    done < "$readme"
+
+    # Reverse direction: every ADR file has its row, and the row points at
+    # this file (not at a same-numbered sibling — the duplicate-claim case
+    # adr-number-unique also reports).
+    local file base
+    while IFS= read -r file; do
+        base="$(basename "$file")"
+        [[ "$base" =~ ^([0-9]{4})- ]] || continue
+        num="${BASH_REMATCH[1]}"
+        if [[ -z "${row_target[$num]:-}" ]]; then
+            violate adr-index-sync "$file" \
+                "no index row in ADR/README.md for ADR number $num — every ADR adds exactly one row at its numeric position (see the comment above the index)"
+        elif [[ "${row_target[$num]}" != "$base" ]]; then
+            violate adr-index-sync "$file" \
+                "index row $num links to ./${row_target[$num]}, not to this file — two files are claiming the same ADR number, or the row was not updated with a rename"
+        fi
+    done < <(find "$ROOT/ADR" -type f -name '*.md' | LC_ALL=C sort)
+}
+
+# ---------------------------------------------------------------------------
 # Gate 6: spec-version-sync
 # ---------------------------------------------------------------------------
 
@@ -895,6 +978,7 @@ run_gate() {
         dead-link)           gate_dead_link           ;;
         adr-status)          gate_adr_status          ;;
         adr-number-unique)   gate_adr_number_unique   ;;
+        adr-index-sync)      gate_adr_index_sync      ;;
         spec-version-sync)   gate_spec_version_sync   ;;
         impl-status)         gate_impl_status         ;;
         *) echo "internal error: unknown gate '$gate'" >&2; exit 2 ;;

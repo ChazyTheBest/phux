@@ -21,13 +21,16 @@ Nygard's template][nygard].
 ## Index
 
 <!--
-This table should be generated from the ADR/0*.md files (each file's first
-`# ` heading is the title, its `Status:` line is the status) rather than
-hand-maintained. It drifted before — the table stopped at 0028 while 0029
-and 0030 existed, and 0022 was missing entirely. Regenerate it instead of
-editing rows by hand, or the same drift recurs. The relationship
-annotations in the Status column (supersedes / refines / builds on /
-amends / extends) are hand-curated from each ADR's body.
+Every ADR has exactly one row here, inserted at its numeric position when
+the ADR is written. This is enforced (`adr-index-sync` in
+scripts/check-docs.sh): a missing row, a duplicate number, or an
+out-of-order row fails `just docs-check`. The row is deliberately a
+collision point — two parallel branches claiming the same ADR number
+produce a textual conflict on this table at rebase, where the two files
+alone would merge silently (it happened: wave 3 created two different
+ADR-0086 files with zero git conflicts). The relationship annotations in
+the Status column (supersedes / refines / builds on / amends / extends)
+are hand-curated from each ADR's body.
 -->
 
 | # | Decision | Status |
@@ -111,7 +114,10 @@ amends / extends) are hand-curated from each ADR's body.
 | [0077](./0077-agent-read-surface.md) | The agent read surface: sources, soft wrap, and truncation | Accepted (extends [0022](./0022-tool-for-agents.md)'s read surface with additive JSON keys under [0061](./0061-capabilities-add-versions-break.md), all four shipped at `SCHEMA_VERSION` 3; the alternate-screen harvest it originally carried is split out to [0078](./0078-alternate-screen-history.md)) |
 | [0078](./0078-alternate-screen-history.md) | Harvesting alternate-screen history | Proposed (split out of [0077](./0077-agent-read-surface.md) because it is the one read that writes: it narrows the side-effect-free guarantee `docs/spec/L1.md` §6.1 makes for `GET_SCREEN`, acquires [0033](./0033-input-authority-and-process-signals.md)'s input lease, and needs a capability bit under [0061](./0061-capabilities-add-versions-break.md)) |
 | [0079](./0079-fatal-signal-terminal-restore.md) | Fatal-signal terminal restore | Accepted (covers the teardown path `RawModeGuard::drop` and the panic hook cannot reach — a SIGSEGV/SIGBUS/SIGABRT out of [0004](./0004-libghostty-vt-as-grid.md)'s native engine, which does not unwind; vendors `phux-crash`, the workspace's only Apache-2.0-ONLY crate, keeping its `unsafe` behind a crate boundary as [0032](./0032-graceful-server-upgrade.md) does for `portable-pty-adopt`) |
+| [0080](./0080-socket-lifecycle-and-instance-isolation.md) | Socket lifecycle and instance isolation | Accepted (liveness is a connect probe, not socket existence; every build resolves a profile that scopes socket/runtime/state dirs; supervision corrected under [0003](./0003-server-process-model.md), with the upgrade handoff riding [0032](./0032-graceful-server-upgrade.md)) |
+| [0081](./0081-overlay-auto-listen-and-one-command-pairing.md) | Overlay auto-listen and one-command pairing | Accepted (binds [0037](./0037-overlay-network-reachability.md)'s overlay address at startup, gated on [0031](./0031-remote-consumer-auth-and-encryption.md)'s pairing-token store, so `phux pair` is a pure credential operation with no restart; default profile only, per [0080](./0080-socket-lifecycle-and-instance-isolation.md)) |
 | [0082](./0082-retire-the-ci-metrics-store.md) | Retire the CI metrics store; the run page is the dashboard | Accepted (supersedes [0047](./0047-ci-metrics-branch.md) — deletes the `ci-metrics` branch, its collector, and the `observatory` lane, keeping only the zero-cost step-summary half; a hosted dashboard, if it returns, is the site's to own) |
+| [0083](./0083-in-place-supervisor-unit-reconcile.md) | In-place supervisor unit reconcile | Accepted (applies [0080](./0080-socket-lifecycle-and-instance-isolation.md)'s restart-policy correction to an already-installed unit by patching only those keys — no re-render, no reload, no stopped server; launchd cannot pick it up live and the command says so) |
 | [0084](./0084-starting-an-agent-in-an-existing-shell.md) | Starting an agent in an existing shell | Accepted (separates in-place, shell-evaluated startup from [0042](./0042-launch-executor.md)'s direct-argv pane creation; positive OSC 133 prompt evidence gates submission, detector publication supplies identity, and possible delivery retains the bound name) |
 | [0085](./0085-hook-sourced-agent-state.md) | Hook-sourced agent state is detector evidence | Accepted (adds capability-gated `REPORT_AGENT_STATE`: hooks publish immediate working/blocked/done edges through the detector without writing a state declaration that disables self-healing) |
 | [0086](./0086-shared-render-pool.md) | The pooled libghostty render trio lives in `phux-protocol` | Accepted (one `RenderPool` owns the `RenderState`/`RowIterator`/`CellIterator` trio and the `phux-5pyx` rebuild-on-resize, behind the existing `server` feature; dirty-bit policy stays at the call sites, which deliberately differ) |

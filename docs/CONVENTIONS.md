@@ -218,6 +218,17 @@ One line. Exactly one of:
 No multi-line statuses. No prose qualifiers on the line. If a
 qualification is important, it goes in the TL;DR or the body.
 
+### The index row
+
+Every ADR adds exactly one row to [`ADR/README.md`](../ADR/README.md)'s
+index, inserted at its numeric position, in the same commit that adds the
+ADR. This is not only navigation — the row is a deliberate collision
+point. Two parallel branches claiming the same ADR number touch disjoint
+files, which git merges silently; the shared index row turns that claim
+into an ordinary textual conflict at rebase, and the `adr-index-sync`
+gate in `just docs-check` fails any tree where a file and its row have
+drifted apart. Write the row when you write the ADR.
+
 ### When to write an ADR
 
 - Picking between viable approaches with long-term consequences.
@@ -382,6 +393,7 @@ The discipline layer is mechanically checked. See
 | dead-link | A relative link that doesn't resolve |
 | adr-status | An ADR with a non-vocabulary `Status:` line |
 | adr-number-unique | Two files under `ADR/` sharing the same leading `NNNN` number |
+| adr-index-sync | An ADR file with no row in `ADR/README.md`'s index, an index row that does not resolve to its file, or rows out of numeric order |
 | spec-version-sync | `docs/spec/CHANGELOG.md` head version vs `phux-protocol`'s declared protocol version |
 | impl-status | A `shipped` / `partial` / `spec-only` claim in `docs/spec/` or `docs/consumers/` that the code contradicts, and a `> **Status` callout with no marker behind it |
 
