@@ -293,7 +293,8 @@ parity-gate *SCENARIOS:
 # (sourced libs shellcheck can't follow, single-quoted heredoc-ish
 # program strings) that are correct as written. On-demand, not in `ci`.
 shellcheck:
-    shellcheck --severity=warning scripts/*.sh examples/agents/*.sh \
+    shellcheck --severity=warning scripts/*.sh scripts/ci/*.sh \
+      examples/agents/*.sh \
       examples/agents/orchestrate-placed-fleet examples/agents/tests/*.sh \
       examples/plugins/*/scripts/*.sh
 

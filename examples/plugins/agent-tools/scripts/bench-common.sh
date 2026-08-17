@@ -1,3 +1,8 @@
+# shellcheck shell=sh
+# Sourced library, not executed: no shebang by design. Several bench_*
+# variables are consumed only by the sibling scripts that source this file,
+# and shellcheck lints one file at a time.
+# shellcheck disable=SC2034
 set -eu
 
 bench_root=${PHUX_PLUGIN_ROOT:-$(CDPATH=; cd -- "$(dirname -- "$0")/.." && pwd)}

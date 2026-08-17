@@ -146,7 +146,7 @@ assert "NATIVE-INPUT-PANE-ONE" in one and "NATIVE-INPUT-PANE-TWO" not in one, on
 assert "NATIVE-INPUT-PANE-TWO" in two and "NATIVE-INPUT-PANE-ONE" not in two, two
 PY
 
-STEP=done
+STEP='done'
 collect_artifacts
 note "PASS"
 printf 'native smoke artifacts: %s\n' "$RUN_DIR"

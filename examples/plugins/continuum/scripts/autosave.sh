@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 set -eu
 
 phux_bin=${PHUX_BIN:-phux}

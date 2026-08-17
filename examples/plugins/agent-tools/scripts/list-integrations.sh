@@ -1,4 +1,7 @@
 #!/bin/sh
+# integration-common.sh (sourced below) defines the agent_tools_* variables;
+# they look unassigned here because sources are not followed across files.
+# shellcheck disable=SC2154
 . "$(CDPATH=; cd -- "$(dirname -- "$0")" && pwd)/integration-common.sh"
 
 printf 'id\tdisplay_name\tkind\tpackage_version\tdetect_mode\tdetect_command\tsession_identity\n'

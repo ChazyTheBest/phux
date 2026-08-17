@@ -2,7 +2,7 @@
 # Deterministic, non-retried release interoperability gate.
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 ARTIFACT_DIR=${PHUX_RELEASE_ARTIFACT_DIR:-"$ROOT/target/release-interop/$STAMP-$$"}
 CURRENT_PHUX=${PHUX_CURRENT_BIN:-"$ROOT/target/release/phux"}

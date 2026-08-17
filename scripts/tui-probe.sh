@@ -407,7 +407,7 @@ path.with_suffix(path.suffix + ".summary.json").write_text(json.dumps(summary, s
 PY
 }
 
-STEP=cast-portability
+STEP='cast-portability'
 note "assert complete and interrupted casts contain portable VT only"
 validate_cast "$VALID_COMPLETE_CAST" TYPED-AFTER-HISTORY complete
 validate_cast "$INTERRUPTED_CAST" INTERRUPTED-CAST-MARKER interrupted
@@ -443,6 +443,6 @@ STEP=interrupted-replay
 note "replay interrupted recording prefix through a real server pane"
 replay_cast "$INTERRUPTED_CAST" INTERRUPTED-CAST-MARKER interrupted
 
-STEP=done
+STEP='done'
 note "PASS"
 printf 'surface artifacts: %s\n' "$RUN_DIR"

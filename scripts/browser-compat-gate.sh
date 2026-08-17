@@ -1,7 +1,7 @@
 #!/bin/sh
 # Real Chrome -> WebSocket -> ServerRuntime -> PTY compatibility gate.
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 ARTIFACT_DIR=${PHUX_BROWSER_ARTIFACT_DIR:-"$ROOT/target/browser-compat/$STAMP-$$"}
 mkdir -p "$ARTIFACT_DIR"

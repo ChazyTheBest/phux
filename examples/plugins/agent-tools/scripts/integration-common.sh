@@ -1,3 +1,5 @@
+# shellcheck shell=sh
+# Sourced library, not executed: no shebang by design.
 set -eu
 
 agent_tools_root=${PHUX_PLUGIN_ROOT:-$(CDPATH=; cd -- "$(dirname -- "$0")/.." && pwd)}
