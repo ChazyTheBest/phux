@@ -1316,6 +1316,21 @@ fn clear_adoption_pending() {
     let _ = std::fs::remove_file(adoption_marker_path());
 }
 
+/// The unit an armed adoption is recorded against, if the record and the
+/// unit are both still present — the read-only view `phux doctor` reports
+/// from (phux-8514, in the spirit of ADR-0080: an invisible supervision
+/// state is how a broken server passes for a working one). Only looks;
+/// sweeping a stale marker stays with the paths that own the state
+/// ([`armed_unit_for`], [`run_status`]).
+pub(crate) fn armed_adoption_unit() -> Option<PathBuf> {
+    if !adoption_marker_path().exists() {
+        return None;
+    }
+    let manager = Manager::host()?;
+    let unit_path = manager.unit_path(profile_suffix().as_deref()).ok()?;
+    unit_path.exists().then_some(unit_path)
+}
+
 /// The armed unit waiting to supervise `socket_path`, if there is one.
 ///
 /// Three conditions, all required, because the consequence of a false positive
@@ -1778,43 +1793,121 @@ pub(crate) fn run_status() -> ExitCode {
     }
     outln!("unit  {}", unit_path.display());
 
-    // An armed unit is the one state the init system cannot describe: to
-    // `launchctl print` an unloaded job and a never-installed one are the same
-    // absence, and phux is the only thing that knows the difference is
-    // deliberate and temporary.
-    if adoption_marker_path().exists() {
-        outln!("state armed — installed with --adopt and waiting for the running server to exit");
-        outln!();
-        outln!(
-            "The server holding this unit's socket is unsupervised and keeps its panes.\n\
-             Supervision begins at the next login, or at the first `phux` command after\n\
-             that server exits. `phux service uninstall` cancels it."
-        );
-        outln!();
-    }
-
-    // Delegate liveness to the init system rather than guessing from a pid
-    // file phux does not write.
-    let status = match manager {
+    // Delegate liveness to the init system, but with its output *captured*,
+    // never inherited: its words reach the user only when status forwards
+    // them deliberately. phux-8514 inherited the pipes, and `launchctl print`
+    // on an unloaded job wrote "Bad request. / Could not find service ..."
+    // straight to the terminal — three lines after the armed paragraph
+    // explaining that unloaded is exactly what armed means.
+    let probe = || match manager {
         Manager::Launchd => std::process::Command::new("launchctl")
             .args(["print", &launchd_target()])
-            .status(),
+            .output(),
         Manager::Systemd => std::process::Command::new("systemctl")
             .args(["--user", "status", &systemd_unit()])
-            .status(),
+            .output(),
     };
 
-    match status {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(_) => {
-            outln!("installed, but the init system is not running it.");
-            ExitCode::FAILURE
+    match status_report(adoption_marker_path().exists(), probe) {
+        Ok(report) => {
+            if report.adoption_complete {
+                // The init system owns the job, so the recorded hand-over is
+                // done, not pending. Sweep the marker so no later verb keeps
+                // describing a state that has already resolved — the same
+                // sweep-on-sight rule `armed_unit_for` applies to a marker
+                // whose unit has vanished.
+                clear_adoption_pending();
+            }
+            out!("{}", report.text);
+            if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(err) => {
             eprintln!("phux service: could not query the init system: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// What `phux service status` prints once the unit exists, and how the verb
+/// exits.
+struct StatusReport {
+    /// Everything the verb writes to stdout past the `unit` line.
+    text: String,
+    /// Whether the verb exits zero. Armed counts as success: the unit is in
+    /// precisely the state `--adopt` promised, not a degraded one.
+    ok: bool,
+    /// The armed record is out of date — the init system is already running
+    /// the unit, so the hand-over it describes has completed and the marker
+    /// should be swept.
+    adoption_complete: bool,
+}
+
+/// The report as a pure function of the armed record and the init system's
+/// answer, so both phux-8514 defects stay unit-testable: the probe's stderr
+/// never reaches the report (a failure is rendered in phux's own
+/// vocabulary), and an armed unit's not-found answer is translated into the
+/// armed vocabulary instead of being reported as a fault — an armed unit is
+/// written-but-not-loaded by design (ADR-0088), so the init system not
+/// knowing the job is the expected observation, not an error.
+///
+/// The probe still runs when the unit is armed rather than being skipped,
+/// because the marker can outlive the state it records: launchd bootstraps
+/// every plist at login, and nothing on that path clears the marker. A
+/// running job under an armed marker therefore means the hand-over has
+/// completed, and the report says so instead of repeating a stale record.
+fn status_report(
+    armed: bool,
+    probe: impl FnOnce() -> std::io::Result<std::process::Output>,
+) -> std::io::Result<StatusReport> {
+    let output = probe()?;
+    let running = output.status.success();
+    // The init system's report proper arrives on stdout; stderr is where
+    // launchctl narrates its own failures ("Bad request.") and is never
+    // forwarded.
+    let init_report = String::from_utf8_lossy(&output.stdout);
+    let report = match (armed, running) {
+        (true, false) => StatusReport {
+            text:
+                "state armed — installed with --adopt and waiting for the running server to exit\n\
+                   \n\
+                   The server holding this unit's socket is unsupervised and keeps its panes.\n\
+                   Supervision begins at the next login, or at the first `phux` command after\n\
+                   that server exits. `phux service uninstall` cancels it.\n\
+                   \n\
+                   The init system is not running the unit — for an armed unit that is the\n\
+                   expected state, not a fault.\n"
+                    .to_owned(),
+            ok: true,
+            adoption_complete: false,
+        },
+        (true, true) => StatusReport {
+            text: format!(
+                "The hand-over armed by `phux service install --adopt` has completed: the init\n\
+                 system is running this unit now.\n\
+                 \n\
+                 {init_report}"
+            ),
+            ok: true,
+            adoption_complete: true,
+        },
+        (false, true) => StatusReport {
+            text: init_report.into_owned(),
+            ok: true,
+            adoption_complete: false,
+        },
+        (false, false) => StatusReport {
+            // The init system's stdout still goes through (systemctl explains
+            // an inactive unit there); only the verdict line is phux's.
+            text: format!("{init_report}installed, but the init system is not running it.\n"),
+            ok: false,
+            adoption_complete: false,
+        },
+    };
+    Ok(report)
 }
 
 /// `phux service logs` — show the server's log.
@@ -2048,11 +2141,148 @@ mod tests {
         Manager, RESTART_THROTTLE_SECS, Reconcile, SERVICE_MANAGED_ENV, START_LIMIT_BURST,
         ServicePlan, arm_unit, config_home_from, dry_run_text, home_dir_from, launchd_label_for,
         launchd_policy_lines, reconcile_unit, render_launchd_plist, render_systemd_unit,
-        render_unit, render_wrapper_script, resolve_plan, sh_quote, systemd_escape,
+        render_unit, render_wrapper_script, resolve_plan, sh_quote, status_report, systemd_escape,
         systemd_policy_lines, systemd_quote, systemd_unit_for, systemd_unquote,
         unit_socket_override, unit_supervises, xml_escape, xml_unescape,
     };
     use std::path::PathBuf;
+
+    /// A captured init-system invocation, for driving [`status_report`]
+    /// without an init system. `raw` is a wait(2) status: `0` is success,
+    /// `1 << 8` is exit code 1.
+    fn probe_output(raw: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// What `launchctl print` writes to stderr for a job that is not loaded —
+    /// the exact text phux-8514 leaked to the terminal.
+    const LAUNCHCTL_NOT_FOUND_STDERR: &str =
+        "Bad request.\nCould not find service \"com.phux.server\" in domain for user gui: 501\n";
+
+    /// phux-8514, defect 2: an armed unit is written-but-not-loaded by design
+    /// (ADR-0088), so the init system's not-found is the expected
+    /// observation. The report must stay in the armed vocabulary and must not
+    /// follow the armed paragraph with a contradiction dressed as a fault —
+    /// and armed exits zero, because it is the state `--adopt` promised.
+    #[test]
+    fn an_armed_units_not_found_answer_is_translated_not_reported_as_a_fault() {
+        let report = status_report(true, || {
+            Ok(probe_output(1 << 8, "", LAUNCHCTL_NOT_FOUND_STDERR))
+        })
+        .expect("the probe ran");
+
+        assert!(report.ok, "armed is the promised state, not a failure");
+        assert!(!report.adoption_complete);
+        assert!(report.text.contains("state armed"), "{}", report.text);
+        assert!(
+            report.text.contains("expected state, not a fault"),
+            "the not-found answer must be translated into the armed vocabulary: {}",
+            report.text
+        );
+        for leaked in [
+            "Bad request",
+            "Could not find service",
+            "installed, but the init system",
+        ] {
+            assert!(
+                !report.text.contains(leaked),
+                "leaked into the armed report: {leaked:?}\n{}",
+                report.text
+            );
+        }
+    }
+
+    /// phux-8514, defect 1: the tool's stderr is never surfaced verbatim,
+    /// armed or not. A not-running unit gets phux's own verdict line, plus
+    /// the probe's stdout — which is where systemctl puts its useful
+    /// explanation of an inactive unit.
+    #[test]
+    fn a_failed_probe_is_rendered_in_phux_vocabulary_not_the_tools_stderr() {
+        let report = status_report(false, || {
+            Ok(probe_output(
+                3 << 8,
+                "Active: inactive (dead)\n",
+                LAUNCHCTL_NOT_FOUND_STDERR,
+            ))
+        })
+        .expect("the probe ran");
+
+        assert!(!report.ok);
+        assert!(!report.adoption_complete);
+        assert!(
+            report
+                .text
+                .contains("installed, but the init system is not running it"),
+            "{}",
+            report.text
+        );
+        assert!(
+            report.text.contains("Active: inactive (dead)"),
+            "the tool's stdout is forwarded — it is the report proper: {}",
+            report.text
+        );
+        assert!(
+            !report.text.contains("Bad request"),
+            "the tool's stderr leaked: {}",
+            report.text
+        );
+    }
+
+    /// The armed marker can outlive the state it records — launchd
+    /// bootstraps every plist at login, and nothing on that path clears the
+    /// marker — so armed-plus-running means the hand-over completed. The
+    /// report says so and asks for the sweep instead of repeating the stale
+    /// record.
+    #[test]
+    fn an_armed_marker_over_a_running_job_reports_completion_and_asks_for_a_sweep() {
+        let report = status_report(true, || {
+            Ok(probe_output(
+                0,
+                "com.phux.server = {\n\tstate = running\n}\n",
+                "",
+            ))
+        })
+        .expect("the probe ran");
+
+        assert!(report.ok);
+        assert!(report.adoption_complete, "the stale record must be swept");
+        assert!(report.text.contains("has completed"), "{}", report.text);
+        assert!(
+            report.text.contains("state = running"),
+            "the init system's report is forwarded: {}",
+            report.text
+        );
+        assert!(
+            !report.text.contains("state armed"),
+            "a completed hand-over must not still read as armed: {}",
+            report.text
+        );
+    }
+
+    /// A running job with no armed record: the init system's own report is
+    /// the status, forwarded from stdout — its stderr chatter is dropped
+    /// even on success.
+    #[test]
+    fn a_running_jobs_report_is_forwarded_without_its_stderr() {
+        let report = status_report(false, || {
+            Ok(probe_output(
+                0,
+                "com.phux.server = {\n}\n",
+                "noise on stderr\n",
+            ))
+        })
+        .expect("the probe ran");
+
+        assert!(report.ok);
+        assert!(!report.adoption_complete);
+        assert!(report.text.contains("com.phux.server"), "{}", report.text);
+        assert!(!report.text.contains("noise on stderr"), "{}", report.text);
+    }
 
     /// A launchd plist as `phux service install` wrote them before
     /// phux-zomb.4: `KeepAlive: true`, no throttle. Carries `--hub`, a QUIC

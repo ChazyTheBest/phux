@@ -230,6 +230,10 @@ fn check_server_health() -> Vec<Check> {
     let crash_loop = phux_server::health::crash_loop()
         .map(|count| (count, phux_server::health::CRASH_LOOP_WINDOW.as_secs() / 60));
 
+    // Supervision armed by `--adopt` but not yet active (ADR-0088): the unit
+    // is written and deliberately unloaded while the incumbent server runs.
+    let armed_unit = super::service::armed_adoption_unit();
+
     // Version skew: a package manager replaced the binary but nothing
     // restarted the server, so it is still serving the old build (phux-zomb.7).
     let ours = env!("CARGO_PKG_VERSION");
@@ -239,9 +243,13 @@ fn check_server_health() -> Vec<Check> {
         .filter(|theirs| *theirs != ours)
         .map(|theirs| (theirs, ours));
 
-    server_health_checks(crash_loop, legacy_unit, version_skew, || {
-        phux_server::health::recent_starts(phux_server::health::CRASH_LOOP_WINDOW).len()
-    })
+    server_health_checks(
+        crash_loop,
+        legacy_unit,
+        armed_unit.as_deref(),
+        version_skew,
+        || phux_server::health::recent_starts(phux_server::health::CRASH_LOOP_WINDOW).len(),
+    )
 }
 
 /// The pure half of [`check_server_health`]: turns already-gathered signals
@@ -257,6 +265,7 @@ fn check_server_health() -> Vec<Check> {
 fn server_health_checks(
     crash_loop: Option<(usize, u64)>,
     legacy_unit: Option<&std::path::Path>,
+    armed_unit: Option<&std::path::Path>,
     version_skew: Option<(&str, &str)>,
     recent_starts: impl FnOnce() -> usize,
 ) -> Vec<Check> {
@@ -299,6 +308,27 @@ fn server_health_checks(
              `phux service reconcile` to correct it in place; nothing is \
              stopped and no pane is lost (on macOS the corrected policy takes \
              effect at your next login, which that command spells out)",
+        ));
+    }
+
+    // Supervision that is armed but not yet active (ADR-0088, phux-8514).
+    // Working as designed — and surfaced for the same reason ADR-0080
+    // surfaced the crash-loop: an invisible supervision state is how a
+    // broken server passes for a working one, and until the hand-over the
+    // running server is not restart-managed by anything.
+    if let Some(unit) = armed_unit {
+        checks.push(Check::warn(
+            "server-health",
+            format!(
+                "supervision is armed, not active — the unit at {} is written but \
+                 deliberately unloaded while the current server runs",
+                unit.display()
+            ),
+            "this is `phux service install --adopt` working as designed: the running \
+             server keeps its panes and stays unsupervised, so a crash before the \
+             hand-over is not caught by anything. Supervision begins at the next \
+             login, or at the first `phux` command after that server exits; \
+             `phux service uninstall` cancels it",
         ));
     }
 
@@ -1254,6 +1284,7 @@ mod tests {
         let checks = server_health_checks(
             Some((9, 60)),
             Some(unit),
+            None,
             Some(("0.13.0", "0.14.0")),
             || panic!("recent_starts must not be read once another condition already applies"),
         );
@@ -1280,10 +1311,50 @@ mod tests {
     /// when nothing applies must survive the rewrite unchanged.
     #[test]
     fn server_health_passes_when_nothing_applies() {
-        let checks = server_health_checks(None, None, None, || 2);
+        let checks = server_health_checks(None, None, None, None, || 2);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, Status::Pass);
         assert!(checks[0].detail.contains("2 server start(s)"));
+    }
+
+    /// phux-8514's adjacent gap: an armed-but-not-active supervision unit
+    /// (ADR-0088) was invisible to doctor, which reported all checks passing
+    /// while the running server was not restart-managed by anything — the
+    /// same invisible-supervision-state shape ADR-0080 made the crash-loop
+    /// reportable for. Informational: a Warn, not a Fail, because armed is
+    /// working as designed; it displaces the Pass line so the in-between
+    /// state is named rather than summarised away.
+    #[test]
+    fn armed_supervision_is_surfaced_as_informational() {
+        let unit = std::path::Path::new("/home/u/Library/LaunchAgents/com.phux.server.plist");
+        let checks = server_health_checks(None, None, Some(unit), None, || {
+            panic!("recent_starts must not be read once another condition already applies")
+        });
+
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(checks[0].detail.contains("armed"), "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains(&unit.display().to_string()),
+            "{}",
+            checks[0].detail
+        );
+        let hint = checks[0]
+            .hint
+            .as_ref()
+            .expect("a warn without a hint is half a diagnosis");
+        assert!(
+            hint.contains("--adopt") && hint.contains("working as designed"),
+            "the hint must name the state's origin and that it is intended: {hint}"
+        );
+        assert!(
+            hint.contains("not caught by anything"),
+            "the one real risk of the armed window must be stated: {hint}"
+        );
+        assert!(
+            hint.contains("service uninstall"),
+            "the way out must be named: {hint}"
+        );
     }
 
     /// phux-nvi2: the legacy-unit hint must stay honest about what following
@@ -1307,7 +1378,7 @@ mod tests {
     #[test]
     fn legacy_unit_hint_stays_honest_about_its_own_remedy() {
         let unit = std::path::Path::new("/home/u/Library/LaunchAgents/com.phux.server.plist");
-        let checks = server_health_checks(None, Some(unit), None, || 0);
+        let checks = server_health_checks(None, Some(unit), None, None, || 0);
         let hint = checks[0]
             .hint
             .as_ref()
