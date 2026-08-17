@@ -107,6 +107,13 @@ impl Harness {
             .env("SHELL", "/bin/sh")
             .env("TERM", "xterm-256color")
             .env("RUST_LOG", "off")
+            // The justfile's e2e recipe exports this backstop (phux-nbam),
+            // but `env_clear()` above wipes it before it can reach the
+            // auto-spawned daemon — which is exactly how this lane leaked
+            // immortal servers (phux-8y3o). Re-arm it inside the hermetic
+            // environment so a daemon that outlives the harness (SIGKILLed
+            // runner, panic before the PID was captured) exits on its own.
+            .env("PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE", common::SERVER_IDLE_LIMIT_SECS)
             .env("PATH", self.path_value());
     }
 
@@ -129,6 +136,14 @@ impl Harness {
         command.env("SHELL", "/bin/sh");
         command.env("TERM", "xterm-256color");
         command.env("RUST_LOG", "off");
+        // Same backstop as `apply_command_env`: `env_clear()` discards the
+        // justfile-level PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE, and the naked PTY
+        // attach below is the invocation that actually auto-spawns the
+        // daemon, so this is the seam that bounds a leaked one (phux-8y3o).
+        command.env(
+            "PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE",
+            common::SERVER_IDLE_LIMIT_SECS,
+        );
         command.env("PATH", self.path_value());
     }
 
@@ -421,6 +436,12 @@ fn run_journey(harness: &mut Harness) {
     );
 
     let mut first = PtyClient::naked(harness, "first-attach");
+    // Capture the daemon's PID before any UI assertion can panic:
+    // `AutoSpawnedServer::cleanup` is a no-op until the PID is known, so a
+    // failure in the waits below used to leak the daemon outright
+    // (phux-8y3o). The idle backstop armed in `apply_pty_env` covers the
+    // one residue this cannot: a runner killed before this capture lands.
+    harness.server.capture_pid();
     first.wait_for("the first-use title", |text| {
         text.contains("Your session is live")
     });

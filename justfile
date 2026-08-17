@@ -30,6 +30,11 @@ default:
 # backstop can only fire once the harness is already gone. `idle_exit_e2e`
 # drives both the set and the unset case and `env_remove`s it for the latter,
 # so inheriting it here does not weaken that coverage.
+#
+# CAVEAT (phux-8y3o): this export cannot survive a lane that `env_clear()`s
+# the processes it spawns — the variable is wiped before it reaches the
+# auto-spawning parent. Such a lane must re-set it inside its own hermetic
+# environment; `first_five_minutes_e2e` does exactly that.
 AUTO_SPAWN_BACKSTOP := "PHUX_AUTO_SPAWN_EXIT_AFTER_IDLE=600"
 
 # Scaffold a commented starter config into a worktree-local XDG dir
