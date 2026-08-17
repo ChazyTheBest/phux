@@ -1226,6 +1226,113 @@ fn session_rename_via_metadata_updates_registry_name() {
     });
 }
 
+/// phux-q7ks regression: an *applied* session rename fans out a
+/// `METADATA_CHANGED` on `(Global, SESSION_NAME_KEY)` to subscribers of that
+/// key, so an attached client's roster learns the new name without a poll or
+/// a re-attach. Before the fix the interception branch returned without any
+/// broadcast, and no subscriber ever heard about a rename.
+///
+/// Drives the production read loop over the wire: client A attaches and
+/// subscribes; client B renames. The two suppression cases are pinned by
+/// ordering rather than by timing sleeps: B issues a failed rename (unknown
+/// session) and a no-op rename (same name) BEFORE the real one, all on one
+/// connection, so if either wrongly broadcast, its frame would arrive ahead
+/// of the real rename's and the first-value assertion below would fail.
+#[test]
+fn session_rename_broadcasts_metadata_changed_to_subscribers() {
+    run_local(async {
+        use phux_protocol::wire::frame::{SESSION_NAME_KEY, Scope};
+
+        fn rename_value(current: &str, new_name: &str) -> Vec<u8> {
+            let mut value = current.as_bytes().to_vec();
+            value.push(0);
+            value.extend_from_slice(new_name.as_bytes());
+            value
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("phux.sock");
+        let (_shutdown_tx, _server) = spawn_server(socket_path.clone(), Some("work"));
+
+        // Client A: attach (giving the L3 fanout a mailbox), then subscribe
+        // to the session-name key under the scope renames are written to.
+        let mut subscriber = wait_for_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
+        send_frame(&mut subscriber, &attach_by_name("work")).await;
+        loop {
+            let (type_byte, _frame) = recv_typed(&mut subscriber).await;
+            if type_byte == TYPE_ATTACHED {
+                break;
+            }
+        }
+        send_frame(
+            &mut subscriber,
+            &FrameKind::SubscribeMetadata {
+                scope: Scope::Global,
+                key: SESSION_NAME_KEY.to_owned(),
+            },
+        )
+        .await;
+        // SUBSCRIBE_METADATA has no ack frame; a command round-trip on the
+        // same connection is the barrier proving the in-order read loop has
+        // registered the subscription before client B writes the rename.
+        send_frame(
+            &mut subscriber,
+            &FrameKind::Command {
+                request_id: 1,
+                command: Command::GetState {
+                    scope: StateScope::Server,
+                },
+            },
+        )
+        .await;
+        let _ = await_command_result(&mut subscriber, 1).await;
+
+        // Client B: a failed rename, a no-op rename, then the real one.
+        let mut renamer = wait_for_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
+        for (request_id, value) in [
+            (10, rename_value("ghost", "phantom")), // unknown session: refused
+            (11, rename_value("work", "work")),     // same name: applied no-op
+            (12, rename_value("work", "renamed")),  // the real rename
+        ] {
+            send_frame(
+                &mut renamer,
+                &FrameKind::SetMetadata {
+                    request_id,
+                    scope: Scope::Global,
+                    key: SESSION_NAME_KEY.to_owned(),
+                    value,
+                },
+            )
+            .await;
+        }
+
+        // The FIRST session-name notification the subscriber sees must be
+        // the applied rename's `current\0new` transition.
+        let deadline = tokio::time::Instant::now() + WIRE_RECV_TIMEOUT;
+        let value = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no METADATA_CHANGED for the applied rename within deadline",
+            );
+            let (_type_byte, frame) = timeout(remaining, recv_typed(&mut subscriber))
+                .await
+                .expect("subscriber stream must stay live while awaiting the rename fanout");
+            if let FrameKind::MetadataChanged { scope, key, value } = frame {
+                assert_eq!(scope, Scope::Global, "rename fanout scope");
+                assert_eq!(key, SESSION_NAME_KEY, "rename fanout key");
+                break value;
+            }
+        };
+        assert_eq!(
+            value.as_deref(),
+            Some(rename_value("work", "renamed").as_slice()),
+            "the broadcast must carry the applied current\\0new transition \
+             (a failed or no-op rename arriving first means suppression broke)",
+        );
+    });
+}
+
 /// **GET_TERMINAL_STATE** on a live pane returns a structured `TerminalState`
 /// JSON object with grid dimensions, cells, cursor, scrollback, shell state,
 /// and metadata (sequence number, timestamp).

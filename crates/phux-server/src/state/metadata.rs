@@ -281,6 +281,30 @@ impl ServerState {
             .broadcast_metadata_changed(&subscribers, scope, key, None)
     }
 
+    /// Broadcast-only counterpart of [`Self::metadata_set`]: enqueue a
+    /// `MetadataChanged` carrying `value` to every L3-capable subscriber of
+    /// `(scope, key)` WITHOUT touching the store.
+    ///
+    /// Exists for the server-intercepted conventional keys whose written
+    /// value is a *command* the server applies, not state it retains — the
+    /// session rename (`phux.session.name/v1`, value `current\0new`) being
+    /// the first caller. Routing such a payload through
+    /// [`Self::metadata_set`] would (a) leak a stale transition blob into
+    /// `GET_METADATA` / `LIST_METADATA`, and (b) let the equal-bytes dedup
+    /// swallow a legitimate repeat of the same rename pair (rename `A -> B`,
+    /// `B` dies, a new `A` appears, rename `A -> B` again). The caller is
+    /// responsible for broadcasting only when the underlying mutation
+    /// actually happened.
+    ///
+    /// Returns the set of clients the broadcast was attempted against, as
+    /// [`Self::metadata_set`] does, so callers can assert fanout shape.
+    #[must_use]
+    pub fn metadata_broadcast(&self, scope: &Scope, key: &str, value: &[u8]) -> Vec<ClientId> {
+        let subscribers = self.metadata.subscribers_for(scope, key);
+        self.clients
+            .broadcast_metadata_changed(&subscribers, scope, key, Some(value))
+    }
+
     /// Publish ownership of a one-shot session-create result.
     ///
     /// The metadata value must already have been written. At most 256 unread

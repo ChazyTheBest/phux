@@ -2373,19 +2373,42 @@ pub(crate) fn handle_set_metadata(
     // storing it as an opaque blob. A malformed value or unknown session is
     // a silent no-op — `SET_METADATA` has no reply frame to carry an error,
     // matching the fire-and-forget shape of every other metadata write.
+    // An APPLIED rename still fans out like one: subscribers of the written
+    // `(scope, key)` receive a `METADATA_CHANGED` carrying the `current\0new`
+    // transition (phux-q7ks — before this, a rename notified nobody and the
+    // ADR-0089 roster kept painting the dead name).
     if key == phux_protocol::wire::frame::SESSION_NAME_KEY && matches!(scope, Scope::Global) {
         match std::str::from_utf8(&value).ok().and_then(|s| {
             s.split_once('\0')
                 .map(|(cur, new)| (cur.to_owned(), new.to_owned()))
         }) {
             Some((current, new_name)) => {
-                let outcome = state.with_mut(|s| s.rename_session(&current, &new_name));
+                let (outcome, delivered) = state.with_mut(|s| {
+                    let outcome = s.rename_session(&current, &new_name);
+                    // Broadcast only an *applied name change* to subscribers
+                    // of the written key: `Renamed` also covers the no-op
+                    // rename to the session's existing name, which no
+                    // subscriber can act on (mirroring `metadata_set`'s
+                    // equal-bytes suppression). The `current\0new` payload
+                    // is forwarded as-is so a subscriber can both find the
+                    // stale entry and learn its replacement; it is not
+                    // stored (see `metadata_broadcast`).
+                    let delivered = if matches!(outcome, crate::state::RenameOutcome::Renamed)
+                        && current != new_name
+                    {
+                        s.metadata_broadcast(scope, key, &value)
+                    } else {
+                        Vec::new()
+                    };
+                    (outcome, delivered)
+                });
                 debug!(
                     ?client_id,
                     request_id,
                     %current,
                     %new_name,
                     ?outcome,
+                    subscriber_count = delivered.len(),
                     "SET_METADATA(session-name): applied registry rename",
                 );
             }
