@@ -38,6 +38,10 @@ display_name = "Codex"
 kind = "terminal-agent"
 first_party = true
 
+[agent_identity]
+name = "codex"
+kind = "codex"
+
 [launch]
 command = ["sh", "${PHUX_PLUGIN_ROOT}/scripts/wrap.sh", "--name", "codex", "--", "codex"]
 working_directory = "workspace"
@@ -105,6 +109,14 @@ fn resolves_named_integration_expanding_plugin_root_and_appending_extra_args() {
     assert_eq!(resolved.plugin_id, "example.launch");
     assert_eq!(resolved.integration_id, "codex");
     assert_eq!(resolved.display_name.as_deref(), Some("Codex"));
+    // The `[agent_identity]` block rides the resolution: its `kind` is the
+    // detection slug, distinct from the category `kind` above.
+    let identity = resolved
+        .agent_identity
+        .as_ref()
+        .expect("agent identity carried");
+    assert_eq!(identity.name.as_deref(), Some("codex"));
+    assert_eq!(identity.kind.as_deref(), Some("codex"));
     assert_eq!(
         resolved.argv,
         vec![
@@ -204,13 +216,33 @@ fn list_launchable_enumerates_only_templates_with_a_launch_command() {
     let tmp = TempDir::new().expect("tempdir");
     let (config, _root) = write_plugin(&tmp, true);
 
-    let mut ids: Vec<String> = phux_plugin::list_launchable(&config)
-        .expect("list")
-        .into_iter()
-        .map(|item| item.integration_id)
+    let items = phux_plugin::list_launchable(&config).expect("list");
+    let mut ids: Vec<&str> = items
+        .iter()
+        .map(|item| item.integration_id.as_str())
         .collect();
-    ids.sort();
-    assert_eq!(ids, vec!["codex".to_owned(), "rooted".to_owned()]);
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["codex", "rooted"]);
+
+    // The listing surfaces each template's `[agent_identity]` (or its
+    // absence), so a caller can map a detection kind to the integration
+    // that launches it.
+    let codex = items
+        .iter()
+        .find(|item| item.integration_id == "codex")
+        .expect("codex listed");
+    assert_eq!(
+        codex
+            .agent_identity
+            .as_ref()
+            .and_then(|identity| identity.kind.as_deref()),
+        Some("codex")
+    );
+    let rooted = items
+        .iter()
+        .find(|item| item.integration_id == "rooted")
+        .expect("rooted listed");
+    assert_eq!(rooted.agent_identity, None);
 }
 
 /// A broken sibling template must not block resolving a healthy one, but a

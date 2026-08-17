@@ -506,7 +506,13 @@ agent verbs and their JSON. Exit codes are collected in §5.2.
 - **`phux agent start --kind KIND --target TARGET [--integration ID]
   [--timeout SECS] [--no-wait] [--force] [--json] NAME [-- ARGS...]`** —
   start an agent inside an existing shell pane. It never creates, splits,
-  moves, or focuses layout. Without `--no-wait`, success requires the first
+  moves, or focuses layout. `--integration` defaults to the unique enabled
+  integration whose `[agent_identity] kind` matches `--kind` (so
+  `--kind claude` starts `claude-code` with no second flag), falling back
+  to the kind slug itself; two enabled integrations claiming one kind are
+  refused by name (`ambiguous_integration`) rather than picked between,
+  and the explicit flag remains the override. Without `--no-wait`, success
+  requires the first
   detector publication after submit; a kind with no manifest is refused
   because readiness would be unenforceable. Timeout exits `124` after the
   command was typed. Before writing, the verb reads the server-owned
@@ -1874,8 +1880,10 @@ and **stderr carries one line of JSON** (ADR-0065 §4):
   and `answer_not_suggested`. Start adds `invalid_agent_name`,
   `unsupported_agent_kind`, `agent_detection_unavailable`,
   `agent_name_conflict`, `target_not_shell`, `invalid_launch_argv`,
-  `agent_start_timeout`, and `agent_kind_mismatch`. Watch adds
-  `unknown_event_name`.
+  `ambiguous_integration` (exit 2 — more than one enabled integration's
+  `[agent_identity]` claims the requested `--kind`; the message names every
+  claimant and `--integration ID` chooses), `agent_start_timeout`, and
+  `agent_kind_mismatch`. Watch adds `unknown_event_name`.
 - `remedy` is always present and non-empty: the next command to run, in
   prose.
 - `exit_code` mirrors the process's own exit status, so a consumer that

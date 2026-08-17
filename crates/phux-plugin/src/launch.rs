@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use phux_config::integration::{
-    self, IntegrationError, IntegrationLaunch, IntegrationSessionIdentity, IntegrationTemplate,
-    LaunchWorkingDirectory, SessionResumeError,
+    self, IntegrationAgentIdentity, IntegrationError, IntegrationLaunch,
+    IntegrationSessionIdentity, IntegrationTemplate, LaunchWorkingDirectory, SessionResumeError,
 };
 use phux_config::loader as config_loader;
 
@@ -48,6 +48,10 @@ pub struct ResolvedLaunch {
     pub plugin_root: PathBuf,
     /// Provider-native session policy declared by the integration.
     pub session_identity: Option<IntegrationSessionIdentity>,
+    /// The launched agent's self-declared identity, when the template
+    /// carries an `[agent_identity]` section. Its `kind` is the
+    /// detection-manifest slug, not the template's category `kind`.
+    pub agent_identity: Option<IntegrationAgentIdentity>,
 }
 
 impl ResolvedLaunch {
@@ -87,8 +91,12 @@ pub struct LaunchableIntegration {
     pub integration_id: String,
     /// Display name, when declared.
     pub display_name: Option<String>,
-    /// Kind slug, when declared.
+    /// Kind slug, when declared. A package *category* (`terminal-agent`),
+    /// not the detection slug — that lives in `agent_identity`.
     pub kind: Option<String>,
+    /// The launched agent's self-declared identity, when the template
+    /// carries an `[agent_identity]` section.
+    pub agent_identity: Option<IntegrationAgentIdentity>,
 }
 
 /// Failure resolving a launch before a spawnable argv exists.
@@ -277,6 +285,7 @@ pub fn list_launchable(config_path: &Path) -> Result<Vec<LaunchableIntegration>,
                 integration_id: template.id,
                 display_name: template.display_name,
                 kind: template.kind,
+                agent_identity: template.agent_identity,
             });
         }
     }
@@ -304,6 +313,7 @@ fn build_resolved(
         working_directory: launch.working_directory,
         plugin_root: plugin.plugin_root.clone(),
         session_identity: template.session_identity.clone(),
+        agent_identity: template.agent_identity.clone(),
     }
 }
 

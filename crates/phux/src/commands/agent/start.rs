@@ -160,7 +160,9 @@ pub(super) struct StartRequest<'a> {
     pub(super) kind: &'a str,
     /// Selector for the existing pane to start into.
     pub(super) target: &'a str,
-    /// Launch integration id; defaults to `kind`.
+    /// Launch integration id; when absent, resolved from `--kind` through
+    /// the enabled templates' `[agent_identity]` blocks, falling back to
+    /// the kind slug itself.
     pub(super) integration: Option<&'a str>,
     /// Readiness deadline in seconds.
     pub(super) timeout: Option<u64>,
@@ -445,6 +447,77 @@ pub(super) fn kind_verdict(record: Option<&AgentRecord>, requested: &str) -> Kin
     }
 }
 
+/// How the enabled launchable integrations map onto one requested kind.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum KindClaim {
+    /// Exactly one enabled integration's `[agent_identity] kind` matches.
+    Unique(String),
+    /// No enabled integration claims the kind.
+    Unclaimed,
+    /// More than one enabled integration claims it (ids sorted, deduped).
+    Ambiguous(Vec<String>),
+}
+
+/// Match a detection kind against each launchable integration's
+/// `[agent_identity] kind`, with the same trim/case tolerance as
+/// [`kind_verdict`].
+///
+/// A template's top-level `kind` (a category such as `terminal-agent`)
+/// deliberately never matches. Identical ids are collapsed before counting:
+/// one id shipped by two plugins is `resolve_launch`'s
+/// `DuplicateIntegrationId` failure, not an ambiguity between two genuine
+/// choices this refusal could name.
+#[must_use]
+pub(super) fn integration_for_kind(
+    kind: &str,
+    launchable: &[phux_plugin::LaunchableIntegration],
+) -> KindClaim {
+    let requested = kind.trim();
+    let mut claims: Vec<String> = launchable
+        .iter()
+        .filter(|item| {
+            item.agent_identity
+                .as_ref()
+                .and_then(|identity| identity.kind.as_deref())
+                .is_some_and(|claimed| claimed.trim().eq_ignore_ascii_case(requested))
+        })
+        .map(|item| item.integration_id.clone())
+        .collect();
+    claims.sort_unstable();
+    claims.dedup();
+    match claims.len() {
+        0 => KindClaim::Unclaimed,
+        1 => KindClaim::Unique(claims.remove(0)),
+        _ => KindClaim::Ambiguous(claims),
+    }
+}
+
+/// The integration id `agent start` launches: the explicit `--integration`
+/// override verbatim, else the unique `[agent_identity]` claimant of
+/// `kind`, else `kind_slug` exactly as the caller spelled it (the
+/// pre-agent-identity default, kept so `--kind codex` still resolves the
+/// `codex` integration on a config whose templates declare no identity).
+///
+/// # Errors
+///
+/// Returns the sorted claimant ids when more than one enabled integration
+/// claims the kind — a default phux refuses to guess between.
+pub(super) fn chosen_integration_id(
+    explicit: Option<&str>,
+    kind: &str,
+    kind_slug: &str,
+    launchable: &[phux_plugin::LaunchableIntegration],
+) -> Result<String, Vec<String>> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_owned());
+    }
+    match integration_for_kind(kind, launchable) {
+        KindClaim::Unique(id) => Ok(id),
+        KindClaim::Unclaimed => Ok(kind_slug.to_owned()),
+        KindClaim::Ambiguous(ids) => Err(ids),
+    }
+}
+
 /// Where the state that satisfied readiness came from, in the manifest's own
 /// terms.
 ///
@@ -605,13 +678,8 @@ fn preflight(req: &StartRequest<'_>) -> Result<Plan, Refusal> {
         })?
     };
 
-    // The integration id and the manifest kind are different namespaces: a
-    // template's own `kind` is a category (`terminal-agent`) and its
-    // `[agent_identity] kind` is not surfaced by the config loader, so there
-    // is no client-side map from one to the other. Defaulting to the slug
-    // covers the templates that name themselves after the agent and the
-    // override covers the rest, rather than guessing.
-    let integration_id = req.integration.unwrap_or(req.kind).to_owned();
+    let config_path = phux_config::loader::config_path();
+    let integration_id = resolve_integration_id(req, &kind, &config_path)?;
     let workspace_cwd = std::env::current_dir().map_err(|err| {
         Refusal::new(
             json_err::codes::INTERNAL_ERROR,
@@ -620,7 +688,6 @@ fn preflight(req: &StartRequest<'_>) -> Result<Plan, Refusal> {
             EXIT_FAILURE,
         )
     })?;
-    let config_path = phux_config::loader::config_path();
     let resolved =
         phux_plugin::resolve_launch(&config_path, &integration_id, req.args, &workspace_cwd)
             .map_err(|err| {
@@ -628,7 +695,8 @@ fn preflight(req: &StartRequest<'_>) -> Result<Plan, Refusal> {
                     codes::UNKNOWN_INTEGRATION,
                     format!("could not resolve integration '{integration_id}': {err}"),
                     "`phux launch --list` enumerates launchable integrations; pass \
-                     `--integration ID` when it is not spelled like the kind slug",
+                     `--integration ID`, or declare `[agent_identity] kind` in the \
+                     template so `--kind` resolves it by itself",
                     EXIT_USAGE,
                 )
             })?;
@@ -654,6 +722,43 @@ fn preflight(req: &StartRequest<'_>) -> Result<Plan, Refusal> {
         resolved_cwd: resolved.cwd.clone(),
         integration_id,
         timeout: Duration::from_secs(req.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+    })
+}
+
+/// The integration id this start resolves, from flags and enabled templates.
+///
+/// The integration id and the manifest kind are different namespaces: a
+/// template's own `kind` is a category (`terminal-agent`); the detection
+/// slug lives in its `[agent_identity]` block, which the config loader
+/// surfaces on every launchable integration. With `--integration` absent,
+/// the default is therefore the unique enabled integration whose
+/// `[agent_identity] kind` claims the requested kind (`--kind claude`
+/// resolves `claude-code` with no second flag); two claimants are refused
+/// by name rather than picked between, and no claimant falls back to the
+/// id-spelled-like-the-slug default that has always worked.
+fn resolve_integration_id(
+    req: &StartRequest<'_>,
+    kind: &str,
+    config_path: &Path,
+) -> Result<String, Refusal> {
+    let launchable = if req.integration.is_some() {
+        Vec::new()
+    } else {
+        // An unreadable config is not this default's error to report: the
+        // same failure surfaces one step later in `resolve_launch`, with
+        // its richer diagnostics, against the fallback id.
+        phux_plugin::list_launchable(config_path).unwrap_or_default()
+    };
+    chosen_integration_id(req.integration, kind, req.kind, &launchable).map_err(|claimants| {
+        Refusal::new(
+            codes::AMBIGUOUS_INTEGRATION,
+            format!(
+                "kind '{kind}' is claimed by more than one enabled integration: {}",
+                claimants.join(", ")
+            ),
+            "pass `--integration ID` to say which one starts this agent",
+            EXIT_USAGE,
+        )
     })
 }
 
@@ -1957,6 +2062,128 @@ mod tests {
         };
         let refusal = preflight(&request).expect_err("a bad name must be refused");
         assert_eq!(refusal.err.code, codes::INVALID_AGENT_NAME);
+    }
+
+    /// A launchable integration as `list_launchable` would surface it:
+    /// category `kind` is always `terminal-agent`, and `agent_kind` (when
+    /// given) rides the `[agent_identity]` block.
+    fn launchable(id: &str, agent_kind: Option<&str>) -> phux_plugin::LaunchableIntegration {
+        phux_plugin::LaunchableIntegration {
+            plugin_id: "example.agent-tools".to_owned(),
+            integration_id: id.to_owned(),
+            display_name: None,
+            kind: Some("terminal-agent".to_owned()),
+            agent_identity: agent_kind.map(|kind| {
+                phux_config::integration::IntegrationAgentIdentity {
+                    name: None,
+                    kind: Some(kind.to_owned()),
+                }
+            }),
+        }
+    }
+
+    /// The map this bead exists for: `--kind claude` finds `claude-code`
+    /// through its `[agent_identity] kind`, with the same trim/case
+    /// tolerance the readiness comparison uses. The category `kind`
+    /// (`terminal-agent`, on every template) never matches.
+    #[test]
+    fn a_unique_agent_identity_claim_resolves_the_integration() {
+        let launchables = [
+            launchable("claude-code", Some("claude")),
+            launchable("codex", Some("codex")),
+            launchable("generic-shell-agent", Some("generic")),
+        ];
+        assert_eq!(
+            integration_for_kind("claude", &launchables),
+            KindClaim::Unique("claude-code".to_owned())
+        );
+        assert_eq!(
+            integration_for_kind(" CLAUDE ", &launchables),
+            KindClaim::Unique("claude-code".to_owned())
+        );
+        assert_eq!(
+            chosen_integration_id(None, "claude", "claude", &launchables),
+            Ok("claude-code".to_owned())
+        );
+        // `terminal-agent` is every template's category, never a claim.
+        assert_eq!(
+            integration_for_kind("terminal-agent", &launchables),
+            KindClaim::Unclaimed
+        );
+    }
+
+    /// `--integration` stays the explicit override: it is taken verbatim
+    /// and the `[agent_identity]` map is never consulted, even when it
+    /// would have said something different.
+    #[test]
+    fn an_explicit_integration_overrides_the_agent_identity_map() {
+        let launchables = [
+            launchable("claude-code", Some("claude")),
+            launchable("claude-fork", Some("claude")),
+        ];
+        assert_eq!(
+            chosen_integration_id(Some("claude-fork"), "claude", "claude", &launchables),
+            Ok("claude-fork".to_owned())
+        );
+        // Even an ambiguous claim set cannot veto the explicit choice.
+        assert_eq!(
+            chosen_integration_id(Some("claude-code"), "claude", "claude", &launchables),
+            Ok("claude-code".to_owned())
+        );
+    }
+
+    /// Two enabled integrations claiming one kind is refused, naming both,
+    /// rather than picked between — the claimants ride the error so the
+    /// refusal message can print them.
+    #[test]
+    fn an_ambiguous_kind_claim_is_refused_naming_every_claimant() {
+        let launchables = [
+            launchable("claude-fork", Some("claude")),
+            launchable("claude-code", Some("claude")),
+            launchable("codex", Some("codex")),
+        ];
+        assert_eq!(
+            integration_for_kind("claude", &launchables),
+            KindClaim::Ambiguous(vec!["claude-code".to_owned(), "claude-fork".to_owned()])
+        );
+        assert_eq!(
+            chosen_integration_id(None, "claude", "claude", &launchables),
+            Err(vec!["claude-code".to_owned(), "claude-fork".to_owned()])
+        );
+        // One id shipped twice is resolve_launch's DuplicateIntegrationId
+        // failure, not an ambiguity between two genuine choices.
+        let duplicated = [
+            launchable("claude-code", Some("claude")),
+            launchable("claude-code", Some("claude")),
+        ];
+        assert_eq!(
+            integration_for_kind("claude", &duplicated),
+            KindClaim::Unique("claude-code".to_owned())
+        );
+    }
+
+    /// With no `[agent_identity]` claim anywhere, the default stays the
+    /// caller's own slug — the pre-agent-identity behavior (`--kind codex`
+    /// resolves the `codex` integration) — including templates that carry
+    /// no identity block at all and an empty launchable listing.
+    #[test]
+    fn an_unclaimed_kind_falls_back_to_the_kind_slug() {
+        let launchables = [
+            launchable("claude-code", None),
+            launchable("codex", Some("codex")),
+        ];
+        assert_eq!(
+            integration_for_kind("claude", &launchables),
+            KindClaim::Unclaimed
+        );
+        assert_eq!(
+            chosen_integration_id(None, "claude", "claude", &launchables),
+            Ok("claude".to_owned())
+        );
+        assert_eq!(
+            chosen_integration_id(None, "claude", "claude", &[]),
+            Ok("claude".to_owned())
+        );
     }
 
     /// Five manifests ship and every one of them is a legitimate `--kind`.

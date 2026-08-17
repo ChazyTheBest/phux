@@ -193,6 +193,9 @@ pub(crate) mod codes {
     pub(crate) const INVALID_LAUNCH_ARGV: &str = "invalid_launch_argv";
     /// No enabled integration resolves the requested agent launch.
     pub(crate) const UNKNOWN_INTEGRATION: &str = "unknown_integration";
+    /// More than one enabled integration's `[agent_identity]` claims the
+    /// requested agent kind, so the `--integration` default is ambiguous.
+    pub(crate) const AMBIGUOUS_INTEGRATION: &str = "ambiguous_integration";
     /// Agent startup failed before a readiness assertion could be made.
     pub(crate) const AGENT_START_FAILED: &str = "agent_start_failed";
     /// The detector published a different kind from the one requested.

@@ -177,6 +177,11 @@ fn run_list(config_path: &std::path::Path, json: bool) -> ExitCode {
                     "plugin": item.plugin_id,
                     "display_name": item.display_name,
                     "kind": item.kind,
+                    // The detection slug from `[agent_identity]` — the value
+                    // `phux agent start --kind` resolves against — as
+                    // distinct from the category `kind` above. Additive.
+                    "agent_kind": item.agent_identity.as_ref()
+                        .and_then(|identity| identity.kind.clone()),
                 })
             })
             .collect();

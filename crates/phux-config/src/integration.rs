@@ -9,11 +9,13 @@
 //! it spawns as a pane's program.
 //!
 //! Only the fields the launcher needs are modeled here (`id`,
-//! `display_name`, `kind`, `[launch]`, and the native-restore subset of
-//! `[session_identity]`). Every other key a template carries — `[detect]`,
-//! `[link]`, `[agent_identity]`, `capabilities`, ... — is ignored, so this
-//! stays a thin, forward-compatible view over a richer package format
-//! (unknown keys are **not** rejected).
+//! `display_name`, `kind`, `[launch]`, the native-restore subset of
+//! `[session_identity]`, and `[agent_identity]` — the identity the launched
+//! agent declares, whose `kind` is the detection-manifest slug that lets
+//! `phux agent start --kind K` find the integration that launches K). Every
+//! other key a template carries — `[detect]`, `[link]`, `capabilities`, ...
+//! — is ignored, so this stays a thin, forward-compatible view over a
+//! richer package format (unknown keys are **not** rejected).
 //!
 //! [ADR-0042]: ../../ADR/0042-launch-executor.md
 
@@ -59,6 +61,25 @@ pub struct IntegrationTemplate {
     pub template_path: PathBuf,
     /// Provider-native session identity and restore policy, when declared.
     pub session_identity: Option<IntegrationSessionIdentity>,
+    /// The launched agent's self-declared identity, when declared.
+    pub agent_identity: Option<IntegrationAgentIdentity>,
+}
+
+/// A template's `[agent_identity]` section: the identity the launched
+/// program declares on its pane (ADR-0040).
+///
+/// Distinct from the template's top-level `kind`, which is a package
+/// *category* (`terminal-agent`): `kind` here is the detection-manifest
+/// slug (`claude`, `codex`, ...) — the client-side map from a detection
+/// kind to the integration that launches it, which is what lets
+/// `phux agent start --kind claude` default to the `claude-code`
+/// integration without a second flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationAgentIdentity {
+    /// Default agent name the launch wrapper declares, when present.
+    pub name: Option<String>,
+    /// Detection-manifest kind slug the agent identifies as, when present.
+    pub kind: Option<String>,
 }
 
 /// The `[launch]` section of an integration template: the argv the launch
@@ -269,6 +290,16 @@ struct RawTemplate {
     launch: Option<RawLaunch>,
     #[serde(default)]
     session_identity: Option<RawSessionIdentity>,
+    #[serde(default)]
+    agent_identity: Option<RawAgentIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAgentIdentity {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +378,12 @@ pub fn parse_integration_template(
         launch,
         session_identity,
         template_path: path.to_path_buf(),
+        agent_identity: raw
+            .agent_identity
+            .map(|raw_identity| IntegrationAgentIdentity {
+                name: raw_identity.name.as_deref().and_then(trim_optional),
+                kind: raw_identity.kind.as_deref().and_then(trim_optional),
+            }),
     })
 }
 
@@ -645,6 +682,87 @@ working_directory = "workspace"
         assert_eq!(launch.command[0], "sh");
         assert_eq!(launch.command.last().unwrap(), "claude");
         assert_eq!(launch.working_directory, LaunchWorkingDirectory::Workspace);
+        let identity = template.agent_identity.expect("agent identity present");
+        assert_eq!(identity.name.as_deref(), Some("claude"));
+        assert_eq!(identity.kind.as_deref(), Some("claude"));
+    }
+
+    /// The template's top-level `kind` is a package category
+    /// (`terminal-agent`); `[agent_identity] kind` is the detection slug.
+    /// They must stay distinct fields, because `phux agent start --kind`
+    /// resolves against the latter.
+    #[test]
+    fn agent_identity_kind_is_not_the_category_kind() {
+        let template = parse(CLAUDE).expect("valid template parses");
+        assert_eq!(template.kind.as_deref(), Some("terminal-agent"));
+        assert_eq!(
+            template
+                .agent_identity
+                .expect("agent identity")
+                .kind
+                .as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn a_template_without_agent_identity_carries_none() {
+        let template = parse(
+            r#"
+id = "bare"
+[launch]
+command = ["sh", "-c", "true"]
+"#,
+        )
+        .expect("valid");
+        assert_eq!(template.agent_identity, None);
+    }
+
+    /// Blank or whitespace-only identity values normalize to `None` like
+    /// every other optional string field, so a matcher never compares
+    /// against `""`.
+    #[test]
+    fn blank_agent_identity_values_normalize_to_none() {
+        let template = parse(
+            r#"
+id = "blank-identity"
+[agent_identity]
+name = "  "
+kind = ""
+[launch]
+command = ["sh"]
+"#,
+        )
+        .expect("valid");
+        let identity = template.agent_identity.expect("section present");
+        assert_eq!(identity.name, None);
+        assert_eq!(identity.kind, None);
+    }
+
+    /// A malformed `[agent_identity]` (wrong value types) is a parse error,
+    /// not a silently dropped section: the block is consumed now, so a
+    /// template author learns about the typo instead of losing the
+    /// `--kind` default it exists to provide.
+    #[test]
+    fn malformed_agent_identity_is_a_parse_error() {
+        for body in [
+            "[agent_identity]\nkind = 3",
+            "[agent_identity]\nkind = [\"claude\"]",
+            "agent_identity = \"claude\"",
+        ] {
+            let text = format!(
+                r#"
+id = "bad-identity"
+{body}
+[launch]
+command = ["sh"]
+"#
+            );
+            assert!(
+                matches!(parse(&text), Err(IntegrationError::Parse { .. })),
+                "{text}"
+            );
+        }
     }
 
     #[test]

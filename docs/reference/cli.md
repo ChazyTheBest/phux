@@ -543,7 +543,7 @@ Options:
           Existing pane to start into. Never created, split, or moved
 
       --integration <ID>
-          Launch integration id, when it is not spelled like the kind slug (e.g. `--kind claude --integration claude-code`)
+          Launch integration id. Defaults to the unique enabled integration whose `[agent_identity] kind` matches `--kind` (so `--kind claude` resolves `claude-code`), else the kind slug itself; two claimants are refused by name
 
       --socket <PATH>
           Override the UDS path of the server to dial. Defaults to `$PHUX_SOCKET`, else `$XDG_RUNTIME_DIR/phux/phux.sock` (or `/tmp/phux-$USER/phux.sock` if `XDG_RUNTIME_DIR` isn't set)

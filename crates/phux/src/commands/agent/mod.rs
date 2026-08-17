@@ -318,8 +318,10 @@ pub(crate) enum AgentAction {
         /// Existing pane to start into. Never created, split, or moved.
         #[arg(long, value_name = "TARGET")]
         target: String,
-        /// Launch integration id, when it is not spelled like the kind slug
-        /// (e.g. `--kind claude --integration claude-code`).
+        /// Launch integration id. Defaults to the unique enabled
+        /// integration whose `[agent_identity] kind` matches `--kind`
+        /// (so `--kind claude` resolves `claude-code`), else the kind
+        /// slug itself; two claimants are refused by name.
         #[arg(long, value_name = "ID")]
         integration: Option<String>,
         /// Give up waiting for readiness after this many seconds and exit
