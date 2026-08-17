@@ -83,7 +83,8 @@ use phux_protocol::caps::{
     BootstrapLimits, BootstrapProfile, BootstrapProfileKind, ClientCapabilities,
 };
 use phux_protocol::ids::SatelliteHost;
-use phux_protocol::wire::frame::FrameKind;
+use phux_protocol::wire::frame::{ErrorCode, FrameKind};
+use phux_protocol::wire::framing::FramingError;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -1301,13 +1302,20 @@ impl LinkConn for NetLinkConn {
 
     async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Self::Quic { recv, buf, .. } => {
+            Self::Quic {
+                send, recv, buf, ..
+            } => {
                 // Cancel-safe reassembly: `read_buf` lands bytes in the
                 // persistent buffer even if this future is dropped between
                 // polls; complete frames are peeled off the front.
                 loop {
-                    if let Some(frame) = split_buffered_frame(buf)? {
-                        return Ok(Some(frame));
+                    match split_buffered_frame(buf) {
+                        Ok(Some(frame)) => return Ok(Some(frame)),
+                        Ok(None) => {}
+                        Err(violation) => {
+                            send_framing_goodbye(send, violation).await;
+                            return Err(framing_loss_reason(violation));
+                        }
                     }
                     let n = tokio::io::AsyncReadExt::read_buf(recv, buf)
                         .await
@@ -1334,6 +1342,16 @@ impl LinkConn for NetLinkConn {
                                 return Ok(None);
                             }
                             tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                                // One binary message is exactly one frame,
+                                // as on every other message-oriented phux
+                                // transport (SPEC §5 defines no second
+                                // framing layer).
+                                if let Err(violation) =
+                                    phux_protocol::wire::framing::check_frame(&data)
+                                {
+                                    send_framing_goodbye_ws(ws.as_mut(), violation).await;
+                                    return Err(framing_loss_reason(violation));
+                                }
                                 return Ok(Some(data));
                             }
                             // Control frames (ping/pong): reading them is
@@ -1346,6 +1364,7 @@ impl LinkConn for NetLinkConn {
             },
             Self::Ssh {
                 child,
+                stdin,
                 stdout,
                 stderr_reader,
                 buf,
@@ -1360,8 +1379,14 @@ impl LinkConn for NetLinkConn {
                 // exit status plus a bounded tail of its stderr become
                 // the loss reason.
                 loop {
-                    if let Some(frame) = split_buffered_frame(buf)? {
-                        return Ok(Some(frame));
+                    match split_buffered_frame(buf) {
+                        Ok(Some(frame)) => return Ok(Some(frame)),
+                        Ok(None) => {}
+                        Err(violation) => {
+                            // The child's stdin pipe is the wire.
+                            send_framing_goodbye(stdin, violation).await;
+                            return Err(framing_loss_reason(violation));
+                        }
                     }
                     let n = tokio::io::AsyncReadExt::read_buf(stdout, buf)
                         .await
@@ -1490,10 +1515,60 @@ async fn ssh_exit_reason(
 /// Peel one complete length-prefixed frame (prefix included, the unit
 /// `FrameKind::decode` expects) off the front of `buf`, or `None` when
 /// the buffer holds only a partial frame.
-fn split_buffered_frame(buf: &mut bytes::BytesMut) -> Result<Option<Vec<u8>>, String> {
+///
+/// The error stays typed so [`LinkConn::recv_frame`] can answer a SPEC §5
+/// framing violation with `ERROR { code: FRAME_TOO_LARGE }` before the
+/// condemned link is dropped, rather than re-deriving the condition.
+fn split_buffered_frame(buf: &mut bytes::BytesMut) -> Result<Option<Vec<u8>>, FramingError> {
     phux_protocol::wire::framing::split_frame(buf)
         .map(|framed| framed.map(|framed| framed.to_vec()))
-        .map_err(|err| format!("satellite sent a malformed frame: {err}"))
+}
+
+/// Compose the loss reason for a satellite that broke SPEC §5 framing.
+fn framing_loss_reason(violation: FramingError) -> String {
+    format!("satellite sent a malformed frame: {violation}")
+}
+
+/// Best-effort SPEC §5 goodbye on a byte-stream link half: answer the
+/// framing violation with `ERROR { code: FRAME_TOO_LARGE }` before the
+/// condemned link is dropped, bounded by [`LINK_SEND_TIMEOUT`] like every
+/// other link write. The satellite may already be gone, and a failed
+/// goodbye must never mask the loss reason — the outcome is discarded.
+async fn send_framing_goodbye<W>(writer: &mut W, violation: FramingError)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let goodbye = encode_frame_too_large(violation);
+    let _ = tokio::time::timeout(
+        LINK_SEND_TIMEOUT,
+        tokio::io::AsyncWriteExt::write_all(writer, &goodbye),
+    )
+    .await;
+}
+
+/// [`send_framing_goodbye`] for the WebSocket link, where the goodbye is
+/// one binary message rather than raw stream bytes.
+async fn send_framing_goodbye_ws(ws: &mut phux_dial::ws::Ws, violation: FramingError) {
+    let goodbye = encode_frame_too_large(violation);
+    let _ = tokio::time::timeout(
+        LINK_SEND_TIMEOUT,
+        futures_util::SinkExt::send(ws, tokio_tungstenite::tungstenite::Message::Binary(goodbye)),
+    )
+    .await;
+}
+
+/// Encode the `ERROR { code: FRAME_TOO_LARGE }` frame SPEC §5 obliges the
+/// receiving peer to send before closing a transport whose peer broke
+/// framing. The hub is that peer on its satellite links.
+fn encode_frame_too_large(violation: FramingError) -> Vec<u8> {
+    let mut encoded = bytes::BytesMut::new();
+    FrameKind::Error {
+        request_id: None,
+        code: ErrorCode::FrameTooLarge,
+        message: format!("frame violates SPEC §5 framing: {violation}"),
+    }
+    .encode(&mut encoded);
+    encoded.to_vec()
 }
 
 /// Drain `reader` to EOF (or error), retaining only the last `max`

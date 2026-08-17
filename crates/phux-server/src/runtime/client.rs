@@ -16,6 +16,7 @@ use phux_protocol::caps::{
 use phux_protocol::wire::frame::{
     AgentEvent, DetachReason, ErrorCode, FrameKind, TERMINAL_AGENT_KEY,
 };
+use phux_protocol::wire::framing::FramingError;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -1217,6 +1218,19 @@ async fn close_client_writer(
     }
 }
 
+/// The typed SPEC §5 framing violation inside a transport read error, if any.
+///
+/// Every transport reader (`UdsReader`, `WsReader`, `QuicReader`, `WtReader`)
+/// defers framing to [`phux_protocol::wire::framing`], whose errors convert to
+/// [`io::ErrorKind::InvalidData`] with the [`FramingError`] retained as the
+/// source — so this downcast is the single, transport-agnostic detection
+/// point for "the peer broke §5" as distinct from "the transport died".
+fn framing_violation(err: &io::Error) -> Option<FramingError> {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<FramingError>())
+        .copied()
+}
+
 /// End one connection for a protocol violation in the order required by §9.
 async fn close_for_protocol_error(
     out_tx: tokio::sync::mpsc::Sender<Outbound>,
@@ -1337,6 +1351,31 @@ where
                     return Ok(());
                 }
                 Err(err) => {
+                    // SPEC §5: a framing violation obliges this peer to send
+                    // `ERROR { code: FRAME_TOO_LARGE }` before closing. Every
+                    // transport reader funnels the violation here as an
+                    // `InvalidData` error with the typed `FramingError` as its
+                    // source, so the emission lives in one place instead of
+                    // one per transport. The send is best-effort by
+                    // construction: `close_for_protocol_error` ignores a dead
+                    // writer, so a peer that already vanished cannot error
+                    // out this close path.
+                    if let Some(framing) = framing_violation(&err) {
+                        warn!(?client_id, error = %framing, "client framing violation; closing");
+                        let message = format!("frame violates SPEC §5 framing: {framing}");
+                        abort_output_pumps(&mut output_pumps, client_id, "framing violation")
+                            .await;
+                        detach_and_release_consumer_state(&state, client_id);
+                        close_for_protocol_error(
+                            out_tx,
+                            &writer_close_tx,
+                            &mut sibling_tasks,
+                            ErrorCode::FrameTooLarge,
+                            message,
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     debug!(error = %err, "client read error; closing");
                     return Ok(());
                 }

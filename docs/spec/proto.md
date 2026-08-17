@@ -247,7 +247,11 @@ Every message on the wire is a length-prefixed frame:
 - The payload format is determined by `type`.
 
 There is no second framing layer. Application-level structure is encoded
-within the payload as defined per-message and per-field.
+within the payload as defined per-message and per-field. On a
+message-oriented transport, where one message carries exactly one frame, a
+message whose size disagrees with the `length` it declares — including one
+too short to hold the length field — is the same framing violation and
+receives the same treatment: `ERROR { code: FRAME_TOO_LARGE }`, then close.
 
 ---
 
