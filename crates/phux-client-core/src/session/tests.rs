@@ -2420,3 +2420,27 @@ fn replacement_effects_are_hidden_until_swap_and_discarded_on_retirement() {
         ]
     );
 }
+
+/// phux-994s: the walk-identity token a frontend hands its render pool packs
+/// the kernel's own generation identity `(stream_id, bootstrap_id)`
+/// losslessly, so distinct generations always yield distinct tokens and a
+/// republish on the same stream changes the token.
+#[test]
+fn generation_token_is_lossless_and_changes_per_generation() {
+    let key = |stream: u64, bootstrap: u64| super::ReplicaKey {
+        terminal_id: TerminalId::local(1),
+        stream_id: StreamId::new(stream).expect("stream"),
+        bootstrap_id: BootstrapId::new(bootstrap).expect("bootstrap"),
+        profile: BootstrapStreamProfile::SynthesizedVtRaw,
+    };
+
+    assert_eq!(key(1, 2).generation_token(), (1_u128 << 64) | 2);
+    // A republish (new bootstrap, same stream) changes the token.
+    assert_ne!(key(1, 1).generation_token(), key(1, 2).generation_token());
+    // The pair packs losslessly: swapped halves cannot collide.
+    assert_ne!(key(1, 2).generation_token(), key(2, 1).generation_token());
+    assert_ne!(
+        key(1, u64::MAX).generation_token(),
+        key(2, 1).generation_token()
+    );
+}

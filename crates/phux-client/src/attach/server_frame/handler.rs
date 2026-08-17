@@ -17,7 +17,9 @@ use crate::attach::outcome::{AttachEnd, AttachError, describe_exit};
 use crate::attach::paint::{
     SidebarReservation, StatusBarPaint, content_rect, paint_bar_after_pane, paint_focused_pane,
 };
-use crate::attach::pane_state::{PaneSlot, published_terminal, reanchor_predict_to_pane};
+use crate::attach::pane_state::{
+    PaneSlot, published_replica, published_terminal, reanchor_predict_to_pane,
+};
 use crate::layout::{self, LayoutState, Workspace};
 use crate::layout_ops::{
     DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, LayoutKeyOwner, layout_key_session,
@@ -306,11 +308,12 @@ pub(in crate::attach) fn handle_server_frame<W: crate::attach::RenderSink>(
             // whether the aggregate attach barrier permits paint damage.
             // A pre-barrier OSC title must update chrome caches even though
             // its visible repaint remains suppressed until ATTACH_READY.
-            let terminal = published_terminal(engine_kernel, &terminal_id).ok_or_else(|| {
-                AttachError::Protocol(format!(
-                    "TERMINAL_OUTPUT targeted unpublished {terminal_id:?}"
-                ))
-            })?;
+            let (terminal, generation) = published_replica(engine_kernel, &terminal_id)
+                .ok_or_else(|| {
+                    AttachError::Protocol(format!(
+                        "TERMINAL_OUTPUT targeted unpublished {terminal_id:?}"
+                    ))
+                })?;
             let bar = status_bar.as_ref().map(|p| p.position());
             let content = content_rect(viewport_dims, bar, sidebar);
             let initial_dims = workspace
@@ -422,7 +425,7 @@ pub(in crate::attach) fn handle_server_frame<W: crate::attach::RenderSink>(
                             // plus combining marks) reconcile against the
                             // whole painted cluster (phux-9gw.1.6).
                             s.renderer
-                                .read_grapheme_string_at(terminal, r, c)
+                                .read_grapheme_string_at(terminal, generation, r, c)
                                 .ok()
                                 .flatten()
                         })
@@ -494,6 +497,7 @@ pub(in crate::attach) fn handle_server_frame<W: crate::attach::RenderSink>(
                         let mirror = crate::attach::paint::mirror_dims(terminal, rect);
                         let _ = slot.renderer.render_at_letterboxed(
                             terminal,
+                            generation,
                             out,
                             (rect.x, rect.y),
                             (rect.w, rect.h),

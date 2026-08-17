@@ -1,14 +1,16 @@
 ---
 audience: contributors
 stability: stable
-last-reviewed: 2026-08-15
+last-reviewed: 2026-08-17
 ---
 
 # 0086 — The pooled libghostty render trio lives in `phux-protocol`
 
 **TL;DR.** Both ends of the wire pool a libghostty `RenderState` +
-`RowIterator` + `CellIterator`, and a pooled state serves stale rows after a
-geometry change. That trio plus its rebuild-on-resize now lives in one type,
+`RowIterator` + `CellIterator`, and a pooled state serves stale rows when the
+grid it cached is no longer the grid it walks. That trio plus its rebuild —
+on a geometry change, and on a caller-named identity change for walkers whose
+`Terminal` can be replaced — now lives in one type,
 `phux_protocol::render_pool::RenderPool`, behind the existing `server`
 feature. Dirty-bit policy stays at the call sites, which legitimately differ.
 
@@ -40,11 +42,19 @@ the trio when they change. `RenderPool::begin` returns the snapshot and the
 two iterators as disjoint borrows, so a call site drives its walk exactly as
 it did with three private fields.
 
+Geometry is not the only staleness axis. A walker whose `Terminal` can be
+REPLACED between walks — the client publishes a new replica generation per
+bootstrap — calls `RenderPool::begin_generation` instead, passing an opaque
+caller-chosen identity token for the terminal it is walking. A token change
+rebuilds the trio even at identical geometry (`phux-994s`). The pool never
+interprets the token; the client packs its replica key's `(stream_id,
+bootstrap_id)` into one, via `ReplicaKey::generation_token`.
+
 It lives in `phux-protocol` behind the `server` feature. It carries no wire
 types and does not participate in protocol versioning.
 
-The pool owns **allocation and geometry only**. Dirty-bit policy stays at the
-call sites.
+The pool owns **allocation, geometry, and caller-named terminal identity**.
+Dirty-bit policy stays at the call sites.
 
 ## Why
 
@@ -95,7 +105,16 @@ consumer decision that upstream should not be asked to guess.
 "Terminal+RenderState pairing". It is not one: only `Replayer` owns its
 terminal. On the server one `Terminal` is walked by several pools, one per
 consumer; on the client the pool outlives individual replica generations.
-Owning the terminal would be wrong at both ends.
+Owning the terminal would be wrong at both ends. The identity token added by
+`phux-994s` is the narrow part of that pairing worth keeping: the pool learns
+*which* terminal it is walking without owning it.
+
+**Detecting replacement from the terminal itself** (comparing a pointer, or
+trusting libghostty's own viewport-pin comparison to notice). Declined: a
+`&Terminal` is not a stable identity — a replacement whose pages recycle the
+freed allocation compares equal — so the check would silently pass in exactly
+the allocator-dependent case that makes the bug rare and hard to reproduce.
+The caller knows the generation for certain; the pool cannot infer it.
 
 **A closure-driven `walk(terminal, |row, cells| ...)` API.** Fully
 encapsulates the iterators, but every call site's per-row body differs

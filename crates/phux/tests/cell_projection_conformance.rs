@@ -359,8 +359,13 @@ fn client_frame(case: &Case) -> RenderedFrame {
     // `render_at_cells` returns the cursor rather than storing it: the
     // compositor elects which pane's cursor becomes the frame's. With one
     // pane, that election is the identity.
+    //
+    // The walk-identity token (phux-994s) is a fixed constant here: this
+    // fixture builds one terminal per case and walks it once, so there is no
+    // replica generation to track. Production threads the live token from
+    // `attach::pane_state::published_replica`.
     frame.cursor = renderer
-        .render_at_cells(&term, &mut frame, (0, 0), (case.cols, case.rows))
+        .render_at_cells(&term, 1, &mut frame, (0, 0), (case.cols, case.rows))
         .expect("render_at_cells");
     frame
 }

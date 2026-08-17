@@ -25,6 +25,7 @@ use phux_client_core::session::SessionKernel;
 #[cfg(test)]
 use phux_protocol::caps::BootstrapLimits;
 use phux_protocol::ids::{ClientId, TerminalId};
+use phux_protocol::render_pool::TerminalGeneration;
 use phux_protocol::wire::frame::TerminalLifecycle;
 
 use super::outcome::AttachError;
@@ -48,6 +49,24 @@ pub(super) fn published_terminal<'a>(
     terminal_id: &TerminalId,
 ) -> Option<&'a GhosttyTerminal<'static, 'static>> {
     kernel.published_engine(terminal_id)?.terminal()
+}
+
+/// The published replica `Terminal` for one pane plus the generation token
+/// the pane's renderer must walk it under.
+///
+/// Any path that hands the terminal to a [`TerminalRenderer`] walk fetches
+/// through this funnel: the kernel REPLACES the published `Terminal` when a
+/// replica generation is republished, and the renderer's pooled render state
+/// discards its cache exactly when this token changes — even at unchanged
+/// geometry (`phux-994s`). Paths that only inspect the terminal (modes,
+/// title, input routing) may keep using [`published_terminal`].
+pub(super) fn published_replica<'a>(
+    kernel: &'a AttachKernel,
+    terminal_id: &TerminalId,
+) -> Option<(&'a GhosttyTerminal<'static, 'static>, TerminalGeneration)> {
+    let replica = kernel.published(terminal_id)?;
+    let terminal = replica.engine().terminal()?;
+    Some((terminal, replica.key().generation_token()))
 }
 
 /// Driver-owned state for client-local attention navigation (phux-oih5.16).
@@ -415,6 +434,7 @@ pub(super) fn clear_attention_on_input(
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::attach::render::TEST_GENERATION;
 
     #[test]
     fn pane_slot_initializes_nonzero_cell_pixels_for_live_kitty_render() {
@@ -424,12 +444,116 @@ mod tests {
 
         let mut out = Vec::new();
         slot.renderer
-            .render(&slot.terminal, &mut out)
+            .render(&slot.terminal, TEST_GENERATION, &mut out)
             .expect("render");
         let replay = String::from_utf8_lossy(&out);
         assert!(
             replay.contains("\x1b_Ga=T,f=32,s=1,v=1,i=77,q=2,c=1,r=1,m=0;/wAA/w==\x1b\\"),
             "initial live render must replay classic Kitty placement; got {replay:?}"
+        );
+    }
+
+    /// phux-994s: a republished replica generation at UNCHANGED geometry must
+    /// serve fresh rows through an incremental paint — no `force_full`.
+    ///
+    /// Before the generation token, this was true only because every
+    /// republish happened to be followed by `paint_full_frame` (whose
+    /// `force_full=true` repaints every row) and because libghostty's
+    /// viewport-pin comparison usually notices a swapped terminal — an
+    /// allocator-dependent accident, not a contract. Like the phux-5pyx
+    /// resize test in `attach::render`, this is a contract lock rather than
+    /// a deterministic fails-without-the-fix guard (the pin comparison can
+    /// mask the stale cache unless the old allocation is recycled); the
+    /// deterministic guard lives in `phux_protocol::render_pool::tests`.
+    /// What this test pins is the client wiring: the kernel's republish
+    /// changes the token `published_replica` hands out, and the renderer's
+    /// pooled state honours it end to end.
+    #[test]
+    fn republish_at_same_geometry_serves_fresh_rows_without_force_full() {
+        use phux_client_core::engine::CanonicalGeometry;
+        use phux_client_core::session::KernelInput;
+        use phux_protocol::{BootstrapId, BootstrapStreamProfile, StreamId};
+
+        let id = TerminalId::local(1);
+        let (mut kernel, mut effects, mut panes) = published_test_state(&[(&id, 10, 2, b"AA")]);
+        let slot = panes.get_mut(&id).expect("slot");
+
+        let (terminal, generation_1) = published_replica(&kernel, &id).expect("generation 1");
+        let mut first = Vec::new();
+        let _ = slot
+            .renderer
+            .render_at(terminal, generation_1, &mut first, (0, 0), (10, 2))
+            .expect("paint generation 1");
+        assert!(
+            String::from_utf8_lossy(&first).contains("AA"),
+            "first incremental paint serves generation 1's rows"
+        );
+
+        // Republish: a second bootstrap generation for the same stream at
+        // the SAME geometry, carrying different content. The kernel stages
+        // and atomically publishes a NEW libghostty Terminal.
+        let stream_id = StreamId::new(1).expect("stream");
+        let bootstrap_id = BootstrapId::new(2).expect("bootstrap 2");
+        kernel
+            .update(
+                KernelInput::BootstrapBegin {
+                    terminal_id: &id,
+                    stream_id,
+                    bootstrap_id,
+                    profile: BootstrapStreamProfile::SynthesizedVtRaw,
+                    geometry: CanonicalGeometry::new(10, 2).expect("geometry"),
+                    base_seq: 0,
+                },
+                &mut effects,
+            )
+            .expect("republish BEGIN");
+        kernel
+            .update(
+                KernelInput::BootstrapChunk {
+                    terminal_id: &id,
+                    stream_id,
+                    bootstrap_id,
+                    chunk_seq: 0,
+                    payload: b"ZZ",
+                },
+                &mut effects,
+            )
+            .expect("republish CHUNK");
+        kernel
+            .update(
+                KernelInput::BootstrapReady {
+                    terminal_id: &id,
+                    stream_id,
+                    bootstrap_id,
+                    history_cursor: None,
+                },
+                &mut effects,
+            )
+            .expect("republish READY");
+
+        let (terminal, generation_2) = published_replica(&kernel, &id).expect("generation 2");
+        assert_ne!(
+            generation_1, generation_2,
+            "a republish must change the walk-identity token"
+        );
+
+        // Simulate an unrelated walk (the structured-cells projection, a
+        // grapheme read) consuming the fresh replica's terminal-side dirty
+        // state before the paint path gets there — the ordering that made
+        // the pre-token coupling dangerous.
+        let mut thief = libghostty_vt::RenderState::new().expect("thief state");
+        let _ = thief.update(terminal).expect("thief update");
+
+        let mut second = Vec::new();
+        let _ = slot
+            .renderer
+            .render_at(terminal, generation_2, &mut second, (0, 0), (10, 2))
+            .expect("paint generation 2");
+        let painted = String::from_utf8_lossy(&second);
+        assert!(
+            painted.contains("ZZ"),
+            "an incremental paint (no force_full) after a same-geometry \
+             republish must serve the new generation's rows, got {painted:?}"
         );
     }
 

@@ -21,6 +21,18 @@
 //! as disjoint borrows so a caller can drive the row/cell walk exactly as it
 //! did with three private fields.
 //!
+//! Geometry is not the only way a pooled state can go stale. The client
+//! REPLACES a pane's `Terminal` wholesale when a replica generation is
+//! republished (bootstrap resync), and a swap at identical geometry leaves
+//! `last_dims` equal while the pooled state's cache — including the viewport
+//! pin libghostty consults to decide whether a walk may skip clean rows —
+//! still belongs to the previous `Terminal`. That pin is compared by copied
+//! pointer value, so a replacement terminal whose pages land at a recycled
+//! address can masquerade as "unchanged" and be served the old terminal's
+//! rows as `Clean`. [`RenderPool::begin_generation`] closes this hazard: the
+//! caller names the identity of the terminal it walks, and a change of that
+//! token rebuilds the trio even at identical geometry (`phux-994s`).
+//!
 //! # What this type deliberately does NOT own
 //!
 //! **Dirty policy.** `RenderState::update` *consumes* the terminal's dirty
@@ -54,6 +66,15 @@ use libghostty_vt::{
     RenderState, Terminal as GhosttyTerminal,
     render::{CellIterator, RowIterator, Snapshot},
 };
+
+/// Opaque caller-chosen identity for the `Terminal` a pool walks.
+///
+/// The pool never inspects the value; it only compares it against the token
+/// of the previous walk, and a change rebuilds the pooled trio even at
+/// identical geometry (see [`RenderPool::begin_generation`]). 128 bits so a
+/// composite identity — the client packs its replica key's non-zero 64-bit
+/// stream and bootstrap ids — fits without hashing or collision.
+pub type TerminalGeneration = u128;
 
 /// One pooled walk of a terminal's grid.
 ///
@@ -94,6 +115,10 @@ pub struct RenderPool<'alloc> {
     /// The `(cols, rows)` this pool last walked, or `None` before the first
     /// walk. A change rebuilds the trio.
     last_dims: Option<(u16, u16)>,
+    /// The caller-supplied terminal identity of the last
+    /// [`Self::begin_generation`] walk, or `None` while no identified walk
+    /// has happened. A change rebuilds the trio even at identical geometry.
+    last_generation: Option<TerminalGeneration>,
 }
 
 impl<'alloc> RenderPool<'alloc> {
@@ -104,6 +129,7 @@ impl<'alloc> RenderPool<'alloc> {
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             last_dims: None,
+            last_generation: None,
         })
     }
 
@@ -114,8 +140,23 @@ impl<'alloc> RenderPool<'alloc> {
         self.last_dims
     }
 
+    /// The caller-supplied terminal identity of the last
+    /// [`Self::begin_generation`] walk, or `None` while no identified walk
+    /// has happened.
+    #[must_use]
+    pub const fn last_generation(&self) -> Option<TerminalGeneration> {
+        self.last_generation
+    }
+
     /// Start a walk of `terminal`, rebuilding the pooled trio first if the
     /// terminal's geometry changed since the last walk.
+    ///
+    /// Only for walkers whose terminal identity is fixed for the life of the
+    /// pool — the server walks one PTY-backed `Terminal` per pane for the
+    /// pane's whole life. A caller whose terminal can be REPLACED between
+    /// walks at unchanged geometry (the client's replica republish) must use
+    /// [`Self::begin_generation`], or the pooled cache silently outlives the
+    /// terminal it came from (see the module docs).
     ///
     /// This performs the `RenderState::update` that **drains `terminal`'s
     /// dirty bits into the pooled state**; what the caller then does with
@@ -125,7 +166,34 @@ impl<'alloc> RenderPool<'alloc> {
         &'s mut self,
         terminal: &GhosttyTerminal<'alloc, 'cb>,
     ) -> Result<RenderWalk<'alloc, 's>, libghostty_vt::Error> {
-        self.rebuild_on_geometry_change(terminal)?;
+        self.begin_inner(terminal, None)
+    }
+
+    /// Start a walk of `terminal` on behalf of the caller-named identity
+    /// `generation`, rebuilding the pooled trio first if either that token
+    /// or the terminal's geometry changed since the last walk.
+    ///
+    /// The token names *which terminal* this pool is walking, not a frame or
+    /// content revision: pass a value that changes exactly when the walked
+    /// `Terminal` object is replaced (the client passes its replica
+    /// generation), and the pool discards the previous terminal's cache
+    /// instead of letting it masquerade as this one's (`phux-994s`).
+    ///
+    /// Same drain contract as [`Self::begin`].
+    pub fn begin_generation<'s, 'cb>(
+        &'s mut self,
+        terminal: &GhosttyTerminal<'alloc, 'cb>,
+        generation: TerminalGeneration,
+    ) -> Result<RenderWalk<'alloc, 's>, libghostty_vt::Error> {
+        self.begin_inner(terminal, Some(generation))
+    }
+
+    fn begin_inner<'s, 'cb>(
+        &'s mut self,
+        terminal: &GhosttyTerminal<'alloc, 'cb>,
+        generation: Option<TerminalGeneration>,
+    ) -> Result<RenderWalk<'alloc, 's>, libghostty_vt::Error> {
+        self.rebuild_if_stale(terminal, generation)?;
         // Destructure so the snapshot (which borrows `state`) and the two
         // iterators are disjoint borrows rather than three overlapping
         // borrows of `self`.
@@ -141,21 +209,139 @@ impl<'alloc> RenderPool<'alloc> {
     }
 
     /// Discard and reallocate the pooled trio when `terminal`'s dimensions
-    /// differ from the last walk (`phux-5pyx`).
+    /// differ from the last walk (`phux-5pyx`), or when the caller-supplied
+    /// identity token says the walked `Terminal` was replaced since the last
+    /// identified walk (`phux-994s`).
     ///
-    /// Scoped to the rare resize tick rather than every call, so the pooled
-    /// allocation win survives on the steady-state hot path.
-    fn rebuild_on_geometry_change<'cb>(
+    /// Scoped to the rare resize/republish tick rather than every call, so
+    /// the pooled allocation win survives on the steady-state hot path. An
+    /// identity-less walk (`generation == None`) neither invalidates nor
+    /// records the token, so interleaving [`Self::begin`] with
+    /// [`Self::begin_generation`] cannot mask a pending replacement.
+    fn rebuild_if_stale<'cb>(
         &mut self,
         terminal: &GhosttyTerminal<'alloc, 'cb>,
+        generation: Option<TerminalGeneration>,
     ) -> Result<(), libghostty_vt::Error> {
         let live = (terminal.cols()?, terminal.rows()?);
-        if self.last_dims != Some(live) {
+        let replaced = match (generation, self.last_generation) {
+            (Some(next), Some(last)) => next != last,
+            _ => false,
+        };
+        if replaced || self.last_dims != Some(live) {
             self.state = RenderState::new()?;
             self.rows = RowIterator::new()?;
             self.cells = CellIterator::new()?;
             self.last_dims = Some(live);
         }
+        if generation.is_some() {
+            self.last_generation = generation;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "tests")]
+mod tests {
+    use libghostty_vt::{Terminal, TerminalOptions, render::Dirty};
+
+    use super::*;
+
+    fn terminal(cols: u16, rows: u16) -> Terminal<'static, 'static> {
+        Terminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: 100,
+        })
+        .expect("Terminal::new")
+    }
+
+    /// One pooled walk under the "clear everything drawn" dirty policy:
+    /// return the walk's dirty classification, then reset both layers the
+    /// way a renderer that painted every reported row would.
+    fn walk_and_clear(
+        pool: &mut RenderPool<'static>,
+        terminal: &Terminal<'static, 'static>,
+        generation: TerminalGeneration,
+    ) -> Dirty {
+        let RenderWalk { snapshot, rows, .. } = pool
+            .begin_generation(terminal, generation)
+            .expect("begin_generation");
+        let dirty = snapshot.dirty().expect("dirty");
+        let mut row_iter = rows.update(&snapshot).expect("rows.update");
+        while let Some(row) = row_iter.next() {
+            row.set_dirty(false).expect("row.set_dirty");
+        }
+        snapshot
+            .set_dirty(Dirty::Clean)
+            .expect("snapshot.set_dirty");
+        dirty
+    }
+
+    /// phux-994s: a generation change rebuilds the pooled state even at
+    /// identical geometry, so the first walk of the new generation reports
+    /// `Dirty::Full` instead of serving the previous generation's
+    /// already-painted cache as `Clean`.
+    ///
+    /// Driven against ONE terminal on purpose. The pool cannot observe the
+    /// walked terminal's allocation, so the same terminal under a new token
+    /// is exactly what a REPLACED terminal whose pages recycled the old
+    /// allocation looks like from the pool's seat — the case libghostty's
+    /// own viewport-pin comparison cannot catch and the caller-supplied
+    /// token exists to.
+    #[test]
+    fn generation_change_rebuilds_at_identical_geometry() {
+        let mut t = terminal(10, 2);
+        t.vt_write(b"AA");
+        let mut pool = RenderPool::new().expect("pool");
+
+        assert_eq!(
+            walk_and_clear(&mut pool, &t, 1),
+            Dirty::Full,
+            "a fresh pool's first walk observes every row"
+        );
+        assert_eq!(
+            walk_and_clear(&mut pool, &t, 1),
+            Dirty::Clean,
+            "same generation, same geometry, no writes: nothing to draw"
+        );
+        assert_eq!(pool.last_dims(), Some((10, 2)));
+        assert_eq!(pool.last_generation(), Some(1));
+
+        let dirty = walk_and_clear(&mut pool, &t, 2);
+        assert_eq!(pool.last_generation(), Some(2));
+        assert_eq!(
+            dirty,
+            Dirty::Full,
+            "a new generation at unchanged geometry must rebuild the pooled \
+             state, not serve the previous generation's Clean cache"
+        );
+    }
+
+    /// An identity-less [`RenderPool::begin`] interleaved between identified
+    /// walks neither invalidates the pool (steady state stays `Clean`) nor
+    /// records a token, so the next token change still rebuilds.
+    #[test]
+    fn identityless_begin_does_not_mask_a_replacement() {
+        let mut t = terminal(10, 2);
+        t.vt_write(b"AA");
+        let mut pool = RenderPool::new().expect("pool");
+
+        let _ = walk_and_clear(&mut pool, &t, 7);
+
+        // An identity-less walk between frames (steady state): clean, and
+        // the recorded token survives.
+        {
+            let RenderWalk { snapshot, .. } = pool.begin(&t).expect("begin");
+            assert_eq!(snapshot.dirty().expect("dirty"), Dirty::Clean);
+        }
+        assert_eq!(pool.last_generation(), Some(7));
+
+        assert_eq!(
+            walk_and_clear(&mut pool, &t, 8),
+            Dirty::Full,
+            "the token change after an identity-less walk must still rebuild"
+        );
     }
 }

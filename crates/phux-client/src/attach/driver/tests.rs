@@ -23,6 +23,7 @@ use crate::attach::paint::{
 };
 use crate::attach::pane_state::{AttachKernel, PaneSlot};
 use crate::attach::render::SelectionRect;
+use crate::attach::render::TEST_GENERATION;
 use crate::attach::server_frame::FrameOutcome;
 use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
@@ -1313,7 +1314,13 @@ fn shipped_frame_rows(view: (u16, u16), windows: &[WindowInfo]) -> Vec<String> {
     let mut frame = phux_core::screen::RenderedFrame::blank(cols, rows);
     probe
         .renderer
-        .render_at_cells(&probe.terminal, &mut frame, (0, 0), (cols, rows))
+        .render_at_cells(
+            &probe.terminal,
+            TEST_GENERATION,
+            &mut frame,
+            (0, 0),
+            (cols, rows),
+        )
         .expect("project probe cells");
     (0..rows)
         .map(|r| {
@@ -1411,7 +1418,13 @@ fn replay_rows(bytes: &[u8]) -> Vec<String> {
     let mut frame = phux_core::screen::RenderedFrame::blank(cols, rows);
     probe
         .renderer
-        .render_at_cells(&probe.terminal, &mut frame, (0, 0), (cols, rows))
+        .render_at_cells(
+            &probe.terminal,
+            TEST_GENERATION,
+            &mut frame,
+            (0, 0),
+            (cols, rows),
+        )
         .expect("project probe cells");
     (0..rows)
         .map(|r| {

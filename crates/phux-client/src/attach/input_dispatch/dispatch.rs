@@ -26,7 +26,8 @@ use crate::attach::input::make_named_key;
 use crate::attach::outcome::AttachError;
 use crate::attach::paint::{SidebarReservation, content_rect};
 use crate::attach::pane_state::{
-    PaneSlot, clear_attention_on_input, published_terminal, reanchor_predict_to_pane,
+    PaneSlot, clear_attention_on_input, published_replica, published_terminal,
+    reanchor_predict_to_pane,
 };
 use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
@@ -781,14 +782,14 @@ pub(in crate::attach) async fn dispatch_input_events<W: crate::attach::RenderSin
         if let InputEvent::Key(key_event) = &ev
             && predict.is_enabled()
             && let Some(fid) = ctx.workspace.active_window().and_then(|w| w.focus.as_ref())
-            && let Some(terminal) = published_terminal(ctx.engine_kernel, fid)
+            && let Some((terminal, generation)) = published_replica(ctx.engine_kernel, fid)
             && let Some(slot) = panes.get_mut(fid)
         {
             use crate::predict::PredictionOutcome;
             predict.set_alt_screen(terminal_in_alt_screen(terminal));
             let outcome = predict.predict_key_with_grid_at(key_event, predict_now_ms(), |r, c| {
                 slot.renderer
-                    .read_grapheme_at(terminal, r, c)
+                    .read_grapheme_at(terminal, generation, r, c)
                     .ok()
                     .flatten()
             });

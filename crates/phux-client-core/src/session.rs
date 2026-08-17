@@ -61,6 +61,23 @@ pub struct ReplicaKey {
     pub profile: BootstrapStreamProfile,
 }
 
+impl ReplicaKey {
+    /// Opaque 128-bit identity of this replica generation, for consumers
+    /// that pool per-terminal state across republishes.
+    ///
+    /// Packs the same `(stream_id, bootstrap_id)` pair the kernel itself
+    /// treats as the generation identity (`GenerationId`), losslessly: both
+    /// ids are non-zero `u64`s, so distinct generations always produce
+    /// distinct tokens and no hashing is involved. A frontend hands this to
+    /// `phux_protocol::render_pool::RenderPool::begin_generation` so a
+    /// pooled render cache is discarded when the published `Terminal` is
+    /// replaced at unchanged geometry (`phux-994s`).
+    #[must_use]
+    pub fn generation_token(&self) -> u128 {
+        u128::from(self.stream_id.get()) << 64 | u128::from(self.bootstrap_id.get())
+    }
+}
+
 /// A normalized borrowed input to [`SessionKernel::update`].
 #[derive(Debug)]
 pub enum KernelInput<'a> {
@@ -468,10 +485,10 @@ impl<E: EngineAdapter> std::fmt::Debug for PublishedReplica<'_, E> {
     }
 }
 
-impl<E: EngineAdapter> PublishedReplica<'_, E> {
+impl<'a, E: EngineAdapter> PublishedReplica<'a, E> {
     /// Exact protocol identity and profile.
     #[must_use]
-    pub const fn key(&self) -> &ReplicaKey {
+    pub const fn key(&self) -> &'a ReplicaKey {
         self.key
     }
 
@@ -489,13 +506,17 @@ impl<E: EngineAdapter> PublishedReplica<'_, E> {
 
     /// Borrow this client's generation-scoped progressive history.
     #[must_use]
-    pub const fn history(&self) -> &HistoryCache {
+    pub const fn history(&self) -> &'a HistoryCache {
         self.history
     }
 
     /// Borrow the adapter-owned live state for frontend projection.
+    ///
+    /// The borrow carries the kernel's lifetime (`'a`), not this view's, so
+    /// a caller can return the engine replica (or state borrowed from it)
+    /// while letting the `PublishedReplica` view itself go out of scope.
     #[must_use]
-    pub const fn engine(&self) -> &E::Replica {
+    pub const fn engine(&self) -> &'a E::Replica {
         self.engine
     }
 }
