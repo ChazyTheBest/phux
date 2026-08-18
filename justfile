@@ -479,12 +479,12 @@ release-check TAG:
 # Dry-run the crates.io publish of phux-protocol (package + verify, no
 # upload). The only publishable crate. Mirrors the publish-crate workflow.
 publish-protocol-dry:
-    cargo publish --dry-run -p phux-protocol
+    cargo publish --locked --dry-run -p phux-protocol
 
 # Publish phux-protocol to crates.io. IRREVERSIBLE. Requires `cargo login`
 # (or CARGO_REGISTRY_TOKEN). Run `just publish-protocol-dry` first.
 publish-protocol:
-    cargo publish -p phux-protocol
+    cargo publish --locked -p phux-protocol
 
 # Builds the `profiling` profile (release codegen + line-table debug
 # info) then records a Firefox Profiler JSON at target/samply-profile.json.
