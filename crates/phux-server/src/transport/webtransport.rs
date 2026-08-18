@@ -111,7 +111,7 @@ impl WtListener {
     async fn establish(
         &self,
         incoming: IncomingSession,
-    ) -> Option<(WtReader, WtWriter, PeerIdentity)> {
+    ) -> Option<(WtReader, WtWriter, crate::auth::ConnectionIdentity)> {
         let request = match incoming.await {
             Ok(request) => request,
             Err(err) => {
@@ -124,14 +124,14 @@ impl WtListener {
         // Token gate BEFORE the session is accepted, mirroring the WebSocket
         // path's reject-at-the-upgrade: an unauthorized consumer sees HTTP
         // 403 and no WebTransport session ever exists.
-        let device_id = match &self.tokens {
+        let credential = match &self.tokens {
             Some(store) => {
-                let Some(id) = authorize_request(&request, store) else {
+                let Some(credential) = authorize_request(&request, store) else {
                     warn!(%remote, "webtransport consumer refused: missing or invalid token");
                     request.forbidden().await;
                     return None;
                 };
-                Some(id)
+                Some(credential)
             }
             None => None,
         };
@@ -158,7 +158,7 @@ impl WtListener {
             uid: 0,
             pid: None,
             exe_path: None,
-            mcp_host_key: device_id,
+            mcp_host_key: credential.as_ref().map(|credential| credential.id.clone()),
             transport: TransportType::WebTransport,
             source_addr: Some(remote.ip()),
         };
@@ -176,7 +176,10 @@ impl WtListener {
                 _connection: connection,
                 send,
             },
-            peer_identity,
+            crate::auth::ConnectionIdentity {
+                peer: peer_identity,
+                credential,
+            },
         ))
     }
 }
@@ -236,7 +239,7 @@ impl Incoming for WtListener {
     type Reader = WtReader;
     type Writer = WtWriter;
 
-    async fn accept(&self) -> io::Result<(WtReader, WtWriter, PeerIdentity)> {
+    async fn accept(&self) -> io::Result<(WtReader, WtWriter, crate::auth::ConnectionIdentity)> {
         // One endpoint multiplexes many sessions; a single bad handshake or
         // refused token must not tear the listener down, so per-session
         // failures loop (logged inside `establish`). This mirrors the QUIC
@@ -265,11 +268,11 @@ impl Incoming for WtListener {
 fn authorize_request(
     request: &SessionRequest,
     store: &crate::auth::ReloadingTokenStore,
-) -> Option<String> {
+) -> Option<crate::auth::AuthenticatedCredential> {
     let token_hex =
         bearer_from_headers(request.headers()).or_else(|| token_from_path(request.path()))?;
     let token = hex::decode(token_hex.trim()).ok()?;
-    store.authenticate(&token).map(|credential| credential.id)
+    store.authenticate(&token)
 }
 
 /// The `Bearer` value of an `Authorization` header, matched

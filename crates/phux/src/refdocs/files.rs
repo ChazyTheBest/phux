@@ -118,9 +118,10 @@ pub(crate) fn page() -> Page {
            (ADR-0091); `phux doctor` reports whether it names the \
            address phux advertises.\n\
          - `remote-tokens` is the versioned verifier-only credential store \
-           the server reads and `phux pair` updates atomically; \
-           `PHUX_WS_TOKENS` moves it. Legacy anonymous token lines require \
-           `phux pair --migrate-legacy`.\n\n\
+           the server reads and `phux pair` updates under the sibling \
+           `.remote-tokens.lock`, using a synced temporary file and atomic \
+           rename; `PHUX_WS_TOKENS` moves it. Legacy anonymous token lines \
+           require the idempotent `phux pair --migrate-legacy` conversion.\n\n\
          ## Design intent (not yet implemented)\n\n\
          A `server.pid` file and a `journal/` directory of per-pane PTY \
          output for crash recovery remain design intent; neither path \

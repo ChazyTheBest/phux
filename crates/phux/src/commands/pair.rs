@@ -249,13 +249,19 @@ pub(crate) fn run_pair(
         eprintln!("phux pair: warning: could not provision certificate: {err}");
     }
 
-    let token = match phux_server::auth::mint_token(&tokens) {
-        Ok(token) => token,
+    let minted = match phux_server::auth::mint_token(&tokens) {
+        Ok(minted) => minted,
         Err(err) => {
             eprintln!("phux pair: failed to mint token: {err}");
             return ExitCode::FAILURE;
         }
     };
+    if !minted.is_durable() {
+        eprintln!(
+            "phux pair: warning: credential is active, but the store directory could not be synced; do not retry pairing"
+        );
+    }
+    let token = minted.secret().to_owned();
 
     // `--json` keeps stdout a single document (the repo-wide contract in
     // docs/consumers/agents.md): the human blocks below are suppressed and
@@ -336,8 +342,20 @@ pub(crate) fn run_pair(
 
 fn migrate_legacy_credentials(tokens: &std::path::Path) -> bool {
     match phux_server::auth::migrate_legacy_store(tokens) {
-        Ok(count) => {
-            eprintln!("phux pair: migrated {count} legacy credential(s) to the versioned store");
+        Ok(outcome) => {
+            eprintln!(
+                "phux pair: migrated {} legacy credential(s) to the versioned store",
+                outcome.migrated()
+            );
+            if !outcome.is_durable() {
+                let durable = phux_server::auth::migrate_legacy_store(tokens)
+                    .is_ok_and(phux_server::auth::MigrationOutcome::is_durable);
+                if !durable {
+                    eprintln!(
+                        "phux pair: warning: migration is active, but the store directory could not be synced"
+                    );
+                }
+            }
             true
         }
         Err(err) => {

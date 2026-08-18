@@ -75,19 +75,27 @@ a pairing step.** Concretely:
   owner-only store records a credential id, SHA-256 verifier (never the bearer
   secret), principal, scopes, issue/expiry/revocation times, and rotation
   generation. Ordinary pairing grants only `terminal.control`; it does not
-  implicitly grant ADR-0092 work-plane authority. The file is
+  implicitly grant ADR-0092 work-plane authority. Every mutation holds an
+  owner-only advisory lock across read, modify, temp-file sync, atomic rename,
+  and directory sync, so concurrent CLI/server writers cannot lose updates.
+  The file is
   stat'd per attempt and re-read only when its generation changed, so both
   pairing, rotation, and revocation take effect at the next connection with no restart
   (`auth::ReloadingTokenStore`; see ADR-0081). An established session is not
   re-authorized and survives revocation until it drops. Rotation admits old and
   new generations for an explicit bounded overlap. Legacy anonymous token lines
   require `phux pair --migrate-legacy`; conversion atomically preserves their
-  bearer values as verifier-only generation-one credentials.
+  bearer values as verifier-only generation-one credentials. Migration is
+  idempotent and retains each legacy peer pseudonym (the first eight bytes of
+  SHA-256 over its bearer) as the credential id.
 - **Identity upgrade.** A WebSocket peer that passes TLS + token is no longer
   the anonymous `uid: 0` stamp: its per-device record maps to a `ConsumerId`
   (used in audit + capability scoping), while `PeerIdentity` carries
   `transport: WebSocket` + the already-populated `source_addr` and a
   token-attestation marker (`mcp_host_key` is the existing attestation slot).
+  The accepting transport also retains the complete non-secret credential
+  attestation beside `PeerIdentity` for the connection lifetime, ready for the
+  separate scope-enforcement work without enforcing those scopes here.
 - **No wire-spec change.** The token rides the WebSocket handshake and TLS sits
   below the frame seam, so the phux frame catalog is untouched; this is
   transport + handshake policy, not protocol.

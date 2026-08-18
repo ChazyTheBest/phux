@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use phux_protocol::policy::PeerIdentity;
+
 /// Default persisted path for the remote-consumer credential store.
 #[must_use]
 pub fn default_token_store_path() -> PathBuf {
@@ -49,9 +51,13 @@ pub enum AuthError {
     /// A requested credential does not exist.
     #[error("credential {0} not found")]
     CredentialNotFound(String),
+    /// Rotation cannot reactivate a credential that has already been revoked.
+    #[error("credential {0} is revoked")]
+    CredentialRevoked(String),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CredentialFile {
     version: u32,
     credentials: Vec<CredentialRecord>,
@@ -69,6 +75,7 @@ impl Default for CredentialFile {
 /// One version of a credential. Rotation retains the prior generation for a
 /// bounded overlap, so records are keyed by `(id, generation)` rather than id.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CredentialRecord {
     id: String,
     verifier: String,
@@ -101,6 +108,37 @@ pub struct AuthenticatedCredential {
     pub generation: u64,
 }
 
+/// Transport-derived identity plus the credential attestation captured at
+/// connection establishment.
+///
+/// The credential is absent for local/SSH trust paths. It is retained unchanged
+/// for the connection lifetime so the downstream authorization seam can inspect
+/// principal, scopes, generation, expiry, and id without re-reading the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionIdentity {
+    /// Existing transport identity used by current terminal policy.
+    pub peer: PeerIdentity,
+    /// Structured remote credential, when bearer authentication was used.
+    pub credential: Option<AuthenticatedCredential>,
+}
+
+impl From<PeerIdentity> for ConnectionIdentity {
+    fn from(peer: PeerIdentity) -> Self {
+        Self {
+            peer,
+            credential: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ConnectionIdentity {
+    type Target = PeerIdentity;
+
+    fn deref(&self) -> &Self::Target {
+        &self.peer
+    }
+}
+
 /// A newly minted bearer secret and its non-secret identity.
 pub struct MintedCredential {
     /// Stable identifier of the credential.
@@ -108,6 +146,7 @@ pub struct MintedCredential {
     /// Newly minted generation number.
     pub generation: u64,
     secret: String,
+    durable: bool,
 }
 
 impl MintedCredential {
@@ -115,6 +154,14 @@ impl MintedCredential {
     #[must_use]
     pub fn secret(&self) -> &str {
         &self.secret
+    }
+
+    /// Whether the containing directory was successfully synced after rename.
+    /// `false` means the credential is active and visible, but a crash could
+    /// lose the directory entry; callers must not retry and mint another secret.
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        self.durable
     }
 }
 
@@ -124,6 +171,7 @@ impl std::fmt::Debug for MintedCredential {
             .field("id", &self.id)
             .field("generation", &self.generation)
             .field("secret", &"[REDACTED]")
+            .field("durable", &self.durable)
             .finish()
     }
 }
@@ -390,8 +438,8 @@ impl ReloadingTokenStore {
 }
 
 /// Mint a generation-one credential with terminal-only authority.
-pub fn mint_token(path: &Path) -> Result<String, AuthError> {
-    Ok(mint_credential(path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None)?.secret)
+pub fn mint_token(path: &Path) -> Result<MintedCredential, AuthError> {
+    mint_credential(path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None)
 }
 
 /// Mint a structured credential. `principal = None` creates a stable principal
@@ -402,24 +450,27 @@ pub fn mint_credential(
     scopes: &[String],
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<MintedCredential, AuthError> {
-    let mut file = load_file_for_update(path)?;
-    let (id, secret) = random_identity_and_secret()?;
-    let principal = principal.map_or_else(|| format!("remote-consumer:{id}"), str::to_owned);
-    file.credentials.push(CredentialRecord {
-        id: id.clone(),
-        verifier: verifier(&secret),
-        principal,
-        scopes: scopes.to_vec(),
-        issued_at: Utc::now(),
-        expires_at,
-        revoked_at: None,
-        generation: 1,
-    });
-    atomic_write(path, &file)?;
-    Ok(MintedCredential {
-        id,
-        generation: 1,
-        secret: hex::encode(secret),
+    with_store_lock(path, || {
+        let mut file = load_file_for_update(path)?;
+        let (id, secret) = random_identity_and_secret()?;
+        let principal = principal.map_or_else(|| format!("remote-consumer:{id}"), str::to_owned);
+        file.credentials.push(CredentialRecord {
+            id: id.clone(),
+            verifier: verifier(&secret),
+            principal,
+            scopes: scopes.to_vec(),
+            issued_at: Utc::now(),
+            expires_at,
+            revoked_at: None,
+            generation: 1,
+        });
+        let commit = atomic_write(path, &file)?;
+        Ok(MintedCredential {
+            id,
+            generation: 1,
+            secret: hex::encode(secret),
+            durable: commit.is_durable(),
+        })
     })
 }
 
@@ -432,7 +483,9 @@ pub fn rotate_credential(
     id: &str,
     overlap: Duration,
 ) -> Result<MintedCredential, AuthError> {
-    rotate_credential_at(path, id, overlap, Utc::now())
+    with_store_lock(path, || {
+        rotate_credential_at(path, id, overlap, Utc::now(), AtomicWriteFault::None)
+    })
 }
 
 fn rotate_credential_at(
@@ -440,6 +493,7 @@ fn rotate_credential_at(
     id: &str,
     overlap: Duration,
     now: DateTime<Utc>,
+    fault: AtomicWriteFault,
 ) -> Result<MintedCredential, AuthError> {
     let mut file = load_file_for_update(path)?;
     let latest = file
@@ -449,6 +503,9 @@ fn rotate_credential_at(
         .max_by_key(|record| record.generation)
         .cloned()
         .ok_or_else(|| AuthError::CredentialNotFound(id.to_owned()))?;
+    if latest.revoked_at.is_some() {
+        return Err(AuthError::CredentialRevoked(id.to_owned()));
+    }
     let overlap_until = now + overlap.max(Duration::zero());
     for record in file.credentials.iter_mut().filter(|record| record.id == id) {
         if record.revoked_at.is_none() {
@@ -472,60 +529,76 @@ fn rotate_credential_at(
         revoked_at: None,
         generation,
     });
-    atomic_write(path, &file)?;
+    let commit = atomic_write_with_fault(path, &file, fault)?;
     Ok(MintedCredential {
         id: id.to_owned(),
         generation,
         secret: hex::encode(secret),
+        durable: commit.is_durable(),
     })
 }
 
 /// Revoke every generation of a credential for future connection attempts.
-pub fn revoke_credential(path: &Path, id: &str) -> Result<(), AuthError> {
-    let mut file = load_file_for_update(path)?;
-    let now = Utc::now();
-    let mut found = false;
-    for record in file.credentials.iter_mut().filter(|record| record.id == id) {
-        record.revoked_at = Some(now);
-        found = true;
-    }
-    if !found {
-        return Err(AuthError::CredentialNotFound(id.to_owned()));
-    }
-    atomic_write(path, &file)
+pub fn revoke_credential(path: &Path, id: &str) -> Result<CommitOutcome, AuthError> {
+    with_store_lock(path, || {
+        let mut file = load_file_for_update(path)?;
+        let now = Utc::now();
+        let mut found = false;
+        for record in file.credentials.iter_mut().filter(|record| record.id == id) {
+            record.revoked_at = Some(now);
+            found = true;
+        }
+        if !found {
+            return Err(AuthError::CredentialNotFound(id.to_owned()));
+        }
+        atomic_write(path, &file)
+    })
 }
 
 /// Explicitly convert anonymous token lines to generation-one structured
 /// records. The old bearer values are read once and replaced by verifiers.
-pub fn migrate_legacy_store(path: &Path) -> Result<usize, AuthError> {
-    let raw = fs::read_to_string(path)?;
-    if raw.trim_start().starts_with('{') {
-        return Err(AuthError::Malformed(
-            "credential store is already structured".to_owned(),
-        ));
-    }
-    let now = Utc::now();
-    let mut file = CredentialFile::default();
-    for line in raw.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+pub fn migrate_legacy_store(path: &Path) -> Result<MigrationOutcome, AuthError> {
+    with_store_lock(path, || {
+        let raw = fs::read_to_string(path)?;
+        if raw.trim_start().starts_with('{') {
+            TokenStore::load(path)?;
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let durable = FileSync::sync_directory(parent).is_ok();
+            return Ok(MigrationOutcome {
+                migrated: 0,
+                durable,
+            });
         }
-        let secret = decode_secret(line)?;
-        let (id, _) = random_identity_and_secret()?;
-        file.credentials.push(CredentialRecord {
-            id: id.clone(),
-            verifier: verifier(&secret),
-            principal: format!("legacy-remote-consumer:{id}"),
-            scopes: vec![TERMINAL_CONTROL_SCOPE.to_owned()],
-            issued_at: now,
-            expires_at: None,
-            revoked_at: None,
-            generation: 1,
-        });
-    }
-    let count = file.credentials.len();
-    atomic_write(path, &file)?;
-    Ok(count)
+        let now = Utc::now();
+        let mut file = CredentialFile::default();
+        let mut migrated_ids = std::collections::HashSet::new();
+        for line in raw.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let secret = decode_secret(line)?;
+            let id = legacy_peer_id(&secret);
+            if !migrated_ids.insert(id.clone()) {
+                continue;
+            }
+            file.credentials.push(CredentialRecord {
+                id: id.clone(),
+                verifier: verifier(&secret),
+                principal: format!("legacy-remote-consumer:{id}"),
+                scopes: vec![TERMINAL_CONTROL_SCOPE.to_owned()],
+                issued_at: now,
+                expires_at: None,
+                revoked_at: None,
+                generation: 1,
+            });
+        }
+        let count = file.credentials.len();
+        let commit = atomic_write(path, &file)?;
+        Ok(MigrationOutcome {
+            migrated: count,
+            durable: commit.is_durable(),
+        })
+    })
 }
 
 fn load_file_for_update(path: &Path) -> Result<CredentialFile, AuthError> {
@@ -540,6 +613,11 @@ fn random_identity_and_secret() -> Result<(String, [u8; TOKEN_LEN]), AuthError> 
     Ok((hex::encode(id), secret))
 }
 
+fn legacy_peer_id(secret: &[u8]) -> String {
+    let digest = Sha256::digest(secret);
+    hex::encode(&digest[..8])
+}
+
 fn decode_secret(encoded: &str) -> Result<[u8; TOKEN_LEN], AuthError> {
     let bytes = hex::decode(encoded)
         .map_err(|_| AuthError::Malformed("legacy token is not hex".to_owned()))?;
@@ -547,7 +625,94 @@ fn decode_secret(encoded: &str) -> Result<[u8; TOKEN_LEN], AuthError> {
         .map_err(|_| AuthError::Malformed("legacy token has wrong length".to_owned()))
 }
 
-fn atomic_write(path: &Path, file: &CredentialFile) -> Result<(), AuthError> {
+/// Outcome of an atomic store replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitOutcome {
+    durable: bool,
+}
+
+/// Result of an idempotent legacy conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrationOutcome {
+    migrated: usize,
+    durable: bool,
+}
+
+impl MigrationOutcome {
+    /// Number of anonymous token lines converted by this call.
+    #[must_use]
+    pub const fn migrated(self) -> usize {
+        self.migrated
+    }
+
+    /// Whether the converted directory entry reached stable storage.
+    #[must_use]
+    pub const fn is_durable(self) -> bool {
+        self.durable
+    }
+}
+
+impl CommitOutcome {
+    /// Whether both file contents and the containing directory entry reached
+    /// stable storage. A false result is already visible and must not be retried.
+    #[must_use]
+    pub const fn is_durable(self) -> bool {
+        self.durable
+    }
+}
+
+struct StoreLock(fs::File);
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+fn with_store_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T, AuthError>,
+) -> Result<T, AuthError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    let lock_path = parent.join(format!(".{name}.lock"));
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)?;
+    let _guard = StoreLock(lock);
+    operation()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicWriteFault {
+    None,
+    BeforeTempSync,
+    AfterTempSyncBeforeRename,
+    AfterRenameBeforeDirectorySync,
+}
+
+fn injected_failure(stage: &str) -> AuthError {
+    io::Error::other(format!("injected atomic-write interruption at {stage}")).into()
+}
+
+fn atomic_write(path: &Path, file: &CredentialFile) -> Result<CommitOutcome, AuthError> {
+    atomic_write_with_fault(path, file, AtomicWriteFault::None)
+}
+
+fn atomic_write_with_fault(
+    path: &Path,
+    file: &CredentialFile,
+    fault: AtomicWriteFault,
+) -> Result<CommitOutcome, AuthError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut suffix = [0u8; 8];
@@ -568,10 +733,27 @@ fn atomic_write(path: &Path, file: &CredentialFile) -> Result<(), AuthError> {
         serde_json::to_writer_pretty(&mut output, file)
             .map_err(|error| AuthError::Malformed(error.to_string()))?;
         output.write_all(b"\n")?;
+        if fault == AtomicWriteFault::BeforeTempSync {
+            return Err(injected_failure("before temp-file fsync"));
+        }
         output.sync_all()?;
+        if fault == AtomicWriteFault::AfterTempSyncBeforeRename {
+            return Err(injected_failure("after temp-file fsync"));
+        }
         fs::rename(&tmp, path)?;
-        FileSync::sync_directory(parent)?;
-        Ok(())
+        if fault == AtomicWriteFault::AfterRenameBeforeDirectorySync {
+            return Ok(CommitOutcome { durable: false });
+        }
+        match FileSync::sync_directory(parent) {
+            Ok(()) => Ok(CommitOutcome { durable: true }),
+            Err(error) => {
+                // Rename already committed. Reporting an ordinary error would
+                // invite a retry that mints another secret or resurrects stale
+                // state. Return a visible-but-not-durable outcome instead.
+                tracing::warn!(path = %path.display(), %error, "credential store replacement is visible but directory fsync failed; do not retry the mutation");
+                Ok(CommitOutcome { durable: false })
+            }
+        }
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -655,11 +837,18 @@ mod tests {
             TokenStore::load(&path),
             Err(AuthError::LegacyMigrationRequired)
         ));
-        assert_eq!(migrate_legacy_store(&path).unwrap(), 1);
+        assert_eq!(migrate_legacy_store(&path).unwrap().migrated(), 1);
+        assert_eq!(
+            migrate_legacy_store(&path).unwrap().migrated(),
+            0,
+            "migration is idempotent"
+        );
         let raw = fs::read_to_string(&path).unwrap();
         assert!(!raw.contains(&token));
         let store = TokenStore::load(&path).unwrap();
-        assert!(store.verify(&hex::decode(token).unwrap()));
+        let secret = hex::decode(token).unwrap();
+        let authenticated = store.authenticate(&secret).unwrap();
+        assert_eq!(authenticated.id, legacy_peer_id(&secret));
     }
 
     #[test]
@@ -713,7 +902,14 @@ mod tests {
         .unwrap();
         let first_secret = secret(&first);
         let now = Utc::now() + Duration::seconds(1);
-        let second = rotate_credential_at(&path, &first.id, Duration::minutes(5), now).unwrap();
+        let second = rotate_credential_at(
+            &path,
+            &first.id,
+            Duration::minutes(5),
+            now,
+            AtomicWriteFault::None,
+        )
+        .unwrap();
         let second_secret = secret(&second);
         let store = TokenStore::load(&path).unwrap();
         assert_eq!(
@@ -740,19 +936,140 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_rotation_temp_file_cannot_replace_last_good_generation() {
+    fn fault_injected_rotation_is_old_or_new_at_each_atomic_commit_stage() {
+        for fault in [
+            AtomicWriteFault::BeforeTempSync,
+            AtomicWriteFault::AfterTempSyncBeforeRename,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials");
+            let first =
+                mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+            let result = with_store_lock(&path, || {
+                rotate_credential_at(&path, &first.id, Duration::minutes(5), Utc::now(), fault)
+            });
+            assert!(result.is_err());
+            let store = TokenStore::load(&path).unwrap();
+            assert!(store.verify(&secret(&first)));
+            assert_eq!(
+                store.len(),
+                1,
+                "pre-rename interruption preserves old store"
+            );
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials");
         let first =
             mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
-        fs::write(
-            dir.path().join(".credentials.interrupted.tmp"),
-            b"{\"version\":1",
+        let rotated = with_store_lock(&path, || {
+            rotate_credential_at(
+                &path,
+                &first.id,
+                Duration::minutes(5),
+                Utc::now(),
+                AtomicWriteFault::AfterRenameBeforeDirectorySync,
+            )
+        })
+        .unwrap();
+        assert!(!rotated.is_durable(), "post-rename ambiguity is explicit");
+        let store = TokenStore::load(&path).unwrap();
+        assert!(
+            store.verify(&secret(&rotated)),
+            "renamed generation is visible"
+        );
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn unknown_store_and_record_fields_are_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::Malformed(_))
+        ));
+
+        value.as_object_mut().unwrap().remove("unknown");
+        value["credentials"][0]["unknown"] = serde_json::json!(minted.id);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn credential_lock_child() {
+        let Some(path) = std::env::var_os("PHUX_TEST_CREDENTIAL_STORE") else {
+            return;
+        };
+        mint_credential(
+            Path::new(&path),
+            None,
+            &[TERMINAL_CONTROL_SCOPE.to_owned()],
+            None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn concurrent_process_writers_do_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for _ in 0..8 {
+            children.push(
+                std::process::Command::new(&executable)
+                    .args(["--exact", "auth::tests::credential_lock_child"])
+                    .env("PHUX_TEST_CREDENTIAL_STORE", &path)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        assert_eq!(TokenStore::load(&path).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn concurrent_rotation_cannot_resurrect_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let first =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let original = secret(&first);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let rotate_path = path.clone();
+        let rotate_id = first.id.clone();
+        let rotate_barrier = barrier.clone();
+        let rotate = std::thread::spawn(move || {
+            rotate_barrier.wait();
+            rotate_credential(&rotate_path, &rotate_id, Duration::minutes(5))
+        });
+        let revoke_path = path.clone();
+        let revoke_id = first.id;
+        let revoke_barrier = barrier.clone();
+        let revoke = std::thread::spawn(move || {
+            revoke_barrier.wait();
+            revoke_credential(&revoke_path, &revoke_id)
+        });
+        barrier.wait();
+        let rotated = rotate.join().unwrap();
+        revoke.join().unwrap().unwrap();
         let store = TokenStore::load(&path).unwrap();
-        assert!(store.verify(&secret(&first)));
-        assert_eq!(store.len(), 1);
+        assert!(!store.verify(&original));
+        if let Ok(rotated) = rotated {
+            assert!(!store.verify(&secret(&rotated)));
+        }
     }
 
     #[test]

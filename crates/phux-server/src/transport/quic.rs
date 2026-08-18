@@ -183,7 +183,9 @@ impl Incoming for QuicListener {
     type Reader = QuicReader;
     type Writer = QuicWriter;
 
-    async fn accept(&self) -> io::Result<(QuicReader, QuicWriter, PeerIdentity)> {
+    async fn accept(
+        &self,
+    ) -> io::Result<(QuicReader, QuicWriter, crate::auth::ConnectionIdentity)> {
         // One QUIC endpoint multiplexes many connections; a single bad
         // handshake or refused token must not tear the listener down, so
         // per-connection failures `continue` (logged) and only an endpoint
@@ -214,14 +216,14 @@ impl Incoming for QuicListener {
                 }
             };
 
-            let device_id = match &self.tokens {
+            let credential = match &self.tokens {
                 Some(store) => {
-                    let Some(id) = authorize_preamble(&mut recv, store).await else {
+                    let Some(credential) = authorize_preamble(&mut recv, store).await else {
                         warn!(%remote, "quic consumer refused: missing or invalid token");
                         conn.close(AUTH_FAILED_CODE.into(), b"unauthorized");
                         continue;
                     };
-                    Some(id)
+                    Some(credential)
                 }
                 None => None,
             };
@@ -230,7 +232,7 @@ impl Incoming for QuicListener {
                 uid: 0,
                 pid: None,
                 exe_path: None,
-                mcp_host_key: device_id,
+                mcp_host_key: credential.as_ref().map(|credential| credential.id.clone()),
                 transport: TransportType::Quic,
                 source_addr: Some(remote.ip()),
             };
@@ -238,7 +240,10 @@ impl Incoming for QuicListener {
             return Ok((
                 QuicReader::from_stream(recv),
                 QuicWriter::from_stream(send),
-                peer_identity,
+                crate::auth::ConnectionIdentity {
+                    peer: peer_identity,
+                    credential,
+                },
             ));
         }
     }
@@ -254,7 +259,7 @@ impl Incoming for QuicListener {
 pub(crate) async fn authorize_preamble(
     recv: &mut quinn::RecvStream,
     store: &crate::auth::ReloadingTokenStore,
-) -> Option<String> {
+) -> Option<crate::auth::AuthenticatedCredential> {
     let mut len_buf = [0u8; LENGTH_PREFIX];
     if !read_exact_quic(recv, &mut len_buf).await.ok()? {
         return None;
@@ -267,7 +272,7 @@ pub(crate) async fn authorize_preamble(
     if !read_exact_quic(recv, &mut token).await.ok()? {
         return None;
     }
-    store.authenticate(&token).map(|credential| credential.id)
+    store.authenticate(&token)
 }
 
 /// Fill `buf` from the QUIC stream. Returns `Ok(true)` when `buf` is filled,

@@ -652,7 +652,11 @@ overrides the token-store path.
   a verifier plus credential id, principal, terminal-only scope, lifecycle
   timestamps, and rotation generation; bearer secrets are never persisted.
   Legacy anonymous token lines require the explicit `phux pair
-  --migrate-legacy` conversion. Comparison is constant-time; tokens are 256-bit
+  --migrate-legacy` conversion; conversion is idempotent and preserves the
+  device pseudonym existing sessions and audit records already use. Store
+  updates are serialized with an owner-only advisory lock and committed by
+  synced temporary file plus atomic rename and directory sync. Comparison is
+  constant-time; tokens are 256-bit
   from the OS CSPRNG. Revocation affects new connections while an established
   session survives until its transport drops. A client certificate
   (mutual TLS) is the stronger v0.2 hardening recorded in ADR-0031.

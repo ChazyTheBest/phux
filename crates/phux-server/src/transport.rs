@@ -65,7 +65,9 @@ pub(crate) trait FrameWriter {
 pub(crate) trait Incoming {
     type Reader: FrameReader + 'static;
     type Writer: FrameWriter + 'static;
-    async fn accept(&self) -> io::Result<(Self::Reader, Self::Writer, PeerIdentity)>;
+    async fn accept(
+        &self,
+    ) -> io::Result<(Self::Reader, Self::Writer, crate::auth::ConnectionIdentity)>;
 
     /// Classify a non-fatal accept error for the shared accept loop's logging.
     ///
@@ -161,7 +163,7 @@ impl Incoming for UdsListener {
     type Reader = UdsReader;
     type Writer = UdsWriter;
 
-    async fn accept(&self) -> io::Result<(UdsReader, UdsWriter, PeerIdentity)> {
+    async fn accept(&self) -> io::Result<(UdsReader, UdsWriter, crate::auth::ConnectionIdentity)> {
         let (stream, _addr) = self.0.accept().await?;
         let peer_identity = peer_identity_from_uds(&stream)?;
         let (reader, writer) = stream.into_split();
@@ -171,7 +173,7 @@ impl Incoming for UdsListener {
                 header: [0u8; LENGTH_PREFIX],
             },
             UdsWriter { writer },
-            peer_identity,
+            peer_identity.into(),
         ))
     }
 
@@ -398,7 +400,7 @@ impl Incoming for WsListener {
     type Reader = WsReader;
     type Writer = WsWriter;
 
-    async fn accept(&self) -> io::Result<(WsReader, WsWriter, PeerIdentity)> {
+    async fn accept(&self) -> io::Result<(WsReader, WsWriter, crate::auth::ConnectionIdentity)> {
         let (tcp, peer) = self.tcp.accept().await?;
         // The remote ephemeral port is neither useful for pairing diagnosis nor
         // stable enough to be an identity field. Retain only the source IP.
@@ -423,17 +425,18 @@ impl Incoming for WsListener {
         // HTTP 401 before any phux frame is read; the matched device's
         // (non-reversible) id is captured for the peer identity. Without one,
         // this is the historical anonymous browser-client path.
-        let (ws, device_id) = match &self.tokens {
+        let (ws, credential) = match &self.tokens {
             Some(store) => {
                 let store = store.clone();
-                let captured: std::rc::Rc<std::cell::RefCell<Option<String>>> =
-                    std::rc::Rc::new(std::cell::RefCell::new(None));
+                let captured: std::rc::Rc<
+                    std::cell::RefCell<Option<crate::auth::AuthenticatedCredential>>,
+                > = std::rc::Rc::new(std::cell::RefCell::new(None));
                 let sink = captured.clone();
                 let ws = tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, resp| {
                     authorize_request(req, &store).map_or_else(
                         || Err(unauthorized_response()),
-                        |id| {
-                            *sink.borrow_mut() = Some(id);
+                        |credential| {
+                            *sink.borrow_mut() = Some(credential);
                             Ok(resp)
                         },
                     )
@@ -456,11 +459,11 @@ impl Incoming for WsListener {
         // policy and audit see a non-anonymous identity rather than the
         // `uid: 0` stamp the plaintext browser path carries. Log the explicitly
         // privacy-safe fields before the identity moves into server state.
-        if let Some(device_pseudonym) = device_id.as_deref() {
+        if let Some(credential) = credential.as_ref() {
             tracing::info!(
                 transport = "ws",
                 %source_ip,
-                device_pseudonym,
+                credential_id = %credential.id,
                 "paired WebSocket consumer admitted"
             );
         }
@@ -468,13 +471,20 @@ impl Incoming for WsListener {
             uid: 0,
             pid: None,
             exe_path: None,
-            mcp_host_key: device_id,
+            mcp_host_key: credential.as_ref().map(|credential| credential.id.clone()),
             transport: TransportType::WebSocket,
             source_addr: Some(source_ip),
         };
 
         let (tx, rx) = ws.split();
-        Ok((WsReader { rx }, WsWriter { tx }, peer_identity))
+        Ok((
+            WsReader { rx },
+            WsWriter { tx },
+            crate::auth::ConnectionIdentity {
+                peer: peer_identity,
+                credential,
+            },
+        ))
     }
 
     fn accept_error_disposition(&self, error: &io::Error) -> AcceptErrorDisposition {
@@ -615,14 +625,17 @@ enum PeerRejectionWarnDecision {
 /// Extract and verify the `Authorization: Bearer <hex>` pairing token from a
 /// WebSocket upgrade request. Returns the stable credential id on success,
 /// `None` on a missing, malformed, or unrecognized token.
-fn authorize_request(req: &Request, store: &crate::auth::ReloadingTokenStore) -> Option<String> {
+fn authorize_request(
+    req: &Request,
+    store: &crate::auth::ReloadingTokenStore,
+) -> Option<crate::auth::AuthenticatedCredential> {
     let header = req.headers().get("authorization")?.to_str().ok()?;
     let token_hex = header
         .strip_prefix("Bearer ")
         .or_else(|| header.strip_prefix("bearer "))?
         .trim();
     let token = hex::decode(token_hex).ok()?;
-    store.authenticate(&token).map(|credential| credential.id)
+    store.authenticate(&token)
 }
 
 /// The HTTP 401 the handshake returns when the pairing token is absent or
@@ -701,6 +714,15 @@ mod tests {
         assert_eq!(peer.transport, TransportType::WebSocket);
         assert_eq!(peer.source_addr, Some(addr.ip()));
         assert_eq!(peer.mcp_host_key.as_deref(), Some("test-credential"));
+        let credential = peer
+            .credential
+            .as_ref()
+            .expect("credential retained at boundary");
+        assert_eq!(credential.id, "test-credential");
+        assert_eq!(credential.principal, "test-principal");
+        assert_eq!(credential.scopes, [crate::auth::TERMINAL_CONTROL_SCOPE]);
+        assert_eq!(credential.generation, 1);
+        assert!(credential.expires_at.is_none());
         assert_eq!(peer.uid, 0);
         assert_eq!(peer.pid, None);
         assert_eq!(peer.exe_path, None);
@@ -856,6 +878,42 @@ mod tests {
         let (server_res, client_res) = tokio::join!(listener.accept(), refused);
         assert!(server_res.is_err(), "a revoked token no longer upgrades");
         assert!(client_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn established_connection_survives_revocation_but_reconnect_is_denied() {
+        let (listener, addr, token_hex, tokens) = token_listener().await;
+        let frame: Vec<u8> = vec![0, 0, 0, 3, 0xde, 0xad, 0xbe];
+
+        let accept = listener.accept();
+        let connect = async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            tokio_tungstenite::client_async(bearer_request(addr, &token_hex), tcp)
+                .await
+                .expect("initial credential is admitted")
+                .0
+        };
+        let (accepted, mut client) = tokio::join!(accept, connect);
+        let (mut reader, _writer, identity) = accepted.unwrap();
+        assert_eq!(identity.credential.as_ref().unwrap().id, "test-credential");
+
+        client.send(Message::Binary(frame.clone())).await.unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().as_ref(),
+            frame.as_slice()
+        );
+
+        crate::auth::revoke_credential(tokens.path(), "test-credential").unwrap();
+        client.send(Message::Binary(frame.clone())).await.unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().as_ref(),
+            frame.as_slice(),
+            "established transport is not re-authorized"
+        );
+
+        let reconnect = bearer_request(addr, &token_hex);
+        let (_server_error, response) = refused_handshake(&listener, addr, reconnect).await;
+        assert_generic_unauthorized(response);
     }
 
     #[test]
