@@ -585,8 +585,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
                     }
                     let graphemes = cell.graphemes()?;
                     let mut style = cell.style()?;
-                    let fg = cell.fg_color()?;
-                    let bg = cell.bg_color()?;
+                    let (fg, bg) = (cell.fg_color()?, cell.bg_color()?);
                     // Invert the cell when it falls in the copy-mode selection:
                     // toggle so an already-reverse cell flips back, making every
                     // selected cell visibly distinct from its normal state.
@@ -594,6 +593,10 @@ impl<'alloc> TerminalRenderer<'alloc> {
                         style.inverse = !style.inverse;
                     }
                     col = col.saturating_add(1);
+                    if matches!(cell.raw_cell()?.wide()?, CellWide::SpacerTail) {
+                        // Account for the tail column, but emit no overwrite.
+                        continue;
+                    }
                     // Coalesce: emit an SGR sequence only when the cell's
                     // effective style differs from the one currently active
                     // on the outer terminal. A run of same-style cells then
@@ -602,11 +605,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
                     // (reset to default = `None` at row start).
                     emit_sgr_if_changed(out, &mut emitted, style, fg, bg)?;
                     if graphemes.is_empty() {
-                        // Blank or wide-tail cell — advance one column with a
-                        // space. Wide-tail mis-emission overwrites the
-                        // right half of a wide cell; the base grapheme
-                        // emitted on the previous cell already covered that
-                        // column. End-state stays equivalent.
+                        // A regular blank advances one column with a space.
                         out.write_all(b" ")?;
                         continue;
                     }
@@ -2113,6 +2112,26 @@ mod tests {
             frame.cell(0, 2).expect("in range").grapheme,
             " ",
             "the cell after the wide glyph is a normal blank"
+        );
+    }
+
+    #[test]
+    fn live_vt_render_does_not_overwrite_wide_glyph_tail() {
+        let mut terminal = fresh(6, 1);
+        terminal.vt_write("世X".as_bytes());
+
+        let emitted = render_once(&terminal);
+        assert!(
+            emitted
+                .windows("世X".len())
+                .any(|window| window == "世X".as_bytes()),
+            "the SpacerTail must emit no intervening space: {:?}",
+            String::from_utf8_lossy(&emitted)
+        );
+        assert_eq!(
+            decode_grid(&emitted, 6, 1),
+            read_grid(&terminal, 6, 1),
+            "the emitted VT must reconstruct the wide glyph and following cell at their logical columns"
         );
     }
 }

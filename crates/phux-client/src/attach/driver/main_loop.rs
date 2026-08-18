@@ -115,15 +115,13 @@ const fn frame_paint_target(frame: &FrameKind) -> Option<&TerminalId> {
 /// deferred, so every touched pane settles exactly once and none is left
 /// stale; control frames (`None`) never defer.
 fn coalesce_defer_flags(targets: &[Option<TerminalId>]) -> Vec<bool> {
-    (0..targets.len())
-        .map(|i| {
-            targets[i].as_ref().is_some_and(|pane| {
-                targets[i + 1..]
-                    .iter()
-                    .any(|later| later.as_ref() == Some(pane))
-            })
-        })
-        .collect()
+    let mut seen = HashSet::with_capacity(targets.len());
+    let mut deferred = Vec::with_capacity(targets.len());
+    for target in targets.iter().rev() {
+        deferred.push(target.as_ref().is_some_and(|pane| !seen.insert(pane)));
+    }
+    deferred.reverse();
+    deferred
 }
 
 /// Apply the per-pane last-wins coalescing decision.
