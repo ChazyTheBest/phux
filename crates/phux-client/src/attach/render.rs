@@ -574,8 +574,6 @@ impl<'alloc> TerminalRenderer<'alloc> {
                 out.write_all(b"\x1b[0m")?;
                 let mut emitted: Option<EmittedStyle> = None;
 
-                // Copy-mode selection (pane-local cells), reverse-videoed as
-                // each cell is emitted with its real style — see `SelectionRect`.
                 let selection = self.selection;
                 let mut col: u16 = 0;
                 let mut cell_iter = cells.update(row)?;
@@ -583,17 +581,15 @@ impl<'alloc> TerminalRenderer<'alloc> {
                     if col >= cols_total {
                         break;
                     }
-                    let graphemes = cell.graphemes()?;
-                    let mut style = cell.style()?;
+                    let (graphemes, mut style) = (cell.graphemes()?, cell.style()?);
                     let (fg, bg) = (cell.fg_color()?, cell.bg_color()?);
-                    // Invert the cell when it falls in the copy-mode selection:
-                    // toggle so an already-reverse cell flips back, making every
-                    // selected cell visibly distinct from its normal state.
-                    if selection.is_some_and(|s| s.contains(row_index, col)) {
+                    let wide = cell.raw_cell()?.wide()?;
+                    // Toggle inverse so selected cells differ from their normal state.
+                    if selection_covers_cell(selection, row_index, col, wide) {
                         style.inverse = !style.inverse;
                     }
                     col = col.saturating_add(1);
-                    if matches!(cell.raw_cell()?.wide()?, CellWide::SpacerTail) {
+                    if matches!(wide, CellWide::SpacerTail) {
                         // Account for the tail column, but emit no overwrite.
                         continue;
                     }
@@ -974,6 +970,18 @@ fn emit_sgr_if_changed(
     emit_sgr_set(out, &style, fg, bg)?;
     *emitted = Some(key);
     Ok(())
+}
+
+fn selection_covers_cell(
+    selection: Option<SelectionRect>,
+    row: u16,
+    col: u16,
+    wide: CellWide,
+) -> bool {
+    selection.is_some_and(|selection| {
+        selection.contains(row, col)
+            || matches!(wide, CellWide::Wide) && selection.contains(row, col.saturating_add(1))
+    })
 }
 
 /// Write a full `\x1b[0m` reset followed by the SGR set for `(style, fg, bg)`.
@@ -2133,5 +2141,32 @@ mod tests {
             read_grid(&terminal, 6, 1),
             "the emitted VT must reconstruct the wide glyph and following cell at their logical columns"
         );
+    }
+
+    #[test]
+    fn selecting_only_a_wide_tail_highlights_its_base_glyph() {
+        let mut terminal = fresh(6, 1);
+        terminal.vt_write("世X".as_bytes());
+        let mut renderer = TerminalRenderer::new().expect("renderer");
+        renderer.set_selection(Some(SelectionRect {
+            start_row: 0,
+            start_col: 1,
+            end_row: 0,
+            end_col: 1,
+            rectangle: true,
+        }));
+        let mut emitted = Vec::new();
+        renderer
+            .render_at_full(
+                ReplicaWalk::for_test(&terminal),
+                &mut emitted,
+                (0, 0),
+                (6, 1),
+            )
+            .expect("render");
+        let output = String::from_utf8_lossy(&emitted);
+        let inverse = output.find("\x1b[7").expect("tail selection is visible");
+        let glyph = output.find('世').expect("wide glyph is rendered");
+        assert!(inverse < glyph, "inverse style must precede the wide glyph");
     }
 }
