@@ -324,69 +324,21 @@ mod tests {
         (file, Arc::new(store))
     }
 
-    /// Test-only cert verifier: QUIC mandates ALPN + TLS so the handshake is
-    /// still exercised end-to-end, but the self-signed leaf is trusted blindly
-    /// rather than pinned (the dialer's fingerprint-pinning is out of scope for
-    /// the listener under test).
-    #[derive(Debug)]
-    struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-    impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-            _server_name: &rustls::pki_types::ServerName<'_>,
-            _ocsp: &[u8],
-            _now: rustls::pki_types::UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &rustls::pki_types::CertificateDer<'_>,
-            dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(
-                message,
-                cert,
-                dss,
-                &self.0.signature_verification_algorithms,
-            )
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &rustls::pki_types::CertificateDer<'_>,
-            dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(
-                message,
-                cert,
-                dss,
-                &self.0.signature_verification_algorithms,
-            )
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            self.0.signature_verification_algorithms.supported_schemes()
-        }
-    }
-
     /// A quinn client endpoint that offers the phux ALPN and trusts the
     /// listener's self-signed cert.
+    ///
+    /// QUIC mandates ALPN + TLS, so the handshake is exercised end to end; the
+    /// self-signed leaf is trusted blindly rather than pinned, the dialer's
+    /// fingerprint-pinning being out of scope for the listener under test.
+    /// That policy comes from [`phux_dial::tls::client_config`] — the same
+    /// builder production consumers dial through — rather than from a
+    /// `ServerCertVerifier` hand-rolled here, which is what this test used to
+    /// carry. A test that re-implements the trust policy is a test that can
+    /// quietly disagree with it.
     fn client_endpoint() -> quinn::Endpoint {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification(provider)))
-            .with_no_client_auth();
-        crypto.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+        let crypto =
+            phux_dial::tls::client_config(&phux_dial::CertTrust::SkipVerify, Some(QUIC_ALPN))
+                .unwrap();
         let client_config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
         ));
