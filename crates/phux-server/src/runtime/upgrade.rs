@@ -11,12 +11,13 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, oneshot};
 
 use super::RuntimeFlags;
@@ -24,6 +25,8 @@ use crate::state::SharedState;
 use crate::terminal_actor::{PaneUpgradeHandle, UpgradeHandleRequest};
 
 const PANE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
+const UPGRADE_SOURCE_EXE: &str = "PHUX_UPGRADE_SOURCE_EXE";
+const UPGRADE_SNAPSHOT_DIR: &str = "PHUX_UPGRADE_SNAPSHOT_DIR";
 
 /// Errors preparing a graceful upgrade. Any of these leaves the running server
 /// untouched (the children are never stranded — see the module docs).
@@ -50,6 +53,68 @@ pub(super) enum UpgradeError {
         /// Whether its mailbox closed, reply disappeared, or deadline elapsed.
         reason: &'static str,
     },
+    /// The live session tree changed while pane actors prepared their replies.
+    #[error("server state changed while collecting upgrade handoffs; retry the upgrade")]
+    TreeChanged,
+    /// A pane must carry both sides of a PTY handoff or neither side.
+    #[error("pane {pane:?} returned an invalid PTY handoff (master fd and child pid must match)")]
+    InvalidPaneHandoff {
+        /// The pane whose actor returned an inconsistent pair.
+        pane: phux_core::ids::TerminalId,
+    },
+    /// All pane actors share one bounded preparation window.
+    #[error("pane upgrade handoffs did not complete within the aggregate deadline")]
+    HandoffDeadline,
+}
+
+/// A private executable snapshot copied from one opened source inode. Both
+/// validation and exec use the snapshot, so replacing the installed path
+/// cannot swap in a different image between the two operations.
+struct PinnedExecutable {
+    path: PathBuf,
+    source_path: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+impl PinnedExecutable {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let mut source = std::fs::File::open(path)?;
+        let mode = source.metadata()?.permissions().mode();
+        let dir = tempfile::Builder::new().prefix("phux-upgrade-").tempdir()?;
+        let pinned = dir.path().join("phux");
+        let mut target = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(&pinned)?;
+        std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        drop(target);
+        Ok(Self {
+            path: pinned,
+            source_path: path.to_path_buf(),
+            dir,
+        })
+    }
+}
+
+/// Remove the private executable snapshot after a successful re-exec. Unix
+/// keeps the mapped image alive after unlink, while the installed source path
+/// remains in the environment for the next upgrade.
+pub(super) fn cleanup_executable_snapshot() {
+    let Some(path) = std::env::var_os(UPGRADE_SNAPSHOT_DIR).map(PathBuf::from) else {
+        return;
+    };
+    let is_ours = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("phux-upgrade-"))
+        && path.parent() == Some(std::env::temp_dir().as_path());
+    if is_ours {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Restores the exact descriptor flags if preparation or `exec` returns.
@@ -93,7 +158,7 @@ impl Drop for FdFlagsGuard {
 /// A validated, ready-to-`exec` upgrade. Holds the open blob temp file so its
 /// fd stays valid until the re-exec consumes it.
 pub(super) struct UpgradePlan {
-    current_exe: PathBuf,
+    executable: PinnedExecutable,
     blob_fd: RawFd,
     socket_path: PathBuf,
     /// The server's effective runtime flags (phux-v45.10), read back from the
@@ -103,6 +168,8 @@ pub(super) struct UpgradePlan {
     flags: RuntimeFlags,
     _fd_flags: FdFlagsGuard,
     _blob_file: std::fs::File,
+    _listener_fd: OwnedFd,
+    _handoffs: HashMap<phux_core::ids::TerminalId, PaneUpgradeHandle>,
 }
 
 /// Do everything reversible: snapshot the tree into a handoff blob, stage it in
@@ -110,22 +177,37 @@ pub(super) struct UpgradePlan {
 /// pane master, and validate the on-disk binary. Returns a [`UpgradePlan`] the
 /// caller execs *after* acking the client.
 pub(super) async fn prepare_upgrade(state: &SharedState) -> Result<UpgradePlan, UpgradeError> {
-    let (listener_fd, socket_path, flags) = state
+    let (listener_fd, socket_path, flags, tree_identity, handles) = state
         .with(|s| {
-            s.upgrade_context()
-                .map(|(fd, path, flags)| (fd, path.to_path_buf(), flags))
+            s.upgrade_context().map(|(fd, path, flags)| {
+                let identity = s.assemble_upgrade_blob(fd, &HashMap::new());
+                (fd, path.to_path_buf(), flags, identity, s.upgrade_handles())
+            })
         })
         .ok_or(UpgradeError::NoContext)?;
 
-    // Gather each pane's handoff out of lock (the state lock can't be held
-    // across the await), then assemble the blob back under the lock.
-    let handles = state.with(crate::state::ServerState::upgrade_handles);
-    let mut handoffs = HashMap::new();
-    for (tid, handle) in handles {
-        let handoff = request_pane_handoff(tid, &handle.upgrade, PANE_HANDOFF_TIMEOUT).await?;
-        handoffs.insert(tid, handoff);
-    }
-    let blob = state.with(|s| s.assemble_upgrade_blob(listener_fd, &handoffs));
+    // Own the listener identity before awaiting actors. The duplicate, not a
+    // raw descriptor owned elsewhere in the runtime, is what crosses exec.
+    // SAFETY: the runtime owns the listening descriptor for its entire serve
+    // loop; this borrow lasts only for the dup syscall.
+    let listener = rustix::io::dup(unsafe { BorrowedFd::borrow_raw(listener_fd) })
+        .map_err(std::io::Error::from)?;
+    let senders = handles
+        .into_iter()
+        .map(|(pane, handle)| (pane, handle.upgrade))
+        .collect();
+    let handoffs = collect_pane_handoffs(senders, PANE_HANDOFF_TIMEOUT).await?;
+
+    // Re-read under one lock and require the exact serializable state used to
+    // choose actors to still be current. A concurrent split/close/focus/name
+    // change aborts rather than pairing old handoffs with a new tree.
+    let blob = state
+        .with(|s| {
+            let current = s.assemble_upgrade_blob(listener_fd, &HashMap::new());
+            (current == tree_identity)
+                .then(|| s.assemble_upgrade_blob(listener.as_raw_fd(), &handoffs))
+        })
+        .ok_or(UpgradeError::TreeChanged)?;
 
     // Stage the blob in an anonymous temp file (auto-removed on close), rewound
     // so the resumed image reads from the start.
@@ -136,8 +218,10 @@ pub(super) async fn prepare_upgrade(state: &SharedState) -> Result<UpgradePlan, 
 
     // Validate before changing any descriptor flags. A broken replacement
     // binary must leave the old process's descriptor policy untouched.
-    let current_exe = std::env::current_exe()?;
-    validate_binary(&current_exe)?;
+    let source_exe = std::env::var_os(UPGRADE_SOURCE_EXE)
+        .map_or_else(std::env::current_exe, |path| Ok(PathBuf::from(path)))?;
+    let executable = PinnedExecutable::open(&source_exe)?;
+    validate_binary(&executable.path)?;
 
     // Everything the re-exec'd image must inherit needs FD_CLOEXEC cleared.
     let mut fd_flags = FdFlagsGuard::new();
@@ -150,39 +234,68 @@ pub(super) async fn prepare_upgrade(state: &SharedState) -> Result<UpgradePlan, 
     }
 
     Ok(UpgradePlan {
-        current_exe,
+        executable,
         blob_fd,
         socket_path,
         flags,
         _fd_flags: fd_flags,
         _blob_file: blob_file,
+        _listener_fd: listener,
+        _handoffs: handoffs,
     })
 }
 
 async fn request_pane_handoff(
     pane: phux_core::ids::TerminalId,
     upgrade: &mpsc::Sender<UpgradeHandleRequest>,
-    deadline: Duration,
 ) -> Result<PaneUpgradeHandle, UpgradeError> {
-    tokio::time::timeout(deadline, async {
-        let (reply, rx) = oneshot::channel();
-        upgrade
-            .send(UpgradeHandleRequest { reply })
-            .await
-            .map_err(|_| UpgradeError::PaneHandoff {
-                pane,
-                reason: "actor mailbox closed",
-            })?;
-        rx.await.map_err(|_| UpgradeError::PaneHandoff {
+    let (reply, rx) = oneshot::channel();
+    upgrade
+        .send(UpgradeHandleRequest { reply })
+        .await
+        .map_err(|_| UpgradeError::PaneHandoff {
             pane,
-            reason: "actor dropped its reply",
-        })
+            reason: "actor mailbox closed",
+        })?;
+    rx.await.map_err(|_| UpgradeError::PaneHandoff {
+        pane,
+        reason: "actor dropped its reply",
+    })
+}
+
+async fn collect_pane_handoffs(
+    handles: Vec<(
+        phux_core::ids::TerminalId,
+        mpsc::Sender<UpgradeHandleRequest>,
+    )>,
+    deadline: Duration,
+) -> Result<HashMap<phux_core::ids::TerminalId, PaneUpgradeHandle>, UpgradeError> {
+    tokio::time::timeout(deadline, async move {
+        let pane_count = handles.len();
+        let mut pending = handles
+            .into_iter()
+            .map(|(pane, sender)| async move {
+                request_pane_handoff(pane, &sender)
+                    .await
+                    .map(|handoff| (pane, handoff))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut handoffs = HashMap::with_capacity(pane_count);
+        while let Some(result) = pending.next().await {
+            let (pane, handoff) = result?;
+            let pair_is_valid = matches!(
+                (&handoff.master_fd, handoff.child_pid),
+                (Some(_), Some(1..)) | (None, None)
+            );
+            if !pair_is_valid {
+                return Err(UpgradeError::InvalidPaneHandoff { pane });
+            }
+            handoffs.insert(pane, handoff);
+        }
+        Ok(handoffs)
     })
     .await
-    .map_err(|_| UpgradeError::PaneHandoff {
-        pane,
-        reason: "timed out",
-    })?
+    .map_err(|_| UpgradeError::HandoffDeadline)?
 }
 
 impl UpgradePlan {
@@ -193,13 +306,16 @@ impl UpgradePlan {
     /// was closed, so the old image keeps serving and the children stay
     /// attached.
     pub(super) fn exec(self) -> std::io::Error {
-        Command::new(&self.current_exe)
+        let mut command = Command::new(&self.executable.path);
+        command
+            .env(UPGRADE_SOURCE_EXE, &self.executable.source_path)
+            .env(UPGRADE_SNAPSHOT_DIR, self.executable.dir.path())
             .args(resume_args(
                 self.blob_fd,
                 &self.socket_path,
                 self.flags.clone(),
-            ))
-            .exec()
+            ));
+        command.exec()
     }
 }
 
@@ -302,6 +418,20 @@ mod tests {
         // SAFETY: test callers keep the backing file open for this borrow.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         rustix::io::fcntl_setfd(borrowed, flags).unwrap();
+    }
+
+    fn no_pty_handoff() -> PaneUpgradeHandle {
+        PaneUpgradeHandle {
+            master_fd: None,
+            child_pid: None,
+            cols: 80,
+            rows: 24,
+            cell_px: None,
+            title: None,
+            cwd: None,
+            vt_replay_bytes: Vec::new(),
+            scrollback_bytes: Vec::new(),
+        }
     }
 
     /// The base of the resume argv is invariant: subcommand, blob fd, socket.
@@ -510,16 +640,50 @@ mod tests {
         guard.clear_cloexec(blob_fd).unwrap();
         guard.clear_cloexec(listener_fd).unwrap();
         let plan = UpgradePlan {
-            current_exe: PathBuf::from("/definitely/missing/phux"),
+            executable: PinnedExecutable {
+                path: PathBuf::from("/definitely/missing/phux"),
+                source_path: PathBuf::from("/definitely/missing/phux"),
+                dir: tempfile::tempdir().unwrap(),
+            },
             blob_fd,
             socket_path: PathBuf::from("/tmp/phux.sock"),
             flags: RuntimeFlags::default(),
             _fd_flags: guard,
             _blob_file: blob_file,
+            _listener_fd: tempfile::tempfile().unwrap().into(),
+            _handoffs: HashMap::new(),
         };
 
         assert_eq!(plan.exec().kind(), std::io::ErrorKind::NotFound);
         assert_eq!(fd_flags(listener_fd), original);
+    }
+
+    #[test]
+    fn executable_validation_and_exec_share_one_private_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phux");
+        std::fs::copy("/usr/bin/true", &path).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::metadata("/usr/bin/true").unwrap().permissions(),
+        )
+        .unwrap();
+        let pinned = PinnedExecutable::open(&path).unwrap();
+
+        let replacement = dir.path().join("replacement");
+        std::fs::copy("/usr/bin/false", &replacement).unwrap();
+        std::fs::set_permissions(
+            &replacement,
+            std::fs::metadata("/usr/bin/false").unwrap().permissions(),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        validate_binary(&pinned.path).expect("the pinned image remains the validated one");
+        assert!(
+            validate_binary(&path).is_err(),
+            "the replaced filesystem path now names a different image"
+        );
     }
 
     #[tokio::test]
@@ -527,12 +691,7 @@ mod tests {
         let (upgrade, receiver) = mpsc::channel(1);
         drop(receiver);
 
-        let result = request_pane_handoff(
-            phux_core::ids::TerminalId::default(),
-            &upgrade,
-            Duration::from_secs(1),
-        )
-        .await;
+        let result = request_pane_handoff(phux_core::ids::TerminalId::default(), &upgrade).await;
 
         assert!(matches!(
             result,
@@ -544,22 +703,52 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pane_handoff_aborts_at_its_deadline() {
+    async fn pane_handoff_collection_aborts_at_its_aggregate_deadline() {
         let (upgrade, _receiver) = mpsc::channel(1);
 
-        let result = request_pane_handoff(
-            phux_core::ids::TerminalId::default(),
-            &upgrade,
+        let result = collect_pane_handoffs(
+            vec![(phux_core::ids::TerminalId::default(), upgrade)],
             Duration::from_secs(2),
         )
         .await;
 
+        assert!(matches!(result, Err(UpgradeError::HandoffDeadline)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pane_handoffs_are_collected_concurrently() {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (sender, mut receiver) = mpsc::channel::<UpgradeHandleRequest>(1);
+            tokio::spawn(async move {
+                let request = receiver.recv().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                let _ = request.reply.send(no_pty_handoff());
+            });
+            handles.push((phux_core::ids::TerminalId::default(), sender));
+        }
+
+        let handoffs = collect_pane_handoffs(handles, Duration::from_secs(2))
+            .await
+            .expect("two 1.5s actors fit in one 2s window only when concurrent");
+        assert_eq!(handoffs.len(), 1, "the duplicate fixture pane id coalesces");
+    }
+
+    #[tokio::test]
+    async fn pane_handoff_rejects_a_half_present_pty_pair() {
+        let pane = phux_core::ids::TerminalId::default();
+        let (sender, mut receiver) = mpsc::channel::<UpgradeHandleRequest>(1);
+        tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            let mut handoff = no_pty_handoff();
+            handoff.child_pid = Some(42);
+            let _ = request.reply.send(handoff);
+        });
+
+        let result = collect_pane_handoffs(vec![(pane, sender)], Duration::from_secs(1)).await;
         assert!(matches!(
             result,
-            Err(UpgradeError::PaneHandoff {
-                reason: "timed out",
-                ..
-            })
+            Err(UpgradeError::InvalidPaneHandoff { pane: found }) if found == pane
         ));
     }
 }
