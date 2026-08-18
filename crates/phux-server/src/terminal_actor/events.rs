@@ -8,6 +8,7 @@ use super::{
     FrameKind, Outbound, SubscribeToEventsRequest, TerminalActor, TerminalEventType,
     TerminalLifecycle, TerminalSignal, UnsubscribeFromEventsRequest, mpsc, osc133, trace,
 };
+use crate::agent_asked::AskedPayload;
 
 impl TerminalActor {
     /// Wire an agent-event sink (SPEC §7.5, phux-y2t). The actor emits
@@ -242,24 +243,39 @@ impl TerminalActor {
             });
         }
         // Asked: source a pending human-answerable question from a `phux-ask`
-        // title sentinel (phux-2sl6). Coalesced like dirty/idle — emit once
-        // when the marker first appears and again only when its content
-        // changes; retitling away from a `phux-ask` title clears the ask so
-        // the next distinct one fires. The v1 trigger is OSC-driven; full
-        // agent-state detection (manifests / hooks) is phux-2sl6.4.
+        // title sentinel (phux-2sl6), tier 2 of the ADR-0036 ladder.
+        //
+        // The actor reports the marker; it does not decide what a subscriber
+        // sees. `AskedDetector` (out in `ServerState`, where the hook reports
+        // land too) ranks the sources and owns the coalescing, so an agent
+        // driving both this sentinel and the hook produces one `Asked`
+        // instead of two. `last_ask` survives as the TRANSPORT edge filter:
+        // its only job is to keep a pane whose title is a stable `phux-ask`
+        // from pushing a message per PTY chunk. Both edges travel — a marker
+        // appearing or changing as `Some`, retitling away as `None` — because
+        // the detector cannot infer a cleared marker, and without the clear
+        // the same question asked twice would coalesce into silence.
         let current_ask = AskMarker::parse(&self.last_title);
         if current_ask != self.last_ask {
-            if let Some(ask) = current_ask.as_ref() {
-                self.emit_event(AgentEvent::Asked {
-                    id: ask.id.clone(),
-                    question: ask.question.clone(),
-                    suggestions: ask.suggestions.clone(),
-                    // Elapsed-since-ask is not tracked server-side in v1; the
-                    // consumer renders a live waiting counter from receipt.
-                    elapsed_seconds: None,
-                });
+            let ask = current_ask.as_ref().map(|marker| AskedPayload {
+                id: marker.id.clone(),
+                question: marker.question.clone(),
+                suggestions: marker.suggestions.clone(),
+                // Elapsed-since-ask is not tracked server-side in v1; the
+                // consumer renders a live waiting counter from receipt.
+                elapsed_seconds: None,
+            });
+            // Advance the mirror only once the edge is actually in flight. An
+            // ask is edge-triggered — unlike the level-triggered detector,
+            // nothing re-derives it — so a full sink would otherwise swallow
+            // it outright; leaving the mirror stale re-attempts on the next
+            // chunk. With no sink wired at all there is nothing to deliver
+            // and nothing to retry.
+            if self.try_emit_agent_state(AgentDetectEvent::AskSentinel(ask))
+                || self.agent_state_sink.is_none()
+            {
+                self.last_ask = current_ask;
             }
-            self.last_ask = current_ask;
         }
         // Dirty: a chunk arrived, so the grid mutated. Coalesce to one
         // `dirty` per burst; `idle` (from the tick arm) closes the burst.

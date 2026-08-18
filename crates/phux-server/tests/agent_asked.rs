@@ -366,6 +366,142 @@ fn report_asked_command_emits_asked_event() {
     });
 }
 
+/// Collect until `request_id`'s `CommandResult`, reporting whether any
+/// `Asked` event arrived ahead of it.
+///
+/// The ordering this leans on is exact, not a race: the server broadcasts an
+/// `Asked` into the client's outbound queue *before* it answers the command,
+/// and one connection's writer drains that queue in order. So an ask that was
+/// going to be emitted is already on the wire by the time the `CommandResult`
+/// lands, and "no `Asked` before the result" is a sound negative.
+async fn asked_events_before_result(
+    stream: &mut UnixStream,
+    request_id: u32,
+    deadline: Duration,
+) -> (Option<CommandResult>, usize) {
+    let end = tokio::time::Instant::now() + deadline;
+    let mut asked = 0;
+    loop {
+        let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return (None, asked);
+        }
+        let Ok((_type_byte, frame)) = timeout(remaining, recv_typed(stream)).await else {
+            return (None, asked);
+        };
+        match frame {
+            FrameKind::CommandResult {
+                request_id: got,
+                result,
+            } if got == request_id => return (Some(result), asked),
+            FrameKind::Event {
+                event: AgentEvent::Asked { .. },
+                ..
+            } => {
+                asked += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One question, both tiers of the ADR-0036 ladder, ONE event.
+///
+/// An agent that sets the `phux-ask` title *and* reports the same question
+/// through the hook is describing a single pending ask. Before the sentinel
+/// joined the ladder these were two unrelated producers — the title path
+/// emitted `Asked` straight out of the pane actor while the hook path went
+/// through the arbiter — so the subscriber saw the question twice and the
+/// "hook outranks sentinel" rung existed only in the ADR. This pins the fix
+/// from the wire's point of view.
+#[test]
+fn a_hook_repeating_the_sentinels_question_does_not_re_emit_it() {
+    run_local(async {
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("phux.sock");
+
+        let release = tmp.path().join("release");
+        let cmd = seed_with_ask_title(&release);
+        let (shutdown_tx, server_handle) =
+            spawn_server_with_seed_cmd(socket_path.clone(), "demo", cmd);
+
+        let mut stream = wait_for_raw_socket(&socket_path, SOCKET_CONNECT_DEADLINE).await;
+        negotiate(&mut stream).await;
+
+        send_frame(&mut stream, &attach_by_name("demo")).await;
+        let (type_byte, attached) = recv_typed(&mut stream).await;
+        assert_eq!(type_byte, TYPE_ATTACHED);
+        let FrameKind::Attached { snapshot, .. } = attached else {
+            panic!("expected ATTACHED to carry a snapshot");
+        };
+
+        send_frame(&mut stream, &FrameKind::SubscribeEvents { terminal: None }).await;
+        // Same subscribe barrier as the sentinel test above: a command that
+        // replies proves the subscribe ahead of it is installed.
+        send_frame(
+            &mut stream,
+            &FrameKind::Command {
+                request_id: 1,
+                command: Command::GetTerminalState {
+                    terminal_id: snapshot.focused_pane.clone(),
+                    include_scrollback: false,
+                    max_scrollback_lines: 0,
+                },
+            },
+        )
+        .await;
+        timeout(WIRE_RECV_TIMEOUT, recv_command_result(&mut stream, 1))
+            .await
+            .expect("the server must answer GET_TERMINAL_STATE before the collection window");
+
+        std::fs::write(&release, b"go").expect("release the ask title");
+
+        // Tier 2 fires first: the pane's title sentinel.
+        let asked = collect_until_asked(&mut stream, WIRE_RECV_TIMEOUT).await;
+        let Some(AgentEvent::Asked { ref id, .. }) = asked else {
+            panic!("expected an Asked event from the phux-ask title; got {asked:?}");
+        };
+        assert_eq!(id, "q1");
+
+        // Now the same agent's hook reports the SAME question. The hook
+        // outranks the sentinel and takes ownership of the ask, but it is not
+        // a new question, so nothing new goes on the wire.
+        send_frame(
+            &mut stream,
+            &FrameKind::Command {
+                request_id: 9,
+                command: Command::ReportAsked {
+                    terminal_id: snapshot.focused_pane,
+                    id: "q1".to_owned(),
+                    question: "Deploy to prod?".to_owned(),
+                    suggestions: vec!["Yes".to_owned(), "No".to_owned(), "Hold".to_owned()],
+                    elapsed_seconds: None,
+                },
+            },
+        )
+        .await;
+        let (result, duplicates) =
+            asked_events_before_result(&mut stream, 9, WIRE_RECV_TIMEOUT).await;
+        assert_eq!(
+            result,
+            Some(CommandResult::Ok),
+            "REPORT_ASKED must still succeed: the ask is accepted, just already told",
+        );
+        assert_eq!(
+            duplicates, 0,
+            "one question reported by two sources must reach a subscriber once",
+        );
+
+        drop(stream);
+        shutdown_tx.send(()).ok();
+        timeout(phux_server_testkit::SERVER_JOIN_DEADLINE, server_handle)
+            .await
+            .expect("server did not shut down after the shutdown signal")
+            .expect("server join")
+            .expect("server run_async ok");
+    });
+}
+
 #[test]
 fn report_asked_rejects_empty_question() {
     run_local(async {

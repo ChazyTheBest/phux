@@ -123,6 +123,11 @@ pub(crate) fn spawn_agent_state_drain(
 
     tokio::task::spawn_local(async move {
         while let Some(event) = rx.recv().await {
+            // The ask the ladder accepted, broadcast outside the lock for the
+            // same reason the hook is: `broadcast_event` re-takes the state
+            // lock to resolve its targets. `None` means the arbiter had
+            // nothing new to say and no subscriber is owed an event.
+            let mut asked = None;
             // Resolved under the lock, fired outside it: `fire_hook` re-takes
             // the state lock to clone the dispatcher handle, so firing from
             // inside `with_mut` would deadlock. `None` means nothing actually
@@ -155,13 +160,53 @@ pub(crate) fn spawn_agent_state_drain(
                     AgentDetectEvent::State(report) => {
                         drain_state(s, &wire_terminal_id, &scope, hooks_live, &report)
                     }
+                    AgentDetectEvent::AskSentinel(ask) => {
+                        asked = drain_ask_sentinel(s, &wire_terminal_id, ask);
+                        None
+                    }
                 }
             });
+            if let Some(payload) = asked {
+                broadcast_event(&state, Some(&wire_terminal_id), &payload.into_event());
+            }
             if let Some(event) = hook {
                 crate::hooks::fire_hook(&state, event);
             }
         }
     });
+}
+
+/// The drain's `AskSentinel` arm: the pane's `phux-ask` title changed
+/// (ADR-0036 tier 2).
+///
+/// This is where the title sentinel joins the ladder. The actor sees the
+/// marker but cannot arbitrate it — `AskedDetector` lives in `ServerState`
+/// alongside the hook reports it has to be ranked against — so the actor
+/// reports the edge and this arm runs it through the same
+/// `report_agent_asked` seam `REPORT_ASKED` uses. Returns the payload to
+/// broadcast, which is `None` whenever the arbiter coalesced the report into
+/// silence: an unchanged question, or one a hook already owns.
+///
+/// A cleared marker retracts only a sentinel-owned ask (see
+/// [`crate::agent_asked::AskedDetector::retract`]) and broadcasts nothing —
+/// there is no wire event for a question going away, and inventing one here
+/// would be a protocol change, not a refactor.
+fn drain_ask_sentinel(
+    s: &mut crate::state::ServerState,
+    wire_terminal_id: &phux_protocol::ids::TerminalId,
+    ask: Option<crate::agent_asked::AskedPayload>,
+) -> Option<crate::agent_asked::AskedPayload> {
+    use crate::agent_asked::AskedSource;
+
+    // A pane reaped between the actor's send and this drain has no core id
+    // left to key the ledger by; its ask died with it.
+    let terminal = s.terminal_from_wire(wire_terminal_id)?;
+    let Some(payload) = ask else {
+        s.retract_agent_asked(terminal, AskedSource::Sentinel);
+        return None;
+    };
+    s.report_agent_asked(terminal, AskedSource::Sentinel, payload)
+        .emit_payload()
 }
 
 /// The drain's `Retract` arm: the pane's agent is confirmed gone.
@@ -3541,6 +3586,7 @@ mod agent_drain_tests {
     use phux_protocol::wire::frame::{Scope, TERMINAL_AGENT_KEY};
 
     use super::{retract_hook, spawn_agent_state_drain, state_change_hook};
+    use crate::agent_asked::AskedPayload;
     use crate::agent_detect::record::AgentRecordJson;
     use crate::agent_detect::{AgentDetectEvent, AgentReport, DetectedState};
     use crate::state::SharedState;
@@ -4481,6 +4527,50 @@ mod agent_drain_tests {
                 assert_eq!(
                     first, after,
                     "byte-identical: metadata_set dedups the write"
+                );
+            })
+            .await;
+    }
+
+    /// Tier 2 of the ADR-0036 ladder, through the real drain: a `phux-ask`
+    /// marker the actor observed lands in the SAME ledger a `REPORT_ASKED`
+    /// hook writes to — which is the whole point, since two ledgers cannot
+    /// arbitrate — and the marker clearing takes it back out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ask_sentinel_lands_in_the_ledger_the_hook_shares() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let state = SharedState::new();
+                let (pane, terminal) = state.with_mut(|s| {
+                    let (_session, _window, pane) = s.seed_session("demo");
+                    let wire = s.intern_terminal_wire(pane);
+                    (pane, wire)
+                });
+                let ask = AskedPayload {
+                    id: "q1".to_owned(),
+                    question: "Deploy to prod?".to_owned(),
+                    suggestions: vec!["Yes".to_owned(), "No".to_owned()],
+                    elapsed_seconds: None,
+                };
+
+                drain(
+                    &state,
+                    &terminal,
+                    vec![AgentDetectEvent::AskSentinel(Some(ask))],
+                )
+                .await;
+                assert_eq!(
+                    state.with(|s| s.current_agent_asked(pane).map(|p| p.id.clone())),
+                    Some("q1".to_owned()),
+                    "the sentinel must reach the arbiter, not bypass it",
+                );
+
+                drain(&state, &terminal, vec![AgentDetectEvent::AskSentinel(None)]).await;
+                assert!(
+                    state.with(|s| s.current_agent_asked(pane).is_none()),
+                    "retitling away from the marker retracts the sentinel's ask, \
+                     so the same question asked again is a new ask",
                 );
             })
             .await;

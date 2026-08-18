@@ -13,6 +13,14 @@ impl ServerState {
         self.agent.report_asked(terminal, source, payload)
     }
 
+    pub(crate) fn retract_agent_asked(
+        &mut self,
+        terminal: TerminalId,
+        source: AskedSource,
+    ) -> Option<AskedPayload> {
+        self.agent.retract_asked(terminal, source)
+    }
+
     #[cfg(test)]
     pub(crate) fn current_agent_asked(&self, terminal: TerminalId) -> Option<&AskedPayload> {
         self.agent.current_asked(terminal)

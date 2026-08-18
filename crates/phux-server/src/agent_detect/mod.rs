@@ -213,12 +213,16 @@ pub(crate) struct AgentReport {
     pub(crate) state: DetectedState,
 }
 
-/// A detector output, drained by `runtime::client::spawn_agent_state_drain`.
+/// Something a pane's actor derived that only `ServerState` can act on,
+/// drained by `runtime::client::spawn_agent_state_drain`.
 ///
 /// Deliberately NOT a `phux_protocol` `AgentEvent`: that is a wire type, and
-/// the detector introduces no wire surface. It rides the shipped
-/// `SET_METADATA` / `METADATA_CHANGED` path for the conventional detector-owned
-/// Terminal keys.
+/// nothing here introduces a wire surface. The record variants ride the
+/// shipped `SET_METADATA` / `METADATA_CHANGED` path for the conventional
+/// detector-owned Terminal keys; [`Self::AskSentinel`] rides the ask ladder
+/// and the already-allocated `Asked` event. What they share is the reason
+/// this channel exists: the actor owns the grid, the PTY and the title, and
+/// the arbiters that rank those observations live outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentDetectEvent {
     /// Publish the privacy-bounded foreground-process observation.
@@ -240,6 +244,17 @@ pub(crate) enum AgentDetectEvent {
         /// The new occupant's manifest name.
         name: String,
     },
+    /// The pane's `phux-ask` title sentinel appeared, changed, or cleared
+    /// (ADR-0036 tier 2). `Some` is the question the marker now carries;
+    /// `None` is the pane retitling away from a marker.
+    ///
+    /// Not a detector tick output — the actor parses the title on the PTY
+    /// chunk path — but it needs exactly what the tick outputs need, so it
+    /// rides the same channel rather than adding a third per-pane task. Set
+    /// and clear travel together here on purpose: split across two channels
+    /// they could arrive out of order and leave the ladder believing a
+    /// cleared marker is still asking.
+    AskSentinel(Option<crate::agent_asked::AskedPayload>),
     /// The agent is gone; withdraw the record.
     Retract,
 }

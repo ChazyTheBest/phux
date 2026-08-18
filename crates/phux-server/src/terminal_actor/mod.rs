@@ -224,7 +224,7 @@ const ASK_TITLE_PREFIX: &str = "phux-ask";
 ///
 /// Construct with [`AskMarker::parse`], which returns `None` for any title that
 /// is not a `phux-ask` sentinel. Equality is by content so the actor can
-/// coalesce: a re-asserted identical marker does not re-fire `Asked`.
+/// edge-filter: a re-asserted identical marker is not a new report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AskMarker {
     /// Stable id the answer correlates against. Defaults to the empty string
@@ -766,16 +766,19 @@ pub struct TerminalActor {
     /// screen at all. Set at the same three mutation sites, cleared by
     /// [`Self::detect_tick`].
     agent_dirty_since_detect: bool,
-    /// Last in-pane "ask" marker observed, for coalescing `AgentEvent::Asked`.
+    /// Last in-pane "ask" marker observed — the actor's mirror of the
+    /// `phux-ask` title sentinel, and a transport edge filter only.
     ///
     /// The v1 ask-trigger is OSC-driven: an in-pane agent signals a pending
     /// human-answerable question by setting the terminal title (OSC 0 / OSC 2)
-    /// to a `phux-ask` sentinel (see [`AskMarker`]). Like `dirty`/`idle`, the
-    /// ask is coalesced — we emit `Asked` once when the marker first appears
-    /// and again only when the marker *content* changes, so an agent that keeps
-    /// re-asserting the same title does not re-fire. `None` means no ask is
-    /// currently pending; clearing the marker (retitling to anything else)
-    /// resets it so the next distinct ask fires.
+    /// to a `phux-ask` sentinel (see [`AskMarker`]). The actor does not decide
+    /// whether that reaches a client: it reports each marker *change* — a new
+    /// or changed marker, and the pane retitling away from one — as an
+    /// [`AgentDetectEvent::AskSentinel`], and [`crate::agent_asked`] out in
+    /// `ServerState` ranks it against the other ADR-0036 sources and owns the
+    /// coalescing. This field exists so a pane sitting on a stable `phux-ask`
+    /// title does not push a message per PTY chunk; `None` means the pane is
+    /// not currently displaying a marker.
     ///
     /// The raw scanner mirrors OSC 9;4 for state detection, but does not treat
     /// generic OSC 9 / OSC 777 desktop notifications as asks. The title

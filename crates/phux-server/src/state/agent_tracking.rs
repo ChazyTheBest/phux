@@ -98,6 +98,17 @@ impl AgentState {
         self.asked.report(terminal, source, payload)
     }
 
+    /// Take back the question `source` reported for `terminal`, if it still
+    /// owns one. A source may only retract its own report — see
+    /// [`AskedDetector::retract`].
+    pub(super) fn retract_asked(
+        &mut self,
+        terminal: TerminalId,
+        source: AskedSource,
+    ) -> Option<AskedPayload> {
+        self.asked.retract(terminal, source)
+    }
+
     /// The question `terminal`'s agent is currently waiting on, if any.
     #[cfg(test)]
     pub(super) fn current_asked(&self, terminal: TerminalId) -> Option<&AskedPayload> {
