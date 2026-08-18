@@ -869,6 +869,16 @@ pub(crate) fn run_reconcile(print: bool) -> ExitCode {
 /// same thing, and the one paragraph a user acts on must not have two
 /// wordings that can drift apart.
 fn report_policy_reach(manager: Manager, unit_path: &Path, live: bool, print: bool) {
+    report_policy_reach_with(manager, unit_path, live, print, run_tool);
+}
+
+fn report_policy_reach_with(
+    manager: Manager,
+    unit_path: &Path,
+    live: bool,
+    print: bool,
+    run_tool: impl FnOnce(&str, &[String]) -> Result<(), String>,
+) {
     match manager {
         Manager::Systemd => {
             let reload = run_tool(
@@ -2222,9 +2232,9 @@ mod tests {
         Manager, RESTART_THROTTLE_SECS, Reconcile, SERVICE_MANAGED_ENV, START_LIMIT_BURST,
         ServicePlan, arm_unit, config_home_from, dry_run_text, home_dir_from, launchd_label_for,
         launchd_policy_lines, reconcile_unit, render_launchd_plist, render_systemd_unit,
-        render_unit, render_wrapper_script, resolve_plan, sh_quote, status_report, systemd_escape,
-        systemd_policy_lines, systemd_quote, systemd_unit_for, systemd_unquote,
-        unit_socket_override, unit_supervises, xml_escape, xml_unescape,
+        render_unit, render_wrapper_script, report_policy_reach_with, resolve_plan, sh_quote,
+        status_report, systemd_escape, systemd_policy_lines, systemd_quote, systemd_unit_for,
+        systemd_unquote, unit_socket_override, unit_supervises, xml_escape, xml_unescape,
     };
     use std::path::PathBuf;
 
@@ -2244,6 +2254,27 @@ mod tests {
     /// the exact text phux-8514 leaked to the terminal.
     const LAUNCHCTL_NOT_FOUND_STDERR: &str =
         "Bad request.\nCould not find service \"com.phux.server\" in domain for user gui: 501\n";
+
+    #[test]
+    fn silent_systemd_policy_reconciliation_still_reloads_the_unit() {
+        let called = std::cell::Cell::new(false);
+        report_policy_reach_with(
+            Manager::Systemd,
+            std::path::Path::new("unused"),
+            false,
+            false,
+            |program, args| {
+                called.set(true);
+                assert_eq!(program, "systemctl");
+                assert_eq!(args, ["--user", "daemon-reload"]);
+                Ok(())
+            },
+        );
+        assert!(
+            called.get(),
+            "JSON mode must suppress output, not side effects"
+        );
+    }
 
     /// phux-8514, defect 2: an armed unit is written-but-not-loaded by design
     /// (ADR-0088), so the init system's not-found is the expected
