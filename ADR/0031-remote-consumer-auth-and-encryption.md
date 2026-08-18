@@ -71,12 +71,18 @@ a pairing step.** Concretely:
   in the **WebSocket upgrade request** (`Authorization: Bearer <token>`), where
   TLS already protects it; the server compares it in constant time and **rejects
   the handshake** (HTTP 401) before any phux frame is read. Verified at every
-  connection attempt against the *current* contents of the store: the file is
+  connection attempt against the *current* contents of the store: the versioned
+  owner-only store records a credential id, SHA-256 verifier (never the bearer
+  secret), principal, scopes, issue/expiry/revocation times, and rotation
+  generation. Ordinary pairing grants only `terminal.control`; it does not
+  implicitly grant ADR-0092 work-plane authority. The file is
   stat'd per attempt and re-read only when its generation changed, so both
-  pairing and revocation take effect at the next connection with no restart
+  pairing, rotation, and revocation take effect at the next connection with no restart
   (`auth::ReloadingTokenStore`; see ADR-0081). An established session is not
-  re-authorized and survives revocation until it drops. Tokens are per-device
-  and may carry an expiry (`Capability.expires_at`).
+  re-authorized and survives revocation until it drops. Rotation admits old and
+  new generations for an explicit bounded overlap. Legacy anonymous token lines
+  require `phux pair --migrate-legacy`; conversion atomically preserves their
+  bearer values as verifier-only generation-one credentials.
 - **Identity upgrade.** A WebSocket peer that passes TLS + token is no longer
   the anonymous `uid: 0` stamp: its per-device record maps to a `ConsumerId`
   (used in audit + capability scoping), while `PeerIdentity` carries

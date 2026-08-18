@@ -1,132 +1,266 @@
-//! Bearer-token authentication for remote WebSocket consumers (ADR-0031).
+//! Structured bearer-credential authentication for remote consumers.
 //!
-//! A remote consumer (the native mobile app) attaches over `wss://` without an
-//! SSH tunnel. Encryption is TLS (see [`crate::transport::tls`]); *authentication*
-//! is an opaque pairing token the consumer presents in the WebSocket upgrade
-//! request (`Authorization: Bearer <hex>`). This module owns the token store:
-//! loading the operator's set of valid tokens, comparing a presented token in
-//! constant time, and minting new ones with the OS CSPRNG.
-//!
-//! The token is a bearer credential: anyone holding it is the paired device
-//! until the token is removed from the store. That tradeoff (versus a client
-//! certificate that never leaves the device) is recorded in ADR-0031; the
-//! mitigations live here — high entropy, constant-time comparison so the store
-//! leaks no timing oracle, owner-only file permissions, and per-line revocation.
+//! The on-disk store contains only SHA-256 verifiers, never bearer secrets.
+//! Credentials carry stable identity and authorization metadata for the
+//! authority boundary described by ADR-0092; scope enforcement is deliberately
+//! owned by the follow-up authorization work, not this module.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-/// Default persisted path for the remote-consumer token store:
-/// `<state-dir>/remote-tokens`. The server reads it and `phux pair` appends to
-/// it, so neither needs an explicit path for the common case.
+/// Default persisted path for the remote-consumer credential store.
 #[must_use]
 pub fn default_token_store_path() -> PathBuf {
     crate::telemetry::state_dir().join("remote-tokens")
 }
 
-/// Length in bytes of a minted pairing token. 32 bytes (256 bits) from the OS
-/// CSPRNG is well past brute-force range and matches the TLS session-key class.
+/// Length in bytes of a bearer secret minted from the OS CSPRNG.
 pub const TOKEN_LEN: usize = 32;
+const STORE_VERSION: u32 = 1;
+const VERIFIER_PREFIX: &str = "sha256:";
 
-/// Errors from loading or minting pairing tokens.
+/// The initial scope of an ordinary terminal pairing. Work-plane access is
+/// intentionally absent: ADR-0092 says existing terminal pairing is not
+/// implicitly work authorization.
+pub const TERMINAL_CONTROL_SCOPE: &str = "terminal.control";
+
+/// Errors from loading or changing credentials.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    /// The token file could not be read or written.
-    #[error("token store io: {0}")]
+    /// The credential file could not be read or written.
+    #[error("credential store io: {0}")]
     Io(#[from] io::Error),
-    /// The OS random source failed while minting a token.
+    /// The OS random source failed while minting a credential.
     #[error("os random source unavailable: {0}")]
     Random(#[from] getrandom::Error),
-    /// A line in the token file was not valid hex of the expected length.
-    #[error("malformed token in store (expected {TOKEN_LEN}-byte hex)")]
-    Malformed,
+    /// The structured store could not be decoded or violates its invariants.
+    #[error("malformed credential store: {0}")]
+    Malformed(String),
+    /// Anonymous token lines require an explicit one-time conversion.
+    #[error("legacy token store requires explicit migration")]
+    LegacyMigrationRequired,
+    /// A requested credential does not exist.
+    #[error("credential {0} not found")]
+    CredentialNotFound(String),
 }
 
-/// A set of valid bearer tokens loaded from an operator-managed file.
+#[derive(Clone, Serialize, Deserialize)]
+struct CredentialFile {
+    version: u32,
+    credentials: Vec<CredentialRecord>,
+}
+
+impl Default for CredentialFile {
+    fn default() -> Self {
+        Self {
+            version: STORE_VERSION,
+            credentials: Vec::new(),
+        }
+    }
+}
+
+/// One version of a credential. Rotation retains the prior generation for a
+/// bounded overlap, so records are keyed by `(id, generation)` rather than id.
+#[derive(Clone, Serialize, Deserialize)]
+struct CredentialRecord {
+    id: String,
+    verifier: String,
+    principal: String,
+    scopes: Vec<String>,
+    issued_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    generation: u64,
+}
+
+/// Identity and policy metadata captured when a connection is established.
 ///
-/// The file is line-oriented: one lowercase-hex token per line, `#` comments
-/// and blank lines ignored. Revoking a device is deleting its line. This type
-/// is a pure snapshot value; [`ReloadingTokenStore`] owns the path and keeps
-/// the snapshot current so `phux pair` needs no restart.
+/// This value is a snapshot. Revocation and expiry apply to the next
+/// authentication attempt; an established session is not re-authorized and
+/// keeps this attestation until its transport closes (ADR-0031).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedCredential {
+    /// Stable credential identifier shared by its rotated generations.
+    pub id: String,
+    /// Authority principal represented by this credential.
+    pub principal: String,
+    /// Declared authorization scopes; enforcement belongs to the caller.
+    pub scopes: Vec<String>,
+    /// Time this generation was issued.
+    pub issued_at: DateTime<Utc>,
+    /// Optional time after which new authentication fails.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Monotonic generation within the credential identifier.
+    pub generation: u64,
+}
+
+/// A newly minted bearer secret and its non-secret identity.
+pub struct MintedCredential {
+    /// Stable identifier of the credential.
+    pub id: String,
+    /// Newly minted generation number.
+    pub generation: u64,
+    secret: String,
+}
+
+impl MintedCredential {
+    /// The bearer secret, exposed only for one-time delivery to the consumer.
+    #[must_use]
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+}
+
+impl std::fmt::Debug for MintedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedCredential")
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// A parsed snapshot of the current structured credential store.
 #[derive(Clone)]
 pub struct TokenStore {
-    tokens: Vec<[u8; TOKEN_LEN]>,
+    file: CredentialFile,
 }
 
-/// Redacted: reports only how many tokens are loaded, never their bytes, so a
-/// `?store` in a log line cannot spill a bearer credential.
 impl std::fmt::Debug for TokenStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenStore")
-            .field("tokens", &self.tokens.len())
+            .field("credentials", &self.file.credentials.len())
             .finish()
     }
 }
 
 impl TokenStore {
-    /// Load the token set from `path`. A missing file is an empty store (no
-    /// tokens, so every connection is rejected) rather than an error, so an
-    /// operator can point at a not-yet-created path and `phux pair` into it.
+    /// Load a versioned store. Missing files are empty; legacy token lines are
+    /// rejected until [`migrate_legacy_store`] is called explicitly.
     pub fn load(path: &Path) -> Result<Self, AuthError> {
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
             Err(err) => return Err(err.into()),
         };
-        let mut tokens = Vec::new();
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            tokens.push(parse_token(line)?);
+        if raw.trim().is_empty() {
+            return Ok(Self {
+                file: CredentialFile::default(),
+            });
         }
-        Ok(Self { tokens })
+        if !raw.trim_start().starts_with('{') {
+            return Err(AuthError::LegacyMigrationRequired);
+        }
+        let file: CredentialFile =
+            serde_json::from_str(&raw).map_err(|error| AuthError::Malformed(error.to_string()))?;
+        validate_file(&file)?;
+        Ok(Self { file })
     }
 
-    /// Number of valid tokens currently loaded.
+    /// Number of credential generations in this snapshot.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.tokens.len()
+        self.file.credentials.len()
     }
 
-    /// Whether the store holds no tokens (every connection would be rejected).
+    /// Whether this snapshot has no credentials.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
+        self.file.credentials.is_empty()
     }
 
-    /// Verify a presented token against the store in constant time.
-    ///
-    /// The comparison visits every stored token and accumulates the match with
-    /// no early return, so the time taken does not reveal which token matched or
-    /// how many leading bytes were correct. A presented token of the wrong
-    /// length cannot match (length is not a secret); it short-circuits to
-    /// `false` without consulting the store.
+    /// Authenticate a bearer secret at the current wall-clock time.
+    #[must_use]
+    pub fn authenticate(&self, presented: &[u8]) -> Option<AuthenticatedCredential> {
+        self.authenticate_at(presented, Utc::now())
+    }
+
+    fn authenticate_at(
+        &self,
+        presented: &[u8],
+        now: DateTime<Utc>,
+    ) -> Option<AuthenticatedCredential> {
+        if presented.len() != TOKEN_LEN {
+            return None;
+        }
+        let candidate = Sha256::digest(presented);
+        let mut matched = None;
+        for record in &self.file.credentials {
+            let verifier = decode_verifier(&record.verifier).ok();
+            let active = record.revoked_at.is_none()
+                && record.expires_at.is_none_or(|expiry| now < expiry)
+                && record.issued_at <= now;
+            let is_match = verifier
+                .as_ref()
+                .is_some_and(|verifier| bool::from(verifier.ct_eq(candidate.as_slice())));
+            if active && is_match {
+                matched = Some(AuthenticatedCredential {
+                    id: record.id.clone(),
+                    principal: record.principal.clone(),
+                    scopes: record.scopes.clone(),
+                    issued_at: record.issued_at,
+                    expires_at: record.expires_at,
+                    generation: record.generation,
+                });
+            }
+        }
+        matched
+    }
+
+    /// Compatibility predicate for transport callers that need only admission.
     #[must_use]
     pub fn verify(&self, presented: &[u8]) -> bool {
-        let Ok(candidate) = <[u8; TOKEN_LEN]>::try_from(presented) else {
-            return false;
-        };
-        let mut matched = subtle::Choice::from(0u8);
-        for token in &self.tokens {
-            matched |= token.ct_eq(&candidate);
-        }
-        bool::from(matched)
+        self.authenticate(presented).is_some()
     }
 }
 
-/// The cheap identity of one token-file generation.
-///
-/// `len` catches a same-second append, which is exactly what [`mint_token`]
-/// does and what a coarse `mtime` alone would miss; `dev`/`ino` catch an
-/// atomic-rename replacement that lands in the same second at the same size.
-/// The residual gap -- a same-second, same-length, same-inode rewrite -- is not
-/// reachable through any path phux ships.
+fn validate_file(file: &CredentialFile) -> Result<(), AuthError> {
+    if file.version != STORE_VERSION {
+        return Err(AuthError::Malformed(format!(
+            "unsupported version {} (expected {STORE_VERSION})",
+            file.version
+        )));
+    }
+    let mut keys = std::collections::HashSet::new();
+    for record in &file.credentials {
+        if record.id.is_empty() || record.principal.is_empty() || record.generation == 0 {
+            return Err(AuthError::Malformed(
+                "credential id, principal, and generation must be present".to_owned(),
+            ));
+        }
+        decode_verifier(&record.verifier)?;
+        if !keys.insert((&record.id, record.generation)) {
+            return Err(AuthError::Malformed(format!(
+                "duplicate credential generation {}:{}",
+                record.id, record.generation
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verifier(secret: &[u8]) -> String {
+    format!("{VERIFIER_PREFIX}{}", hex::encode(Sha256::digest(secret)))
+}
+
+fn decode_verifier(encoded: &str) -> Result<[u8; 32], AuthError> {
+    let hex = encoded
+        .strip_prefix(VERIFIER_PREFIX)
+        .ok_or_else(|| AuthError::Malformed("credential verifier must use sha256".to_owned()))?;
+    let bytes = hex::decode(hex)
+        .map_err(|_| AuthError::Malformed("credential verifier is not hex".to_owned()))?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| AuthError::Malformed("credential verifier has wrong length".to_owned()))
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 struct Stamp {
     mtime: Option<std::time::SystemTime>,
@@ -136,8 +270,6 @@ struct Stamp {
 }
 
 impl Stamp {
-    /// Stat `path`. `None` means the file could not be stat'd at all, which is
-    /// never equal to a real generation, so the next verify re-reads.
     fn probe(path: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(path).ok()?;
@@ -150,58 +282,33 @@ impl Stamp {
     }
 }
 
-/// The live token set: a [`TokenStore`] snapshot plus the stamp it was read at.
 struct Cached {
     stamp: Option<Stamp>,
     store: TokenStore,
     reloads: u64,
 }
 
-/// A token store that stays current with its file.
-///
-/// ADR-0081 binds the overlay listener at startup so that `phux pair` is a pure
-/// credential operation needing no restart. That is only true if the credential
-/// *set* also tracks the file, which is what this type provides: every
-/// connection attempt stats the store and re-reads it only when the generation
-/// changed (phux-0d92). One `stat(2)` behind a TLS handshake is not a cost worth
-/// optimizing, so there is no debounce -- a device works the moment it is paired.
-///
-/// Revocation rides the same path: deleting a line, or the whole file, takes
-/// effect at the next connection attempt. An already-established session is not
-/// re-authorized and survives until it drops.
-///
-/// # Failure policy
-///
-/// A store that cannot be read keeps the last known-good set rather than
-/// locking every paired device out, and does *not* commit the failed stamp, so
-/// the next attempt retries. This matters concretely: [`TokenStore::load`]
-/// fails the whole file on one malformed line, so a verify that races
-/// `mint_token`'s `writeln!` can observe a torn final line. Retaining the
-/// previous set makes that a transient no-op instead of an outage.
-///
-/// A *missing* file is not a failure -- it loads as the empty store and
-/// correctly revokes everyone (`missing_file_is_empty_store_that_rejects_all`).
+/// A last-known-good snapshot that re-reads after each atomic file generation.
 pub struct ReloadingTokenStore {
     path: PathBuf,
     cached: std::sync::Mutex<Cached>,
 }
 
-/// Redacted for the same reason as [`TokenStore`]'s: count only, never bytes.
 #[allow(
     clippy::missing_fields_in_debug,
-    reason = "the omitted field is the guarded token set itself; printing it is the exact thing this impl exists to prevent"
+    reason = "the cached field contains credential verifiers and is deliberately redacted"
 )]
 impl std::fmt::Debug for ReloadingTokenStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReloadingTokenStore")
             .field("path", &self.path)
-            .field("tokens", &self.len())
+            .field("credentials", &self.len())
             .finish()
     }
 }
 
 impl ReloadingTokenStore {
-    /// Wrap an already-loaded snapshot of `path`, stamped as of now.
+    /// Wrap an already-loaded snapshot and its current file generation.
     #[must_use]
     pub fn new(path: PathBuf, initial: TokenStore) -> Self {
         let stamp = Stamp::probe(&path);
@@ -215,23 +322,18 @@ impl ReloadingTokenStore {
         }
     }
 
-    /// Load `path` and wrap it. Propagates a load failure, so a caller that
-    /// wants to fail fast at bind time still can.
+    /// Load the current snapshot and begin tracking its file generation.
     pub fn load(path: PathBuf) -> Result<Self, AuthError> {
         let store = TokenStore::load(&path)?;
         Ok(Self::new(path, store))
     }
 
-    /// The store file this tracks.
+    /// Path of the tracked credential store.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Run `f` against the current token set, re-reading the file first if its
-    /// generation changed. Poisoning is recovered rather than propagated: the
-    /// guarded state is a plain cache, and panicking every future connection
-    /// because one earlier one unwound is strictly worse than serving it.
     fn with_current<T>(&self, f: impl FnOnce(&TokenStore) -> T) -> T {
         let mut cached = self
             .cached
@@ -241,44 +343,43 @@ impl ReloadingTokenStore {
         if stamp.is_none() || stamp != cached.stamp {
             match TokenStore::load(&self.path) {
                 Ok(store) => {
-                    // Commit the stamp only alongside a store that actually
-                    // parsed, so a torn read is retried rather than pinned.
                     cached.stamp = stamp;
                     cached.store = store;
                     cached.reloads = cached.reloads.saturating_add(1);
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        %error,
-                        "token store unreadable; keeping the last known-good token set"
-                    );
-                }
+                Err(error) => tracing::warn!(
+                    path = %self.path.display(), %error,
+                    "credential store unreadable; keeping last known-good generation"
+                ),
             }
         }
         f(&cached.store)
     }
 
-    /// Verify a presented token against the current set, reloading if needed.
+    /// Authenticate against the current readable generation.
     #[must_use]
-    pub fn verify(&self, presented: &[u8]) -> bool {
-        self.with_current(|store| store.verify(presented))
+    pub fn authenticate(&self, presented: &[u8]) -> Option<AuthenticatedCredential> {
+        self.with_current(|store| store.authenticate(presented))
     }
 
-    /// Number of valid tokens in the current set.
+    /// Whether a bearer secret authenticates against the current generation.
+    #[must_use]
+    pub fn verify(&self, presented: &[u8]) -> bool {
+        self.authenticate(presented).is_some()
+    }
+
+    /// Number of credential generations in the current snapshot.
     #[must_use]
     pub fn len(&self) -> usize {
         self.with_current(TokenStore::len)
     }
 
-    /// Whether the current set holds no tokens (every connection is rejected).
+    /// Whether the current snapshot contains no credentials.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.with_current(TokenStore::is_empty)
     }
 
-    /// How many times the file has been re-read since construction. Lets a test
-    /// prove an unchanged file costs a `stat` and nothing more.
     #[cfg(test)]
     fn reloads(&self) -> u64 {
         self.cached
@@ -288,240 +389,462 @@ impl ReloadingTokenStore {
     }
 }
 
-/// Mint a fresh token, append it to the store file (created `0o600` if absent),
-/// and return it as lowercase hex for one-time display at pairing time.
-///
-/// Appending — rather than rewriting — preserves the tokens of other paired
-/// devices. The parent directory must already exist.
+/// Mint a generation-one credential with terminal-only authority.
 pub fn mint_token(path: &Path) -> Result<String, AuthError> {
-    let mut token = [0u8; TOKEN_LEN];
-    getrandom::getrandom(&mut token)?;
-    let encoded = hex::encode(token);
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    writeln!(file, "{encoded}")?;
-    Ok(encoded)
+    Ok(mint_credential(path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None)?.secret)
 }
 
-/// Parse and hex-decode one token line into a fixed-size token.
-fn parse_token(line: &str) -> Result<[u8; TOKEN_LEN], AuthError> {
-    let bytes = hex::decode(line).map_err(|_| AuthError::Malformed)?;
-    <[u8; TOKEN_LEN]>::try_from(bytes.as_slice()).map_err(|_| AuthError::Malformed)
+/// Mint a structured credential. `principal = None` creates a stable principal
+/// from the generated credential id.
+pub fn mint_credential(
+    path: &Path,
+    principal: Option<&str>,
+    scopes: &[String],
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<MintedCredential, AuthError> {
+    let mut file = load_file_for_update(path)?;
+    let (id, secret) = random_identity_and_secret()?;
+    let principal = principal.map_or_else(|| format!("remote-consumer:{id}"), str::to_owned);
+    file.credentials.push(CredentialRecord {
+        id: id.clone(),
+        verifier: verifier(&secret),
+        principal,
+        scopes: scopes.to_vec(),
+        issued_at: Utc::now(),
+        expires_at,
+        revoked_at: None,
+        generation: 1,
+    });
+    atomic_write(path, &file)?;
+    Ok(MintedCredential {
+        id,
+        generation: 1,
+        secret: hex::encode(secret),
+    })
+}
+
+/// Rotate a credential with a bounded overlap.
+///
+/// The atomic replacement means interruption exposes either the old complete
+/// store or the new complete store, never half a rotation.
+pub fn rotate_credential(
+    path: &Path,
+    id: &str,
+    overlap: Duration,
+) -> Result<MintedCredential, AuthError> {
+    rotate_credential_at(path, id, overlap, Utc::now())
+}
+
+fn rotate_credential_at(
+    path: &Path,
+    id: &str,
+    overlap: Duration,
+    now: DateTime<Utc>,
+) -> Result<MintedCredential, AuthError> {
+    let mut file = load_file_for_update(path)?;
+    let latest = file
+        .credentials
+        .iter()
+        .filter(|record| record.id == id)
+        .max_by_key(|record| record.generation)
+        .cloned()
+        .ok_or_else(|| AuthError::CredentialNotFound(id.to_owned()))?;
+    let overlap_until = now + overlap.max(Duration::zero());
+    for record in file.credentials.iter_mut().filter(|record| record.id == id) {
+        if record.revoked_at.is_none() {
+            record.expires_at = Some(
+                record
+                    .expires_at
+                    .map_or(overlap_until, |expiry| expiry.min(overlap_until)),
+            );
+        }
+    }
+    let mut secret = [0u8; TOKEN_LEN];
+    getrandom::getrandom(&mut secret)?;
+    let generation = latest.generation.saturating_add(1);
+    file.credentials.push(CredentialRecord {
+        id: id.to_owned(),
+        verifier: verifier(&secret),
+        principal: latest.principal,
+        scopes: latest.scopes,
+        issued_at: now,
+        expires_at: None,
+        revoked_at: None,
+        generation,
+    });
+    atomic_write(path, &file)?;
+    Ok(MintedCredential {
+        id: id.to_owned(),
+        generation,
+        secret: hex::encode(secret),
+    })
+}
+
+/// Revoke every generation of a credential for future connection attempts.
+pub fn revoke_credential(path: &Path, id: &str) -> Result<(), AuthError> {
+    let mut file = load_file_for_update(path)?;
+    let now = Utc::now();
+    let mut found = false;
+    for record in file.credentials.iter_mut().filter(|record| record.id == id) {
+        record.revoked_at = Some(now);
+        found = true;
+    }
+    if !found {
+        return Err(AuthError::CredentialNotFound(id.to_owned()));
+    }
+    atomic_write(path, &file)
+}
+
+/// Explicitly convert anonymous token lines to generation-one structured
+/// records. The old bearer values are read once and replaced by verifiers.
+pub fn migrate_legacy_store(path: &Path) -> Result<usize, AuthError> {
+    let raw = fs::read_to_string(path)?;
+    if raw.trim_start().starts_with('{') {
+        return Err(AuthError::Malformed(
+            "credential store is already structured".to_owned(),
+        ));
+    }
+    let now = Utc::now();
+    let mut file = CredentialFile::default();
+    for line in raw.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let secret = decode_secret(line)?;
+        let (id, _) = random_identity_and_secret()?;
+        file.credentials.push(CredentialRecord {
+            id: id.clone(),
+            verifier: verifier(&secret),
+            principal: format!("legacy-remote-consumer:{id}"),
+            scopes: vec![TERMINAL_CONTROL_SCOPE.to_owned()],
+            issued_at: now,
+            expires_at: None,
+            revoked_at: None,
+            generation: 1,
+        });
+    }
+    let count = file.credentials.len();
+    atomic_write(path, &file)?;
+    Ok(count)
+}
+
+fn load_file_for_update(path: &Path) -> Result<CredentialFile, AuthError> {
+    Ok(TokenStore::load(path)?.file)
+}
+
+fn random_identity_and_secret() -> Result<(String, [u8; TOKEN_LEN]), AuthError> {
+    let mut id = [0u8; 16];
+    let mut secret = [0u8; TOKEN_LEN];
+    getrandom::getrandom(&mut id)?;
+    getrandom::getrandom(&mut secret)?;
+    Ok((hex::encode(id), secret))
+}
+
+fn decode_secret(encoded: &str) -> Result<[u8; TOKEN_LEN], AuthError> {
+    let bytes = hex::decode(encoded)
+        .map_err(|_| AuthError::Malformed("legacy token is not hex".to_owned()))?;
+    <[u8; TOKEN_LEN]>::try_from(bytes.as_slice())
+        .map_err(|_| AuthError::Malformed("legacy token has wrong length".to_owned()))
+}
+
+fn atomic_write(path: &Path, file: &CredentialFile) -> Result<(), AuthError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut suffix = [0u8; 8];
+    getrandom::getrandom(&mut suffix)?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("credentials"),
+        hex::encode(suffix)
+    ));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        serde_json::to_writer_pretty(&mut output, file)
+            .map_err(|error| AuthError::Malformed(error.to_string()))?;
+        output.write_all(b"\n")?;
+        output.sync_all()?;
+        fs::rename(&tmp, path)?;
+        FileSync::sync_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+struct FileSync;
+
+impl FileSync {
+    fn sync_directory(path: &Path) -> io::Result<()> {
+        fs::File::open(path)?.sync_all()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_credential(path: &Path, secret: &[u8; TOKEN_LEN]) {
+    let file = CredentialFile {
+        version: STORE_VERSION,
+        credentials: vec![CredentialRecord {
+            id: "test-credential".to_owned(),
+            verifier: verifier(secret),
+            principal: "test-principal".to_owned(),
+            scopes: vec![TERMINAL_CONTROL_SCOPE.to_owned()],
+            issued_at: Utc::now() - Duration::seconds(1),
+            expires_at: None,
+            revoked_at: None,
+            generation: 1,
+        }],
+    };
+    atomic_write(path, &file).unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-    fn write_store(contents: &str) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(contents.as_bytes()).unwrap();
-        f
+    fn secret(minted: &MintedCredential) -> Vec<u8> {
+        hex::decode(minted.secret()).unwrap()
     }
 
     #[test]
-    fn missing_file_is_empty_store_that_rejects_all() {
-        let store = TokenStore::load(Path::new("/nonexistent/phux/tokens")).unwrap();
-        assert!(store.is_empty());
-        assert!(!store.verify(&[0u8; TOKEN_LEN]));
-    }
-
-    #[test]
-    fn loads_hex_tokens_skipping_comments_and_blanks() {
-        let tok = "a".repeat(TOKEN_LEN * 2);
-        let store = write_store(&format!("# a comment\n\n{tok}\n"));
-        let store = TokenStore::load(store.path()).unwrap();
-        assert_eq!(store.len(), 1);
-        assert!(store.verify(&[0xaa; TOKEN_LEN]));
-    }
-
-    #[test]
-    fn rejects_unknown_token_and_wrong_length() {
-        let tok = "a".repeat(TOKEN_LEN * 2);
-        let f = write_store(&format!("{tok}\n"));
-        let store = TokenStore::load(f.path()).unwrap();
-        assert!(!store.verify(&[0xbb; TOKEN_LEN]));
-        assert!(!store.verify(b"too-short"));
-        assert!(!store.verify(&[0xaa; TOKEN_LEN + 1]));
-    }
-
-    #[test]
-    fn malformed_line_is_an_error() {
-        let f = write_store("not-hex-at-all\n");
-        assert!(matches!(
-            TokenStore::load(f.path()),
-            Err(AuthError::Malformed)
-        ));
-    }
-
-    #[test]
-    fn mint_appends_verifiable_token_with_owner_only_perms() {
-        use std::os::unix::fs::PermissionsExt;
+    fn structured_mint_persists_only_a_redacted_verifier() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
+        let path = dir.path().join("credentials");
+        let minted = mint_credential(
+            &path,
+            Some("device:cockpit"),
+            &[TERMINAL_CONTROL_SCOPE.to_owned()],
+            None,
+        )
+        .unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"version\": 1"));
+        assert!(raw.contains("device:cockpit"));
+        assert!(raw.contains("sha256:"));
+        assert!(!raw.contains(minted.secret()));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
-        let first = mint_token(&path).unwrap();
-        let second = mint_token(&path).unwrap();
-        assert_ne!(first, second, "each mint is unique");
+        let auth = TokenStore::load(&path)
+            .unwrap()
+            .authenticate(&secret(&minted))
+            .unwrap();
+        assert_eq!(auth.id, minted.id);
+        assert_eq!(auth.principal, "device:cockpit");
+        assert_eq!(auth.scopes, [TERMINAL_CONTROL_SCOPE]);
+        assert_eq!(auth.generation, 1);
+    }
 
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "token store must be owner-only");
+    #[test]
+    fn legacy_store_requires_and_survives_explicit_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let token = "ab".repeat(TOKEN_LEN);
+        fs::write(&path, format!("# old\n{token}\n")).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::LegacyMigrationRequired)
+        ));
+        assert_eq!(migrate_legacy_store(&path).unwrap(), 1);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(&token));
+        let store = TokenStore::load(&path).unwrap();
+        assert!(store.verify(&hex::decode(token).unwrap()));
+    }
 
+    #[test]
+    fn expiry_and_revocation_fail_closed() {
+        let now = Utc::now();
+        let token = [0x44; TOKEN_LEN];
+        let base = CredentialRecord {
+            id: "cred".to_owned(),
+            verifier: verifier(&token),
+            principal: "device:test".to_owned(),
+            scopes: vec![TERMINAL_CONTROL_SCOPE.to_owned()],
+            issued_at: now - Duration::minutes(1),
+            expires_at: Some(now + Duration::seconds(1)),
+            revoked_at: None,
+            generation: 1,
+        };
+        let store = TokenStore {
+            file: CredentialFile {
+                version: 1,
+                credentials: vec![base.clone()],
+            },
+        };
+        assert!(store.authenticate_at(&token, now).is_some());
+        assert!(
+            store
+                .authenticate_at(&token, now + Duration::seconds(1))
+                .is_none()
+        );
+        let mut revoked = base;
+        revoked.expires_at = None;
+        revoked.revoked_at = Some(now);
+        let store = TokenStore {
+            file: CredentialFile {
+                version: 1,
+                credentials: vec![revoked],
+            },
+        };
+        assert!(store.authenticate_at(&token, now).is_none());
+    }
+
+    #[test]
+    fn rotation_has_bounded_ab_overlap_and_preserves_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let first = mint_credential(
+            &path,
+            Some("device:a"),
+            &[TERMINAL_CONTROL_SCOPE.to_owned()],
+            None,
+        )
+        .unwrap();
+        let first_secret = secret(&first);
+        let now = Utc::now() + Duration::seconds(1);
+        let second = rotate_credential_at(&path, &first.id, Duration::minutes(5), now).unwrap();
+        let second_secret = secret(&second);
         let store = TokenStore::load(&path).unwrap();
         assert_eq!(
-            store.len(),
-            2,
-            "both tokens persisted (append, not rewrite)"
+            store
+                .authenticate_at(&first_secret, now)
+                .unwrap()
+                .generation,
+            1
         );
-        assert!(store.verify(&hex::decode(&first).unwrap()));
-        assert!(store.verify(&hex::decode(&second).unwrap()));
+        let current = store.authenticate_at(&second_secret, now).unwrap();
+        assert_eq!(current.id, first.id);
+        assert_eq!(current.principal, "device:a");
+        assert_eq!(current.generation, 2);
+        assert!(
+            store
+                .authenticate_at(&first_secret, now + Duration::minutes(5))
+                .is_none()
+        );
+        assert!(
+            store
+                .authenticate_at(&second_secret, now + Duration::minutes(5))
+                .is_some()
+        );
     }
 
-    // phux-0d92: the reloading wrapper is what makes ADR-0081's "pairing needs
-    // no restart" true. Each test below pins one leg of that claim.
-
     #[test]
-    fn a_token_minted_after_construction_verifies_without_a_restart() {
+    fn interrupted_rotation_temp_file_cannot_replace_last_good_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
-        let first = mint_token(&path).unwrap();
-        let store = ReloadingTokenStore::load(path.clone()).unwrap();
+        let path = dir.path().join("credentials");
+        let first =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        fs::write(
+            dir.path().join(".credentials.interrupted.tmp"),
+            b"{\"version\":1",
+        )
+        .unwrap();
+        let store = TokenStore::load(&path).unwrap();
+        assert!(store.verify(&secret(&first)));
         assert_eq!(store.len(), 1);
-
-        // This is `phux pair` against a server that is already running.
-        let second = mint_token(&path).unwrap();
-        assert!(
-            store.verify(&hex::decode(&second).unwrap()),
-            "a freshly paired device is live immediately"
-        );
-        assert!(
-            store.verify(&hex::decode(&first).unwrap()),
-            "pairing does not disturb the devices already paired"
-        );
-        assert_eq!(store.len(), 2);
     }
 
     #[test]
-    fn deleting_a_line_revokes_that_device_at_the_next_verify() {
+    fn reloads_new_generation_and_keeps_last_good_on_malformed_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
-        let doomed = mint_token(&path).unwrap();
-        let kept = mint_token(&path).unwrap();
+        let path = dir.path().join("credentials");
+        let first =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
         let store = ReloadingTokenStore::load(path.clone()).unwrap();
-        assert!(store.verify(&hex::decode(&doomed).unwrap()));
-
-        fs::write(&path, format!("{kept}\n")).unwrap();
-        assert!(
-            !store.verify(&hex::decode(&doomed).unwrap()),
-            "a deleted line revokes without a restart"
-        );
-        assert!(store.verify(&hex::decode(&kept).unwrap()));
+        let second =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        assert!(store.verify(&secret(&second)));
+        assert_eq!(store.reloads(), 1);
+        fs::write(&path, "{broken").unwrap();
+        assert!(store.verify(&secret(&first)));
+        assert_eq!(store.reloads(), 1, "failed reads do not commit a stamp");
     }
 
     #[test]
-    fn deleting_the_whole_store_revokes_everyone() {
+    fn unchanged_store_is_statted_without_re_reading() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
-        let token = mint_token(&path).unwrap();
-        let store = ReloadingTokenStore::load(path.clone()).unwrap();
-        assert!(store.verify(&hex::decode(&token).unwrap()));
+        let path = dir.path().join("credentials");
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let bearer = secret(&minted);
+        let store = ReloadingTokenStore::load(path).unwrap();
+        for _ in 0..8 {
+            assert!(store.verify(&bearer));
+        }
+        assert_eq!(store.reloads(), 0);
+    }
 
-        fs::remove_file(&path).unwrap();
-        assert!(
-            !store.verify(&hex::decode(&token).unwrap()),
-            "an absent store is the empty store, not a retained one"
-        );
+    #[test]
+    fn deleting_store_revokes_all_on_next_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let bearer = secret(&minted);
+        let store = ReloadingTokenStore::load(path.clone()).unwrap();
+        assert!(store.verify(&bearer));
+        fs::remove_file(path).unwrap();
+        assert!(!store.verify(&bearer));
         assert!(store.is_empty());
     }
 
     #[test]
-    fn a_torn_write_keeps_the_last_good_set_and_recovers() {
+    fn revocation_affects_new_authentication_not_established_attestation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
-        let good = mint_token(&path).unwrap();
-        let store = ReloadingTokenStore::load(path.clone()).unwrap();
-        assert!(store.verify(&hex::decode(&good).unwrap()));
-
-        // A verify racing `mint_token`'s writeln! sees a partial hex line, and
-        // one malformed line fails the entire load.
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        write!(f, "abcd").unwrap();
-        drop(f);
+        let path = dir.path().join("credentials");
+        let minted = mint_credential(
+            &path,
+            Some("device:a"),
+            &[TERMINAL_CONTROL_SCOPE.to_owned()],
+            None,
+        )
+        .unwrap();
+        let bearer = secret(&minted);
+        let live = ReloadingTokenStore::load(path.clone()).unwrap();
+        let established = live.authenticate(&bearer).unwrap();
+        revoke_credential(&path, &minted.id).unwrap();
         assert!(
-            store.verify(&hex::decode(&good).unwrap()),
-            "an unparseable store must not lock out already-paired devices"
+            live.authenticate(&bearer).is_none(),
+            "next handshake is revoked"
         );
-
-        // The failed stamp was not committed, so the completed write is picked
-        // up rather than pinned behind the torn generation.
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{}", "a".repeat(TOKEN_LEN * 2 - 4)).unwrap();
-        drop(f);
-        let mut completed = [0xaa_u8; TOKEN_LEN];
-        completed[0] = 0xab;
-        completed[1] = 0xcd;
-        assert!(
-            store.verify(&completed),
-            "the completed line is honoured once it parses"
+        assert_eq!(
+            established.principal, "device:a",
+            "established session retains its captured attestation"
         );
     }
 
     #[test]
-    fn an_unreadable_store_keeps_the_last_good_set() {
-        use std::os::unix::fs::PermissionsExt;
+    fn debug_output_never_contains_bearer_or_verifier() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
-        let token = mint_token(&path).unwrap();
-        let store = ReloadingTokenStore::load(path.clone()).unwrap();
-        assert!(store.verify(&hex::decode(&token).unwrap()));
-
-        // Touch the file so the stamp changes, then make the read fail.
-        fs::write(&path, format!("{token}\n{token}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        let readable = fs::read_to_string(&path).is_ok();
-        if readable {
-            // Running as root: the permission bits do not deny us, so there is
-            // no unreadable state to assert against.
-            return;
-        }
-        assert!(
-            store.verify(&hex::decode(&token).unwrap()),
-            "an EACCES store must not lock out already-paired devices"
+        let path = dir.path().join("credentials");
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let verifier = raw
+            .split("sha256:")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let output = format!(
+            "{minted:?} {:?} {:?}",
+            TokenStore::load(&path).unwrap(),
+            ReloadingTokenStore::load(path).unwrap()
         );
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(store.len(), 2, "the retry lands once the file is readable");
-    }
-
-    #[test]
-    fn an_unchanged_store_is_stated_but_not_re_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens");
-        let token = mint_token(&path).unwrap();
-        let store = ReloadingTokenStore::load(path.clone()).unwrap();
-
-        let presented = hex::decode(&token).unwrap();
-        for _ in 0..8 {
-            assert!(store.verify(&presented));
-        }
-        assert_eq!(
-            store.reloads(),
-            0,
-            "an untouched store costs one stat per connection and no read"
-        );
-
-        mint_token(&path).unwrap();
-        assert!(store.verify(&presented));
-        assert_eq!(
-            store.reloads(),
-            1,
-            "a changed store is re-read exactly once"
-        );
-        assert!(store.verify(&presented));
-        assert_eq!(store.reloads(), 1, "and not again while it stays put");
+        assert!(!output.contains(minted.secret()));
+        assert!(!output.contains(verifier));
+        assert!(output.contains("[REDACTED]"));
     }
 }

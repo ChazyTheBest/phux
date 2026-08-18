@@ -202,6 +202,7 @@ pub(crate) fn run_pair(
     host: Option<String>,
     name: Option<String>,
     json: bool,
+    migrate_legacy: bool,
 ) -> ExitCode {
     let tokens = tokens
         .or_else(|| std::env::var_os("PHUX_WS_TOKENS").map(PathBuf::from))
@@ -212,6 +213,10 @@ pub(crate) fn run_pair(
         .unwrap_or_else(phux_server::transport::tls::default_cert_path);
     let key = std::env::var_os("PHUX_WS_TLS_KEY")
         .map_or_else(phux_server::transport::tls::default_key_path, PathBuf::from);
+
+    if migrate_legacy && !migrate_legacy_credentials(&tokens) {
+        return ExitCode::FAILURE;
+    }
 
     // Address resolution comes FIRST, before the certificate is provisioned,
     // because SANs can only be chosen at generation time (phux-q9a0,
@@ -327,6 +332,19 @@ pub(crate) fn run_pair(
 
     outln!("Token written to {}", tokens.display());
     ExitCode::SUCCESS
+}
+
+fn migrate_legacy_credentials(tokens: &std::path::Path) -> bool {
+    match phux_server::auth::migrate_legacy_store(tokens) {
+        Ok(count) => {
+            eprintln!("phux pair: migrated {count} legacy credential(s) to the versioned store");
+            true
+        }
+        Err(err) => {
+            eprintln!("phux pair: failed to migrate legacy credentials: {err}");
+            false
+        }
+    }
 }
 
 /// Emit the machine-readable pairing document.

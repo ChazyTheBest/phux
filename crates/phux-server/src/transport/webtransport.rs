@@ -35,7 +35,6 @@ use std::time::Duration;
 use bytes::BytesMut;
 use phux_protocol::policy::{PeerIdentity, TransportType};
 use phux_protocol::wire::framing;
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use wtransport::endpoint::{IncomingSession, SessionRequest};
 use wtransport::error::StreamReadExactError;
@@ -261,11 +260,8 @@ impl Incoming for WtListener {
 /// <hex>` header (native consumers, exactly the `wss://` shape) or a
 /// `token=<hex>` query parameter on the `:path` (browsers — the JS
 /// `WebTransport` constructor takes a URL and nothing else). Returns a
-/// non-reversible device id (a short SHA-256 prefix of the *presented*
-/// token, matching the WebSocket and QUIC paths) on success, `None` on a
-/// missing, malformed, or unrecognized token. Deriving the id from the
-/// presented token (not the matched stored one) keeps it off the
-/// constant-time comparison and never logs the secret.
+/// stable credential id on success, `None` on a missing, malformed, or
+/// unrecognized token.
 fn authorize_request(
     request: &SessionRequest,
     store: &crate::auth::ReloadingTokenStore,
@@ -273,11 +269,7 @@ fn authorize_request(
     let token_hex =
         bearer_from_headers(request.headers()).or_else(|| token_from_path(request.path()))?;
     let token = hex::decode(token_hex.trim()).ok()?;
-    if !store.verify(&token) {
-        return None;
-    }
-    let digest = Sha256::digest(&token);
-    Some(hex::encode(&digest[..8]))
+    store.authenticate(&token).map(|credential| credential.id)
 }
 
 /// The `Bearer` value of an `Authorization` header, matched
@@ -317,7 +309,6 @@ async fn read_exact_wt(recv: &mut RecvStream, buf: &mut [u8]) -> io::Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::time::Duration;
 
     use super::super::tls::ensure_self_signed;
@@ -344,8 +335,8 @@ mod tests {
         tempfile::NamedTempFile,
         Arc<crate::auth::ReloadingTokenStore>,
     ) {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "{}", hex::encode(TEST_TOKEN)).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        crate::auth::write_test_credential(file.path(), &TEST_TOKEN);
         let store = crate::auth::ReloadingTokenStore::load(file.path().to_path_buf()).unwrap();
         (file, Arc::new(store))
     }

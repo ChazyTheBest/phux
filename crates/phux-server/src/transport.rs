@@ -37,7 +37,6 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use phux_protocol::policy::{PeerIdentity, TransportType};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UnixListener};
@@ -614,9 +613,8 @@ enum PeerRejectionWarnDecision {
 }
 
 /// Extract and verify the `Authorization: Bearer <hex>` pairing token from a
-/// WebSocket upgrade request. Returns a non-reversible device id (a short
-/// SHA-256 prefix of the *presented* token) on success, `None` on a missing,
-/// malformed, or unrecognized token.
+/// WebSocket upgrade request. Returns the stable credential id on success,
+/// `None` on a missing, malformed, or unrecognized token.
 fn authorize_request(req: &Request, store: &crate::auth::ReloadingTokenStore) -> Option<String> {
     let header = req.headers().get("authorization")?.to_str().ok()?;
     let token_hex = header
@@ -624,14 +622,7 @@ fn authorize_request(req: &Request, store: &crate::auth::ReloadingTokenStore) ->
         .or_else(|| header.strip_prefix("bearer "))?
         .trim();
     let token = hex::decode(token_hex).ok()?;
-    if !store.verify(&token) {
-        return None;
-    }
-    // Device id is derived from the presented token (not from which stored
-    // token matched), so deriving it never branches on the constant-time
-    // comparison and never logs the secret itself.
-    let digest = Sha256::digest(&token);
-    Some(hex::encode(&digest[..8]))
+    store.authenticate(&token).map(|credential| credential.id)
 }
 
 /// The HTTP 401 the handshake returns when the pairing token is absent or
@@ -647,7 +638,6 @@ fn unauthorized_response() -> ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::sync::Arc;
 
     use tokio::net::TcpStream;
@@ -662,9 +652,9 @@ mod tests {
     /// The `NamedTempFile` is returned, not dropped: the store re-reads it on
     /// every connection (phux-0d92), so deleting it would revoke every token.
     async fn token_listener() -> (WsListener, SocketAddr, String, tempfile::NamedTempFile) {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
         let token_hex = hex::encode(TEST_TOKEN);
-        writeln!(file, "{token_hex}").unwrap();
+        crate::auth::write_test_credential(file.path(), &TEST_TOKEN);
         let store = crate::auth::ReloadingTokenStore::load(file.path().to_path_buf()).unwrap();
 
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -708,10 +698,9 @@ mod tests {
 
         let ((got, peer), ()) = tokio::join!(server, client);
         assert_eq!(got.unwrap().as_ref(), frame.as_slice(), "frame round-trips");
-        let expected_device = hex::encode(&Sha256::digest(TEST_TOKEN)[..8]);
         assert_eq!(peer.transport, TransportType::WebSocket);
         assert_eq!(peer.source_addr, Some(addr.ip()));
-        assert_eq!(peer.mcp_host_key.as_deref(), Some(expected_device.as_str()));
+        assert_eq!(peer.mcp_host_key.as_deref(), Some("test-credential"));
         assert_eq!(peer.uid, 0);
         assert_eq!(peer.pid, None);
         assert_eq!(peer.exe_path, None);
@@ -820,8 +809,9 @@ mod tests {
     /// this is the promise as a test.
     #[tokio::test]
     async fn a_token_minted_after_bind_upgrades_without_a_restart() {
-        let (listener, addr, _token_hex, mut tokens) = token_listener().await;
-        let paired = hex::encode([0x33u8; crate::auth::TOKEN_LEN]);
+        let (listener, addr, _token_hex, tokens) = token_listener().await;
+        let paired_bytes = [0x33u8; crate::auth::TOKEN_LEN];
+        let paired = hex::encode(paired_bytes);
 
         // Before pairing, the device is a stranger.
         let refused = async {
@@ -832,10 +822,9 @@ mod tests {
         assert!(server_res.is_err(), "unpaired device is refused");
         assert!(client_res.is_err());
 
-        // `phux pair` appends the token to the store the server is already
+        // `phux pair` atomically updates the store the server is already
         // serving from. Nothing restarts.
-        writeln!(tokens, "{paired}").unwrap();
-        tokens.flush().unwrap();
+        crate::auth::write_test_credential(tokens.path(), &paired_bytes);
 
         let accepted = async {
             let tcp = TcpStream::connect(addr).await.unwrap();
@@ -858,7 +847,7 @@ mod tests {
     async fn a_revoked_token_is_refused_without_a_restart() {
         let (listener, addr, token_hex, tokens) = token_listener().await;
 
-        std::fs::write(tokens.path(), "# every device revoked\n").unwrap();
+        crate::auth::revoke_credential(tokens.path(), "test-credential").unwrap();
 
         let refused = async {
             let tcp = TcpStream::connect(addr).await.unwrap();

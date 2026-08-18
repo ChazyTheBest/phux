@@ -35,7 +35,6 @@ use std::time::Duration;
 use bytes::BytesMut;
 use phux_protocol::policy::{PeerIdentity, TransportType};
 use phux_protocol::wire::framing;
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use super::tls::quic_server_config;
@@ -250,11 +249,8 @@ impl Incoming for QuicListener {
 }
 
 /// Read the token preamble (`len: u32 BE` + `len` token bytes) off the stream
-/// and verify it against the store. Returns a non-reversible device id (a short
-/// SHA-256 prefix of the *presented* token, matching the WebSocket path) on
-/// success, or `None` on a missing, oversized, malformed, or unrecognized
-/// token. Deriving the id from the presented token (not the matched stored one)
-/// keeps it off the constant-time comparison and never logs the secret.
+/// and verify it against the store. Returns the stable credential id on
+/// success, or `None` on a missing, oversized, malformed, or unrecognized token.
 pub(crate) async fn authorize_preamble(
     recv: &mut quinn::RecvStream,
     store: &crate::auth::ReloadingTokenStore,
@@ -271,11 +267,7 @@ pub(crate) async fn authorize_preamble(
     if !read_exact_quic(recv, &mut token).await.ok()? {
         return None;
     }
-    if !store.verify(&token) {
-        return None;
-    }
-    let digest = Sha256::digest(&token);
-    Some(hex::encode(&digest[..8]))
+    store.authenticate(&token).map(|credential| credential.id)
 }
 
 /// Fill `buf` from the QUIC stream. Returns `Ok(true)` when `buf` is filled,
@@ -295,7 +287,6 @@ async fn read_exact_quic(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::time::Duration;
 
     use super::super::tls::{QUIC_ALPN, ensure_self_signed};
@@ -318,8 +309,8 @@ mod tests {
         tempfile::NamedTempFile,
         Arc<crate::auth::ReloadingTokenStore>,
     ) {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "{}", hex::encode(TEST_TOKEN)).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        crate::auth::write_test_credential(file.path(), &TEST_TOKEN);
         let store = crate::auth::ReloadingTokenStore::load(file.path().to_path_buf()).unwrap();
         (file, Arc::new(store))
     }

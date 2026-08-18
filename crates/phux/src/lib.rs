@@ -924,7 +924,8 @@ pub fn run() -> ExitCode {
             host,
             name,
             json,
-        }) => commands::pair::run_pair(tokens, cert, qr, host, name, json),
+            migrate_legacy,
+        }) => commands::pair::run_pair(tokens, cert, qr, host, name, json, migrate_legacy),
         Some(Command::Completion { shell }) => commands::completion::run_completion(shell),
         // Returned above, before process-global setup.
         Some(Command::Mcp { .. }) => ExitCode::FAILURE,

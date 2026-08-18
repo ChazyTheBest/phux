@@ -1423,18 +1423,17 @@ pub(crate) enum Command {
     ///
     /// Remote consumers (e.g. the native mobile app) attach over `wss://`
     /// without an SSH tunnel: TLS encrypts the link and an opaque bearer
-    /// token authenticates the device. This mints one token into the store
+    /// credential authenticates the device. This mints one credential into the store
     /// the server reads (`PHUX_WS_TOKENS`) and prints it once alongside the
     /// server certificate's SHA-256 fingerprint. Pair both into the device:
-    /// the token is the credential, and verifying the fingerprint on first
-    /// connect defeats a man-in-the-middle. Revoke a device by deleting its
-    /// line from the token file. When an overlay network address
+    /// the bearer secret is shown only once, and verifying the fingerprint on
+    /// first connect defeats a man-in-the-middle. When an overlay network address
     /// (Tailscale/WireGuard) is detected, it is printed alongside the
     /// credentials.
     ///
     /// This never contacts a running server — it only writes the token file.
     Pair {
-        /// Token store to append to. Defaults to `PHUX_WS_TOKENS`.
+        /// Versioned credential store to update. Defaults to `PHUX_WS_TOKENS`.
         #[arg(long, value_name = "PATH")]
         tokens: Option<std::path::PathBuf>,
 
@@ -1469,6 +1468,11 @@ pub(crate) enum Command {
         /// over ssh.
         #[arg(long)]
         json: bool,
+
+        /// Explicitly convert legacy anonymous token lines before pairing.
+        /// Conversion preserves each bearer secret but stores only its verifier.
+        #[arg(long)]
+        migrate_legacy: bool,
     },
 
     /// Register the machines phux talks to: remotes and satellites.

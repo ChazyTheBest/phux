@@ -648,8 +648,13 @@ overrides the token-store path.
   attack surface than local UDS. A routable `--listen` address engages TLS and
   token auth automatically; `PHUX_WS_SECURE=1` only forces that path on loopback.
 - The token is a bearer credential — anyone holding it is the device until the
-  token is revoked. The store is owner-only (`0o600`); the comparison is
-  constant-time; tokens are 256-bit from the OS CSPRNG. A client certificate
+  token is revoked. The versioned store is owner-only (`0o600`) and retains only
+  a verifier plus credential id, principal, terminal-only scope, lifecycle
+  timestamps, and rotation generation; bearer secrets are never persisted.
+  Legacy anonymous token lines require the explicit `phux pair
+  --migrate-legacy` conversion. Comparison is constant-time; tokens are 256-bit
+  from the OS CSPRNG. Revocation affects new connections while an established
+  session survives until its transport drops. A client certificate
   (mutual TLS) is the stronger v0.2 hardening recorded in ADR-0031.
 - Certificate lifecycle is an operator responsibility, like socket permissions.
   With a self-signed certificate, verifying the `phux pair` fingerprint on the

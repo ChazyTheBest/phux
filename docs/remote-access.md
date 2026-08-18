@@ -75,9 +75,10 @@ to do when it cannot reach the host.
 ## Common steps: pair, then listen
 
 Every path below shares the same server-side setup, done once. Pairing order
-does not matter: the server re-reads the token store when it changes, so a
+does not matter: the server re-reads the credential store when it changes, so a
 token minted against an already-running listener works at the next connection
-attempt, and deleting a line revokes that device just as promptly. `phux pair`
+attempt, and credential revocation applies just as promptly. Legacy anonymous
+token lines require a one-time explicit `phux pair --migrate-legacy`. `phux pair`
 never contacts a running server, and it provisions the self-signed certificate
 if none exists yet, so the fingerprint it prints is the one the server will
 present.

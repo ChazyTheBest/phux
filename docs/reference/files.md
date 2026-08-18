@@ -52,7 +52,7 @@ $XDG_STATE_HOME/<profile-dir>/
 ├── onboarding.lock     # serializes first-use moment delivery
 ├── remote-cert.pem     # auto-provisioned remote-consumer certificate
 ├── remote-key.pem      # its private key (owner-only, 0600)
-└── remote-tokens       # pairing-token store (owner-only, 0600)
+└── remote-tokens       # structured credential store (owner-only, 0600)
 ```
 
 - `server.log` is the canonical server log regardless of how the server was started: the auto-spawn path redirects the daemon's stderr here, and the service unit points its log capture at the same file. `phux logs` and `phux service logs` read it; `PHUX_LOG` tees the server's structured log to an additional file without moving this one. Whenever it exceeds 8 MiB it is rolled aside to `server.log.1` (older generations shifting to `.2`, `.3`, `.4`, oldest dropped), checked at server start and again periodically for as long as the server runs -- so one very long-lived server is bounded the same as many short-lived ones. Rotation truncates the live file in place rather than replacing it, so a `tail -f` or the OS-redirected stdio a service-managed server writes through keeps working across it.
@@ -60,7 +60,7 @@ $XDG_STATE_HOME/<profile-dir>/
 - `client-<pid>.log` is where an interactive client writes its trace — the TUI owns the alt screen, so the client never logs to stderr. `PHUX_LOG` redirects it. Log files are created mode `0600`.
 - `onboarding.json` records only the versioned first-use journey stage. `onboarding.lock` serializes delivery within that profile. State is best-effort: missing state starts the guidance, while unreadable, unknown, or unwritable state stays quiet and never prevents attach.
 - `remote-cert.pem` / `remote-key.pem` are the self-signed TLS pair auto-provisioned for remote consumers (ADR-0031); `PHUX_WS_TLS_CERT` / `PHUX_WS_TLS_KEY` substitute an operator-supplied pair. A complete pair is never regenerated, so the pinned fingerprint stays stable -- which also means its subjectAltName set is fixed at generation (ADR-0091); `phux doctor` reports whether it names the address phux advertises.
-- `remote-tokens` is the pairing-token store the server reads and `phux pair` appends to; `PHUX_WS_TOKENS` moves it.
+- `remote-tokens` is the versioned verifier-only credential store the server reads and `phux pair` updates atomically; `PHUX_WS_TOKENS` moves it. Legacy anonymous token lines require `phux pair --migrate-legacy`.
 
 ## Design intent (not yet implemented)
 
