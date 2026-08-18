@@ -57,7 +57,7 @@ build:
 
 # Release build with full LTO.
 build-release:
-    cargo build --workspace --release
+    cargo build --locked --workspace --release
 
 # Build the current checkout and atomically install its developer binaries.
 # The binaries live in Cargo's bin dir, matching normal source installs. Keep

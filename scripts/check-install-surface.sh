@@ -112,6 +112,7 @@ require_fixed scripts/test-install.sh 'installer transaction tests passed'
 
 require_fixed justfile "release-preflight TAG:"
 require_fixed justfile "release-preflight-fast TAG:"
+require_fixed justfile "cargo build --locked --workspace --release"
 require_fixed justfile "cargo publish --locked --dry-run -p phux-protocol"
 require_fixed justfile "cargo publish --locked -p phux-protocol"
 require_fixed scripts/release-preflight.sh "cargo publish --locked --dry-run --allow-dirty -p phux-protocol"
@@ -129,6 +130,7 @@ require_fixed scripts/gen-formula.sh 'depends_on arch: :arm64'
 forbid_fixed scripts/gen-formula.sh 'x86_64-apple-darwin'
 
 require_fixed .github/workflows/release.yml 'cargo +1.90.0 build --locked --release --bin phux --bin phux-mcp'
+require_fixed docs/RELEASING.md 'cargo build --locked --release --bin phux --bin phux-mcp'
 require_fixed .github/workflows/release.yml 'cp -f target/release/phux target/release/phux-mcp'
 require_fixed .github/workflows/release.yml 'target: aarch64-apple-darwin'
 require_fixed .github/workflows/release.yml 'target: x86_64-unknown-linux-gnu'
