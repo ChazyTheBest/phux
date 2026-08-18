@@ -931,9 +931,10 @@ fn report_policy_reach(manager: Manager, unit_path: &Path, live: bool) {
 /// phux-bd30's "have `phux update` do it" waited on phux-l1yx rather than
 /// shipping first.
 ///
-/// Silent unless it changed something, and never fatal: an update that
-/// succeeded must not report failure because a unit could not be tidied.
-pub(crate) fn reconcile_after_update() {
+/// Silent unless it changed something and `print` is true, and never fatal: an
+/// update that succeeded must not report failure because a unit could not be
+/// tidied.
+pub(crate) fn reconcile_after_update(print: bool) {
     let Some(manager) = Manager::host() else {
         return;
     };
@@ -947,6 +948,10 @@ pub(crate) fn reconcile_after_update() {
         return;
     };
     if std::fs::write(&unit_path, &patched).is_err() {
+        return;
+    }
+
+    if !print {
         return;
     }
 

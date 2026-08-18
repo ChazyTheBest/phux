@@ -653,7 +653,7 @@ pub(crate) fn ensure_server(
     // to acquire the lock is never fatal: falling through to an unserialised
     // spawn is exactly the old behaviour, and the server's own bind-time
     // probe still rejects a duplicate.
-    let guard = SpawnLock::acquire(&socket::spawn_lock_path());
+    let guard = SpawnLock::acquire(&socket::spawn_lock_path(socket_path));
 
     // Re-probe under the lock. Whoever held it before us most likely spawned
     // the server we were about to duplicate.
