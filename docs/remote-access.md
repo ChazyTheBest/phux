@@ -113,9 +113,10 @@ fingerprint is SHA-256, 64 hex digits, optionally colon-separated.
 Keep the non-secret credential ID for lifecycle operations. Rotation prints a
 new bearer once and keeps the previous generation valid for at most five
 minutes by default; `--overlap-seconds 0` cuts over immediately. An existing
-absolute expiry is preserved and can shorten that overlap. Revocation affects
-new connections immediately, while already-established sessions continue until
-they disconnect:
+absolute expiry is preserved and can shorten that overlap. An already-expired
+credential cannot be rotated and produces no replacement token. Revocation
+affects new connections immediately, while already-established sessions
+continue until they disconnect:
 
 ```sh
 phux pair rotate <credential-id> --overlap-seconds 300

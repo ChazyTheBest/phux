@@ -90,6 +90,31 @@ fn custom_store_mint_rotate_revoke_is_operational_and_secret_safe() {
 }
 
 #[test]
+fn expired_rotation_emits_no_secret_and_leaves_the_store_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let tokens = dir.path().join("custom-credentials");
+    let minted = json(&phux(&state, Some(&tokens), &["pair", "--json"]));
+    let id = minted["credential_id"].as_str().unwrap().to_owned();
+
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&tokens).unwrap()).unwrap();
+    store["credentials"][0]["expires_at"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&tokens, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+    let before = std::fs::read(&tokens).unwrap();
+
+    let denied = phux(&state, Some(&tokens), &["pair", "rotate", &id, "--json"]);
+    assert!(!denied.status.success());
+    assert!(
+        denied.stdout.is_empty(),
+        "failed JSON action emits no document"
+    );
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("expired"));
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains("token"));
+    assert_eq!(std::fs::read(&tokens).unwrap(), before);
+}
+
+#[test]
 fn default_and_environment_selected_stores_refuse_unsafe_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");

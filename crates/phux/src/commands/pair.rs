@@ -22,7 +22,8 @@ pub(crate) enum PairAction {
         credential_id: String,
 
         /// Seconds the previous generation remains valid. Its existing
-        /// absolute expiry still wins when it is sooner.
+        /// absolute expiry still wins when it is sooner; an already-expired
+        /// credential cannot be rotated.
         #[arg(
             long,
             default_value_t = DEFAULT_ROTATION_OVERLAP_SECONDS,

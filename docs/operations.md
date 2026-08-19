@@ -598,8 +598,10 @@ TCP/WebSocket, set it either with `phux server --listen HOST:PORT` or the
   certificate's SHA-256 fingerprint to pin out-of-band. The output also names
   the non-secret credential ID accepted by `phux pair rotate ID` and `phux pair
   revoke ID`. Pairing, rotation, and revocation take effect at the next
-  connection attempt, with no restart: the server
-  re-reads the token store whenever the file changes. An already-established
+  connection attempt, with no restart: the server re-reads the token store
+  whenever the file changes. If that changed generation is malformed, fails
+  integrity checks, or cannot settle during bounded retries, new admissions
+  fail closed rather than using cached credentials. An already-established
   session is not re-authorized and survives revocation until it drops.
 
 Native clients can use the same TCP fallback with:
@@ -670,8 +672,9 @@ overrides the token-store path.
   session survives until its transport drops. Rotation defaults to a 300-second
   overlap, configurable with `--overlap-seconds`; an existing absolute expiry
   is preserved for the new generation and can shorten the old generation's
-  overlap. A client certificate
-  (mutual TLS) is the stronger v0.2 hardening recorded in ADR-0031.
+  overlap. An already-expired credential cannot be rotated, and no replacement
+  secret is generated or printed for that rejected operation. A client
+  certificate (mutual TLS) is the stronger v0.2 hardening recorded in ADR-0031.
 - Certificate lifecycle is an operator responsibility, like socket permissions.
   With a self-signed certificate, verifying the `phux pair` fingerprint on the
   device's first connect is what closes the trust-on-first-use MITM window.

@@ -57,6 +57,9 @@ pub enum AuthError {
     /// Rotation cannot reactivate a credential that has already been revoked.
     #[error("credential {0} is revoked")]
     CredentialRevoked(String),
+    /// Rotation cannot issue another generation after absolute expiry.
+    #[error("credential {0} is expired")]
+    CredentialExpired(String),
     /// The store changed during every bounded stable-read attempt.
     #[error("credential store changed during {STABLE_READ_ATTEMPTS} consecutive reads")]
     UnstableStore,
@@ -486,7 +489,9 @@ impl ReloadingTokenStore {
             Ok(stamp) => stamp,
             Err(error) => {
                 tracing::warn!(path = %self.path.display(), %error, "credential store integrity check failed; denying authentication");
-                return f(&TokenStore::default());
+                cached.stamp = None;
+                cached.store = TokenStore::default();
+                return f(&cached.store);
             }
         };
         if stamp != cached.stamp {
@@ -499,11 +504,11 @@ impl ReloadingTokenStore {
                 Err(error) => {
                     tracing::warn!(
                         path = %self.path.display(), %error,
-                        "credential store unreadable; keeping last known-good generation"
+                        "changed credential store could not be loaded; denying authentication"
                     );
-                    if matches!(error, AuthError::InsecureStore(_)) {
-                        return f(&TokenStore::default());
-                    }
+                    cached.stamp = None;
+                    cached.store = TokenStore::default();
+                    return f(&cached.store);
                 }
             }
         }
@@ -540,6 +545,15 @@ impl ReloadingTokenStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reloads
+    }
+
+    #[cfg(test)]
+    fn cached_is_empty(&self) -> bool {
+        self.cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store
+            .is_empty()
     }
 }
 
@@ -636,6 +650,9 @@ fn rotate_credential_at(
         .ok_or_else(|| AuthError::CredentialNotFound(id.to_owned()))?;
     if latest.revoked_at.is_some() {
         return Err(AuthError::CredentialRevoked(id.to_owned()));
+    }
+    if latest.expires_at.is_some_and(|expiry| now >= expiry) {
+        return Err(AuthError::CredentialExpired(id.to_owned()));
     }
     let overlap_until = now + overlap.max(Duration::zero());
     for record in file.credentials.iter_mut().filter(|record| record.id == id) {
@@ -1229,6 +1246,33 @@ mod tests {
     }
 
     #[test]
+    fn rotation_rejects_an_already_expired_credential_without_changing_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let now = Utc::now() + Duration::minutes(1);
+        let first = mint_credential(
+            &path,
+            Some("device:expired"),
+            &[TERMINAL_CONTROL_SCOPE.to_owned()],
+            Some(now - Duration::seconds(1)),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let result = rotate_credential_at(
+            &path,
+            &first.id,
+            Duration::minutes(5),
+            now,
+            AtomicWriteFault::None,
+        );
+
+        assert!(matches!(result, Err(AuthError::CredentialExpired(id)) if id == first.id));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(TokenStore::load(&path).unwrap().len(), 1);
+    }
+
+    #[test]
     fn insecure_store_types_permissions_and_ownership_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials");
@@ -1244,6 +1288,7 @@ mod tests {
             Err(AuthError::InsecureStore(_))
         ));
         assert!(!live.verify(&bearer), "reload fails closed on unsafe mode");
+        assert!(live.cached_is_empty(), "integrity failure clears the cache");
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(live.verify(&bearer), "repair restores authentication");
@@ -1508,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn reloads_new_generation_and_keeps_last_good_on_malformed_replacement() {
+    fn changed_malformed_generation_denies_instead_of_using_cached_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials");
         let first =
@@ -1519,8 +1564,37 @@ mod tests {
         assert!(store.verify(&secret(&second)));
         assert_eq!(store.reloads(), 1);
         fs::write(&path, "{broken").unwrap();
-        assert!(store.verify(&secret(&first)));
+        assert!(!store.verify(&secret(&first)));
+        assert!(store.cached_is_empty(), "malformed change clears the cache");
         assert_eq!(store.reloads(), 1, "failed reads do not commit a stamp");
+    }
+
+    #[test]
+    fn generation_unstable_through_all_retries_denies_cached_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let bearer = secret(&minted);
+        let store = ReloadingTokenStore::load(path.clone()).unwrap();
+
+        fs::write(&path, "{changed").unwrap();
+        let changing_path = path;
+        let accepted = store.with_current_observed(
+            move |attempt| {
+                let replacement = if attempt % 2 == 0 {
+                    "{changed-again"
+                } else {
+                    "{changed"
+                };
+                fs::write(&changing_path, replacement).unwrap();
+            },
+            |snapshot| snapshot.verify(&bearer),
+        );
+
+        assert!(!accepted, "unstable changed state cannot retain old access");
+        assert!(store.cached_is_empty(), "unstable change clears the cache");
+        assert_eq!(store.reloads(), 0);
     }
 
     #[test]

@@ -1551,7 +1551,7 @@ Arguments:
 
 Options:
       --overlap-seconds <SECONDS>
-          Seconds the previous generation remains valid. Its existing absolute expiry still wins when it is sooner
+          Seconds the previous generation remains valid. Its existing absolute expiry still wins when it is sooner; an already-expired credential cannot be rotated
 
           [default: 300]
 

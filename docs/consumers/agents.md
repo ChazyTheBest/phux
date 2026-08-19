@@ -1669,8 +1669,10 @@ operation document with `operation: "rotate"`, `credential_id`, the new
 pair revoke CREDENTIAL_ID --json` emits `operation: "revoke"`,
 `credential_id`, and `tokens_path`; it never emits any bearer token. Rotation
 keeps prior generations valid only for the requested overlap and never beyond
-their existing absolute expiry. Revocation and rotation affect new connections;
-an established session retains its admission until it disconnects.
+their existing absolute expiry. An already-expired credential is rejected
+before a replacement token is generated, so failed rotation emits no JSON
+document or secret. Revocation and rotation affect new connections; an
+established session retains its admission until it disconnects.
 
 ## 5. The read-act-wait loop and exit-code mirroring
 
