@@ -388,7 +388,7 @@ impl ReloadingTokenStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stamp = Stamp::probe(&self.path);
-        if stamp.is_none() || stamp != cached.stamp {
+        if stamp != cached.stamp {
             match TokenStore::load(&self.path) {
                 Ok(store) => {
                     cached.stamp = stamp;
@@ -1100,6 +1100,39 @@ mod tests {
             assert!(store.verify(&bearer));
         }
         assert_eq!(store.reloads(), 0);
+    }
+
+    #[test]
+    fn missing_generation_is_cached_while_creation_and_deletion_are_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let store = ReloadingTokenStore::load(path.clone()).unwrap();
+        let absent_bearer = [0x55; TOKEN_LEN];
+
+        for _ in 0..8 {
+            assert!(!store.verify(&absent_bearer));
+        }
+        assert_eq!(
+            store.reloads(),
+            0,
+            "an unchanged missing generation is not re-read"
+        );
+
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let bearer = secret(&minted);
+        assert!(store.verify(&bearer), "later store creation is discovered");
+        assert_eq!(store.reloads(), 1);
+
+        fs::remove_file(&path).unwrap();
+        assert!(!store.verify(&bearer), "store deletion revokes credentials");
+        assert_eq!(store.reloads(), 2);
+        assert!(!store.verify(&bearer));
+        assert_eq!(
+            store.reloads(),
+            2,
+            "the missing generation after deletion is cached too"
+        );
     }
 
     #[test]
