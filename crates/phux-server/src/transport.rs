@@ -653,8 +653,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use phux_protocol::PROTOCOL_VERSION;
+    use phux_protocol::caps::ClientCapabilities;
+    use phux_protocol::wire::frame::{AttachTarget, FrameKind, ViewportInfo};
     use tokio::net::TcpStream;
+    use tokio::task::LocalSet;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_util::sync::CancellationToken;
 
     const TEST_TOKEN: [u8; crate::auth::TOKEN_LEN] = [0x11; crate::auth::TOKEN_LEN];
 
@@ -880,40 +885,168 @@ mod tests {
         assert!(client_res.is_err());
     }
 
-    #[tokio::test]
-    async fn established_connection_survives_revocation_but_reconnect_is_denied() {
-        let (listener, addr, token_hex, tokens) = token_listener().await;
-        let frame: Vec<u8> = vec![0, 0, 0, 3, 0xde, 0xad, 0xbe];
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear end-to-end connection lifecycle is clearer than stateful test helpers"
+    )]
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_attached_session_survives_revocation_then_cleans_up() {
+        LocalSet::new()
+            .run_until(async {
+                let (listener, addr, token_hex, tokens) = token_listener().await;
+                let state = crate::state::SharedState::new();
+                let root_token = CancellationToken::new();
+                crate::runtime::commands::seed_session_with_actor(
+                    &state,
+                    "authenticated",
+                    100,
+                    &root_token,
+                )
+                .expect("seed attached-session target");
 
-        let accept = listener.accept();
-        let connect = async {
-            let tcp = TcpStream::connect(addr).await.unwrap();
-            tokio_tungstenite::client_async(bearer_request(addr, &token_hex), tcp)
+                let accept_state = state.clone();
+                let accept_token = root_token.clone();
+                let accept_task = tokio::task::spawn_local(async move {
+                    crate::runtime::client::accept_loop(&listener, accept_state, accept_token, None)
+                        .await
+                });
+
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                let (mut client, _) =
+                    tokio_tungstenite::client_async(bearer_request(addr, &token_hex), tcp)
+                        .await
+                        .expect("initial credential is admitted");
+                let encode = |frame: FrameKind| {
+                    let mut encoded = BytesMut::new();
+                    frame.encode(&mut encoded);
+                    Message::Binary(encoded.to_vec())
+                };
+                client
+                    .send(encode(FrameKind::Hello {
+                        client_name: "authenticated-runtime-test".to_owned(),
+                        protocol_major: PROTOCOL_VERSION.major,
+                        protocol_minor: PROTOCOL_VERSION.minor,
+                        protocol_patch: PROTOCOL_VERSION.patch,
+                        client_caps: ClientCapabilities::default(),
+                    }))
+                    .await
+                    .unwrap();
+                client
+                    .send(encode(FrameKind::Attach {
+                        attach_id: 1,
+                        target: AttachTarget::ByName("authenticated".to_owned()),
+                        viewport: ViewportInfo::new(80, 24),
+                        request_scrollback: false,
+                        scrollback_limit_lines: 0,
+                    }))
+                    .await
+                    .unwrap();
+
+                let mut got_attached = false;
+                let mut got_bootstrap = false;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !(got_attached && got_bootstrap) {
+                        let Some(Ok(Message::Binary(data))) = client.next().await else {
+                            continue;
+                        };
+                        match FrameKind::decode(&data).expect("decode runtime frame").0 {
+                            FrameKind::Attached { .. } => got_attached = true,
+                            FrameKind::BootstrapBegin { .. } => got_bootstrap = true,
+                            _ => {}
+                        }
+                    }
+                })
                 .await
-                .expect("initial credential is admitted")
-                .0
-        };
-        let (accepted, mut client) = tokio::join!(accept, connect);
-        let (mut reader, _writer, identity) = accepted.unwrap();
-        assert_eq!(identity.credential.as_ref().unwrap().id, "test-credential");
+                .expect("authenticated client attaches through handle_client");
 
-        client.send(Message::Binary(frame.clone())).await.unwrap();
-        assert_eq!(
-            reader.read_frame().await.unwrap().unwrap().as_ref(),
-            frame.as_slice()
-        );
+                let client_id = state.with(|server| {
+                    assert_eq!(server.attached().len(), 1);
+                    assert!(
+                        server.idle_since().is_none(),
+                        "accept loop records the live authenticated connection"
+                    );
+                    *server.attached().keys().next().unwrap()
+                });
+                let credential = state.with(|server| {
+                    server
+                        .authenticated_credential(client_id)
+                        .cloned()
+                        .expect("accept loop retains credential attestation")
+                });
+                assert_eq!(credential.id, "test-credential");
+                assert_eq!(credential.principal, "test-principal");
+                assert_eq!(credential.scopes, [crate::auth::TERMINAL_CONTROL_SCOPE]);
+                assert_eq!(credential.generation, 1);
+                assert!(credential.expires_at.is_none());
 
-        crate::auth::revoke_credential(tokens.path(), "test-credential").unwrap();
-        client.send(Message::Binary(frame.clone())).await.unwrap();
-        assert_eq!(
-            reader.read_frame().await.unwrap().unwrap().as_ref(),
-            frame.as_slice(),
-            "established transport is not re-authorized"
-        );
+                crate::auth::revoke_credential(tokens.path(), "test-credential").unwrap();
 
-        let reconnect = bearer_request(addr, &token_hex);
-        let (_server_error, response) = refused_handshake(&listener, addr, reconnect).await;
-        assert_generic_unauthorized(response);
+                // VIEWPORT_RESIZE is meaningful only to an attached client. Its
+                // state change proves the established runtime session remains
+                // operational without re-authorizing after revocation.
+                let resized = ViewportInfo::new(97, 31);
+                client
+                    .send(encode(FrameKind::ViewportResize { viewport: resized }))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let updated = state.with(|server| {
+                            server
+                                .attached()
+                                .get(&client_id)
+                                .and_then(|attached| attached.viewport.as_ref())
+                                == Some(&resized)
+                        });
+                        if updated {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("revoked established session processes attached operation");
+                assert_eq!(
+                    state.with(|server| server.authenticated_credential(client_id).cloned()),
+                    Some(credential),
+                    "revocation does not erase the established attestation"
+                );
+
+                let reconnect_tcp = TcpStream::connect(addr).await.unwrap();
+                let reconnect = tokio_tungstenite::client_async(
+                    bearer_request(addr, &token_hex),
+                    reconnect_tcp,
+                )
+                .await
+                .expect_err("revoked credential cannot reconnect");
+                assert_generic_unauthorized(reconnect);
+
+                client.close(None).await.unwrap();
+                drop(client);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let cleaned = state.with(|server| {
+                            !server.attached().contains_key(&client_id)
+                                && server.peer_identity(client_id).is_none()
+                                && server.authenticated_credential(client_id).is_none()
+                                && server.idle_since().is_some()
+                        });
+                        if cleaned {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("connection close cleans attachment and credential state");
+
+                root_token.cancel();
+                accept_task
+                    .await
+                    .expect("accept-loop task")
+                    .expect("accept loop shuts down cleanly");
+            })
+            .await;
     }
 
     #[test]
