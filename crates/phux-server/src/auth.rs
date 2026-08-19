@@ -27,6 +27,9 @@ pub fn default_token_store_path() -> PathBuf {
 pub const TOKEN_LEN: usize = 32;
 const STORE_VERSION: u32 = 1;
 const VERIFIER_PREFIX: &str = "sha256:";
+// One read plus two retries bounds each authentication attempt; a later
+// authentication retries again if writers keep replacing the store.
+const STABLE_READ_ATTEMPTS: usize = 3;
 
 /// The initial scope of an ordinary terminal pairing. Work-plane access is
 /// intentionally absent: ADR-0092 says existing terminal pairing is not
@@ -54,6 +57,9 @@ pub enum AuthError {
     /// Rotation cannot reactivate a credential that has already been revoked.
     #[error("credential {0} is revoked")]
     CredentialRevoked(String),
+    /// The store changed during every bounded stable-read attempt.
+    #[error("credential store changed during {STABLE_READ_ATTEMPTS} consecutive reads")]
+    UnstableStore,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -356,15 +362,12 @@ impl std::fmt::Debug for ReloadingTokenStore {
 }
 
 impl ReloadingTokenStore {
-    /// Wrap an already-loaded snapshot and its current file generation.
-    #[must_use]
-    pub fn new(path: PathBuf, initial: TokenStore) -> Self {
-        let stamp = Stamp::probe(&path);
+    const fn from_snapshot(path: PathBuf, stamp: Option<Stamp>, store: TokenStore) -> Self {
         Self {
             path,
             cached: std::sync::Mutex::new(Cached {
                 stamp,
-                store: initial,
+                store,
                 reloads: 0,
             }),
         }
@@ -372,8 +375,12 @@ impl ReloadingTokenStore {
 
     /// Load the current snapshot and begin tracking its file generation.
     pub fn load(path: PathBuf) -> Result<Self, AuthError> {
-        let store = TokenStore::load(&path)?;
-        Ok(Self::new(path, store))
+        Self::load_observed(path, |_| {})
+    }
+
+    fn load_observed(path: PathBuf, after_load: impl FnMut(usize)) -> Result<Self, AuthError> {
+        let (stamp, store) = stable_load_observed(&path, after_load)?;
+        Ok(Self::from_snapshot(path, stamp, store))
     }
 
     /// Path of the tracked credential store.
@@ -383,14 +390,22 @@ impl ReloadingTokenStore {
     }
 
     fn with_current<T>(&self, f: impl FnOnce(&TokenStore) -> T) -> T {
+        self.with_current_observed(|_| {}, f)
+    }
+
+    fn with_current_observed<T>(
+        &self,
+        after_load: impl FnMut(usize),
+        f: impl FnOnce(&TokenStore) -> T,
+    ) -> T {
         let mut cached = self
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stamp = Stamp::probe(&self.path);
         if stamp != cached.stamp {
-            match TokenStore::load(&self.path) {
-                Ok(store) => {
+            match stable_load_observed(&self.path, after_load) {
+                Ok((stamp, store)) => {
                     cached.stamp = stamp;
                     cached.store = store;
                     cached.reloads = cached.reloads.saturating_add(1);
@@ -435,6 +450,22 @@ impl ReloadingTokenStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reloads
     }
+}
+
+fn stable_load_observed(
+    path: &Path,
+    mut after_load: impl FnMut(usize),
+) -> Result<(Option<Stamp>, TokenStore), AuthError> {
+    for attempt in 0..STABLE_READ_ATTEMPTS {
+        let before = Stamp::probe(path);
+        let loaded = TokenStore::load(path);
+        after_load(attempt);
+        let after = Stamp::probe(path);
+        if before == after {
+            return loaded.map(|store| (after, store));
+        }
+    }
+    Err(AuthError::UnstableStore)
 }
 
 /// Mint a generation-one credential with terminal-only authority.
@@ -1132,6 +1163,65 @@ mod tests {
             store.reloads(),
             2,
             "the missing generation after deletion is cached too"
+        );
+    }
+
+    #[test]
+    fn stable_reads_reject_credentials_deleted_during_initialization_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let stale =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let stale_bearer = secret(&stale);
+
+        // Reproduce the initialization race deterministically: the first read
+        // sees the credential, then deletion lands before the generation probe
+        // that the old load-then-probe implementation cached beside it.
+        let init_path = path.clone();
+        let store = ReloadingTokenStore::load_observed(path.clone(), move |attempt| {
+            if attempt == 0 {
+                fs::remove_file(&init_path).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(store.is_empty());
+        assert!(!store.verify(&stale_bearer));
+        assert_eq!(store.reloads(), 0);
+
+        for _ in 0..8 {
+            assert!(!store.verify(&stale_bearer));
+        }
+        assert_eq!(store.reloads(), 0, "the stable absent result is cached");
+
+        let current =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let current_bearer = secret(&current);
+        assert!(
+            store.verify(&current_bearer),
+            "later creation is discovered"
+        );
+        assert_eq!(store.reloads(), 1);
+
+        // Force another reload, then delete after its first file read. The
+        // stable-read retry must commit the absent generation, not credentials
+        // from the now-deleted generation.
+        mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let reload_path = path;
+        let accepted = store.with_current_observed(
+            move |attempt| {
+                if attempt == 0 {
+                    fs::remove_file(&reload_path).unwrap();
+                }
+            },
+            |snapshot| snapshot.verify(&current_bearer),
+        );
+        assert!(!accepted, "reload cannot cache a deleted credential");
+        assert_eq!(store.reloads(), 2);
+        assert!(!store.verify(&current_bearer));
+        assert_eq!(
+            store.reloads(),
+            2,
+            "the absent generation produced by the retry remains cached"
         );
     }
 
