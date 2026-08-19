@@ -6,8 +6,8 @@
 //! owned by the follow-up authorization work, not this module.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -60,6 +60,9 @@ pub enum AuthError {
     /// The store changed during every bounded stable-read attempt.
     #[error("credential store changed during {STABLE_READ_ATTEMPTS} consecutive reads")]
     UnstableStore,
+    /// Credential stores must be regular, owner-only files owned by this user.
+    #[error("insecure credential store: {0}")]
+    InsecureStore(String),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,7 +186,7 @@ impl std::fmt::Debug for MintedCredential {
 }
 
 /// A parsed snapshot of the current structured credential store.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TokenStore {
     file: CredentialFile,
 }
@@ -200,11 +203,7 @@ impl TokenStore {
     /// Load a versioned store. Missing files are empty; legacy token lines are
     /// rejected until [`migrate_legacy_store`] is called explicitly.
     pub fn load(path: &Path) -> Result<Self, AuthError> {
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(err) => return Err(err.into()),
-        };
+        let raw = read_secure_store(path)?.unwrap_or_default();
         if raw.trim().is_empty() {
             return Ok(Self {
                 file: CredentialFile::default(),
@@ -276,6 +275,69 @@ impl TokenStore {
     }
 }
 
+fn validate_store_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), AuthError> {
+    validate_store_metadata_for_uid(path, metadata, rustix::process::geteuid().as_raw())
+}
+
+fn validate_store_metadata_for_uid(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+) -> Result<(), AuthError> {
+    if !metadata.file_type().is_file() {
+        return Err(AuthError::InsecureStore(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(AuthError::InsecureStore(format!(
+            "{} is owned by uid {}, expected effective uid {expected_uid}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(AuthError::InsecureStore(format!(
+            "{} has mode {:04o}; group and world permissions must be zero",
+            path.display(),
+            metadata.mode() & 0o777
+        )));
+    }
+    if metadata.mode() & 0o400 == 0 {
+        return Err(AuthError::InsecureStore(format!(
+            "{} has mode {:04o}; owner read permission is required",
+            path.display(),
+            metadata.mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
+fn read_secure_store(path: &Path) -> Result<Option<String>, AuthError> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if path_metadata.file_type().is_symlink() {
+        return Err(AuthError::InsecureStore(format!(
+            "{} is a symbolic link",
+            path.display()
+        )));
+    }
+    validate_store_metadata(path, &path_metadata)?;
+
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    validate_store_metadata(path, &input.metadata()?)?;
+    let mut raw = String::new();
+    input.read_to_string(&mut raw)?;
+    Ok(Some(raw))
+}
+
 fn validate_file(file: &CredentialFile) -> Result<(), AuthError> {
     if file.version != STORE_VERSION {
         return Err(AuthError::Malformed(format!(
@@ -321,18 +383,36 @@ struct Stamp {
     len: u64,
     dev: u64,
     ino: u64,
+    uid: u32,
+    mode: u32,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 impl Stamp {
-    fn probe(path: &Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = fs::metadata(path).ok()?;
-        Some(Self {
+    fn probe(path: &Path) -> Result<Option<Self>, AuthError> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(AuthError::InsecureStore(format!(
+                "{} is a symbolic link",
+                path.display()
+            )));
+        }
+        validate_store_metadata(path, &meta)?;
+        Ok(Some(Self {
             mtime: meta.modified().ok(),
             len: meta.len(),
             dev: meta.dev(),
             ino: meta.ino(),
-        })
+            uid: meta.uid(),
+            mode: meta.mode(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        }))
     }
 }
 
@@ -402,7 +482,13 @@ impl ReloadingTokenStore {
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stamp = Stamp::probe(&self.path);
+        let stamp = match Stamp::probe(&self.path) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                tracing::warn!(path = %self.path.display(), %error, "credential store integrity check failed; denying authentication");
+                return f(&TokenStore::default());
+            }
+        };
         if stamp != cached.stamp {
             match stable_load_observed(&self.path, after_load) {
                 Ok((stamp, store)) => {
@@ -410,10 +496,15 @@ impl ReloadingTokenStore {
                     cached.store = store;
                     cached.reloads = cached.reloads.saturating_add(1);
                 }
-                Err(error) => tracing::warn!(
-                    path = %self.path.display(), %error,
-                    "credential store unreadable; keeping last known-good generation"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %self.path.display(), %error,
+                        "credential store unreadable; keeping last known-good generation"
+                    );
+                    if matches!(error, AuthError::InsecureStore(_)) {
+                        return f(&TokenStore::default());
+                    }
+                }
             }
         }
         f(&cached.store)
@@ -457,10 +548,10 @@ fn stable_load_observed(
     mut after_load: impl FnMut(usize),
 ) -> Result<(Option<Stamp>, TokenStore), AuthError> {
     for attempt in 0..STABLE_READ_ATTEMPTS {
-        let before = Stamp::probe(path);
+        let before = Stamp::probe(path)?;
         let loaded = TokenStore::load(path);
         after_load(attempt);
-        let after = Stamp::probe(path);
+        let after = Stamp::probe(path)?;
         if before == after {
             return loaded.map(|store| (after, store));
         }
@@ -556,7 +647,7 @@ fn rotate_credential_at(
         principal: latest.principal,
         scopes: latest.scopes,
         issued_at: now,
-        expires_at: None,
+        expires_at: latest.expires_at,
         revoked_at: None,
         generation,
     });
@@ -590,7 +681,9 @@ pub fn revoke_credential(path: &Path, id: &str) -> Result<CommitOutcome, AuthErr
 /// records. The old bearer values are read once and replaced by verifiers.
 pub fn migrate_legacy_store(path: &Path) -> Result<MigrationOutcome, AuthError> {
     with_store_lock(path, || {
-        let raw = fs::read_to_string(path)?;
+        let raw = read_secure_store(path)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "credential store does not exist")
+        })?;
         if raw.trim_start().starts_with('{') {
             TokenStore::load(path)?;
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -864,6 +957,7 @@ mod tests {
         let path = dir.path().join("credentials");
         let token = "ab".repeat(TOKEN_LEN);
         fs::write(&path, format!("# old\n{token}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
             TokenStore::load(&path),
             Err(AuthError::LegacyMigrationRequired)
@@ -964,6 +1058,87 @@ mod tests {
                 .authenticate_at(&second_secret, now + Duration::minutes(5))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn rotation_preserves_absolute_expiry_for_new_and_overlap_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let now = Utc::now() + Duration::seconds(1);
+        let expiry = now + Duration::minutes(2);
+        let first = mint_credential(
+            &path,
+            Some("device:expiring"),
+            &[TERMINAL_CONTROL_SCOPE.to_owned()],
+            Some(expiry),
+        )
+        .unwrap();
+        let first_secret = secret(&first);
+        let second = rotate_credential_at(
+            &path,
+            &first.id,
+            Duration::minutes(5),
+            now,
+            AtomicWriteFault::None,
+        )
+        .unwrap();
+        let second_secret = secret(&second);
+        let store = TokenStore::load(&path).unwrap();
+
+        assert!(store.authenticate_at(&first_secret, now).is_some());
+        let current = store.authenticate_at(&second_secret, now).unwrap();
+        assert_eq!(current.expires_at, Some(expiry));
+        assert!(store.authenticate_at(&first_secret, expiry).is_none());
+        assert!(store.authenticate_at(&second_secret, expiry).is_none());
+    }
+
+    #[test]
+    fn insecure_store_types_permissions_and_ownership_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let minted =
+            mint_credential(&path, None, &[TERMINAL_CONTROL_SCOPE.to_owned()], None).unwrap();
+        let bearer = secret(&minted);
+        let live = ReloadingTokenStore::load(path.clone()).unwrap();
+        assert!(live.verify(&bearer));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
+        assert!(!live.verify(&bearer), "reload fails closed on unsafe mode");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(live.verify(&bearer), "repair restores authentication");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
+        assert!(!live.verify(&bearer), "owner-unreadable stores fail closed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(matches!(
+            validate_store_metadata_for_uid(&path, &metadata, metadata.uid().saturating_add(1)),
+            Err(AuthError::InsecureStore(_))
+        ));
+
+        let target = dir.path().join("target");
+        fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
+        assert!(!live.verify(&bearer), "reload fails closed on symlinks");
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            TokenStore::load(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
     }
 
     #[test]

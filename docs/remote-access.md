@@ -92,6 +92,9 @@ Its output looks like this (the overlay-address block appears only when a
 tailnet or CGNAT-routed address is detected on the host):
 
 ```
+Credential ID (use with `phux pair rotate|revoke`):
+  <credential-id>
+
 Pairing token (a secret — give it to the device once):
   <64-hex token>
 
@@ -106,6 +109,18 @@ Token written to <state-dir>/remote-tokens
 
 Record the token and the fingerprint; every `phux attach` below uses both. The
 fingerprint is SHA-256, 64 hex digits, optionally colon-separated.
+
+Keep the non-secret credential ID for lifecycle operations. Rotation prints a
+new bearer once and keeps the previous generation valid for at most five
+minutes by default; `--overlap-seconds 0` cuts over immediately. An existing
+absolute expiry is preserved and can shorten that overlap. Revocation affects
+new connections immediately, while already-established sessions continue until
+they disconnect:
+
+```sh
+phux pair rotate <credential-id> --overlap-seconds 300
+phux pair revoke <credential-id>
+```
 
 For a phone or tablet, skip the transcription entirely: when the server
 address is known — pass `--host HOST:PORT` (or a full `ws://`/`wss://` URL),
@@ -297,6 +312,10 @@ Failures fall into a few classes, and the symptom tells you which one you have.
   or was revoked. Mint one with `phux pair`; it is live at the next connection
   attempt, with no restart. The 401 is returned before any phux frame is read,
   so a 401 proves reachability.
+- **Insecure credential store.** The default store and any path selected by
+  `PHUX_WS_TOKENS` must be a regular, non-symlink file owned by the effective
+  user with no group or world permissions. Restore owner-only permissions
+  (normally `chmod 600 <path>`); authentication fails closed until repaired.
 - **Fingerprint mismatch.** The certificate the server presented does not
   match `--cert-fingerprint`. Either the pinned value is stale (the server
   state dir was recreated, regenerating `remote-cert.pem`), an operator

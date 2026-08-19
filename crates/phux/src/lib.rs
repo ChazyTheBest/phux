@@ -135,7 +135,7 @@ pub use commands::server::AUTO_SPAWN_IDLE_ENV;
           workspace  Inspect worktrees and save/restore session archives\n  \
           worktree   Create, open, list, and remove worktree-bound sessions\n\n\
         FEDERATION\n  \
-          pair       Mint a pairing token for a remote consumer\n  \
+          pair       Mint, rotate, or revoke remote credentials\n  \
           relay      Run a standalone relay, or enroll a route with it\n\n\
         TARGET is a session name, `name:window`, `name:window.pane`, `@id`,\n\
         `#tag`, or `.` (focused). `=` is reserved for the\n\
@@ -918,6 +918,7 @@ pub fn run() -> ExitCode {
         Some(Command::StdioBridge {}) => commands::stdio_bridge::run_stdio_bridge(socket),
         Some(Command::Relay { action }) => commands::relay::run_relay(action),
         Some(Command::Pair {
+            action,
             tokens,
             cert,
             qr,
@@ -925,7 +926,7 @@ pub fn run() -> ExitCode {
             name,
             json,
             migrate_legacy,
-        }) => commands::pair::run_pair(tokens, cert, qr, host, name, json, migrate_legacy),
+        }) => commands::pair::run_pair(action, tokens, cert, qr, host, name, json, migrate_legacy),
         Some(Command::Completion { shell }) => commands::completion::run_completion(shell),
         // Returned above, before process-global setup.
         Some(Command::Mcp { .. }) => ExitCode::FAILURE,
@@ -1283,6 +1284,54 @@ mod tests {
         assert!(
             Cli::try_parse_from(["phux", "relay", "pair"]).is_err(),
             "--route is required"
+        );
+    }
+
+    #[test]
+    fn pair_credential_lifecycle_actions_parse_with_ids_and_global_options() {
+        let cli = Cli::try_parse_from([
+            "phux",
+            "pair",
+            "rotate",
+            "credential-a",
+            "--overlap-seconds",
+            "30",
+            "--tokens",
+            "/tmp/tokens",
+            "--json",
+        ])
+        .expect("pair rotate parses");
+        let Some(Command::Pair {
+            action:
+                Some(crate::commands::pair::PairAction::Rotate {
+                    credential_id,
+                    overlap_seconds,
+                }),
+            tokens,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected pair rotate");
+        };
+        assert_eq!(credential_id, "credential-a");
+        assert_eq!(overlap_seconds, 30);
+        assert_eq!(tokens.as_deref(), Some(std::path::Path::new("/tmp/tokens")));
+        assert!(json);
+
+        assert!(Cli::try_parse_from(["phux", "pair", "revoke", "credential-a"]).is_ok());
+        assert!(Cli::try_parse_from(["phux", "pair", "rotate"]).is_err());
+        assert!(Cli::try_parse_from(["phux", "pair", "--qr", "rotate", "credential-a"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "phux",
+                "pair",
+                "rotate",
+                "credential-a",
+                "--overlap-seconds",
+                "86401",
+            ])
+            .is_err()
         );
     }
 

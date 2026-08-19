@@ -1,7 +1,7 @@
 ---
 audience: contributors
 stability: stable
-last-reviewed: 2026-08-02
+last-reviewed: 2026-08-18
 ---
 
 # 0031 — Remote-consumer authentication and encryption (no SSH tunnel)
@@ -78,12 +78,17 @@ a pairing step.** Concretely:
   implicitly grant ADR-0092 work-plane authority. Every mutation holds an
   owner-only advisory lock across read, modify, temp-file sync, atomic rename,
   and directory sync, so concurrent CLI/server writers cannot lose updates.
+  Every load verifies that the path is a regular, non-symlink file owned by the
+  effective user with no group/world permissions; this applies equally to the
+  default path and `PHUX_WS_TOKENS`, and an integrity failure denies admission.
   The file is
   stat'd per attempt and re-read only when its generation changed, so both
   pairing, rotation, and revocation take effect at the next connection with no restart
   (`auth::ReloadingTokenStore`; see ADR-0081). An established session is not
   re-authorized and survives revocation until it drops. Rotation admits old and
-  new generations for an explicit bounded overlap. Legacy anonymous token lines
+  new generations for an explicit bounded overlap without extending an
+  existing absolute expiry. `phux pair` prints the stable credential ID used by
+  `phux pair rotate ID` and `phux pair revoke ID`. Legacy anonymous token lines
   require `phux pair --migrate-legacy`; conversion atomically preserves their
   bearer values as verifier-only generation-one credentials. Migration is
   idempotent and retains each legacy peer pseudonym (the first eight bytes of

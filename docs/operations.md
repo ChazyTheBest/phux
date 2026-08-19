@@ -596,8 +596,10 @@ TCP/WebSocket, set it either with `phux server --listen HOST:PORT` or the
   in the WebSocket upgrade; a missing or unrecognized token is refused with HTTP
   401 before any phux frame is read. Plaintext never reaches a routable address.
   Tokens are minted with `phux pair`, which prints the token once alongside the
-  certificate's SHA-256 fingerprint to pin out-of-band. Pairing and revocation
-  both take effect at the next connection attempt, with no restart: the server
+  certificate's SHA-256 fingerprint to pin out-of-band. The output also names
+  the non-secret credential ID accepted by `phux pair rotate ID` and `phux pair
+  revoke ID`. Pairing, rotation, and revocation take effect at the next
+  connection attempt, with no restart: the server
   re-reads the token store whenever the file changes. An already-established
   session is not re-authorized and survives revocation until it drops.
 
@@ -648,8 +650,12 @@ overrides the token-store path.
   attack surface than local UDS. A routable `--listen` address engages TLS and
   token auth automatically; `PHUX_WS_SECURE=1` only forces that path on loopback.
 - The token is a bearer credential — anyone holding it is the device until the
-  token is revoked. The versioned store is owner-only (`0o600`) and retains only
-  a verifier plus credential id, principal, terminal-only scope, lifecycle
+  token is revoked. The versioned store must be a regular, non-symlink file
+  owned by the effective user with no group/world permissions (normally
+  `0o600`), including when `PHUX_WS_TOKENS` selects a custom path. Integrity
+  failures deny authentication rather than retaining a stale credential. The
+  store retains only a verifier plus credential id, principal, terminal-only
+  scope, lifecycle
   timestamps, and rotation generation; bearer secrets are never persisted.
   Legacy anonymous token lines require the explicit `phux pair
   --migrate-legacy` conversion; conversion is idempotent and preserves the
@@ -658,7 +664,10 @@ overrides the token-store path.
   synced temporary file plus atomic rename and directory sync. Comparison is
   constant-time; tokens are 256-bit
   from the OS CSPRNG. Revocation affects new connections while an established
-  session survives until its transport drops. A client certificate
+  session survives until its transport drops. Rotation defaults to a 300-second
+  overlap, configurable with `--overlap-seconds`; an existing absolute expiry
+  is preserved for the new generation and can shorten the old generation's
+  overlap. A client certificate
   (mutual TLS) is the stronger v0.2 hardening recorded in ADR-0031.
 - Certificate lifecycle is an operator responsibility, like socket permissions.
   With a self-signed certificate, verifying the `phux pair` fingerprint on the

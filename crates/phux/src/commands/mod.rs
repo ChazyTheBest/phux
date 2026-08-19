@@ -1419,22 +1419,22 @@ pub(crate) enum Command {
         action: relay::RelayAction,
     },
 
-    /// Mint a pairing token for a remote consumer.
+    /// Mint, rotate, or revoke a remote-consumer credential.
     ///
-    /// Remote consumers (e.g. the native mobile app) attach over `wss://`
-    /// without an SSH tunnel: TLS encrypts the link and an opaque bearer
-    /// credential authenticates the device. This mints one credential into the store
-    /// the server reads (`PHUX_WS_TOKENS`) and prints it once alongside the
-    /// server certificate's SHA-256 fingerprint. Pair both into the device:
-    /// the bearer secret is shown only once, and verifying the fingerprint on
-    /// first connect defeats a man-in-the-middle. When an overlay network address
-    /// (Tailscale/WireGuard) is detected, it is printed alongside the
-    /// credentials.
+    /// With no subcommand, mint one credential into the server's store and
+    /// print its stable ID, one-time bearer secret, and certificate fingerprint.
+    /// `rotate` replaces the bearer with a bounded overlap; `revoke` denies all
+    /// generations on future connections. These operations update the store
+    /// directly and take effect without restarting the server.
     ///
     /// This never contacts a running server — it only writes the token file.
+    #[command(args_conflicts_with_subcommands = true)]
     Pair {
+        #[command(subcommand)]
+        action: Option<pair::PairAction>,
+
         /// Versioned credential store to update. Defaults to `PHUX_WS_TOKENS`.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, global = true, value_name = "PATH")]
         tokens: Option<std::path::PathBuf>,
 
         /// Server certificate PEM, used to print the pairing fingerprint.
@@ -1463,10 +1463,9 @@ pub(crate) enum Command {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
 
-        /// Emit the pairing material as JSON on stdout instead of the
-        /// human-readable report. This is what `phux host enroll` reads
-        /// over ssh.
-        #[arg(long)]
+        /// Emit the mint, rotation, or revocation result as JSON on stdout.
+        /// `phux host enroll` consumes the mint document over ssh.
+        #[arg(long, global = true)]
         json: bool,
 
         /// Explicitly convert legacy anonymous token lines before pairing.

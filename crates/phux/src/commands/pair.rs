@@ -1,13 +1,43 @@
-//! `phux pair` — mint a bearer pairing token for a remote consumer (ADR-0031).
+//! `phux pair` — mint, rotate, or revoke remote credentials (ADR-0031).
 //!
 //! The token authenticates a device that attaches over `wss://`; the server
-//! reads the same token store at `PHUX_WS_TOKENS`. This verb only writes the
-//! token file — it never contacts a running server — so it works before the
-//! server starts and needs no socket.
+//! reads the same token store at `PHUX_WS_TOKENS`. These operations only write
+//! that file — they never contact a running server — so they work before the
+//! server starts and need no socket.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use clap::Subcommand;
+
+const DEFAULT_ROTATION_OVERLAP_SECONDS: i64 = 300;
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PairAction {
+    /// Replace a credential's bearer secret with a bounded overlap.
+    Rotate {
+        /// Stable credential ID printed when the credential was minted.
+        #[arg(value_name = "CREDENTIAL_ID")]
+        credential_id: String,
+
+        /// Seconds the previous generation remains valid. Its existing
+        /// absolute expiry still wins when it is sooner.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_ROTATION_OVERLAP_SECONDS,
+            value_parser = clap::value_parser!(i64).range(0..=86_400),
+            value_name = "SECONDS"
+        )]
+        overlap_seconds: i64,
+    },
+    /// Revoke every generation of a credential for new connections.
+    Revoke {
+        /// Stable credential ID printed when the credential was minted.
+        #[arg(value_name = "CREDENTIAL_ID")]
+        credential_id: String,
+    },
+}
 
 /// Scheme + host for the one-tap connect deep-link (and the QR that encodes
 /// it). A device that opens or scans it gets the server URL, the cert
@@ -195,7 +225,16 @@ fn render_qr(payload: &str) -> Result<String, String> {
     clippy::needless_pass_by_value,
     reason = "CLI entry point owns the args clap dispatch hands it; taking them by value keeps the call site clean"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the existing mint options remain flat for CLI compatibility while the optional action selects lifecycle operations"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "pairing keeps address, certificate, secret, and output sequencing together so diagnostics cannot leak into JSON stdout"
+)]
 pub(crate) fn run_pair(
+    action: Option<PairAction>,
     tokens: Option<PathBuf>,
     cert: Option<PathBuf>,
     qr: bool,
@@ -207,6 +246,9 @@ pub(crate) fn run_pair(
     let tokens = tokens
         .or_else(|| std::env::var_os("PHUX_WS_TOKENS").map(PathBuf::from))
         .unwrap_or_else(phux_server::auth::default_token_store_path);
+    if let Some(action) = action {
+        return run_credential_action(&tokens, action, json);
+    }
     let operator_cert = cert.is_some() || std::env::var_os("PHUX_WS_TLS_CERT").is_some();
     let cert = cert
         .or_else(|| std::env::var_os("PHUX_WS_TLS_CERT").map(PathBuf::from))
@@ -268,6 +310,9 @@ pub(crate) fn run_pair(
     // every diagnostic still goes to stderr. `phux host enroll` consumes
     // this over ssh, which is what keeps a 64-hex token out of human hands.
     if !json {
+        outln!("Credential ID (use with `phux pair rotate|revoke`):");
+        outln!("  {}", minted.id);
+        outln!();
         outln!("Pairing token (a secret — give it to the device once):");
         outln!("  {token}");
         outln!();
@@ -311,6 +356,8 @@ pub(crate) fn run_pair(
             ws_addr.as_deref(),
             link.as_deref(),
             &tokens,
+            &minted.id,
+            minted.generation,
         );
     }
 
@@ -338,6 +385,93 @@ pub(crate) fn run_pair(
 
     outln!("Token written to {}", tokens.display());
     ExitCode::SUCCESS
+}
+
+fn run_credential_action(tokens: &std::path::Path, action: PairAction, json: bool) -> ExitCode {
+    match action {
+        PairAction::Rotate {
+            credential_id,
+            overlap_seconds,
+        } => {
+            let overlap = chrono::Duration::seconds(overlap_seconds);
+            let rotated =
+                match phux_server::auth::rotate_credential(tokens, &credential_id, overlap) {
+                    Ok(rotated) => rotated,
+                    Err(error) => {
+                        eprintln!("phux pair rotate: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            if !rotated.is_durable() {
+                eprintln!(
+                    "phux pair rotate: warning: rotation is active, but the store directory could not be synced; do not retry"
+                );
+            }
+            if json {
+                return print_action_json(&serde_json::json!({
+                    "schema_version": 1,
+                    "operation": "rotate",
+                    "credential_id": rotated.id,
+                    "generation": rotated.generation,
+                    "token": rotated.secret(),
+                    "overlap_seconds": overlap_seconds,
+                    "tokens_path": tokens.display().to_string(),
+                }));
+            }
+            outln!(
+                "Rotated credential {} to generation {}.",
+                rotated.id,
+                rotated.generation
+            );
+            outln!(
+                "Previous generations remain valid for at most {overlap_seconds} seconds and never beyond their absolute expiry."
+            );
+            outln!();
+            outln!("Pairing token (a secret — give it to the device once):");
+            outln!("  {}", rotated.secret());
+            outln!();
+            outln!("Token written to {}", tokens.display());
+            ExitCode::SUCCESS
+        }
+        PairAction::Revoke { credential_id } => {
+            let outcome = match phux_server::auth::revoke_credential(tokens, &credential_id) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("phux pair revoke: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if !outcome.is_durable() {
+                eprintln!(
+                    "phux pair revoke: warning: revocation is active, but the store directory could not be synced; do not retry"
+                );
+            }
+            if json {
+                return print_action_json(&serde_json::json!({
+                    "schema_version": 1,
+                    "operation": "revoke",
+                    "credential_id": credential_id,
+                    "tokens_path": tokens.display().to_string(),
+                }));
+            }
+            outln!("Revoked credential {credential_id} for new connections.");
+            outln!("Established sessions remain active until disconnected.");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn print_action_json(document: &serde_json::Value) -> ExitCode {
+    match serde_json::to_string_pretty(&document) {
+        Ok(text) => {
+            outln!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("phux pair: could not encode JSON: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn migrate_legacy_credentials(tokens: &std::path::Path) -> bool {
@@ -372,6 +506,10 @@ fn migrate_legacy_credentials(tokens: &std::path::Path) -> bool {
 /// consumer pairs them with an overlay address to build an endpoint. They are
 /// null when this host has no listener configured, which is exactly the
 /// signal `phux host enroll` uses to fall back to `ssh://`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per pairing document source keeps secret-bearing output construction explicit"
+)]
 fn print_pair_json(
     token: &str,
     fingerprint: Option<&str>,
@@ -379,6 +517,8 @@ fn print_pair_json(
     ws_addr: Option<&str>,
     connect_link: Option<&str>,
     tokens_path: &std::path::Path,
+    credential_id: &str,
+    generation: u64,
 ) -> ExitCode {
     let document = pair_document(
         token,
@@ -388,6 +528,8 @@ fn print_pair_json(
         std::env::var("PHUX_QUIC_ADDR").ok().as_deref(),
         connect_link,
         tokens_path,
+        credential_id,
+        generation,
     );
     match serde_json::to_string_pretty(&document) {
         Ok(text) => {
@@ -405,7 +547,7 @@ fn print_pair_json(
 /// `schema_version`) is unit-testable without touching the environment.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one field per documented key; a struct would only move the same seven names one level up"
+    reason = "one field per documented key; a struct would only move the same names one level up"
 )]
 fn pair_document(
     token: &str,
@@ -415,6 +557,8 @@ fn pair_document(
     quic_addr: Option<&str>,
     connect_link: Option<&str>,
     tokens_path: &std::path::Path,
+    credential_id: &str,
+    generation: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
@@ -428,6 +572,8 @@ fn pair_document(
         "quic_addr": quic_addr,
         "connect_link": connect_link,
         "tokens_path": tokens_path.display().to_string(),
+        "credential_id": credential_id,
+        "generation": generation,
     })
 }
 
@@ -440,7 +586,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::Path;
 
-    /// `phux pair --json` pins `schema_version` 1 plus the seven documented
+    /// `phux pair --json` pins `schema_version` 1 plus the documented
     /// fields, with absent addresses/link reported as `null` rather than
     /// omitted.
     #[test]
@@ -454,6 +600,8 @@ mod tests {
             Some("0.0.0.0:8788"),
             Some("phux://connect?url=wss://100.64.0.2:8787&token=deadbeef"),
             Path::new("/state/remote-tokens"),
+            "credential-a",
+            1,
         );
         assert_eq!(doc["schema_version"], 1);
         assert_eq!(doc["token"], "deadbeef");
@@ -466,7 +614,9 @@ mod tests {
             "phux://connect?url=wss://100.64.0.2:8787&token=deadbeef"
         );
         assert_eq!(doc["tokens_path"], "/state/remote-tokens");
-        assert_eq!(doc.as_object().map(serde_json::Map::len), Some(8));
+        assert_eq!(doc["credential_id"], "credential-a");
+        assert_eq!(doc["generation"], 1);
+        assert_eq!(doc.as_object().map(serde_json::Map::len), Some(10));
 
         // No address material known: nulls, not absent keys.
         let doc = pair_document(
@@ -477,6 +627,8 @@ mod tests {
             None,
             None,
             Path::new("/state/remote-tokens"),
+            "credential-a",
+            1,
         );
         assert!(doc["cert_fingerprint"].is_null());
         assert!(doc["ws_addr"].is_null());

@@ -118,9 +118,13 @@ pub(crate) fn page() -> Page {
            (ADR-0091); `phux doctor` reports whether it names the \
            address phux advertises.\n\
          - `remote-tokens` is the versioned verifier-only credential store \
-           the server reads and `phux pair` updates under the sibling \
+           the server reads and `phux pair`, `phux pair rotate`, and `phux \
+           pair revoke` update under the sibling \
            `.remote-tokens.lock`, using a synced temporary file and atomic \
-           rename; `PHUX_WS_TOKENS` moves it. Legacy anonymous token lines \
+           rename. It must be a regular, non-symlink file owned by the \
+           effective user with no group/world permissions; an integrity \
+           failure denies authentication. `PHUX_WS_TOKENS` moves it without \
+           weakening those checks. Legacy anonymous token lines \
            require the idempotent `phux pair --migrate-legacy` conversion.\n\n\
          ## Design intent (not yet implemented)\n\n\
          A `server.pid` file and a `journal/` directory of per-pane PTY \
