@@ -120,11 +120,15 @@ pub(crate) fn page() -> Page {
          - `remote-tokens` is the versioned verifier-only credential store \
            the server reads and `phux pair`, `phux pair rotate`, and `phux \
            pair revoke` update under the sibling \
-           `.remote-tokens.lock`, using a synced temporary file and atomic \
-           rename. It must be a regular, non-symlink file owned by the \
-           effective user with no group/world permissions; an integrity \
-           failure denies authentication. `PHUX_WS_TOKENS` moves it without \
-           weakening those checks. Legacy anonymous token lines \
+           `.remote-tokens.lock`. Writers first lock the owner-controlled, \
+           non-group/world-writable parent directory, then no-follow open and \
+           validate the owner-only regular lock file, preventing lock-path \
+           replacement from splitting concurrent writers. Store commits use \
+           a synced temporary file and atomic rename. The store must be a \
+           regular, non-symlink file owned by the effective user with no \
+           group/world permissions; an integrity failure denies \
+           authentication. `PHUX_WS_TOKENS` moves it without weakening those \
+           checks. Legacy anonymous token lines \
            require the idempotent `phux pair --migrate-legacy` conversion.\n\n\
          ## Design intent (not yet implemented)\n\n\
          A `server.pid` file and a `journal/` directory of per-pane PTY \

@@ -76,8 +76,11 @@ a pairing step.** Concretely:
   secret), principal, scopes, issue/expiry/revocation times, and rotation
   generation. Ordinary pairing grants only `terminal.control`; it does not
   implicitly grant ADR-0092 work-plane authority. Every mutation holds an
-  owner-only advisory lock across read, modify, temp-file sync, atomic rename,
-  and directory sync, so concurrent CLI/server writers cannot lose updates.
+  validated owner-controlled parent-directory lock plus an owner-only,
+  no-follow-opened regular lock file across read, modify, temp-file sync,
+  atomic rename, and directory sync. The lock path is checked against the
+  opened inode after acquisition, so precreation or replacement cannot split
+  concurrent CLI/server writers across lock inodes or lose updates.
   Every load verifies that the path is a regular, non-symlink file owned by the
   effective user with no group/world permissions; this applies equally to the
   default path and `PHUX_WS_TOKENS`, and an integrity failure denies admission.

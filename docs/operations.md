@@ -113,10 +113,9 @@ material visible. Its decision tree is:
   malformed, unknown, and revoked tokens all use the same pairing-authentication
   text and the same generic HTTP 401 response.
 - A successfully token-authenticated WebSocket admission produces one `INFO`
-  event with only `transport=ws`, `source_ip`, and `device_pseudonym`. The
-  pseudonym is the existing non-reversible 16-hex SHA-256 prefix derived from
-  the presented token; it is useful for correlating reconnects but is not the
-  bearer token.
+  event with only `transport=ws`, `source_ip`, and `credential_id`. The stable,
+  non-secret credential ID correlates reconnects and rotated generations; it is
+  not derived from or equal to the bearer token.
 - Anonymous loopback WebSocket admissions and admissions on other transports
   retain the shared `DEBUG` connection event; they gain no default-visible
   identity event.
@@ -660,8 +659,12 @@ overrides the token-store path.
   Legacy anonymous token lines require the explicit `phux pair
   --migrate-legacy` conversion; conversion is idempotent and preserves the
   device pseudonym existing sessions and audit records already use. Store
-  updates are serialized with an owner-only advisory lock and committed by
-  synced temporary file plus atomic rename and directory sync. Comparison is
+  updates are serialized by locking the validated, owner-controlled parent
+  directory before no-follow opening the owner-only regular advisory lock file.
+  The lock path is revalidated against the opened inode after acquisition, so a
+  symlink, unsafe precreated file, or lock-path replacement cannot split
+  cooperating writers across lock inodes. Store changes are committed by synced
+  temporary file plus atomic rename and directory sync. Comparison is
   constant-time; tokens are 256-bit
   from the OS CSPRNG. Revocation affects new connections while an established
   session survives until its transport drops. Rotation defaults to a 300-second

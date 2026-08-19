@@ -7,7 +7,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -573,26 +573,35 @@ pub fn mint_credential(
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<MintedCredential, AuthError> {
     with_store_lock(path, || {
-        let mut file = load_file_for_update(path)?;
-        let (id, secret) = random_identity_and_secret()?;
-        let principal = principal.map_or_else(|| format!("remote-consumer:{id}"), str::to_owned);
-        file.credentials.push(CredentialRecord {
-            id: id.clone(),
-            verifier: verifier(&secret),
-            principal,
-            scopes: scopes.to_vec(),
-            issued_at: Utc::now(),
-            expires_at,
-            revoked_at: None,
-            generation: 1,
-        });
-        let commit = atomic_write(path, &file)?;
-        Ok(MintedCredential {
-            id,
-            generation: 1,
-            secret: hex::encode(secret),
-            durable: commit.is_durable(),
-        })
+        mint_credential_unlocked(path, principal, scopes, expires_at)
+    })
+}
+
+fn mint_credential_unlocked(
+    path: &Path,
+    principal: Option<&str>,
+    scopes: &[String],
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<MintedCredential, AuthError> {
+    let mut file = load_file_for_update(path)?;
+    let (id, secret) = random_identity_and_secret()?;
+    let principal = principal.map_or_else(|| format!("remote-consumer:{id}"), str::to_owned);
+    file.credentials.push(CredentialRecord {
+        id: id.clone(),
+        verifier: verifier(&secret),
+        principal,
+        scopes: scopes.to_vec(),
+        issued_at: Utc::now(),
+        expires_at,
+        revoked_at: None,
+        generation: 1,
+    });
+    let commit = atomic_write(path, &file)?;
+    Ok(MintedCredential {
+        id,
+        generation: 1,
+        secret: hex::encode(secret),
+        durable: commit.is_durable(),
     })
 }
 
@@ -785,34 +794,161 @@ impl CommitOutcome {
     }
 }
 
-struct StoreLock(fs::File);
+struct StoreLock {
+    file: fs::File,
+    parent: fs::File,
+}
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        let _ = rustix::fs::flock(&self.parent, rustix::fs::FlockOperation::Unlock);
     }
+}
+
+fn credential_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn credential_lock_path(path: &Path) -> PathBuf {
+    let parent = credential_parent(path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    parent.join(format!(".{name}.lock"))
+}
+
+fn validate_lock_parent(path: &Path, metadata: &fs::Metadata) -> Result<(), AuthError> {
+    if !metadata.file_type().is_dir() {
+        return Err(AuthError::InsecureStore(format!(
+            "credential parent {} is not a directory",
+            path.display()
+        )));
+    }
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(AuthError::InsecureStore(format!(
+            "credential parent {} is owned by uid {}, expected effective uid {expected_uid}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o022 != 0 || mode & 0o700 != 0o700 {
+        return Err(AuthError::InsecureStore(format!(
+            "credential parent {} has mode {mode:04o}; owner rwx and no group/world write permission are required",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lock_file(path: &Path, metadata: &fs::Metadata) -> Result<(), AuthError> {
+    if !metadata.file_type().is_file() {
+        return Err(AuthError::InsecureStore(format!(
+            "credential lock {} is not a regular file",
+            path.display()
+        )));
+    }
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(AuthError::InsecureStore(format!(
+            "credential lock {} is owned by uid {}, expected effective uid {expected_uid}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode != 0o600 {
+        return Err(AuthError::InsecureStore(format!(
+            "credential lock {} has mode {mode:04o}; expected 0600",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_open_path_identity(
+    path: &Path,
+    open_metadata: &fs::Metadata,
+    validate: impl FnOnce(&Path, &fs::Metadata) -> Result<(), AuthError>,
+) -> Result<(), AuthError> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    validate(path, &path_metadata)?;
+    if path_metadata.dev() != open_metadata.dev() || path_metadata.ino() != open_metadata.ino() {
+        return Err(AuthError::InsecureStore(format!(
+            "{} was replaced during lock acquisition",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn open_lock_parent(parent: &Path) -> Result<fs::File, AuthError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(parent)?;
+    let path_metadata = fs::symlink_metadata(parent)?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(AuthError::InsecureStore(format!(
+            "credential parent {} is a symbolic link",
+            parent.display()
+        )));
+    }
+    validate_lock_parent(parent, &path_metadata)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(parent)?;
+    let open_metadata = directory.metadata()?;
+    validate_lock_parent(parent, &open_metadata)?;
+    validate_open_path_identity(parent, &open_metadata, validate_lock_parent)?;
+    Ok(directory)
 }
 
 fn with_store_lock<T>(
     path: &Path,
     operation: impl FnOnce() -> Result<T, AuthError>,
 ) -> Result<T, AuthError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("credentials");
-    let lock_path = parent.join(format!(".{name}.lock"));
+    let parent = credential_parent(path);
+    let parent_lock = open_lock_parent(parent)?;
+    rustix::fs::flock(&parent_lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(io::Error::from)?;
+    let parent_metadata = parent_lock.metadata()?;
+    validate_open_path_identity(parent, &parent_metadata, validate_lock_parent)?;
+
+    let lock_path = credential_lock_path(path);
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(AuthError::InsecureStore(format!(
+                    "credential lock {} is a symbolic link",
+                    lock_path.display()
+                )));
+            }
+            validate_lock_file(&lock_path, &metadata)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(lock_path)?;
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    validate_lock_file(&lock_path, &lock.metadata()?)?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)?;
-    let _guard = StoreLock(lock);
+    let lock_metadata = lock.metadata()?;
+    validate_open_path_identity(&lock_path, &lock_metadata, validate_lock_file)?;
+    let _guard = StoreLock {
+        file: lock,
+        parent: parent_lock,
+    };
     operation()
 }
 
@@ -1209,6 +1345,99 @@ mod tests {
             TokenStore::load(&path),
             Err(AuthError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn hostile_precreated_lock_and_untrusted_parent_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let lock_path = credential_lock_path(&path);
+        let target = dir.path().join("attacker-lock-target");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&target)
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+        assert!(matches!(
+            mint_token(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"hostile").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            mint_token(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(matches!(
+            mint_token(&path),
+            Err(AuthError::InsecureStore(_))
+        ));
+    }
+
+    #[test]
+    fn replacing_lock_path_cannot_split_concurrent_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        mint_token(&path).unwrap();
+
+        let acquired = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_path = path.clone();
+        let first_acquired = acquired.clone();
+        let first_release = release.clone();
+        let first = std::thread::spawn(move || {
+            with_store_lock(&first_path, || {
+                first_acquired.wait();
+                first_release.wait();
+                mint_credential_unlocked(
+                    &first_path,
+                    None,
+                    &[TERMINAL_CONTROL_SCOPE.to_owned()],
+                    None,
+                )
+            })
+        });
+        acquired.wait();
+
+        let lock_path = credential_lock_path(&path);
+        fs::rename(&lock_path, dir.path().join("displaced-lock")).unwrap();
+        OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || {
+            let result = mint_token(&second_path);
+            completed_tx.send(()).unwrap();
+            result
+        });
+        assert!(
+            completed_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "replacement lock inode must not admit a concurrent writer"
+        );
+
+        release.wait();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(
+            TokenStore::load(&path).unwrap().len(),
+            3,
+            "both serialized mutations survive lock-path replacement"
+        );
     }
 
     #[test]
