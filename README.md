@@ -59,6 +59,16 @@ shows every key. Prebuilt binaries cover macOS arm64, Linux x86_64, and Linux ar
 Windows is not supported. Other channels and source builds:
 [INSTALL](./docs/INSTALL.md).
 
+Another machine works the same way, as long as it is reachable:
+
+```sh
+phux --remote me@mini
+```
+
+The first run pairs the host and remembers it; every run after that is a
+direct, encrypted QUIC dial with no ssh in the path. See
+[Remote access](./docs/remote-access.md).
+
 Interactive entry points require terminal stdin and stdout. For redirected
 work, use the headless commands below; they never need a TTY.
 

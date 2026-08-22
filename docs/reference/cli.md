@@ -117,6 +117,9 @@ Usage: phux [OPTIONS] [COMMAND]
           - terminal: Quick guidance plus terminal screen and input mechanics
           - full:     The complete guide and command inventory
 
+      --remote <[USER@]HOST[:PORT]>
+          Attach to a phux server on another machine, ssh-style: `phux --remote me@mini`. Belongs to the naked `phux` attach alone; `phux attach --remote` carries its own copy (and the `--code` / `--no-enroll` modifiers that go with it)
+
       --capabilities
           Print machine-readable capabilities with `--json`, then exit
 
@@ -692,6 +695,17 @@ Options:
 
       --tls-server-name <NAME>
           TLS server name (SNI) to offer the remote listener. QUIC defaults to `localhost`; WebSocket defaults to the URL host. Requires `--quic` or `--ws`
+
+      --remote <[USER@]HOST[:PORT]>
+          Attach to a phux server on another machine, ssh-style: `--remote me@mini`. Resolves to a registered host when there is one, otherwise pairs the host first (over a `--code`, or over your existing ssh trust) and registers the result, so every later attach is a direct QUIC dial with no ssh in the path.
+
+          PORT defaults to 8788, the port a server auto-binds on its overlay address. The `user@` half names the ssh destination used to pair; it is not sent on the wire.
+
+      --code <LINK>
+          Pair `--remote` from a `phux://connect?...` link instead of over ssh — the same link `phux pair` prints and `phux pair --qr` renders. Quote it: it contains `&`
+
+      --no-enroll
+          Never shell out to ssh for `--remote`. An unregistered host is refused with its remedies named instead of paired
 
       --rec <PATH>
           Record this session while it runs and write the result to PATH.

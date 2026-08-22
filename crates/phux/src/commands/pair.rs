@@ -106,6 +106,102 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
+/// The credentials a `phux://connect?...` link carries.
+///
+/// The link is the same artifact `phux pair` prints and `phux pair --qr`
+/// renders: a phone scans it, and a laptop pastes it into `phux attach
+/// --remote HOST --code '<link>'`. Both ends of the pairing therefore share
+/// one format, and `--code` needs no second credential shape to exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectLink {
+    /// The `ws://`/`wss://` endpoint to dial.
+    pub(crate) url: String,
+    /// The operator's label for the server, when the link carries one.
+    pub(crate) name: Option<String>,
+    /// The TLS certificate SHA-256 pin.
+    pub(crate) cert_fingerprint: Option<String>,
+    /// The bearer pairing token. A secret — never echoed back.
+    pub(crate) token: String,
+}
+
+/// Parse a `phux://connect?...` link back into its parts.
+///
+/// The exact inverse of [`build_connect_link`], and pinned to it by
+/// `connect_link_round_trips`: the link shape is a cross-repo contract
+/// (see [`CONNECT_URI_PREFIX`]'s note on the phux-mobile outage), so the
+/// parser must never drift from the builder that feeds the QR.
+///
+/// Strict about the two fields a dial cannot proceed without — a `url` and a
+/// `token` — and tolerant of unknown query keys, so a newer minting phux can
+/// add one without breaking an older `--code`.
+pub(crate) fn parse_connect_link(link: &str) -> Result<ConnectLink, String> {
+    let trimmed = link.trim().trim_matches(|c| c == '\'' || c == '"');
+    let query = trimmed
+        .strip_prefix(CONNECT_URI_PREFIX)
+        .and_then(|rest| rest.strip_prefix('?'))
+        .ok_or_else(|| {
+            format!("a connect code must start with `{CONNECT_URI_PREFIX}?` (paste the whole link `phux pair` printed)")
+        })?;
+
+    let (mut url, mut name, mut fingerprint, mut token) = (None, None, None, None);
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, raw) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("connect code field {pair:?} has no value"))?;
+        let decoded = percent_decode(raw)?;
+        match key {
+            "url" => url = Some(decoded),
+            "name" => name = Some(decoded),
+            "fp" => fingerprint = Some(decoded),
+            "token" => token = Some(decoded),
+            // Unknown keys are forward-compat room, not an error.
+            _ => {}
+        }
+    }
+
+    let url = url.filter(|url| !url.is_empty()).ok_or_else(|| {
+        "connect code carries no `url=` — it cannot name a server to dial".to_owned()
+    })?;
+    if !url.starts_with("wss://") && !url.starts_with("ws://") {
+        return Err(format!("connect code url {url:?} must be ws:// or wss://"));
+    }
+    let token = token
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "connect code carries no `token=` — it grants no access".to_owned())?;
+
+    Ok(ConnectLink {
+        url,
+        name: name.filter(|name| !name.is_empty()),
+        cert_fingerprint: fingerprint.filter(|fp| !fp.is_empty()),
+        token,
+    })
+}
+
+/// Decode the percent-escapes [`percent_encode`] produces. Only `name` is
+/// ever encoded on the minting side, but decoding every field keeps the
+/// parser honest against a link written by some other tool.
+fn percent_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes
+                .get(index + 1..index + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .ok_or_else(|| format!("truncated percent-escape in {value:?}"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|_| format!("invalid percent-escape `%{hex}` in {value:?}"))?;
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| format!("connect code field {value:?} is not UTF-8"))
+}
+
 /// Resolve the ws(s):// URL the connect link embeds. `--host` wins: a full
 /// `ws://`/`wss://` URL passes through, a bare `host:port` gets the `wss://`
 /// the remote path always uses (ADR-0031: a routable bind is always TLS).
@@ -581,8 +677,8 @@ fn pair_document(
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_names, build_connect_link, pair_document, percent_encode, render_qr,
-        resolve_server_url,
+        advertised_names, build_connect_link, pair_document, parse_connect_link, percent_encode,
+        render_qr, resolve_server_url,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::Path;
@@ -776,5 +872,73 @@ mod tests {
             art.chars().any(|c| matches!(c, '█' | '▀' | '▄' | ' ')),
             "QR render must contain half-block glyphs",
         );
+    }
+
+    /// The parser is the builder's exact inverse. The link shape is a
+    /// cross-repo contract (phux-mobile reads it too), so a change to either
+    /// side that the other does not follow must fail here rather than in the
+    /// field.
+    #[test]
+    fn connect_link_round_trips() {
+        let link = build_connect_link(
+            "wss://100.64.0.2:8787",
+            Some("mini box"),
+            Some("AB:CD:EF"),
+            "deadbeef",
+        );
+        let parsed = parse_connect_link(&link).expect("parse");
+        assert_eq!(parsed.url, "wss://100.64.0.2:8787");
+        assert_eq!(parsed.name.as_deref(), Some("mini box"));
+        assert_eq!(parsed.cert_fingerprint.as_deref(), Some("AB:CD:EF"));
+        assert_eq!(parsed.token, "deadbeef");
+    }
+
+    /// A link with no `name`/`fp` (the minimal shape the builder emits) is
+    /// still parseable — those two are genuinely optional.
+    #[test]
+    fn connect_link_without_optional_fields_parses() {
+        let link = build_connect_link("wss://mini.ts.net:8787", None, None, "abc123");
+        let parsed = parse_connect_link(&link).expect("parse");
+        assert_eq!(parsed.name, None);
+        assert_eq!(parsed.cert_fingerprint, None);
+        assert_eq!(parsed.token, "abc123");
+    }
+
+    /// Shells and chat clients wrap a pasted link in quotes; stripping them
+    /// is cheaper than teaching every operator to remove them.
+    #[test]
+    fn connect_link_tolerates_pasted_quotes_and_whitespace() {
+        let link = build_connect_link("wss://mini:8787", None, Some("AB"), "tok");
+        let pasted = format!("  '{link}'\n");
+        assert_eq!(
+            parse_connect_link(&pasted).expect("parse"),
+            parse_connect_link(&link).expect("parse"),
+        );
+    }
+
+    /// A newer minting phux must be able to add a query key without breaking
+    /// an older `--code`.
+    #[test]
+    fn connect_link_tolerates_unknown_query_keys() {
+        let parsed =
+            parse_connect_link("phux://connect?url=wss://mini:8787&brand_new=42&token=tok")
+                .expect("parse");
+        assert_eq!(parsed.token, "tok");
+    }
+
+    /// The two fields a dial cannot proceed without are rejected loudly,
+    /// and a non-ws scheme is refused rather than dialed.
+    #[test]
+    fn connect_link_refuses_links_that_cannot_dial() {
+        // Not a connect link at all.
+        assert!(parse_connect_link("https://example.com").is_err());
+        // No token: grants no access.
+        assert!(parse_connect_link("phux://connect?url=wss://mini:8787").is_err());
+        // No url: names no server.
+        assert!(parse_connect_link("phux://connect?token=tok").is_err());
+        // A scheme the WebSocket dialer cannot use.
+        assert!(parse_connect_link("phux://connect?url=quic://mini:8788&token=tok").is_err());
+        // Empty values are the same as absent.
+        assert!(parse_connect_link("phux://connect?url=wss://mini:8787&token=").is_err());
     }
 }
