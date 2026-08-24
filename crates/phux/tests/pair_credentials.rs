@@ -7,14 +7,32 @@ use std::process::{Command, Output};
 
 const PHUX: &str = env!("CARGO_BIN_EXE_phux");
 
+/// Run the real `phux` binary against an isolated state dir.
+///
+/// `tokens: None` means "use the DEFAULT store under `state`", and saying so
+/// requires actively removing `PHUX_WS_TOKENS` from the inherited
+/// environment — a child process inherits the parent's env, and this suite's
+/// most likely reader is a maintainer running it from inside a phux pane,
+/// where the service manager exports `PHUX_WS_TOKENS` pointing at their REAL
+/// credential store. Without the removal the "default store" cases silently
+/// operate on that store instead: the failure observed was `phux pair
+/// --json` refusing with "legacy token store requires explicit migration",
+/// and the case that mints successfully would go on to chmod 0o640 a live
+/// credential file. The env is scrubbed rather than cleared wholesale
+/// because `PATH` and friends still have to reach the child.
 fn phux(state: &std::path::Path, tokens: Option<&std::path::Path>, args: &[&str]) -> Output {
     let mut command = Command::new(PHUX);
     command
         .env("XDG_STATE_HOME", state)
         .env("PHUX_TAILSCALE", "phux-test-no-such-overlay-command")
         .args(args);
-    if let Some(tokens) = tokens {
-        command.env("PHUX_WS_TOKENS", tokens);
+    match tokens {
+        Some(tokens) => {
+            command.env("PHUX_WS_TOKENS", tokens);
+        }
+        None => {
+            command.env_remove("PHUX_WS_TOKENS");
+        }
     }
     command.output().expect("run phux pair")
 }
