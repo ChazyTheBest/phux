@@ -117,6 +117,7 @@ pub(crate) fn run_doctor(json: bool, socket: Option<PathBuf>) -> ExitCode {
         check_plugins(),
         check_agent_shim(),
         check_remote_cert(),
+        check_token_store(),
         check_remote_reachable(),
         check_logs(),
     ]);
@@ -807,6 +808,63 @@ fn check_logs() -> Check {
 /// documented pairing flow works end to end on a narrow certificate. Calling
 /// that a failure would turn doctor's exit code red on installs where nothing
 /// is broken.
+/// Can the credential store the remote listeners gate on actually be read?
+///
+/// Every remote transport binds only if `ReloadingTokenStore::load` succeeds;
+/// when it fails the server logs one ERROR per transport and then serves UDS
+/// only. Nothing downstream restates that. The server keeps running, local
+/// clients keep working, `phux ls` and `phux status` stay green, and the
+/// entire remote surface is gone — which is precisely the state an operator
+/// runs `phux doctor` to have explained.
+///
+/// [`check_remote_reachable`] would notice the absence, but only as "nothing
+/// is listening", which reads like "you have not paired yet" and sends the
+/// reader to `phux pair` — the one command that cannot fix an unreadable
+/// store. This check names the actual cause and carries the actual remedy.
+fn check_token_store() -> Check {
+    let path = std::env::var_os("PHUX_WS_TOKENS")
+        .map_or_else(phux_server::auth::default_token_store_path, PathBuf::from);
+    token_store_check(
+        &path,
+        phux_server::auth::ReloadingTokenStore::load(path.clone()).err(),
+    )
+}
+
+/// The pure half of [`check_token_store`], so the failure branch is testable
+/// without arranging a broken store in the real environment.
+fn token_store_check(path: &std::path::Path, error: Option<phux_server::auth::AuthError>) -> Check {
+    let Some(error) = error else {
+        return Check::pass(
+            "token-store",
+            format!("credential store at {} loads", path.display()),
+        );
+    };
+    // A store that exists and will not load takes the remote listeners down
+    // with it, so this is a failure, not a warning: `phux --remote` cannot
+    // work until it is resolved.
+    let remedy = if error.to_string().contains("legacy") {
+        "the server refuses to guess at a pre-versioned store: convert it with \
+         `phux pair --migrate-legacy`, then restart or `phux upgrade` the server \
+         so the listeners re-read it"
+            .to_owned()
+    } else {
+        format!(
+            "the remote listeners will not bind until this loads; fix the file at {} \
+             (or point PHUX_WS_TOKENS elsewhere), then restart or `phux upgrade` the server",
+            path.display()
+        )
+    };
+    Check::fail(
+        "token-store",
+        format!(
+            "credential store at {} cannot be loaded ({error}) — every remote \
+             listener is disabled and this server is reachable over UDS only",
+            path.display()
+        ),
+        remedy,
+    )
+}
+
 /// How long the reachability probe waits for the listener to say anything.
 ///
 /// Generous relative to a loopback-speed handshake, because the probe rides
@@ -1158,6 +1216,49 @@ fn report_json(checks: &[Check]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A credential store that will not load takes every remote listener with
+    /// it, silently — the server stays up, UDS keeps working, and nothing else
+    /// in the report says the remote surface is gone. So this must fail, and
+    /// the legacy case must name the one command that resolves it.
+    #[test]
+    fn an_unloadable_credential_store_fails_and_names_the_fix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("remote-tokens");
+
+        // A store that loads (or is simply absent) is not this check's problem.
+        assert_eq!(token_store_check(&store, None).status, Status::Pass);
+
+        // A pre-versioned store is the case that actually stranded a server:
+        // both listeners disabled at boot, with only an ERROR in the log. A
+        // bare hex line is that format, and the store must refuse to guess.
+        std::fs::write(&store, "deadbeef\n").expect("write legacy line");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600))
+                .expect("the store rejects group/world-readable modes first");
+        }
+        let legacy = phux_server::auth::ReloadingTokenStore::load(store.clone())
+            .expect_err("a pre-versioned store must refuse to load");
+
+        let check = token_store_check(&store, Some(legacy));
+        assert_eq!(
+            check.status,
+            Status::Fail,
+            "a store that disables every remote listener is a failure, not a warning"
+        );
+        assert!(
+            check.detail.contains("remote listener"),
+            "the detail must say what was lost, not just that a file is bad: {}",
+            check.detail
+        );
+        let hint = check.hint.expect("a failure must carry a remedy");
+        assert!(
+            hint.contains("restart") || hint.contains("upgrade"),
+            "loading is not enough — the listeners only re-read on restart: {hint}"
+        );
+    }
 
     /// A bound-but-unreachable listener is the one failure every other check
     /// here reports as healthy, so this check has to fail loudly and say what
