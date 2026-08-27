@@ -63,15 +63,24 @@ test("timeout terminates descendants in the spawned POSIX process group", async 
     // do not, the group was killed before the descendant ever wrote, and the
     // test failed as an ENOENT on the heartbeat file — naming a missing file
     // rather than the startup race that caused it. The timeout still does the
-    // killing; it just no longer doubles as a startup budget. 1.5s is ~6x the
-    // observed two-cold-start cost, and if a machine is ever slower still the
-    // guard below fails by naming the startup race instead of an ENOENT.
+    // killing; it just no longer doubles as a startup budget. The budget is
+    // sized as a multiple of the observed two-cold-start cost, and if a machine
+    // is ever slower still the guard below fails by naming the startup race
+    // instead of an ENOENT.
+    //
+    // That guard fired: the budget was 1.5s against a ~250ms cost measured on
+    // the machine that set it, but two nested node cold starts cost 750-1000ms
+    // on an M-series laptop, leaving only ~1.5x headroom. The node test runner
+    // executes this file's cases concurrently, so the suite loads itself past
+    // that margin and the case failed on an otherwise idle machine. 6s restores
+    // the ~6x headroom against the slower measurement. It widens only the
+    // startup budget — every assertion below is unchanged.
     const pending = nodeProcessRunner({
       executable: process.execPath,
       args: ["-e", parent],
-      timeoutMs: 1_500,
+      timeoutMs: 6_000,
     });
-    const started = await waitFor(() => existsSync(heartbeat), 1_400);
+    const started = await waitFor(() => existsSync(heartbeat), 5_500);
     assert.ok(started, "descendant never started, so the kill proves nothing");
 
     const result = await pending;
