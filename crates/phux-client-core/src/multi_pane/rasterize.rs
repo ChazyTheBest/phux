@@ -272,172 +272,203 @@ fn walk_layout_at(
     }
 }
 
-/// Final pass: convert `DividerSegment`s into the per-cell
-/// `DividerCell`s the painter consumes. Resolves heavy/light per
-/// segment edge by checking focus adjacency, and picks junction
-/// characters when two segments cross.
-#[allow(
-    clippy::too_many_lines,
-    reason = "two-pass rasterizer (lay down edges + neighbour-pass T-piece resolution); splitting would lose locality between the per-segment paint and the per-cell inheritance."
-)]
-pub(super) fn rasterize(
-    segments: &[DividerSegment],
+/// Per-cell record of the divider grid: which edges are present at one
+/// coordinate, and which of them are heavy? Order of bits is [N, E, S,
+/// W]; weight is parallel.
+#[derive(Default, Clone, Copy)]
+struct DividerEdges {
+    north: Option<bool>, // Some(heavy?) when an edge points north
+    east: Option<bool>,
+    south: Option<bool>,
+    west: Option<bool>,
+}
+
+/// The four cardinal neighbours of one grid coordinate. A direction is
+/// `Some` only when that neighbour is itself a divider cell.
+#[derive(Default, Clone, Copy)]
+struct Neighbours {
+    north: Option<DividerEdges>,
+    east: Option<DividerEdges>,
+    south: Option<DividerEdges>,
+    west: Option<DividerEdges>,
+}
+
+impl Neighbours {
+    /// Read the divider cells cardinally adjacent to `(x, y)`.
+    fn around(grid: &HashMap<(u16, u16), DividerEdges>, x: u16, y: u16) -> Self {
+        Self {
+            north: if y > 0 {
+                grid.get(&(x, y - 1)).copied()
+            } else {
+                None
+            },
+            east: grid.get(&(x + 1, y)).copied(),
+            south: grid.get(&(x, y + 1)).copied(),
+            west: if x > 0 {
+                grid.get(&(x - 1, y)).copied()
+            } else {
+                None
+            },
+        }
+    }
+}
+
+impl DividerEdges {
+    /// Inherit a junction edge toward each cardinal neighbour that is a
+    /// divider cell and that we don't already have an edge toward. The
+    /// inherited weight matches the neighbour's touching edge.
+    fn inherit_junctions(&mut self, neighbours: &Neighbours) {
+        if self.north.is_none() {
+            // The neighbour's south edge is what touches us.
+            self.north = neighbours.north.and_then(|n| n.south.or(n.north));
+        }
+        if self.south.is_none() {
+            self.south = neighbours.south.and_then(|n| n.north.or(n.south));
+        }
+        if self.east.is_none() {
+            self.east = neighbours.east.and_then(|n| n.west.or(n.east));
+        }
+        if self.west.is_none() {
+            self.west = neighbours.west.and_then(|n| n.east.or(n.west));
+        }
+    }
+}
+
+/// Does the focused pane's rect share an edge with a vertical line at
+/// column `seg.cross`? Adjacent iff the focused rect's left edge ==
+/// cross+1 OR right edge == cross, AND it overlaps the segment's y
+/// range.
+const fn rect_borders_vertical_line(rect: Rect, seg: &DividerSegment) -> bool {
+    let adjacent_x =
+        rect.x == seg.cross.saturating_add(1) || rect.x.saturating_add(rect.w) == seg.cross;
+    let overlaps_y = rect.y <= seg.a1 && rect.y.saturating_add(rect.h).saturating_sub(1) >= seg.a0;
+    adjacent_x && overlaps_y
+}
+
+/// Mirror of [`rect_borders_vertical_line`] for a horizontal line at row
+/// `seg.cross`.
+const fn rect_borders_horizontal_line(rect: Rect, seg: &DividerSegment) -> bool {
+    let adjacent_y =
+        rect.y == seg.cross.saturating_add(1) || rect.y.saturating_add(rect.h) == seg.cross;
+    let overlaps_x = rect.x <= seg.a1 && rect.x.saturating_add(rect.w).saturating_sub(1) >= seg.a0;
+    adjacent_y && overlaps_x
+}
+
+/// Does the segment touch the focused pane? Focused pane is adjacent
+/// iff its `TerminalId` is in either `low_leaves` or `high_leaves` AND
+/// its rect borders the segment along the cross axis. We use membership
+/// only — the rasterizer doesn't need the exact rect contact test
+/// because every leaf in a subtree is adjacent to *its* outer divider
+/// (binary-split-tree invariant).
+fn segment_heavy(
+    seg: &DividerSegment,
     focus: Option<&TerminalId>,
     rects: &HashMap<TerminalId, Rect>,
-    viewport: (u16, u16),
-) -> Vec<DividerCell> {
-    // Per-cell map: which edges are present at (x, y), and which are
-    // heavy? Order of bits is [N, E, S, W]; weight is parallel.
-    #[derive(Default, Clone, Copy)]
-    struct Cell {
-        north: Option<bool>, // Some(heavy?) when an edge points north
-        east: Option<bool>,
-        south: Option<bool>,
-        west: Option<bool>,
-    }
-    let (vcols, vrows) = viewport;
-    let mut grid: HashMap<(u16, u16), Cell> = HashMap::new();
-
-    // Helper: does the segment touch the focused pane? Focused pane is
-    // adjacent iff its TerminalId is in either low_leaves or high_leaves
-    // AND its rect borders the segment along the cross axis. We use
-    // membership only — the rasterizer doesn't need the exact rect
-    // contact test because every leaf in a subtree is adjacent to *its*
-    // outer divider (binary-split-tree invariant).
-    let focused_pane_id = focus;
-    let segment_heavy = |seg: &DividerSegment| -> bool {
-        let Some(fid) = focused_pane_id else {
-            return false;
-        };
-        let touches = seg.low_leaves.contains(fid) || seg.high_leaves.contains(fid);
-        if !touches {
-            return false;
-        }
-        // Confirm the focused pane's rect actually shares an edge with
-        // this segment. Otherwise we'd mark non-adjacent dividers heavy
-        // when the focused pane is deep in one subtree.
-        let Some(fr) = rects.get(fid) else {
-            return false;
-        };
-        match seg.split {
-            SplitDir::Horizontal => {
-                // Vertical line at column `cross`. Adjacent iff the
-                // focused rect's left edge == cross+1 OR right edge ==
-                // cross. AND it must overlap the segment's y range.
-                let adjacent_x =
-                    fr.x == seg.cross.saturating_add(1) || fr.x.saturating_add(fr.w) == seg.cross;
-                let overlaps_y =
-                    fr.y <= seg.a1 && fr.y.saturating_add(fr.h).saturating_sub(1) >= seg.a0;
-                adjacent_x && overlaps_y
-            }
-            SplitDir::Vertical => {
-                let adjacent_y =
-                    fr.y == seg.cross.saturating_add(1) || fr.y.saturating_add(fr.h) == seg.cross;
-                let overlaps_x =
-                    fr.x <= seg.a1 && fr.x.saturating_add(fr.w).saturating_sub(1) >= seg.a0;
-                adjacent_y && overlaps_x
-            }
-            _ => false,
-        }
+) -> bool {
+    let Some(fid) = focus else {
+        return false;
     };
+    let touches = seg.low_leaves.contains(fid) || seg.high_leaves.contains(fid);
+    if !touches {
+        return false;
+    }
+    // Confirm the focused pane's rect actually shares an edge with
+    // this segment. Otherwise we'd mark non-adjacent dividers heavy
+    // when the focused pane is deep in one subtree.
+    let Some(fr) = rects.get(fid) else {
+        return false;
+    };
+    match seg.split {
+        SplitDir::Horizontal => rect_borders_vertical_line(*fr, seg),
+        SplitDir::Vertical => rect_borders_horizontal_line(*fr, seg),
+        _ => false,
+    }
+}
 
-    // Lay down each segment's cells, recording incident edges.
-    for seg in segments {
-        let heavy = segment_heavy(seg);
-        match seg.split {
-            SplitDir::Horizontal => {
-                // Vertical line at column `cross` from row a0..=a1.
-                let x = seg.cross;
-                if x >= vcols {
-                    continue;
-                }
-                for y in seg.a0..=seg.a1.min(vrows.saturating_sub(1)) {
-                    let cell = grid.entry((x, y)).or_default();
-                    if y > seg.a0 {
-                        cell.north = Some(heavy);
-                    }
-                    if y < seg.a1 {
-                        cell.south = Some(heavy);
-                    }
-                }
-            }
-            SplitDir::Vertical => {
-                // Horizontal line at row `cross` from col a0..=a1.
-                let y = seg.cross;
-                if y >= vrows {
-                    continue;
-                }
-                for x in seg.a0..=seg.a1.min(vcols.saturating_sub(1)) {
-                    let cell = grid.entry((x, y)).or_default();
-                    if x > seg.a0 {
-                        cell.west = Some(heavy);
-                    }
-                    if x < seg.a1 {
-                        cell.east = Some(heavy);
-                    }
-                }
-            }
-            _ => {}
+/// Lay down a vertical line at column `cross` from row a0..=a1.
+fn lay_down_vertical_line(
+    grid: &mut HashMap<(u16, u16), DividerEdges>,
+    seg: &DividerSegment,
+    heavy: bool,
+    vcols: u16,
+    vrows: u16,
+) {
+    let x = seg.cross;
+    if x >= vcols {
+        return;
+    }
+    for y in seg.a0..=seg.a1.min(vrows.saturating_sub(1)) {
+        let cell = grid.entry((x, y)).or_default();
+        if y > seg.a0 {
+            cell.north = Some(heavy);
+        }
+        if y < seg.a1 {
+            cell.south = Some(heavy);
         }
     }
+}
 
-    // Post-pass: T-piece junctions where one segment terminates at
-    // another. A cell whose neighbour is itself a divider cell gets an
-    // edge pointing toward that neighbour (inheriting the neighbour's
-    // weight on the touching edge). Without this pass an inner segment
-    // ending against an outer segment paints as a straight line + a
-    // straight perpendicular at the same coordinates, with no junction
-    // glyph — visually a "broken cross."
+/// Lay down a horizontal line at row `cross` from col a0..=a1.
+fn lay_down_horizontal_line(
+    grid: &mut HashMap<(u16, u16), DividerEdges>,
+    seg: &DividerSegment,
+    heavy: bool,
+    vcols: u16,
+    vrows: u16,
+) {
+    let y = seg.cross;
+    if y >= vrows {
+        return;
+    }
+    for x in seg.a0..=seg.a1.min(vcols.saturating_sub(1)) {
+        let cell = grid.entry((x, y)).or_default();
+        if x > seg.a0 {
+            cell.west = Some(heavy);
+        }
+        if x < seg.a1 {
+            cell.east = Some(heavy);
+        }
+    }
+}
+
+/// Lay down one segment's cells, recording incident edges. A
+/// `Horizontal` split paints a vertical line, a `Vertical` split a
+/// horizontal one.
+fn lay_down_segment(
+    grid: &mut HashMap<(u16, u16), DividerEdges>,
+    seg: &DividerSegment,
+    heavy: bool,
+    viewport: (u16, u16),
+) {
+    let (vcols, vrows) = viewport;
+    match seg.split {
+        SplitDir::Horizontal => lay_down_vertical_line(grid, seg, heavy, vcols, vrows),
+        SplitDir::Vertical => lay_down_horizontal_line(grid, seg, heavy, vcols, vrows),
+        _ => {}
+    }
+}
+
+/// Post-pass: T-piece junctions where one segment terminates at
+/// another. A cell whose neighbour is itself a divider cell gets an
+/// edge pointing toward that neighbour (inheriting the neighbour's
+/// weight on the touching edge). Without this pass an inner segment
+/// ending against an outer segment paints as a straight line + a
+/// straight perpendicular at the same coordinates, with no junction
+/// glyph — visually a "broken cross."
+fn inherit_junction_edges(grid: &mut HashMap<(u16, u16), DividerEdges>) {
     let cell_coords: Vec<(u16, u16)> = grid.keys().copied().collect();
     for (x, y) in cell_coords {
-        // Look at each cardinal neighbour. If the neighbour is a
-        // divider cell AND we don't already have an edge in that
-        // direction, inherit one whose weight matches the neighbour's
-        // touching edge.
-        let north_neighbour = if y > 0 {
-            grid.get(&(x, y - 1)).copied()
-        } else {
-            None
-        };
-        let south_neighbour = grid.get(&(x, y + 1)).copied();
-        let east_neighbour = grid.get(&(x + 1, y)).copied();
-        let west_neighbour = if x > 0 {
-            grid.get(&(x - 1, y)).copied()
-        } else {
-            None
-        };
-
+        let neighbours = Neighbours::around(grid, x, y);
         let Some(cell) = grid.get_mut(&(x, y)) else {
             continue;
         };
-        if cell.north.is_none()
-            && let Some(n) = north_neighbour
-            && let Some(heavy) = n.south.or(n.north)
-        {
-            // The neighbour's south edge is what touches us.
-            cell.north = Some(heavy);
-        }
-        if cell.south.is_none()
-            && let Some(n) = south_neighbour
-            && let Some(heavy) = n.north.or(n.south)
-        {
-            cell.south = Some(heavy);
-        }
-        if cell.east.is_none()
-            && let Some(n) = east_neighbour
-            && let Some(heavy) = n.west.or(n.east)
-        {
-            cell.east = Some(heavy);
-        }
-        if cell.west.is_none()
-            && let Some(n) = west_neighbour
-            && let Some(heavy) = n.east.or(n.west)
-        {
-            cell.west = Some(heavy);
-        }
+        cell.inherit_junctions(&neighbours);
     }
+}
 
-    // Stable output order: row-major.
+/// Resolve every grid cell to its box-drawing glyph, in stable
+/// row-major output order.
+fn into_divider_cells(grid: &HashMap<(u16, u16), DividerEdges>) -> Vec<DividerCell> {
     let mut keys: Vec<(u16, u16)> = grid.keys().copied().collect();
     keys.sort_by_key(|(x, y)| (*y, *x));
     keys.into_iter()
@@ -450,6 +481,24 @@ pub(super) fn rasterize(
             }
         })
         .collect()
+}
+
+/// Final pass: convert `DividerSegment`s into the per-cell
+/// `DividerCell`s the painter consumes. Resolves heavy/light per
+/// segment edge by checking focus adjacency, and picks junction
+/// characters when two segments cross.
+pub(super) fn rasterize(
+    segments: &[DividerSegment],
+    focus: Option<&TerminalId>,
+    rects: &HashMap<TerminalId, Rect>,
+    viewport: (u16, u16),
+) -> Vec<DividerCell> {
+    let mut grid: HashMap<(u16, u16), DividerEdges> = HashMap::new();
+    for seg in segments {
+        lay_down_segment(&mut grid, seg, segment_heavy(seg, focus, rects), viewport);
+    }
+    inherit_junction_edges(&mut grid);
+    into_divider_cells(&grid)
 }
 
 /// Build the per-split grab map from the same segments [`rasterize`]

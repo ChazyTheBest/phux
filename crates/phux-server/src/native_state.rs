@@ -566,6 +566,161 @@ struct NativeCheckpointGeneration {
     charge: Arc<NativeGenerationCharge>,
 }
 
+impl NativeCheckpointGeneration {
+    /// Reject an index that is not exactly the frontier, a generation whose
+    /// continuation is already spent, and a record table at its ceiling.
+    const fn ensure_frontier_appendable(&self, index: usize) -> Result<(), NativeStateError> {
+        if index != self.records.len() || self.continuation.is_none() {
+            return Err(NativeStateError::InvalidHandle);
+        }
+        if self.records.len() == self.bounds.max_records {
+            return Err(NativeStateError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// A zeroed scratch buffer sized to the smaller of the per-record bound and
+    /// the payload budget this generation has left.
+    fn frontier_scratch(&self) -> Result<Vec<u8>, NativeStateError> {
+        let remaining_capacity = self
+            .payload_capacity
+            .checked_sub(self.cached_capacity)
+            .ok_or(NativeStateError::LimitExceeded)?;
+        let output_len = self.bounds.max_record_bytes.min(remaining_capacity);
+        if output_len == 0 {
+            return Err(NativeStateError::LimitExceeded);
+        }
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(output_len)
+            .map_err(|_| NativeStateError::OutOfMemory)?;
+        scratch.resize(output_len, 0);
+        Ok(scratch)
+    }
+
+    /// Advance the continuation by exactly one record and cache it at the
+    /// frontier.
+    ///
+    /// Allocation, row-bound, and native `OutOfSpace` failures happen before
+    /// native advancement and leave the frontier fixed. A record this frontier
+    /// must never observe spends the continuation instead of resuming.
+    fn append_frontier_record(&mut self) -> Result<CachedNativeHistoryRecord, NativeStateError> {
+        let max_bytes = self.bounds.max_record_bytes;
+        let max_rows = self.bounds.max_rows;
+        let mut scratch = self.frontier_scratch()?;
+        let event = self
+            .continuation
+            .as_mut()
+            .ok_or(NativeStateError::InvalidHandle)?
+            .next(ContinuationOptions { max_rows }, &mut scratch)?;
+        if event.codec_version != CHECKPOINT_VERSION || event.record.len() > max_bytes {
+            self.continuation.take();
+            return Err(NativeStateError::InvalidState);
+        }
+        let record_len = event.record.len();
+        let Some((rows, finish)) = frontier_record_shape(&event.kind, event.rows, max_rows) else {
+            self.continuation.take();
+            return Err(NativeStateError::InvalidState);
+        };
+        let cached_capacity = self
+            .cached_capacity
+            .checked_add(record_len)
+            .filter(|bytes| *bytes <= self.payload_capacity)
+            .ok_or(NativeStateError::LimitExceeded)?;
+        scratch.truncate(record_len);
+        let payload =
+            ChargedNativePayload::new(scratch.into_boxed_slice(), Arc::clone(&self.charge));
+        let record = CachedNativeHistoryRecord {
+            bytes: Bytes::from_owner(payload),
+            rows,
+            finish,
+        };
+        self.records.push(record.clone());
+        self.cached_capacity = cached_capacity;
+        if finish {
+            self.continuation.take();
+        }
+        Ok(record)
+    }
+}
+
+/// The row count and finish flag one frontier event contributes, or `None` for
+/// an event kind a history frontier must never observe.
+const fn frontier_record_shape(
+    kind: &CaptureEventKind,
+    rows: usize,
+    max_rows: usize,
+) -> Option<(usize, bool)> {
+    match kind {
+        CaptureEventKind::HistoryBegin { .. } => Some((0, false)),
+        CaptureEventKind::HistoryPage { .. } if rows <= max_rows => Some((rows, false)),
+        CaptureEventKind::Finish => Some((0, true)),
+        CaptureEventKind::Record
+        | CaptureEventKind::Ready { .. }
+        | CaptureEventKind::HistoryPage { .. } => None,
+    }
+}
+
+/// The caller's byte and row ceiling for one history record, rejected when
+/// either collapses to zero or overflows this platform's `usize`.
+fn requested_record_window(
+    requested_max_bytes: u32,
+    requested_max_rows: u32,
+) -> Result<(usize, usize), NativeStateError> {
+    let requested_bytes =
+        usize::try_from(requested_max_bytes).map_err(|_| NativeStateError::LimitExceeded)?;
+    let requested_rows =
+        usize::try_from(requested_max_rows).map_err(|_| NativeStateError::LimitExceeded)?;
+    if requested_bytes == 0 || requested_rows == 0 {
+        return Err(NativeStateError::LimitExceeded);
+    }
+    Ok((requested_bytes, requested_rows))
+}
+
+/// The page, row, record, and byte ceilings one generation inherits from the
+/// protocol page constants, the engine's advertised bounds, and the detach
+/// defaults.
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "every field is a ceiling, and the `max_` prefix is the name it carries in `DetachOptions`, `NativeGenerationBounds`, and the engine capabilities it is derived from"
+)]
+struct NativeGenerationLayout {
+    max_pages: usize,
+    max_unit_bytes: usize,
+    max_rows: usize,
+    max_total_bytes: usize,
+    max_records: usize,
+}
+
+impl NativeGenerationLayout {
+    /// True when a ceiling collapsed to zero, leaving a capture that can never
+    /// emit a record. `max_records` is `max_pages + 2` and so is never zero.
+    const fn has_zero_bound(&self) -> bool {
+        self.max_unit_bytes == 0
+            || self.max_rows == 0
+            || self.max_total_bytes == 0
+            || self.max_records == 0
+    }
+
+    const fn detach_options(&self) -> DetachOptions {
+        DetachOptions {
+            max_pages: self.max_pages,
+            max_total_bytes: self.max_total_bytes,
+            max_rows: self.max_rows,
+        }
+    }
+
+    const fn generation_bounds(&self) -> NativeGenerationBounds {
+        NativeGenerationBounds {
+            max_record_bytes: self.max_unit_bytes,
+            max_rows: self.max_rows,
+            max_records: self.max_records,
+            max_total_bytes: self.max_total_bytes,
+        }
+    }
+}
+
 /// Actor-owned terminal and bounded concurrent native history cuts.
 #[derive(Debug)]
 pub(crate) struct NativeTerminalManager {
@@ -658,6 +813,27 @@ impl NativeTerminalManager {
         self.capture_bounded_inner(limits, max_prefix_bytes, max_prefix_chunks, true)
     }
 
+    /// Capture options clamped to the prefix budget, plus the generation layout
+    /// they imply, rejecting any ceiling that collapses to zero.
+    #[cfg(test)]
+    fn bounded_capture_plan(
+        &self,
+        limits: BootstrapLimits,
+        max_prefix_bytes: usize,
+        max_prefix_chunks: usize,
+    ) -> Result<(CaptureOptions, NativeGenerationLayout), NativeStateError> {
+        let mut options = bounded_capture_options(limits, &self.engine)?;
+        options.max_record_bytes = options.max_record_bytes.min(max_prefix_bytes);
+        if options.max_record_bytes == 0 || max_prefix_chunks == 0 {
+            return Err(NativeStateError::LimitExceeded);
+        }
+        let layout = self.generation_layout(options.max_pages)?;
+        if options.max_pages == 0 || layout.has_zero_bound() {
+            return Err(NativeStateError::LimitExceeded);
+        }
+        Ok((options, layout))
+    }
+
     #[cfg(test)]
     fn capture_bounded_inner(
         &mut self,
@@ -669,43 +845,11 @@ impl NativeTerminalManager {
         if require_available_slot && self.retained_generation_count()? >= self.capacity {
             return Err(NativeStateError::LimitExceeded);
         }
-        let mut options = bounded_capture_options(limits, &self.engine)?;
-        options.max_record_bytes = options.max_record_bytes.min(max_prefix_bytes);
-        if options.max_record_bytes == 0 || max_prefix_chunks == 0 {
-            return Err(NativeStateError::LimitExceeded);
-        }
+        let (options, layout) =
+            self.bounded_capture_plan(limits, max_prefix_bytes, max_prefix_chunks)?;
         let wire_chunk_bytes = usize::try_from(limits.max_chunk_bytes())
             .map_err(|_| NativeStateError::LimitExceeded)?;
         let max_record_bytes = options.max_record_bytes;
-        let max_pages = options.max_pages;
-        let protocol_max_unit_bytes = usize::try_from(phux_protocol::MAX_HISTORY_PAGE_BYTES)
-            .map_err(|_| NativeStateError::LimitExceeded)?;
-        let max_unit_bytes = protocol_max_unit_bytes.min(self.engine.max_unit_bytes);
-        let detach_defaults = DetachOptions::default();
-        let protocol_max_rows = usize::try_from(phux_protocol::MAX_HISTORY_PAGE_ROWS)
-            .map_err(|_| NativeStateError::LimitExceeded)?;
-        let max_rows = detach_defaults
-            .max_rows
-            .min(self.engine.max_rows)
-            .min(protocol_max_rows);
-        let engine_protocol_total_bytes = max_unit_bytes
-            .checked_mul(max_pages)
-            .ok_or(NativeStateError::LimitExceeded)?;
-        let max_total_bytes = detach_defaults
-            .max_total_bytes
-            .min(engine_protocol_total_bytes);
-        let max_records = max_pages
-            .checked_add(2)
-            .ok_or(NativeStateError::LimitExceeded)?;
-        if max_record_bytes == 0
-            || max_unit_bytes == 0
-            || max_pages == 0
-            || max_rows == 0
-            || max_total_bytes == 0
-            || max_records == 0
-        {
-            return Err(NativeStateError::LimitExceeded);
-        }
         preflight_checkpoint_prefix(
             &mut self.terminal,
             options,
@@ -718,17 +862,8 @@ impl NativeTerminalManager {
         Ok(NativeManagedCapture {
             capture: Some(capture),
             max_record_bytes,
-            detach_options: DetachOptions {
-                max_pages,
-                max_total_bytes,
-                max_rows,
-            },
-            generation_bounds: NativeGenerationBounds {
-                max_record_bytes: max_unit_bytes,
-                max_rows,
-                max_records,
-                max_total_bytes,
-            },
+            detach_options: layout.detach_options(),
+            generation_bounds: layout.generation_bounds(),
             ready_cursor: None,
         })
     }
@@ -767,26 +902,8 @@ impl NativeTerminalManager {
             return Err(NativeStateError::LimitExceeded);
         }
         let max_record_bytes = options.max_record_bytes;
-        let max_pages = options.max_pages;
-        let protocol_max_unit_bytes = usize::try_from(phux_protocol::MAX_HISTORY_PAGE_BYTES)
-            .map_err(|_| NativeStateError::LimitExceeded)?;
-        let max_unit_bytes = protocol_max_unit_bytes.min(self.engine.max_unit_bytes);
-        let detach_defaults = DetachOptions::default();
-        let protocol_max_rows = usize::try_from(phux_protocol::MAX_HISTORY_PAGE_ROWS)
-            .map_err(|_| NativeStateError::LimitExceeded)?;
-        let max_rows = detach_defaults
-            .max_rows
-            .min(self.engine.max_rows)
-            .min(protocol_max_rows);
-        let max_total_bytes = detach_defaults.max_total_bytes.min(
-            max_unit_bytes
-                .checked_mul(max_pages)
-                .ok_or(NativeStateError::LimitExceeded)?,
-        );
-        let max_records = max_pages
-            .checked_add(2)
-            .ok_or(NativeStateError::LimitExceeded)?;
-        if max_unit_bytes == 0 || max_rows == 0 || max_total_bytes == 0 {
+        let layout = self.generation_layout(options.max_pages)?;
+        if layout.has_zero_bound() {
             return Err(NativeStateError::LimitExceeded);
         }
 
@@ -803,18 +920,43 @@ impl NativeTerminalManager {
         Ok(NativeManagedCapture {
             capture: Some(capture),
             max_record_bytes,
-            detach_options: DetachOptions {
-                max_pages,
-                max_total_bytes,
-                max_rows,
-            },
-            generation_bounds: NativeGenerationBounds {
-                max_record_bytes: max_unit_bytes,
-                max_rows,
-                max_records,
-                max_total_bytes,
-            },
+            detach_options: layout.detach_options(),
+            generation_bounds: layout.generation_bounds(),
             ready_cursor: None,
+        })
+    }
+
+    /// Derive one generation's layout from the capture's page budget, the
+    /// engine's advertised bounds, and the detach defaults.
+    fn generation_layout(
+        &self,
+        max_pages: usize,
+    ) -> Result<NativeGenerationLayout, NativeStateError> {
+        let protocol_max_unit_bytes = usize::try_from(phux_protocol::MAX_HISTORY_PAGE_BYTES)
+            .map_err(|_| NativeStateError::LimitExceeded)?;
+        let max_unit_bytes = protocol_max_unit_bytes.min(self.engine.max_unit_bytes);
+        let detach_defaults = DetachOptions::default();
+        let protocol_max_rows = usize::try_from(phux_protocol::MAX_HISTORY_PAGE_ROWS)
+            .map_err(|_| NativeStateError::LimitExceeded)?;
+        let max_rows = detach_defaults
+            .max_rows
+            .min(self.engine.max_rows)
+            .min(protocol_max_rows);
+        let engine_protocol_total_bytes = max_unit_bytes
+            .checked_mul(max_pages)
+            .ok_or(NativeStateError::LimitExceeded)?;
+        let max_total_bytes = detach_defaults
+            .max_total_bytes
+            .min(engine_protocol_total_bytes);
+        let max_records = max_pages
+            .checked_add(2)
+            .ok_or(NativeStateError::LimitExceeded)?;
+        Ok(NativeGenerationLayout {
+            max_pages,
+            max_unit_bytes,
+            max_rows,
+            max_total_bytes,
+            max_records,
         })
     }
 
@@ -908,14 +1050,8 @@ impl NativeTerminalManager {
         requested_max_bytes: u32,
         requested_max_rows: u32,
     ) -> Result<CachedNativeHistoryRecord, NativeStateError> {
-        let requested_bytes =
-            usize::try_from(requested_max_bytes).map_err(|_| NativeStateError::LimitExceeded)?;
-        let requested_rows =
-            usize::try_from(requested_max_rows).map_err(|_| NativeStateError::LimitExceeded)?;
-        if requested_bytes == 0 || requested_rows == 0 {
-            return Err(NativeStateError::LimitExceeded);
-        }
-
+        let (requested_bytes, requested_rows) =
+            requested_record_window(requested_max_bytes, requested_max_rows)?;
         let generation = self
             .generations
             .get_mut(cursor)
@@ -923,69 +1059,10 @@ impl NativeTerminalManager {
         if let Some(record) = generation.records.get(index) {
             return record.for_request(requested_bytes, requested_rows);
         }
-        if index != generation.records.len() || generation.continuation.is_none() {
-            return Err(NativeStateError::InvalidHandle);
-        }
-        if generation.records.len() == generation.bounds.max_records {
-            return Err(NativeStateError::LimitExceeded);
-        }
-
-        let remaining_capacity = generation
-            .payload_capacity
-            .checked_sub(generation.cached_capacity)
-            .ok_or(NativeStateError::LimitExceeded)?;
-        let max_bytes = generation.bounds.max_record_bytes;
-        let max_rows = generation.bounds.max_rows;
-        let output_len = max_bytes.min(remaining_capacity);
-        if output_len == 0 {
-            return Err(NativeStateError::LimitExceeded);
-        }
-        let mut scratch = Vec::new();
-        scratch
-            .try_reserve_exact(output_len)
-            .map_err(|_| NativeStateError::OutOfMemory)?;
-        scratch.resize(output_len, 0);
-
-        let event = generation
-            .continuation
-            .as_mut()
-            .ok_or(NativeStateError::InvalidHandle)?
-            .next(ContinuationOptions { max_rows }, &mut scratch)?;
-        if event.codec_version != CHECKPOINT_VERSION || event.record.len() > max_bytes {
-            generation.continuation.take();
-            return Err(NativeStateError::InvalidState);
-        }
-        let record_len = event.record.len();
-        let (rows, finish) = match event.kind {
-            CaptureEventKind::HistoryBegin { .. } => (0, false),
-            CaptureEventKind::HistoryPage { .. } if event.rows <= max_rows => (event.rows, false),
-            CaptureEventKind::Finish => (0, true),
-            CaptureEventKind::Record
-            | CaptureEventKind::Ready { .. }
-            | CaptureEventKind::HistoryPage { .. } => {
-                generation.continuation.take();
-                return Err(NativeStateError::InvalidState);
-            }
-        };
-        let cached_capacity = generation
-            .cached_capacity
-            .checked_add(record_len)
-            .filter(|bytes| *bytes <= generation.payload_capacity)
-            .ok_or(NativeStateError::LimitExceeded)?;
-        scratch.truncate(record_len);
-        let payload =
-            ChargedNativePayload::new(scratch.into_boxed_slice(), Arc::clone(&generation.charge));
-        let record = CachedNativeHistoryRecord {
-            bytes: Bytes::from_owner(payload),
-            rows,
-            finish,
-        };
-        generation.records.push(record.clone());
-        generation.cached_capacity = cached_capacity;
-        if finish {
-            generation.continuation.take();
-        }
-        record.for_request(requested_bytes, requested_rows)
+        generation.ensure_frontier_appendable(index)?;
+        generation
+            .append_frontier_record()?
+            .for_request(requested_bytes, requested_rows)
     }
 
     /// Release one generation reference. Cached allocations that escaped through
@@ -1124,23 +1201,45 @@ fn require_protocol_07_native() -> Result<incremental::Capabilities, NativeState
     }
 }
 
+/// The complete protocol-0.7 native contract: the engine speaks this build's
+/// checkpoint codec, exposes every capture feature the native profile is built
+/// on, and advertises bounds the bounded-capture arithmetic can work with.
 fn supports_protocol_07_native(engine: &incremental::Capabilities) -> bool {
+    speaks_checkpoint_codec(engine)
+        && exposes_native_capture_features(engine)
+        && advertises_usable_bounds(engine)
+}
+
+/// The engine's incremental ABI matches this build, and its encode/decode
+/// window covers the exact checkpoint codec phux puts on the wire.
+fn speaks_checkpoint_codec(engine: &incremental::Capabilities) -> bool {
     engine.version == INCREMENTAL_ABI_VERSION
         && engine.min_decode_version <= CHECKPOINT_VERSION
         && engine.max_decode_version >= CHECKPOINT_VERSION
         && engine.default_encode_version == CHECKPOINT_VERSION
-        && engine.incremental
+        && engine.codec_identity == CHECKPOINT_CODEC_IDENTITY
+}
+
+/// Every capture feature the native bootstrap profile depends on: incremental
+/// capture, an authenticated READY boundary, pullable history, and the three
+/// bounded-emission guarantees.
+const fn exposes_native_capture_features(engine: &incremental::Capabilities) -> bool {
+    engine.incremental
         && engine.ready
         && engine.history
         && engine.authenticated_tokens
         && engine.bounded_records
         && engine.bounded_pages
         && engine.bounded_units
-        && engine.max_record_bytes > 0
+}
+
+/// No advertised bound collapsed to zero, which would leave a capture that can
+/// never emit a record.
+const fn advertises_usable_bounds(engine: &incremental::Capabilities) -> bool {
+    engine.max_record_bytes > 0
         && engine.max_pages > 0
         && engine.max_unit_bytes > 0
         && engine.max_rows > 0
-        && engine.codec_identity == CHECKPOINT_CODEC_IDENTITY
 }
 
 fn intersect_engine_limits(

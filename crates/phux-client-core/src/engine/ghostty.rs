@@ -133,6 +133,54 @@ impl GhosttyAdapter {
     pub const fn limits(&self) -> BootstrapLimits {
         self.limits
     }
+
+    /// Convert scanned history ranges into tracked anchor pairs.
+    ///
+    /// Any failure releases every anchor already tracked for this search, so a
+    /// partially tracked result never leaks tracked grid refs into the replica.
+    fn track_search_matches(
+        &mut self,
+        replica: &mut GhosttyReplica,
+        ranges: Vec<(DocumentPoint, DocumentPoint)>,
+    ) -> Result<Vec<EngineSearchMatch>, GhosttyEngineError> {
+        let mut matches: Vec<EngineSearchMatch> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match self.track_match_range(replica, start, end) {
+                Ok(found) => matches.push(found),
+                Err(error) => {
+                    self.release_matches(replica, std::mem::take(&mut matches));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Track both endpoints of one match, releasing the start if the end fails.
+    fn track_match_range(
+        &mut self,
+        replica: &mut GhosttyReplica,
+        start: DocumentPoint,
+        end: DocumentPoint,
+    ) -> Result<EngineSearchMatch, GhosttyEngineError> {
+        let start = self.track_document_anchor(replica, start)?;
+        let end = match self.track_document_anchor(replica, end) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                self.release_document_anchor(replica, start);
+                return Err(error);
+            }
+        };
+        Ok(EngineSearchMatch { start, end })
+    }
+
+    /// Release both anchors of every already-tracked match.
+    fn release_matches(&mut self, replica: &mut GhosttyReplica, matches: Vec<EngineSearchMatch>) {
+        for found in matches {
+            self.release_document_anchor(replica, found.start);
+            self.release_document_anchor(replica, found.end);
+        }
+    }
 }
 
 /// One adapter-owned libghostty replica.
@@ -585,61 +633,21 @@ impl EngineDocumentAdapter for GhosttyAdapter {
             .ok_or(GhosttyEngineError::LiveOutputBeforeReady)?;
         let width = width.max(2);
         if max_rows == 0 {
-            return Ok(EngineHistoryProjection {
-                width,
-                rows: Vec::new(),
-                has_older: false,
-            });
+            return Ok(empty_projection(width, false));
         }
         let history_rows = terminal.scrollback_rows()?;
         let physical_limit = max_rows.saturating_add(1);
-        let (mut start, tail) = match origin {
-            EngineProjectionOrigin::Tail => (history_rows.saturating_sub(physical_limit), true),
-            EngineProjectionOrigin::Anchor(anchor) => {
-                let Some(anchor) = replica.anchors.get(&anchor) else {
-                    return Ok(EngineHistoryProjection {
-                        width,
-                        rows: Vec::new(),
-                        has_older: true,
-                    });
-                };
-                let Some(point) = anchor.point(PointSpace::History)? else {
-                    return Ok(EngineHistoryProjection {
-                        width,
-                        rows: Vec::new(),
-                        has_older: true,
-                    });
-                };
-                (point.y as usize, false)
-            }
+        let Some(window) = history_window(replica, terminal, origin, history_rows, physical_limit)?
+        else {
+            return Ok(empty_projection(width, true));
         };
-        while start > 0 && history_row_wrapped(terminal, start - 1)? {
-            start -= 1;
-        }
-        let mut physical_end = history_rows.min(start.saturating_add(physical_limit));
-        while physical_end < history_rows
-            && physical_end > start
-            && history_row_wrapped(terminal, physical_end - 1)?
-        {
-            physical_end += 1;
-        }
-        let source = engine_history_rows(terminal, start, physical_end)?;
+        let source = engine_history_rows(terminal, window.start, window.end)?;
         let mut rows = rewrap_history_rows(source, width);
-        let mut has_older = start > 0;
-        if rows.len() > max_rows {
-            if tail {
-                rows.drain(..rows.len() - max_rows);
-            } else {
-                rows.truncate(max_rows);
-            }
-            if tail {
-                has_older = true;
-            }
-        }
+        let trimmed_older = trim_projection_rows(&mut rows, max_rows, window.tail);
         Ok(EngineHistoryProjection {
             width,
             rows,
-            has_older,
+            has_older: window.start > 0 || trimmed_older,
         })
     }
 
@@ -690,99 +698,13 @@ impl EngineDocumentAdapter for GhosttyAdapter {
         if needle.is_empty() || max_matches == 0 {
             return Ok(Vec::new());
         }
-        let needle: Vec<char> = needle.chars().collect();
-        let mut ranges = Vec::new();
-        let mut window = VecDeque::with_capacity(needle.len());
-        let mut push_scalar = |scalar: char, point: DocumentPoint| {
-            window.push_back((scalar, point));
-            if window.len() > needle.len() {
-                window.pop_front();
-            }
-            if window.len() == needle.len()
-                && window
-                    .iter()
-                    .map(|(value, _)| *value)
-                    .eq(needle.iter().copied())
-            {
-                let (Some((_, start)), Some((_, end))) = (window.front(), window.back()) else {
-                    unreachable!("a matched search window is non-empty");
-                };
-                ranges.push((*start, *end));
-            }
-            ranges.len() == max_matches
-        };
-        {
+        let ranges = {
             let terminal = replica
                 .terminal()
                 .ok_or(GhosttyEngineError::LiveOutputBeforeReady)?;
-            let cols = terminal.cols()?;
-            let mut y = 0_u32;
-            'history: loop {
-                let first = match terminal.grid_ref(Point::History(PointCoordinate { x: 0, y })) {
-                    Ok(value) => value,
-                    Err(libghostty_vt::Error::InvalidValue) => break,
-                    Err(error) => return Err(error.into()),
-                };
-                let wrapped = first.row()?.is_wrapped()?;
-                for x in 0..cols {
-                    let grid_ref = terminal.grid_ref(Point::History(PointCoordinate { x, y }))?;
-                    for scalar in grid_ref_graphemes(&grid_ref)? {
-                        if push_scalar(
-                            scalar,
-                            DocumentPoint {
-                                space: DocumentSpace::History,
-                                x,
-                                y,
-                            },
-                        ) {
-                            break 'history;
-                        }
-                    }
-                }
-                if !wrapped
-                    && push_scalar(
-                        '\n',
-                        DocumentPoint {
-                            space: DocumentSpace::History,
-                            x: cols.saturating_sub(1),
-                            y,
-                        },
-                    )
-                {
-                    break;
-                }
-                y = match y.checked_add(1) {
-                    Some(value) => value,
-                    None => break,
-                };
-            }
-        }
-        let mut matches: Vec<EngineSearchMatch> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            let start = match self.track_document_anchor(replica, start) {
-                Ok(anchor) => anchor,
-                Err(error) => {
-                    for found in std::mem::take(&mut matches) {
-                        self.release_document_anchor(replica, found.start);
-                        self.release_document_anchor(replica, found.end);
-                    }
-                    return Err(error);
-                }
-            };
-            let end = match self.track_document_anchor(replica, end) {
-                Ok(anchor) => anchor,
-                Err(error) => {
-                    self.release_document_anchor(replica, start);
-                    for found in std::mem::take(&mut matches) {
-                        self.release_document_anchor(replica, found.start);
-                        self.release_document_anchor(replica, found.end);
-                    }
-                    return Err(error);
-                }
-            };
-            matches.push(EngineSearchMatch { start, end });
-        }
-        Ok(matches)
+            scan_history_for_needle(terminal, needle, max_matches)?
+        };
+        self.track_search_matches(replica, ranges)
     }
 
     fn format_selection(
@@ -810,6 +732,122 @@ impl EngineDocumentAdapter for GhosttyAdapter {
             .format_selection_alloc(None, FormatOptions::new().with_selection(&selection))?;
         Ok(formatted.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
     }
+}
+
+/// Rolling window of scalars compared against the search needle.
+struct NeedleScan<'needle> {
+    needle: &'needle [char],
+    max_matches: usize,
+    window: VecDeque<(char, DocumentPoint)>,
+    ranges: Vec<(DocumentPoint, DocumentPoint)>,
+}
+
+impl<'needle> NeedleScan<'needle> {
+    fn new(needle: &'needle [char], max_matches: usize) -> Self {
+        Self {
+            needle,
+            max_matches,
+            window: VecDeque::with_capacity(needle.len()),
+            ranges: Vec::new(),
+        }
+    }
+
+    /// Feed one scalar; reports whether every requested match has been collected.
+    fn push(&mut self, scalar: char, point: DocumentPoint) -> bool {
+        self.window.push_back((scalar, point));
+        if self.window.len() > self.needle.len() {
+            self.window.pop_front();
+        }
+        if self.window.len() == self.needle.len()
+            && self
+                .window
+                .iter()
+                .map(|(value, _)| *value)
+                .eq(self.needle.iter().copied())
+        {
+            let (Some((_, start)), Some((_, end))) = (self.window.front(), self.window.back())
+            else {
+                unreachable!("a matched search window is non-empty");
+            };
+            self.ranges.push((*start, *end));
+        }
+        self.ranges.len() == self.max_matches
+    }
+
+    fn into_ranges(self) -> Vec<(DocumentPoint, DocumentPoint)> {
+        self.ranges
+    }
+}
+
+/// A history-space document point at one grid coordinate.
+const fn history_point(x: u16, y: u32) -> DocumentPoint {
+    DocumentPoint {
+        space: DocumentSpace::History,
+        x,
+        y,
+    }
+}
+
+/// Read one history row's soft-wrap flag, or `None` once history runs out.
+fn history_row_wrapped_at(
+    terminal: &GhosttyTerminal<'_, '_>,
+    y: u32,
+) -> Result<Option<bool>, GhosttyEngineError> {
+    let first = match terminal.grid_ref(Point::History(PointCoordinate { x: 0, y })) {
+        Ok(value) => value,
+        Err(libghostty_vt::Error::InvalidValue) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(first.row()?.is_wrapped()?))
+}
+
+/// Feed every scalar of one history row to the scan; reports whether it filled.
+fn scan_history_row(
+    terminal: &GhosttyTerminal<'_, '_>,
+    scan: &mut NeedleScan<'_>,
+    cols: u16,
+    y: u32,
+) -> Result<bool, GhosttyEngineError> {
+    for x in 0..cols {
+        let grid_ref = terminal.grid_ref(Point::History(PointCoordinate { x, y }))?;
+        for scalar in grid_ref_graphemes(&grid_ref)? {
+            if scan.push(scalar, history_point(x, y)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Scan loaded history oldest-first for `needle`, stopping at `max_matches` ranges.
+///
+/// A row that is not soft-wrapped ends a logical line, so a newline scalar is fed
+/// at its end; the needle therefore matches across the engine's own row wrapping.
+fn scan_history_for_needle(
+    terminal: &GhosttyTerminal<'_, '_>,
+    needle: &str,
+    max_matches: usize,
+) -> Result<Vec<(DocumentPoint, DocumentPoint)>, GhosttyEngineError> {
+    let needle: Vec<char> = needle.chars().collect();
+    let mut scan = NeedleScan::new(&needle, max_matches);
+    let cols = terminal.cols()?;
+    let mut y = 0_u32;
+    loop {
+        let Some(wrapped) = history_row_wrapped_at(terminal, y)? else {
+            break;
+        };
+        if scan_history_row(terminal, &mut scan, cols, y)? {
+            break;
+        }
+        if !wrapped && scan.push('\n', history_point(cols.saturating_sub(1), y)) {
+            break;
+        }
+        let Some(next) = y.checked_add(1) else {
+            break;
+        };
+        y = next;
+    }
+    Ok(scan.into_ranges())
 }
 
 fn enforce_history_budget(replica: &mut GhosttyReplica) -> Result<(), GhosttyEngineError> {
@@ -883,29 +921,156 @@ fn engine_history_rows(
     let cols = terminal.cols()?;
     let mut rows = Vec::with_capacity(end.saturating_sub(start));
     for row in start..end {
-        let y = u32::try_from(row).unwrap_or(u32::MAX);
-        let first = terminal.grid_ref(Point::History(PointCoordinate { x: 0, y }))?;
-        let wrapped = first.row()?.is_wrapped()?;
-        let mut cells = Vec::with_capacity(usize::from(cols));
-        for x in 0..cols {
-            let grid_ref = terminal.grid_ref(Point::History(PointCoordinate { x, y }))?;
-            let cell = grid_ref.cell()?;
-            let wide = cell.wide()?;
-            if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
-                continue;
-            }
-            let text: String = grid_ref_graphemes(&grid_ref)?.into_iter().collect();
-            cells.push(ProjectedCell {
-                empty_default: text.is_empty()
-                    && cell.codepoint()? == 0
-                    && cell.content_tag()? == CellContentTag::Codepoint,
-                text,
-                width: if wide == CellWide::Wide { 2 } else { 1 },
-            });
-        }
-        rows.push((cells, wrapped));
+        rows.push(engine_history_row(terminal, row, cols)?);
     }
     Ok(rows)
+}
+
+/// Project one physical history row into its cells plus its soft-wrap flag.
+fn engine_history_row(
+    terminal: &GhosttyTerminal<'_, '_>,
+    row: usize,
+    cols: u16,
+) -> Result<(Vec<ProjectedCell>, bool), GhosttyEngineError> {
+    let y = u32::try_from(row).unwrap_or(u32::MAX);
+    let first = terminal.grid_ref(Point::History(PointCoordinate { x: 0, y }))?;
+    let wrapped = first.row()?.is_wrapped()?;
+    let mut cells = Vec::with_capacity(usize::from(cols));
+    for x in 0..cols {
+        if let Some(cell) = project_history_cell(terminal, x, y)? {
+            cells.push(cell);
+        }
+    }
+    Ok((cells, wrapped))
+}
+
+/// Project one history cell, or `None` for a wide-cell spacer that owns no text.
+fn project_history_cell(
+    terminal: &GhosttyTerminal<'_, '_>,
+    x: u16,
+    y: u32,
+) -> Result<Option<ProjectedCell>, GhosttyEngineError> {
+    let grid_ref = terminal.grid_ref(Point::History(PointCoordinate { x, y }))?;
+    let cell = grid_ref.cell()?;
+    let wide = cell.wide()?;
+    if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
+        return Ok(None);
+    }
+    let text: String = grid_ref_graphemes(&grid_ref)?.into_iter().collect();
+    Ok(Some(ProjectedCell {
+        empty_default: is_empty_default_cell(cell, &text)?,
+        text,
+        width: if wide == CellWide::Wide { 2 } else { 1 },
+    }))
+}
+
+/// Whether a cell carries nothing but untouched default codepoint content.
+fn is_empty_default_cell(
+    cell: libghostty_vt::screen::Cell,
+    text: &str,
+) -> Result<bool, GhosttyEngineError> {
+    Ok(text.is_empty()
+        && cell.codepoint()? == 0
+        && cell.content_tag()? == CellContentTag::Codepoint)
+}
+
+/// Physical history rows to project, and whether the tail pinned the window.
+#[derive(Debug, Clone, Copy)]
+struct HistoryWindow {
+    start: usize,
+    end: usize,
+    tail: bool,
+}
+
+/// An empty projection at the caller's width.
+const fn empty_projection(width: u16, has_older: bool) -> EngineHistoryProjection {
+    EngineHistoryProjection {
+        width,
+        rows: Vec::new(),
+        has_older,
+    }
+}
+
+/// Resolve the physical history rows one projection origin selects.
+///
+/// Returns `None` when an anchored origin no longer resolves to a history
+/// point; the caller then reports an empty projection that still has older rows.
+fn history_window(
+    replica: &GhosttyReplica,
+    terminal: &GhosttyTerminal<'_, '_>,
+    origin: EngineProjectionOrigin,
+    history_rows: usize,
+    physical_limit: usize,
+) -> Result<Option<HistoryWindow>, GhosttyEngineError> {
+    let Some((start, tail)) = window_origin(replica, origin, history_rows, physical_limit)? else {
+        return Ok(None);
+    };
+    let start = extend_start_to_logical_line(terminal, start)?;
+    let end = extend_end_to_logical_line(terminal, start, history_rows, physical_limit)?;
+    Ok(Some(HistoryWindow { start, end, tail }))
+}
+
+/// First physical row for one origin, and whether that origin is the tail.
+fn window_origin(
+    replica: &GhosttyReplica,
+    origin: EngineProjectionOrigin,
+    history_rows: usize,
+    physical_limit: usize,
+) -> Result<Option<(usize, bool)>, GhosttyEngineError> {
+    match origin {
+        EngineProjectionOrigin::Tail => {
+            Ok(Some((history_rows.saturating_sub(physical_limit), true)))
+        }
+        EngineProjectionOrigin::Anchor(anchor) => {
+            let Some(anchor) = replica.anchors.get(&anchor) else {
+                return Ok(None);
+            };
+            let Some(point) = anchor.point(PointSpace::History)? else {
+                return Ok(None);
+            };
+            Ok(Some((point.y as usize, false)))
+        }
+    }
+}
+
+/// Walk the window start back over soft-wrapped rows onto a logical line boundary.
+fn extend_start_to_logical_line(
+    terminal: &GhosttyTerminal<'_, '_>,
+    mut start: usize,
+) -> Result<usize, GhosttyEngineError> {
+    while start > 0 && history_row_wrapped(terminal, start - 1)? {
+        start -= 1;
+    }
+    Ok(start)
+}
+
+/// Extend the window end past soft-wrapped rows so it closes on a logical line.
+fn extend_end_to_logical_line(
+    terminal: &GhosttyTerminal<'_, '_>,
+    start: usize,
+    history_rows: usize,
+    physical_limit: usize,
+) -> Result<usize, GhosttyEngineError> {
+    let mut end = history_rows.min(start.saturating_add(physical_limit));
+    while end < history_rows && end > start && history_row_wrapped(terminal, end - 1)? {
+        end += 1;
+    }
+    Ok(end)
+}
+
+/// Trim a rewrapped projection to `max_rows`, dropping the end the origin did not pin.
+///
+/// Returns whether trimming dropped rows off the front, which leaves older rows behind.
+fn trim_projection_rows(rows: &mut Vec<EngineProjectionRow>, max_rows: usize, tail: bool) -> bool {
+    if rows.len() <= max_rows {
+        return false;
+    }
+    if tail {
+        rows.drain(..rows.len() - max_rows);
+        return true;
+    }
+    rows.truncate(max_rows);
+    false
 }
 
 fn rewrap_history_rows(
@@ -1082,35 +1247,12 @@ fn push_history(
         return Err(GhosttyEngineError::HistoryBeforePublication);
     }
     if input.is_empty() {
-        return match native.decoder {
-            NativeDecoderState::AfterReady(_) => Ok(HistoryApplyOutcome {
-                progress: BootstrapProgress::Ready,
-                retained: true,
-            }),
-            NativeDecoderState::Finished(_) => Err(GhosttyEngineError::InputAfterFinish),
-            NativeDecoderState::BeforeReady(_) => Err(GhosttyEngineError::HistoryBeforePublication),
-            NativeDecoderState::Failed(_) => Err(GhosttyEngineError::DecoderFailed),
-        };
+        return empty_history_outcome(&native.decoder);
     }
 
     let mut retained = true;
     loop {
-        let state = std::mem::replace(&mut native.decoder, NativeDecoderState::Failed(None));
-        let stream = match state {
-            NativeDecoderState::AfterReady(stream) => stream,
-            NativeDecoderState::Finished(terminal) => {
-                native.decoder = NativeDecoderState::Finished(terminal);
-                return Err(GhosttyEngineError::InputAfterFinish);
-            }
-            NativeDecoderState::BeforeReady(decoder) => {
-                native.decoder = NativeDecoderState::BeforeReady(decoder);
-                return Err(GhosttyEngineError::HistoryBeforePublication);
-            }
-            NativeDecoderState::Failed(terminal) => {
-                native.decoder = NativeDecoderState::Failed(terminal);
-                return Err(GhosttyEngineError::DecoderFailed);
-            }
-        };
+        let stream = take_after_ready_stream(native)?;
         match stream.push(input) {
             Err(failure) => {
                 native.decoder = NativeDecoderState::Failed(Some(failure.terminal));
@@ -1126,16 +1268,7 @@ fn push_history(
                     decoder, progress, ..
                 },
             ) => {
-                let version = check_version(progress);
-                native.decoder = NativeDecoderState::AfterReady(decoder);
-                version?;
-                input = remaining(input, progress)?;
-                if input.is_empty() {
-                    return Ok(HistoryApplyOutcome {
-                        progress: BootstrapProgress::Ready,
-                        retained,
-                    });
-                }
+                input = resume_after_ready(native, decoder, progress, input)?;
             }
             Ok(AfterReadyStep::HistoryPage {
                 decoder,
@@ -1144,40 +1277,102 @@ fn push_history(
                 ..
             }) => {
                 retained &= page_retained;
-                let version = check_version(progress);
-                native.decoder = NativeDecoderState::AfterReady(decoder);
-                version?;
-                input = remaining(input, progress)?;
-                if input.is_empty() {
-                    return Ok(HistoryApplyOutcome {
-                        progress: BootstrapProgress::Ready,
-                        retained,
-                    });
-                }
+                input = resume_after_ready(native, decoder, progress, input)?;
             }
             Ok(AfterReadyStep::Finish(finished)) => {
-                let version = check_version(finished.progress);
-                let codec_version = finished.codec_version;
-                let trailing_result = remaining(input, finished.progress);
-                native.decoder = NativeDecoderState::Finished(finished.terminal);
-                version?;
-                if codec_version != CHECKPOINT_VERSION {
-                    return Err(GhosttyEngineError::WrongCodecVersion {
-                        expected: CHECKPOINT_VERSION,
-                        actual: codec_version,
-                    });
-                }
-                let trailing = trailing_result?.len();
-                if trailing != 0 {
-                    return Err(GhosttyEngineError::TrailingAfterFinish { trailing });
-                }
-                return Ok(HistoryApplyOutcome {
-                    progress: BootstrapProgress::Finished,
-                    retained,
-                });
+                return finish_history(native, finished, input, retained);
             }
         }
+        if input.is_empty() {
+            return Ok(HistoryApplyOutcome {
+                progress: BootstrapProgress::Ready,
+                retained,
+            });
+        }
     }
+}
+
+/// Outcome for an empty history fragment: only a live post-READY stream accepts it.
+const fn empty_history_outcome(
+    decoder: &NativeDecoderState,
+) -> Result<HistoryApplyOutcome, GhosttyEngineError> {
+    match decoder {
+        NativeDecoderState::AfterReady(_) => Ok(HistoryApplyOutcome {
+            progress: BootstrapProgress::Ready,
+            retained: true,
+        }),
+        NativeDecoderState::Finished(_) => Err(GhosttyEngineError::InputAfterFinish),
+        NativeDecoderState::BeforeReady(_) => Err(GhosttyEngineError::HistoryBeforePublication),
+        NativeDecoderState::Failed(_) => Err(GhosttyEngineError::DecoderFailed),
+    }
+}
+
+/// Take the live post-READY stream, restoring and rejecting every other decoder state.
+fn take_after_ready_stream(
+    native: &mut NativeReplica,
+) -> Result<
+    libghostty_vt::snapshot::incremental::DecodedStream<'static, 'static>,
+    GhosttyEngineError,
+> {
+    match std::mem::replace(&mut native.decoder, NativeDecoderState::Failed(None)) {
+        NativeDecoderState::AfterReady(stream) => Ok(stream),
+        NativeDecoderState::Finished(terminal) => {
+            native.decoder = NativeDecoderState::Finished(terminal);
+            Err(GhosttyEngineError::InputAfterFinish)
+        }
+        NativeDecoderState::BeforeReady(decoder) => {
+            native.decoder = NativeDecoderState::BeforeReady(decoder);
+            Err(GhosttyEngineError::HistoryBeforePublication)
+        }
+        NativeDecoderState::Failed(terminal) => {
+            native.decoder = NativeDecoderState::Failed(terminal);
+            Err(GhosttyEngineError::DecoderFailed)
+        }
+    }
+}
+
+/// Reinstate the live stream, authenticate the codec version, and consume the transition.
+///
+/// The decoder is put back before any error propagates, so a rejected version
+/// never leaves the replica holding the poisoned placeholder state.
+fn resume_after_ready<'input>(
+    native: &mut NativeReplica,
+    decoder: libghostty_vt::snapshot::incremental::DecodedStream<'static, 'static>,
+    progress: DecodeProgress,
+    input: &'input [u8],
+) -> Result<&'input [u8], GhosttyEngineError> {
+    let version = check_version(progress);
+    native.decoder = NativeDecoderState::AfterReady(decoder);
+    version?;
+    remaining(input, progress)
+}
+
+/// Settle one authenticated FINISH transition, rejecting a wrong codec or trailing bytes.
+fn finish_history(
+    native: &mut NativeReplica,
+    finished: libghostty_vt::snapshot::incremental::FinishedSnapshot<'static, 'static>,
+    input: &[u8],
+    retained: bool,
+) -> Result<HistoryApplyOutcome, GhosttyEngineError> {
+    let version = check_version(finished.progress);
+    let codec_version = finished.codec_version;
+    let trailing_result = remaining(input, finished.progress);
+    native.decoder = NativeDecoderState::Finished(finished.terminal);
+    version?;
+    if codec_version != CHECKPOINT_VERSION {
+        return Err(GhosttyEngineError::WrongCodecVersion {
+            expected: CHECKPOINT_VERSION,
+            actual: codec_version,
+        });
+    }
+    let trailing = trailing_result?.len();
+    if trailing != 0 {
+        return Err(GhosttyEngineError::TrailingAfterFinish { trailing });
+    }
+    Ok(HistoryApplyOutcome {
+        progress: BootstrapProgress::Finished,
+        retained,
+    })
 }
 
 const fn check_version(progress: DecodeProgress) -> Result<(), GhosttyEngineError> {

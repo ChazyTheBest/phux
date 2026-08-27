@@ -301,26 +301,77 @@ impl TerminalActor {
         })
     }
 
+    /// The READY publication fence: install the generation, charge its
+    /// reservation, notify every waiting owner, and unwind all of it on any
+    /// failure. Each stage below either answers every prepared waiter and
+    /// stops, or hands the still-live set to the next one, so a waiter is
+    /// answered exactly once no matter where the fence fails.
     #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the READY publication fence: install the generation, charge its reservation, notify every waiting owner, and unwind all of it on any failure. The unwind must see every resource the happy path acquired, so the two halves cannot be separated without duplicating the cleanup"
-    )]
     pub(super) fn finish_native_bootstrap(
         &mut self,
         pending: PendingNativeBootstrap,
         cursor: crate::native_state::OpaqueHistoryCursor,
         seed: crate::native_state::NativeGenerationSeed,
     ) {
-        let record_retained_bytes = pending.retained_bytes;
+        let PendingNativeBootstrap {
+            waiters,
+            records,
+            retained_bytes,
+            base_seq,
+            replay,
+            replay_bytes,
+            ..
+        } = pending;
+        let prepared = self.prepare_native_bootstrap_replies(
+            waiters,
+            &records,
+            retained_bytes,
+            cursor,
+            base_seq,
+        );
+        if prepared.is_empty() {
+            return;
+        }
+        let installed_new = match self.install_native_generation(cursor, seed) {
+            Ok(installed_new) => installed_new,
+            Err(error) => {
+                fail_native_waiters(prepared, error);
+                return;
+            }
+        };
+        if self.native_publication_conflicts(cursor, base_seq, &replay) {
+            fail_native_waiters(
+                prepared,
+                crate::native_state::NativeStateError::LimitExceeded,
+            );
+            return;
+        }
+        let waiting = self.register_native_bootstrap_waiters(prepared, cursor, installed_new);
+        if waiting.is_empty() {
+            return;
+        }
+        self.record_native_publication(cursor, base_seq, replay, replay_bytes, waiting);
+    }
+
+    /// Build every waiter's BOOTSTRAP reply up front, answering (and dropping)
+    /// the ones whose reply cannot be assembled within their own limits.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn prepare_native_bootstrap_replies(
+        &self,
+        waiters: Vec<NativeBootstrapRequest>,
+        records: &[Bytes],
+        record_retained_bytes: usize,
+        cursor: crate::native_state::OpaqueHistoryCursor,
+        base_seq: u64,
+    ) -> Vec<(NativeBootstrapRequest, NativeBootstrapReply)> {
         let mut prepared = Vec::new();
-        for waiter in pending.waiters {
+        for waiter in waiters {
             match self.native_bootstrap_reply(
                 &waiter,
-                &pending.records,
+                records,
                 record_retained_bytes,
                 cursor,
-                pending.base_seq,
+                base_seq,
             ) {
                 Ok(reply) => prepared.push((waiter, reply)),
                 Err(error) => {
@@ -328,69 +379,66 @@ impl TerminalActor {
                 }
             }
         }
-        if prepared.is_empty() {
-            return;
-        }
-        let installed_new = {
-            let mut host = self.terminal.borrow_mut();
-            let manager = match &mut *host {
-                CanonicalTerminal::Native(manager) => manager,
-                CanonicalTerminal::Plain(_) => {
-                    for (waiter, _) in prepared {
-                        let _ = waiter
-                            .reply
-                            .send(Err(crate::native_state::NativeStateError::InvalidState));
-                    }
-                    return;
-                }
-            };
-            if manager.has_generation(&cursor) {
-                drop(seed);
-                Ok(false)
-            } else {
-                let bounds = seed.bounds();
-                bounds
-                    .required_reserved_bytes()
-                    .and_then(|reserved| manager.install_generation(cursor, seed, bounds, reserved))
-                    .map(|()| true)
-            }
-        };
-        let Ok(installed_new) = installed_new else {
-            for (waiter, _) in prepared {
-                let _ = waiter
-                    .reply
-                    .send(Err(crate::native_state::NativeStateError::LimitExceeded));
-            }
-            return;
-        };
-        if let Some(existing) = self.native_publications.get(&cursor)
-            && (existing.base_seq != pending.base_seq || existing.replay != pending.replay)
-        {
-            for (waiter, _) in prepared {
-                let _ = waiter
-                    .reply
-                    .send(Err(crate::native_state::NativeStateError::LimitExceeded));
-            }
-            return;
-        }
+        prepared
+    }
 
+    /// Install `cursor`'s generation on the native manager, charging its
+    /// reservation. `Ok(true)` when this call installed it, `Ok(false)` when
+    /// the manager already held it (the seed is then dropped unused).
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn install_native_generation(
+        &self,
+        cursor: crate::native_state::OpaqueHistoryCursor,
+        seed: crate::native_state::NativeGenerationSeed,
+    ) -> Result<bool, crate::native_state::NativeStateError> {
+        let mut host = self.terminal.borrow_mut();
+        let manager = match &mut *host {
+            CanonicalTerminal::Native(manager) => manager,
+            CanonicalTerminal::Plain(_) => {
+                return Err(crate::native_state::NativeStateError::InvalidState);
+            }
+        };
+        if manager.has_generation(&cursor) {
+            drop(seed);
+            return Ok(false);
+        }
+        let bounds = seed.bounds();
+        bounds
+            .required_reserved_bytes()
+            .and_then(|reserved| manager.install_generation(cursor, seed, bounds, reserved))
+            .map(|()| true)
+            .map_err(|_| crate::native_state::NativeStateError::LimitExceeded)
+    }
+
+    /// Whether an already-published generation for `cursor` disagrees with the
+    /// capture we are about to publish. Republishing over it would hand two
+    /// replicas different bytes for the same cursor.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn native_publication_conflicts(
+        &self,
+        cursor: crate::native_state::OpaqueHistoryCursor,
+        base_seq: u64,
+        replay: &VecDeque<(u64, Bytes)>,
+    ) -> bool {
+        self.native_publications
+            .get(&cursor)
+            .is_some_and(|existing| existing.base_seq != base_seq || existing.replay != *replay)
+    }
+
+    /// Retain the installed generation once per waiter, bind each owner to the
+    /// cursor, and ship its reply. Returns the owners still waiting on the
+    /// publication (a waiter whose reply channel is gone is released again).
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn register_native_bootstrap_waiters(
+        &mut self,
+        prepared: Vec<(NativeBootstrapRequest, NativeBootstrapReply)>,
+        cursor: crate::native_state::OpaqueHistoryCursor,
+        installed_new: bool,
+    ) -> HashSet<u64> {
         let mut waiting = HashSet::new();
         let mut installed = 0_usize;
         for (waiter, reply_value) in prepared {
-            let retained = {
-                let mut host = self.terminal.borrow_mut();
-                match &mut *host {
-                    CanonicalTerminal::Native(manager) => {
-                        if installed_new && installed == 0 {
-                            true
-                        } else {
-                            manager.retain_generation(&cursor).is_ok()
-                        }
-                    }
-                    CanonicalTerminal::Plain(_) => false,
-                }
-            };
-            if !retained {
+            if !self.retain_native_generation(&cursor, installed_new && installed == 0) {
                 let _ = waiter
                     .reply
                     .send(Err(crate::native_state::NativeStateError::LimitExceeded));
@@ -415,20 +463,50 @@ impl TerminalActor {
                 self.release_native_owner(waiter.owner);
             }
         }
-        if !waiting.is_empty() {
-            use std::collections::hash_map::Entry;
-            match self.native_publications.entry(cursor) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().waiting.extend(waiting);
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(NativePublicationGeneration {
-                        base_seq: pending.base_seq,
-                        replay: pending.replay,
-                        replay_bytes: pending.replay_bytes,
-                        waiting,
-                    });
-                }
+        waiting
+    }
+
+    /// Charge one waiter's retain against the generation. `rides_install` is
+    /// the first waiter on a freshly installed generation: the install itself
+    /// already retained it, so it takes no second retain.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn retain_native_generation(
+        &self,
+        cursor: &crate::native_state::OpaqueHistoryCursor,
+        rides_install: bool,
+    ) -> bool {
+        let mut host = self.terminal.borrow_mut();
+        match &mut *host {
+            CanonicalTerminal::Native(manager) => {
+                rides_install || manager.retain_generation(cursor).is_ok()
+            }
+            CanonicalTerminal::Plain(_) => false,
+        }
+    }
+
+    /// Record (or extend) the publication generation the waiting owners are
+    /// parked on, so a later PUBLICATION request can serve them the replay.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn record_native_publication(
+        &mut self,
+        cursor: crate::native_state::OpaqueHistoryCursor,
+        base_seq: u64,
+        replay: VecDeque<(u64, Bytes)>,
+        replay_bytes: usize,
+        waiting: HashSet<u64>,
+    ) {
+        use std::collections::hash_map::Entry;
+        match self.native_publications.entry(cursor) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().waiting.extend(waiting);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(NativePublicationGeneration {
+                    base_seq,
+                    replay,
+                    replay_bytes,
+                    waiting,
+                });
             }
         }
     }
@@ -571,11 +649,13 @@ impl TerminalActor {
         let _ = req.reply.send(Ok(NativePublicationReply { replay, live }));
     }
 
+    /// Serve one HISTORY request end to end: validate the cursor, size the
+    /// caller buffer against the generation bounds, pull or serve-from-cache,
+    /// and answer.
+    ///
+    /// Every exit path releases the permit and answers the request exactly
+    /// once, which is what the staged early returns below preserve.
     #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one HISTORY request end to end: validate the cursor, size the caller buffer against the generation bounds, pull or serve-from-cache, and answer. Every early return needs the permit released and the request answered exactly once, which is what keeps this a single function"
-    )]
     pub(super) fn handle_native_history(&mut self, req: NativeHistoryRequest) {
         let NativeHistoryRequest {
             permit,
@@ -589,6 +669,12 @@ impl TerminalActor {
             limits,
             reply,
         } = req;
+        let id = HistoryFrameId {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            cursor: wire_cursor,
+        };
         // A cursor the actor cannot honour is a routine race, not a fault: a
         // resize drains every binding (`invalidate_all_native_cursors`) while
         // the client's HISTORY_REQUEST for the generation it was just handed
@@ -598,195 +684,177 @@ impl TerminalActor {
         // exactly this -- it degrades the one replica's scrollback and leaves
         // the attach intact -- so an unusable cursor is answered, never
         // escalated to a connection-scoped Error.
-        let stale = |wire_cursor: Bytes| FrameKind::HistoryTombstone {
-            terminal_id: terminal_id.clone(),
-            stream_id,
-            bootstrap_id,
-            cursor: wire_cursor,
-            reason: phux_protocol::wire::frame::HistoryTombstoneReason::Stale,
-        };
+        let stale = phux_protocol::wire::frame::HistoryTombstoneReason::Stale;
         let Ok(cursor): Result<crate::native_state::OpaqueHistoryCursor, _> =
-            wire_cursor.as_ref().try_into()
+            id.cursor.as_ref().try_into()
         else {
             // Unlike the races below this one is a client protocol violation,
             // so it is worth a log line -- but not worth ending the attach.
             warn!(
-                len = wire_cursor.len(),
-                ?terminal_id,
+                len = id.cursor.len(),
+                terminal_id = ?id.terminal_id,
                 "HISTORY_REQUEST carried a malformed cursor"
             );
-            let _ = reply.send(NativeHistoryReply {
-                permit,
-                result: Ok(stale(wire_cursor)),
-            });
+            answer_history(reply, permit, Ok(id.tombstone(stale)));
             return;
         };
-        let Some(binding) = self.native_cursor_owners.get(&owner) else {
-            let _ = reply.send(NativeHistoryReply {
-                permit,
-                result: Ok(stale(wire_cursor)),
-            });
+        let Some((page_seq, record_index)) = self.history_binding(owner, &id, cursor) else {
+            answer_history(reply, permit, Ok(id.tombstone(stale)));
             return;
         };
-        if binding.cursor != cursor
-            || binding.terminal_id != terminal_id
-            || binding.stream_id != stream_id
-            || binding.bootstrap_id != bootstrap_id
-        {
-            let _ = reply.send(NativeHistoryReply {
-                permit,
-                result: Ok(stale(wire_cursor)),
-            });
-            return;
-        }
-        let page_seq = binding.next_page_seq;
-        let record_index = binding.record_index;
         let bound = max_bytes.min(limits.max_history_page_bytes());
         if bound == 0 || max_rows == 0 {
-            let _ = reply.send(NativeHistoryReply {
-                permit,
-                result: Ok(FrameKind::HistoryRejected {
-                    terminal_id,
-                    stream_id,
-                    bootstrap_id,
-                    cursor: wire_cursor,
-                    reason: phux_protocol::wire::frame::HistoryRejectionReason::ZeroLimit,
-                    required_bytes: 1,
-                    required_rows: 1,
-                }),
-            });
+            let frame = id.rejected(
+                phux_protocol::wire::frame::HistoryRejectionReason::ZeroLimit,
+                1,
+                1,
+            );
+            answer_history(reply, permit, Ok(frame));
             return;
         }
-        let delivery = {
-            let mut host = self.terminal.borrow_mut();
-            match host.native_manager() {
-                Ok(manager) => manager.history_record_at(&cursor, record_index, bound, max_rows),
-                Err(error) => Err(error),
-            }
-        };
+        let delivery = self.history_record_at(&cursor, record_index, bound, max_rows);
         let (result, keep) = match delivery {
             Ok(record) => {
-                let Some(next_page_seq) = page_seq.checked_add(1) else {
-                    self.release_native_owner(owner);
-                    let _ = reply.send(NativeHistoryReply {
-                        permit,
-                        result: Err(crate::native_state::NativeStateError::LimitExceeded),
-                    });
-                    return;
-                };
-                let Ok(rows) = u32::try_from(record.rows) else {
-                    self.release_native_owner(owner);
-                    let _ = reply.send(NativeHistoryReply {
-                        permit,
-                        result: Err(crate::native_state::NativeStateError::LimitExceeded),
-                    });
-                    return;
-                };
-                if record.finish {
-                    self.release_native_owner(owner);
-                } else if let Some(binding) = self.native_cursor_owners.get_mut(&owner) {
-                    binding.record_index += 1;
-                    binding.next_page_seq = next_page_seq;
-                    binding.touched = tokio::time::Instant::now();
+                let finish = record.finish;
+                match self.advance_history_binding(owner, &record, page_seq) {
+                    Ok(rows) => (Ok(id.page(page_seq, record.bytes, rows, finish)), !finish),
+                    Err(error) => {
+                        answer_history(reply, permit, Err(error));
+                        return;
+                    }
                 }
-                (
-                    Ok(FrameKind::HistoryPage {
-                        terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        page_seq,
-                        cursor: wire_cursor.clone(),
-                        next_cursor: (!record.finish).then_some(wire_cursor),
-                        payload: record.bytes,
-                        rows,
-                    }),
-                    !record.finish,
-                )
             }
             Err(crate::native_state::NativeStateError::OutOfSpace {
                 required_bytes,
                 required_rows,
             }) => {
-                let frame = match (
-                    u32::try_from(required_bytes),
-                    u32::try_from(required_rows.max(1)),
-                ) {
-                    (Ok(required_bytes), Ok(required_rows))
-                        if required_bytes != 0
-                            && required_bytes <= limits.max_history_page_bytes()
-                            && required_rows <= phux_protocol::MAX_HISTORY_PAGE_ROWS =>
-                    {
-                        FrameKind::HistoryRejected {
-                            terminal_id,
-                            stream_id,
-                            bootstrap_id,
-                            cursor: wire_cursor,
-                            reason: phux_protocol::wire::frame::HistoryRejectionReason::TooSmall,
-                            required_bytes,
-                            required_rows,
-                        }
-                    }
-                    _ => {
-                        self.release_native_owner(owner);
-                        FrameKind::HistoryTombstone {
-                            terminal_id,
-                            stream_id,
-                            bootstrap_id,
-                            cursor: wire_cursor,
-                            reason: phux_protocol::wire::frame::HistoryTombstoneReason::Limit,
-                        }
-                    }
-                };
-                (Ok(frame), self.native_cursor_owners.contains_key(&owner))
+                let (frame, keep) =
+                    self.history_out_of_space(owner, id, limits, required_bytes, required_rows);
+                (Ok(frame), keep)
             }
             Err(crate::native_state::NativeStateError::ImportBusy) => (
-                Ok(FrameKind::HistoryRejected {
-                    terminal_id,
-                    stream_id,
-                    bootstrap_id,
-                    cursor: wire_cursor,
-                    reason: phux_protocol::wire::frame::HistoryRejectionReason::Busy,
-                    required_bytes: bound,
-                    required_rows: max_rows,
-                }),
+                Ok(id.rejected(
+                    phux_protocol::wire::frame::HistoryRejectionReason::Busy,
+                    bound,
+                    max_rows,
+                )),
                 true,
             ),
             Err(error) => {
-                let reason = match error {
-                    crate::native_state::NativeStateError::Stale
-                    | crate::native_state::NativeStateError::WrongGeneration => {
-                        phux_protocol::wire::frame::HistoryTombstoneReason::Stale
-                    }
-                    crate::native_state::NativeStateError::Pruned => {
-                        phux_protocol::wire::frame::HistoryTombstoneReason::Pruned
-                    }
-                    crate::native_state::NativeStateError::Reset => {
-                        phux_protocol::wire::frame::HistoryTombstoneReason::Reset
-                    }
-                    crate::native_state::NativeStateError::Resize => {
-                        phux_protocol::wire::frame::HistoryTombstoneReason::Resize
-                    }
-                    crate::native_state::NativeStateError::LimitExceeded => {
-                        phux_protocol::wire::frame::HistoryTombstoneReason::Limit
-                    }
-                    _ => phux_protocol::wire::frame::HistoryTombstoneReason::CodecFailure,
-                };
+                let reason = history_tombstone_reason(error);
                 self.release_native_owner(owner);
-                (
-                    Ok(FrameKind::HistoryTombstone {
-                        terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        cursor: wire_cursor,
-                        reason,
-                    }),
-                    false,
-                )
+                (Ok(id.tombstone(reason)), false)
             }
         };
         if reply.send(NativeHistoryReply { permit, result }).is_err() && keep {
             self.release_native_owner(owner);
         }
+    }
+
+    /// Resolve `owner`'s cursor binding, returning its next page sequence and
+    /// record index. `None` when the owner has no binding or the binding does
+    /// not match this request's generation identity -- both routine races the
+    /// caller answers with a stale tombstone.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn history_binding(
+        &self,
+        owner: u64,
+        id: &HistoryFrameId,
+        cursor: crate::native_state::OpaqueHistoryCursor,
+    ) -> Option<(u64, usize)> {
+        let binding = self.native_cursor_owners.get(&owner)?;
+        if binding.cursor != cursor
+            || binding.terminal_id != id.terminal_id
+            || binding.stream_id != id.stream_id
+            || binding.bootstrap_id != id.bootstrap_id
+        {
+            return None;
+        }
+        Some((binding.next_page_seq, binding.record_index))
+    }
+
+    /// Pull one history record out of the native manager, bounded by the
+    /// caller's byte and row budget. A host with no native manager surfaces
+    /// its own error unchanged.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn history_record_at(
+        &self,
+        cursor: &crate::native_state::OpaqueHistoryCursor,
+        record_index: usize,
+        bound: u32,
+        max_rows: u32,
+    ) -> Result<crate::native_state::CachedNativeHistoryRecord, crate::native_state::NativeStateError>
+    {
+        let mut host = self.terminal.borrow_mut();
+        match host.native_manager() {
+            Ok(manager) => manager.history_record_at(cursor, record_index, bound, max_rows),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Advance `owner`'s binding past the record just served, returning the
+    /// page's row count. A binding that can no longer be advanced (sequence or
+    /// row count out of range) releases the owner and fails the request; a
+    /// finished record releases the owner too, since there is no next page.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn advance_history_binding(
+        &mut self,
+        owner: u64,
+        record: &crate::native_state::CachedNativeHistoryRecord,
+        page_seq: u64,
+    ) -> Result<u32, crate::native_state::NativeStateError> {
+        let Some(next_page_seq) = page_seq.checked_add(1) else {
+            self.release_native_owner(owner);
+            return Err(crate::native_state::NativeStateError::LimitExceeded);
+        };
+        let Ok(rows) = u32::try_from(record.rows) else {
+            self.release_native_owner(owner);
+            return Err(crate::native_state::NativeStateError::LimitExceeded);
+        };
+        if record.finish {
+            self.release_native_owner(owner);
+        } else if let Some(binding) = self.native_cursor_owners.get_mut(&owner) {
+            binding.record_index += 1;
+            binding.next_page_seq = next_page_seq;
+            binding.touched = tokio::time::Instant::now();
+        }
+        Ok(rows)
+    }
+
+    /// Answer a record the caller's buffer cannot hold: `HISTORY_REJECTED` with
+    /// the exact requirement when the client can retry within the negotiated
+    /// bounds, else a `HISTORY_TOMBSTONE` that also releases the owner. Returns
+    /// the frame and whether the owner is still bound.
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    fn history_out_of_space(
+        &mut self,
+        owner: u64,
+        id: HistoryFrameId,
+        limits: phux_protocol::caps::BootstrapLimits,
+        required_bytes: usize,
+        required_rows: usize,
+    ) -> (FrameKind, bool) {
+        let frame = match (
+            u32::try_from(required_bytes),
+            u32::try_from(required_rows.max(1)),
+        ) {
+            (Ok(required_bytes), Ok(required_rows))
+                if required_bytes != 0
+                    && required_bytes <= limits.max_history_page_bytes()
+                    && required_rows <= phux_protocol::MAX_HISTORY_PAGE_ROWS =>
+            {
+                id.rejected(
+                    phux_protocol::wire::frame::HistoryRejectionReason::TooSmall,
+                    required_bytes,
+                    required_rows,
+                )
+            }
+            _ => {
+                self.release_native_owner(owner);
+                id.tombstone(phux_protocol::wire::frame::HistoryTombstoneReason::Limit)
+            }
+        };
+        (frame, self.native_cursor_owners.contains_key(&owner))
     }
 
     #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
@@ -934,5 +1002,116 @@ impl TerminalActor {
     pub(super) fn cooperative_native_step(&mut self) {
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
         self.step_native_bootstrap();
+    }
+}
+
+/// Answer every still-live prepared waiter with `error`.
+///
+/// The unwind path of the READY publication fence: whichever stage fails, the
+/// waiters it was holding are answered exactly once and dropped.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+fn fail_native_waiters(
+    prepared: Vec<(NativeBootstrapRequest, NativeBootstrapReply)>,
+    error: crate::native_state::NativeStateError,
+) {
+    for (waiter, _) in prepared {
+        let _ = waiter.reply.send(Err(error));
+    }
+}
+
+/// The wire identity every HISTORY answer frame is stamped with.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+struct HistoryFrameId {
+    /// Wire terminal identity for this subscription.
+    terminal_id: phux_protocol::ids::TerminalId,
+    /// Logical stream identity.
+    stream_id: phux_protocol::ids::StreamId,
+    /// Replica generation identity.
+    bootstrap_id: phux_protocol::ids::BootstrapId,
+    /// The opaque cursor the client echoed.
+    cursor: Bytes,
+}
+
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+impl HistoryFrameId {
+    /// Stamp a `HISTORY_TOMBSTONE`: this cursor will never be served again.
+    fn tombstone(self, reason: phux_protocol::wire::frame::HistoryTombstoneReason) -> FrameKind {
+        FrameKind::HistoryTombstone {
+            terminal_id: self.terminal_id,
+            stream_id: self.stream_id,
+            bootstrap_id: self.bootstrap_id,
+            cursor: self.cursor,
+            reason,
+        }
+    }
+
+    /// Stamp a `HISTORY_REJECTED`: the request as posed cannot be served, but
+    /// the cursor stays usable for a retry within the stated requirement.
+    fn rejected(
+        self,
+        reason: phux_protocol::wire::frame::HistoryRejectionReason,
+        required_bytes: u32,
+        required_rows: u32,
+    ) -> FrameKind {
+        FrameKind::HistoryRejected {
+            terminal_id: self.terminal_id,
+            stream_id: self.stream_id,
+            bootstrap_id: self.bootstrap_id,
+            cursor: self.cursor,
+            reason,
+            required_bytes,
+            required_rows,
+        }
+    }
+
+    /// Stamp a `HISTORY_PAGE`, echoing the cursor as `next_cursor` while more
+    /// records remain.
+    fn page(self, page_seq: u64, payload: Bytes, rows: u32, finish: bool) -> FrameKind {
+        FrameKind::HistoryPage {
+            terminal_id: self.terminal_id,
+            stream_id: self.stream_id,
+            bootstrap_id: self.bootstrap_id,
+            page_seq,
+            cursor: self.cursor.clone(),
+            next_cursor: (!finish).then_some(self.cursor),
+            payload,
+            rows,
+        }
+    }
+}
+
+/// Answer one HISTORY request, handing the reserved permit back to the pump.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+fn answer_history(
+    reply: tokio::sync::oneshot::Sender<NativeHistoryReply>,
+    permit: tokio::sync::mpsc::OwnedPermit<crate::mailbox::Outbound>,
+    result: Result<FrameKind, crate::native_state::NativeStateError>,
+) {
+    let _ = reply.send(NativeHistoryReply { permit, result });
+}
+
+/// Map a native-state failure onto the tombstone reason the wire carries.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+const fn history_tombstone_reason(
+    error: crate::native_state::NativeStateError,
+) -> phux_protocol::wire::frame::HistoryTombstoneReason {
+    match error {
+        crate::native_state::NativeStateError::Stale
+        | crate::native_state::NativeStateError::WrongGeneration => {
+            phux_protocol::wire::frame::HistoryTombstoneReason::Stale
+        }
+        crate::native_state::NativeStateError::Pruned => {
+            phux_protocol::wire::frame::HistoryTombstoneReason::Pruned
+        }
+        crate::native_state::NativeStateError::Reset => {
+            phux_protocol::wire::frame::HistoryTombstoneReason::Reset
+        }
+        crate::native_state::NativeStateError::Resize => {
+            phux_protocol::wire::frame::HistoryTombstoneReason::Resize
+        }
+        crate::native_state::NativeStateError::LimitExceeded => {
+            phux_protocol::wire::frame::HistoryTombstoneReason::Limit
+        }
+        _ => phux_protocol::wire::frame::HistoryTombstoneReason::CodecFailure,
     }
 }

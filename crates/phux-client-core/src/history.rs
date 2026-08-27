@@ -425,24 +425,53 @@ impl HistoryCache {
             cursor: cursor.clone(),
             page_seq,
         };
-        if let Some(existing) = self.pages.get(&id) {
+        if self.is_replayed_page(&id, next_cursor, declared_rows, payload)? {
+            return Ok(HistoryPageCheck::Duplicate(id));
+        }
+        self.check_page_order(cursor, page_seq, next_cursor)?;
+        self.check_page_budgets(declared_rows, payload)?;
+        Ok(HistoryPageCheck::New)
+    }
+
+    /// Has this exact page already been seen — still cached, or already
+    /// consumed? Byte-identical repeats are duplicates; anything else
+    /// under the same identity is a conflict.
+    fn is_replayed_page(
+        &self,
+        id: &HistoryPageId,
+        next_cursor: Option<&HistoryCursor>,
+        declared_rows: u32,
+        payload: &[u8],
+    ) -> Result<bool, HistoryCacheError> {
+        if let Some(existing) = self.pages.get(id) {
             if existing.payload.as_ref() == payload
                 && existing.next_cursor.as_ref() == next_cursor
                 && existing.declared_rows == declared_rows as usize
             {
-                return Ok(HistoryPageCheck::Duplicate(id));
+                return Ok(true);
             }
             return Err(HistoryCacheError::DuplicateConflict);
         }
-        if let Some(consumed) = self.consumed.iter().find(|entry| entry.id == id) {
+        if let Some(consumed) = self.consumed.iter().find(|entry| &entry.id == id) {
             if consumed.digest == payload_digest(payload)
                 && consumed.next_cursor.as_ref() == next_cursor
                 && consumed.declared_rows == declared_rows as usize
             {
-                return Ok(HistoryPageCheck::Duplicate(id));
+                return Ok(true);
             }
             return Err(HistoryCacheError::DuplicateConflict);
         }
+        Ok(false)
+    }
+
+    /// Is this page the one we are currently waiting for, at the exact
+    /// cursor-local sequence we expect next?
+    fn check_page_order(
+        &self,
+        cursor: &HistoryCursor,
+        page_seq: u64,
+        next_cursor: Option<&HistoryCursor>,
+    ) -> Result<(), HistoryCacheError> {
         if self.state != HistoryLoadState::Loading || self.next_cursor.as_ref() != Some(cursor) {
             return Err(HistoryCacheError::Gap);
         }
@@ -456,6 +485,15 @@ impl HistoryCache {
         if next_cursor == Some(cursor) && page_seq == u64::MAX {
             return Err(HistoryCacheError::SequenceExhausted);
         }
+        Ok(())
+    }
+
+    /// Does the page fit the per-page limits and the pinned budgets?
+    fn check_page_budgets(
+        &self,
+        declared_rows: u32,
+        payload: &[u8],
+    ) -> Result<(), HistoryCacheError> {
         if payload.is_empty() {
             return Err(HistoryCacheError::EmptyPayload);
         }
@@ -488,7 +526,7 @@ impl HistoryCache {
                 budget: self.config.max_materialized_rows,
             });
         }
-        Ok(HistoryPageCheck::New)
+        Ok(())
     }
 
     /// Insert one engine-accepted response in exact cursor-local sequence.

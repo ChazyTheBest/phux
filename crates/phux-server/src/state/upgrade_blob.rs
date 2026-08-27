@@ -282,6 +282,17 @@ fn pane_blob(
     }
 }
 
+/// Each rebuilt pane's core id and the one-shot exit receiver the runtime
+/// restores its lifecycle watcher from.
+type PaneExitWatchers = Vec<(TerminalId, oneshot::Receiver<Option<i32>>)>;
+
+/// What the pane pass produces: the wire-id -> core-id map the re-link passes
+/// resolve against, and each rebuilt pane's exit receiver.
+struct RebuiltPanes {
+    core_ids: HashMap<u32, TerminalId>,
+    exit_watchers: PaneExitWatchers,
+}
+
 impl ServerState {
     /// Rebuild the session/window/pane tree from a [`StateBlob`] in the
     /// re-exec'd image (ADR-0032): recreate every entity under its recorded
@@ -291,15 +302,15 @@ impl ServerState {
     /// rebuilt pane's exit receiver so the runtime can restore its lifecycle
     /// watcher after releasing the state lock.
     ///
+    /// Linear reconstruction: create entities, bind wire ids, spawn actors,
+    /// re-link the tree, restore counters. The order of the passes is the
+    /// meaning — each one resolves references the previous one bound.
+    ///
     /// Must run inside the `LocalSet` that owns pane actors (it spawns them).
     ///
     /// # Errors
     /// [`RebuildError`] on a registry insertion failure, an actor build
     /// failure, or a dangling wire-id reference in the blob.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "linear reconstruction: create entities, bind wire ids, spawn actors, re-link the tree, restore counters — three short passes whose order is the meaning; splitting fragments it."
-    )]
     #[allow(
         clippy::type_complexity,
         reason = "the runtime immediately consumes each rebuilt pane id and its one-shot exit receiver"
@@ -308,12 +319,19 @@ impl ServerState {
         &mut self,
         blob: &StateBlob,
     ) -> Result<Vec<(TerminalId, oneshot::Receiver<Option<i32>>)>, RebuildError> {
-        let max_scrollback = self.config.history_limit;
-        let mut session_core: HashMap<u32, SessionId> = HashMap::new();
-        let mut window_core: HashMap<u32, WindowId> = HashMap::new();
-        let mut pane_core: HashMap<u32, TerminalId> = HashMap::new();
-        let mut exit_watchers = Vec::with_capacity(blob.panes.len());
+        let session_core = self.rebuild_sessions(blob);
+        let window_core = self.rebuild_windows(blob, &session_core)?;
+        let panes = self.rebuild_panes(blob, &window_core)?;
+        self.relink_window_contents(blob, &window_core, &panes.core_ids);
+        self.relink_session_windows(blob, &session_core, &window_core);
+        self.restore_counters(blob);
+        Ok(panes.exit_watchers)
+    }
 
+    /// Recreate every session under its recorded wire id, restoring its
+    /// creation time, last-touched stamp, and root.
+    fn rebuild_sessions(&mut self, blob: &StateBlob) -> HashMap<u32, SessionId> {
+        let mut session_core: HashMap<u32, SessionId> = HashMap::new();
         for s in &blob.sessions {
             let core = self.sessions.registry.new_session(s.name.clone());
             self.idspace
@@ -331,7 +349,17 @@ impl ServerState {
             }
             session_core.insert(s.wire_id, core);
         }
+        session_core
+    }
 
+    /// Recreate every window under its recorded wire id, attached to the
+    /// session the blob names.
+    fn rebuild_windows(
+        &mut self,
+        blob: &StateBlob,
+        session_core: &HashMap<u32, SessionId>,
+    ) -> Result<HashMap<u32, WindowId>, RebuildError> {
+        let mut window_core: HashMap<u32, WindowId> = HashMap::new();
         for w in &blob.windows {
             let session =
                 *session_core
@@ -347,7 +375,21 @@ impl ServerState {
             }
             window_core.insert(w.wire_id, core);
         }
+        Ok(window_core)
+    }
 
+    /// Recreate every pane under its recorded wire id, in the window the blob
+    /// names, and spawn the actor that re-adopts its PTY.
+    fn rebuild_panes(
+        &mut self,
+        blob: &StateBlob,
+        window_core: &HashMap<u32, WindowId>,
+    ) -> Result<RebuiltPanes, RebuildError> {
+        let max_scrollback = self.config.history_limit;
+        let mut panes = RebuiltPanes {
+            core_ids: HashMap::new(),
+            exit_watchers: Vec::with_capacity(blob.panes.len()),
+        };
         for p in &blob.panes {
             let window = *window_core
                 .get(&p.window_wire_id)
@@ -362,23 +404,7 @@ impl ServerState {
                 desc.title.clone_from(&p.title);
             }
 
-            let seed = pane_seed(p);
-            let bundle = match (p.master_fd, p.child_pid) {
-                (Some(master_fd), Some(child_pid)) => TerminalActor::new_with_adopted_pty(
-                    master_fd,
-                    child_pid,
-                    p.cols,
-                    p.rows,
-                    max_scrollback,
-                    CancellationToken::new(),
-                    &seed,
-                )?,
-                (None, None) => TerminalActor::new_with_seed(p.cols, p.rows, &seed)?,
-                _ => {
-                    return Err(RebuildError::InvalidPtyPair { wire_id: p.wire_id });
-                }
-            };
-
+            let bundle = pane_actor_bundle(p, max_scrollback)?;
             // Pre-bind the wire id so `spawn_terminal_actor`'s intern is a
             // no-op (it returns the existing mapping instead of allocating a
             // fresh one that would diverge from the blob).
@@ -392,44 +418,61 @@ impl ServerState {
             } = bundle;
             self.spawn_terminal_actor(core, handle, token, actor.run());
             if let Some(exit_notify) = exit_notify {
-                exit_watchers.push((core, exit_notify));
+                panes.exit_watchers.push((core, exit_notify));
             }
-            pane_core.insert(p.wire_id, core);
+            panes.core_ids.insert(p.wire_id, core);
         }
+        Ok(panes)
+    }
 
-        // Re-apply window pane order / active / layout (the auto-split layout
-        // `new_terminal` produced is discarded for the blob's).
+    /// Re-apply window pane order / active / layout (the auto-split layout
+    /// `new_terminal` produced is discarded for the blob's).
+    fn relink_window_contents(
+        &mut self,
+        blob: &StateBlob,
+        window_core: &HashMap<u32, WindowId>,
+        pane_core: &HashMap<u32, TerminalId>,
+    ) {
         for w in &blob.windows {
             let Some(&core) = window_core.get(&w.wire_id) else {
                 continue;
             };
-            let panes = resolve_ids(&w.pane_wire_ids, &pane_core);
+            let panes = resolve_ids(&w.pane_wire_ids, pane_core);
             let active = w.active_pane.and_then(|id| pane_core.get(&id).copied());
             let layout = w
                 .layout
                 .as_ref()
-                .and_then(|l| layout_from_blob(l, &pane_core));
+                .and_then(|l| layout_from_blob(l, pane_core));
             if let Some(win) = self.sessions.registry.window_mut(core) {
                 win.panes = panes;
                 win.active = active;
                 win.layout = layout;
             }
         }
+    }
 
-        // Re-apply session window order / active.
+    /// Re-apply session window order / active.
+    fn relink_session_windows(
+        &mut self,
+        blob: &StateBlob,
+        session_core: &HashMap<u32, SessionId>,
+        window_core: &HashMap<u32, WindowId>,
+    ) {
         for s in &blob.sessions {
             let Some(&core) = session_core.get(&s.wire_id) else {
                 continue;
             };
-            let windows = resolve_ids(&s.window_wire_ids, &window_core);
+            let windows = resolve_ids(&s.window_wire_ids, window_core);
             let active = s.active_window.and_then(|id| window_core.get(&id).copied());
             if let Some(sess) = self.sessions.registry.session_mut(core) {
                 sess.windows = windows;
                 sess.active = active;
             }
         }
+    }
 
-        // Restore the allocators above every restored id.
+    /// Restore the allocators above every restored id.
+    fn restore_counters(&mut self, blob: &StateBlob) {
         self.idspace
             .set_next_session_wire(blob.counters.next_session_wire_id);
         self.idspace
@@ -438,9 +481,33 @@ impl ServerState {
             .set_next_window_wire(blob.counters.next_window_wire_id);
         self.sessions
             .set_next_touch_timestamp(blob.counters.next_touch_timestamp);
-
-        Ok(exit_watchers)
     }
+}
+
+/// Build one pane's actor around its inherited PTY, or — for a pane the old
+/// image handed off no PTY for — around a fresh no-PTY actor its snapshot is
+/// replayed into. A pane carrying only one of the two PTY identities is a
+/// corrupt handoff, not a no-PTY pane.
+fn pane_actor_bundle(
+    p: &PaneBlob,
+    max_scrollback: u32,
+) -> Result<crate::terminal_actor::TerminalActorBundle, RebuildError> {
+    let seed = pane_seed(p);
+    Ok(match (p.master_fd, p.child_pid) {
+        (Some(master_fd), Some(child_pid)) => TerminalActor::new_with_adopted_pty(
+            master_fd,
+            child_pid,
+            p.cols,
+            p.rows,
+            max_scrollback,
+            CancellationToken::new(),
+            &seed,
+        )?,
+        (None, None) => TerminalActor::new_with_seed(p.cols, p.rows, &seed)?,
+        _ => {
+            return Err(RebuildError::InvalidPtyPair { wire_id: p.wire_id });
+        }
+    })
 }
 
 /// Resolve a list of wire ids to their rebuilt core ids, dropping any that

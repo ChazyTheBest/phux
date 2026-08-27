@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::RuntimeFlags;
 use crate::state::SharedState;
+use crate::upgrade::blob::StateBlob;
 use crate::terminal_actor::{PaneUpgradeHandle, UpgradeHandleRequest};
 
 const PANE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -172,66 +173,48 @@ pub(super) struct UpgradePlan {
     _handoffs: HashMap<phux_core::ids::TerminalId, PaneUpgradeHandle>,
 }
 
+/// Everything `prepare_upgrade` reads out of the live server under one lock,
+/// before it starts awaiting pane actors.
+struct UpgradeContext {
+    listener_fd: RawFd,
+    socket_path: PathBuf,
+    flags: RuntimeFlags,
+    /// The serializable tree as it stood when the actor set was chosen. The
+    /// blob is reassembled only if the tree still matches this exactly.
+    tree_identity: StateBlob,
+    pane_senders: Vec<(
+        phux_core::ids::TerminalId,
+        mpsc::Sender<UpgradeHandleRequest>,
+    )>,
+}
+
 /// Do everything reversible: snapshot the tree into a handoff blob, stage it in
 /// an inheritable temp file, clear `FD_CLOEXEC` on the blob / listener / every
 /// pane master, and validate the on-disk binary. Returns a [`UpgradePlan`] the
 /// caller execs *after* acking the client.
 pub(super) async fn prepare_upgrade(state: &SharedState) -> Result<UpgradePlan, UpgradeError> {
-    let (listener_fd, socket_path, flags, tree_identity, handles) = state
-        .with(|s| {
-            s.upgrade_context().map(|(fd, path, flags)| {
-                let identity = s.assemble_upgrade_blob(fd, &HashMap::new());
-                (fd, path.to_path_buf(), flags, identity, s.upgrade_handles())
-            })
-        })
-        .ok_or(UpgradeError::NoContext)?;
+    let UpgradeContext {
+        listener_fd,
+        socket_path,
+        flags,
+        tree_identity,
+        pane_senders,
+    } = capture_upgrade_context(state)?;
 
-    // Own the listener identity before awaiting actors. The duplicate, not a
-    // raw descriptor owned elsewhere in the runtime, is what crosses exec.
-    // SAFETY: the runtime owns the listening descriptor for its entire serve
-    // loop; this borrow lasts only for the dup syscall.
-    let listener = rustix::io::dup(unsafe { BorrowedFd::borrow_raw(listener_fd) })
-        .map_err(std::io::Error::from)?;
-    let senders = handles
-        .into_iter()
-        .map(|(pane, handle)| (pane, handle.upgrade))
-        .collect();
-    let handoffs = collect_pane_handoffs(senders, PANE_HANDOFF_TIMEOUT).await?;
+    let listener = dup_listener(listener_fd)?;
+    let handoffs = collect_pane_handoffs(pane_senders, PANE_HANDOFF_TIMEOUT).await?;
+    let blob = reassemble_unchanged_tree(
+        state,
+        listener_fd,
+        listener.as_raw_fd(),
+        &tree_identity,
+        &handoffs,
+    )?;
 
-    // Re-read under one lock and require the exact serializable state used to
-    // choose actors to still be current. A concurrent split/close/focus/name
-    // change aborts rather than pairing old handoffs with a new tree.
-    let blob = state
-        .with(|s| {
-            let current = s.assemble_upgrade_blob(listener_fd, &HashMap::new());
-            (current == tree_identity)
-                .then(|| s.assemble_upgrade_blob(listener.as_raw_fd(), &handoffs))
-        })
-        .ok_or(UpgradeError::TreeChanged)?;
-
-    // Stage the blob in an anonymous temp file (auto-removed on close), rewound
-    // so the resumed image reads from the start.
-    let mut blob_file = tempfile::tempfile()?;
-    blob_file.write_all(&blob.to_bytes()?)?;
-    blob_file.seek(SeekFrom::Start(0))?;
+    let blob_file = stage_blob_file(&blob)?;
     let blob_fd = blob_file.as_raw_fd();
-
-    // Validate before changing any descriptor flags. A broken replacement
-    // binary must leave the old process's descriptor policy untouched.
-    let source_exe = std::env::var_os(UPGRADE_SOURCE_EXE)
-        .map_or_else(std::env::current_exe, |path| Ok(PathBuf::from(path)))?;
-    let executable = PinnedExecutable::open(&source_exe)?;
-    validate_binary(&executable.path)?;
-
-    // Everything the re-exec'd image must inherit needs FD_CLOEXEC cleared.
-    let mut fd_flags = FdFlagsGuard::new();
-    fd_flags.clear_cloexec(blob_fd)?;
-    fd_flags.clear_cloexec(listener_fd)?;
-    for pane in &blob.panes {
-        if let Some(master_fd) = pane.master_fd {
-            fd_flags.clear_cloexec(master_fd)?;
-        }
-    }
+    let executable = pin_validated_executable()?;
+    let fd_flags = clear_inherited_cloexec(blob_fd, listener_fd, &blob)?;
 
     Ok(UpgradePlan {
         executable,
@@ -243,6 +226,92 @@ pub(super) async fn prepare_upgrade(state: &SharedState) -> Result<UpgradePlan, 
         _listener_fd: listener,
         _handoffs: handoffs,
     })
+}
+
+/// Read the listener context, the tree identity, and one upgrade sender per
+/// pane out of the live server under a single lock.
+fn capture_upgrade_context(state: &SharedState) -> Result<UpgradeContext, UpgradeError> {
+    state
+        .with(|s| {
+            s.upgrade_context()
+                .map(|(listener_fd, path, flags)| UpgradeContext {
+                    listener_fd,
+                    socket_path: path.to_path_buf(),
+                    flags,
+                    tree_identity: s.assemble_upgrade_blob(listener_fd, &HashMap::new()),
+                    pane_senders: s
+                        .upgrade_handles()
+                        .into_iter()
+                        .map(|(pane, handle)| (pane, handle.upgrade))
+                        .collect(),
+                })
+        })
+        .ok_or(UpgradeError::NoContext)
+}
+
+/// Own the listener identity before awaiting actors. The duplicate, not a
+/// raw descriptor owned elsewhere in the runtime, is what crosses exec.
+fn dup_listener(listener_fd: RawFd) -> Result<OwnedFd, UpgradeError> {
+    // SAFETY: the runtime owns the listening descriptor for its entire serve
+    // loop; this borrow lasts only for the dup syscall.
+    rustix::io::dup(unsafe { BorrowedFd::borrow_raw(listener_fd) })
+        .map_err(|err| UpgradeError::Io(std::io::Error::from(err)))
+}
+
+/// Re-read under one lock and require the exact serializable state used to
+/// choose actors to still be current. A concurrent split/close/focus/name
+/// change aborts rather than pairing old handoffs with a new tree.
+fn reassemble_unchanged_tree(
+    state: &SharedState,
+    listener_fd: RawFd,
+    inherited_fd: RawFd,
+    tree_identity: &StateBlob,
+    handoffs: &HashMap<phux_core::ids::TerminalId, PaneUpgradeHandle>,
+) -> Result<StateBlob, UpgradeError> {
+    state
+        .with(|s| {
+            let current = s.assemble_upgrade_blob(listener_fd, &HashMap::new());
+            (current == *tree_identity).then(|| s.assemble_upgrade_blob(inherited_fd, handoffs))
+        })
+        .ok_or(UpgradeError::TreeChanged)
+}
+
+/// Stage the blob in an anonymous temp file (auto-removed on close), rewound
+/// so the resumed image reads from the start.
+fn stage_blob_file(blob: &StateBlob) -> Result<std::fs::File, UpgradeError> {
+    let mut blob_file = tempfile::tempfile()?;
+    blob_file.write_all(&blob.to_bytes()?)?;
+    blob_file.seek(SeekFrom::Start(0))?;
+    Ok(blob_file)
+}
+
+/// Pin and validate the replacement image before any descriptor flag changes.
+/// A broken replacement binary must leave the old process's descriptor policy
+/// untouched.
+fn pin_validated_executable() -> Result<PinnedExecutable, UpgradeError> {
+    let source_exe = std::env::var_os(UPGRADE_SOURCE_EXE)
+        .map_or_else(std::env::current_exe, |path| Ok(PathBuf::from(path)))?;
+    let executable = PinnedExecutable::open(&source_exe)?;
+    validate_binary(&executable.path)?;
+    Ok(executable)
+}
+
+/// Everything the re-exec'd image must inherit needs `FD_CLOEXEC` cleared: the
+/// blob, the listener, and every pane master.
+fn clear_inherited_cloexec(
+    blob_fd: RawFd,
+    listener_fd: RawFd,
+    blob: &StateBlob,
+) -> Result<FdFlagsGuard, UpgradeError> {
+    let mut fd_flags = FdFlagsGuard::new();
+    fd_flags.clear_cloexec(blob_fd)?;
+    fd_flags.clear_cloexec(listener_fd)?;
+    for pane in &blob.panes {
+        if let Some(master_fd) = pane.master_fd {
+            fd_flags.clear_cloexec(master_fd)?;
+        }
+    }
+    Ok(fd_flags)
 }
 
 async fn request_pane_handoff(

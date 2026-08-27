@@ -615,30 +615,8 @@ impl PredictionState {
     where
         F: FnMut(u16, u16) -> Option<char>,
     {
-        if !self.cfg.enabled {
-            return PredictionOutcome::Disabled;
-        }
-        // Reject any non-Press action — repeats and releases produce
-        // their own server-side echo path we don't model yet.
-        if !matches!(event.action, phux_protocol::input::key::KeyAction::Press) {
-            return PredictionOutcome::Skipped;
-        }
-        // ADR-0090: on the alternate screen, mode-changing input kills
-        // the echo evidence and the burst — Esc is exactly how vim
-        // leaves insert mode, and chords / arrows / function keys are
-        // app commands, so typing after one of them can never paint a
-        // ghost on stale evidence. Checked before the suspended guard so
-        // the latch dies even while a burst is suspended.
-        if self.alt_screen && is_mode_changing_input(event) {
-            self.suspend();
-            self.echo_confirmed = false;
-            return PredictionOutcome::Skipped;
-        }
-        // Suspended after a re-anchor to a pane with no known cursor: predict
-        // nothing until an authoritative cursor sync re-arms us, so a fast
-        // keystroke after a split can't echo a ghost at the guessed (0, 0).
-        if self.suspended {
-            return PredictionOutcome::Skipped;
+        if let Some(outcome) = self.reject_unpredictable_context(event) {
+            return outcome;
         }
         // Ctrl-U (kill-to-start-of-line) is the one CTRL chord we predict
         // (phux-9gw.1.5). It carries CTRL, so it must be handled *before*
@@ -661,18 +639,7 @@ impl PredictionState {
             return self.predict_backspace_eol(now_ms);
         }
         if event.key == PhysicalKey::Enter {
-            // ADR-0090: on the alternate screen Enter is a SUBMIT
-            // (Claude Code sends the prompt, vim executes), not a line
-            // feed — the row+1/col-0 guess would anchor the rest of the
-            // burst wrong. Suspend instead; the next authoritative
-            // cursor sync re-arms. The echo latch survives: a submit
-            // does not change who echoes (an agent TUI's prompt keeps
-            // echoing the next message).
-            if self.alt_screen {
-                self.suspend();
-                return PredictionOutcome::Skipped;
-            }
-            return self.predict_enter(now_ms);
+            return self.predict_enter_unless_alt_screen(now_ms);
         }
         if event.key == PhysicalKey::ArrowLeft {
             return self.predict_arrow_left(&mut read_cell, now_ms);
@@ -680,14 +647,66 @@ impl PredictionState {
         if event.key == PhysicalKey::ArrowRight {
             return self.predict_arrow_right(&mut read_cell, now_ms);
         }
+        self.predict_printable_cluster(event, now_ms)
+    }
 
-        // Printable insert. The `text` payload is one grapheme cluster in
-        // the common case, but may carry several Unicode scalars that form
-        // a single visual cell: a flag emoji (U+1F1FA U+1F1F8), a ZWJ
-        // family sequence, or a base plus combining marks (phux-9gw.1.6).
-        // Split into clusters and predict only when the payload is exactly
-        // one cluster — a multi-cluster payload is paste-like and outside
-        // the single-keystroke model we predict.
+    /// Reject a keystroke that cannot be predicted whatever key it
+    /// carries: prediction disabled, a non-Press action, mode-changing
+    /// input on the alternate screen, or a suspended burst. `Some` is
+    /// the outcome the caller must return.
+    fn reject_unpredictable_context(&mut self, event: &KeyEvent) -> Option<PredictionOutcome> {
+        if !self.cfg.enabled {
+            return Some(PredictionOutcome::Disabled);
+        }
+        // Reject any non-Press action — repeats and releases produce
+        // their own server-side echo path we don't model yet.
+        if !matches!(event.action, phux_protocol::input::key::KeyAction::Press) {
+            return Some(PredictionOutcome::Skipped);
+        }
+        // ADR-0090: on the alternate screen, mode-changing input kills
+        // the echo evidence and the burst — Esc is exactly how vim
+        // leaves insert mode, and chords / arrows / function keys are
+        // app commands, so typing after one of them can never paint a
+        // ghost on stale evidence. Checked before the suspended guard so
+        // the latch dies even while a burst is suspended.
+        if self.alt_screen && is_mode_changing_input(event) {
+            self.suspend();
+            self.echo_confirmed = false;
+            return Some(PredictionOutcome::Skipped);
+        }
+        // Suspended after a re-anchor to a pane with no known cursor: predict
+        // nothing until an authoritative cursor sync re-arms us, so a fast
+        // keystroke after a split can't echo a ghost at the guessed (0, 0).
+        if self.suspended {
+            return Some(PredictionOutcome::Skipped);
+        }
+        None
+    }
+
+    /// Predict Enter as a line feed, except on the alternate screen.
+    ///
+    /// ADR-0090: on the alternate screen Enter is a SUBMIT (Claude Code
+    /// sends the prompt, vim executes), not a line feed — the row+1/col-0
+    /// guess would anchor the rest of the burst wrong. Suspend instead;
+    /// the next authoritative cursor sync re-arms. The echo latch
+    /// survives: a submit does not change who echoes (an agent TUI's
+    /// prompt keeps echoing the next message).
+    fn predict_enter_unless_alt_screen(&mut self, now_ms: u64) -> PredictionOutcome {
+        if self.alt_screen {
+            self.suspend();
+            return PredictionOutcome::Skipped;
+        }
+        self.predict_enter(now_ms)
+    }
+
+    /// Printable insert. The `text` payload is one grapheme cluster in
+    /// the common case, but may carry several Unicode scalars that form
+    /// a single visual cell: a flag emoji (U+1F1FA U+1F1F8), a ZWJ
+    /// family sequence, or a base plus combining marks (phux-9gw.1.6).
+    /// Split into clusters and predict only when the payload is exactly
+    /// one cluster — a multi-cluster payload is paste-like and outside
+    /// the single-keystroke model we predict.
+    fn predict_printable_cluster(&mut self, event: &KeyEvent, now_ms: u64) -> PredictionOutcome {
         let Some(text) = event.text.as_deref() else {
             return PredictionOutcome::Skipped;
         };

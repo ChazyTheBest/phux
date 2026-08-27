@@ -717,6 +717,84 @@ struct RelayBootstrapFlow {
     generation_frames: u32,
     ready: bool,
 }
+
+/// Reject a chunk whose stream/bootstrap identity drifted away from the
+/// in-flight generation, or that arrives after that generation reached READY.
+fn ensure_chunk_identity(
+    host: &SatelliteHost,
+    terminal: u32,
+    flow: &RelayBootstrapFlow,
+    stream_id: StreamId,
+    bootstrap_id: BootstrapId,
+) -> Result<(), String> {
+    if flow.ready || flow.stream_id != stream_id || flow.bootstrap_id != bootstrap_id {
+        return Err(format!(
+            "satellite {host} changed or reused bootstrap identity before READY for terminal {terminal}"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a chunk that skipped or repeated the generation's chunk sequence.
+fn ensure_chunk_sequence(
+    host: &SatelliteHost,
+    flow: &RelayBootstrapFlow,
+    chunk_seq: u32,
+) -> Result<(), String> {
+    if chunk_seq != flow.next_chunk_seq {
+        return Err(format!(
+            "satellite {host} sent BOOTSTRAP_CHUNK sequence {chunk_seq}, expected {}",
+            flow.next_chunk_seq
+        ));
+    }
+    Ok(())
+}
+
+/// One more frame charged against `limit`, or the rejection a satellite gets
+/// for outrunning `budget` (a spent budget and an overflowed counter are the
+/// same refusal).
+fn charge_frame(
+    host: &SatelliteHost,
+    budget: &str,
+    current: u32,
+    limit: u32,
+) -> Result<u32, String> {
+    current
+        .checked_add(1)
+        .filter(|count| *count <= limit)
+        .ok_or_else(|| format!("satellite {host} exceeded the {budget}"))
+}
+
+/// `payload_len` more bytes charged against `limit`, or the rejection a
+/// satellite gets for outrunning `budget`.
+fn charge_bytes(
+    host: &SatelliteHost,
+    budget: &str,
+    current: u64,
+    payload_len: u64,
+    limit: u64,
+) -> Result<u64, String> {
+    current
+        .checked_add(payload_len)
+        .filter(|bytes| *bytes <= limit)
+        .ok_or_else(|| format!("satellite {host} exceeded the {budget}"))
+}
+
+/// The terminal scope a return-leg stream frame carries, if it has one.
+const fn stream_frame_scope(frame: &FrameKind) -> Option<&TerminalId> {
+    match frame {
+        FrameKind::Event { terminal, .. } => terminal.as_ref(),
+        FrameKind::TerminalOutput { terminal_id, .. }
+        | FrameKind::BootstrapBegin { terminal_id, .. }
+        | FrameKind::BootstrapChunk { terminal_id, .. }
+        | FrameKind::BootstrapReady { terminal_id, .. }
+        | FrameKind::HistoryPage { terminal_id, .. }
+        | FrameKind::BootstrapTombstone { terminal_id, .. }
+        | FrameKind::HistoryTombstone { terminal_id, .. }
+        | FrameKind::HistoryRejected { terminal_id, .. } => Some(terminal_id),
+        _ => None,
+    }
+}
 #[derive(Debug)]
 
 pub(crate) struct RelaySession {
@@ -1032,10 +1110,6 @@ impl RelaySession {
 
     /// Dispatch one frame arriving from the satellite: resolve relayed
     /// command and spawn replies and re-tag + fan out subscribed streams.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one resolve/re-tag arm per relayable return-leg frame kind; splitting hides the catalog"
-    )]
     pub(crate) fn handle_inbound(&mut self, framed: &[u8]) -> Result<(), String> {
         let frame = FrameKind::decode_with_limits(framed, self.bootstrap_limits)
             .map_err(|err| format!("satellite {} sent an undecodable frame: {err:?}", self.host))?
@@ -1051,299 +1125,21 @@ impl RelaySession {
                 request_id: Some(request_id),
                 code,
                 message,
-            } => {
-                // Correlated errors resolve whichever request kind holds
-                // the id — commands own it in the common case, but a
-                // satellite MAY answer a relayed spawn with a generic
-                // correlated ERROR instead of TERMINAL_SPAWNED.
-                if self.pending_spawns.contains_key(&request_id) {
-                    self.resolve_pending_spawn(
-                        request_id,
-                        SpawnResult::Err(SpawnError::SpawnFailed(format!(
-                            "satellite refused the spawn: {code:?}: {message}"
-                        ))),
-                    );
-                } else {
-                    self.resolve_pending(request_id, CommandResult::Error { code, message });
-                }
-            }
-            FrameKind::Event { terminal, event } => {
-                if let Some(id) = self.retag_inbound(terminal.as_ref()) {
-                    self.fan_out(
-                        id,
-                        &FrameKind::Event {
-                            terminal: Some(TerminalId::satellite(self.host.clone(), id)),
-                            event,
-                        },
-                    );
-                }
-            }
-            FrameKind::TerminalOutput {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                seq,
-                bytes,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.validate_ready_identity(
-                            id,
-                            stream_id,
-                            bootstrap_id,
-                            "TERMINAL_OUTPUT",
-                        )?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::TerminalOutput {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            seq,
-                            bytes,
-                        },
-                    );
-                }
-            }
-            FrameKind::BootstrapBegin {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                profile,
-                cols,
-                rows,
-                base_seq,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.begin_bootstrap_flow(id, stream_id, bootstrap_id, profile)?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::BootstrapBegin {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            profile,
-                            cols,
-                            rows,
-                            base_seq,
-                        },
-                    );
-                }
-            }
-            FrameKind::BootstrapChunk {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                chunk_seq,
-                payload,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.accept_bootstrap_chunk(
-                            id,
-                            stream_id,
-                            bootstrap_id,
-                            chunk_seq,
-                            payload.len(),
-                        )?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::BootstrapChunk {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            chunk_seq,
-                            payload,
-                        },
-                    );
-                }
-            }
-            FrameKind::BootstrapReady {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                history_cursor,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.finish_bootstrap_flow(id, stream_id, bootstrap_id)?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::BootstrapReady {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            history_cursor,
-                        },
-                    );
-                }
-            }
-            FrameKind::HistoryPage {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                page_seq,
-                cursor,
-                next_cursor,
-                payload,
-                rows,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.validate_ready_identity(id, stream_id, bootstrap_id, "HISTORY_PAGE")?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::HistoryPage {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            page_seq,
-                            cursor,
-                            next_cursor,
-                            payload,
-                            rows,
-                        },
-                    );
-                }
-            }
-            FrameKind::BootstrapTombstone {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                reason,
-                last_valid_seq,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.validate_known_identity(
-                            id,
-                            stream_id,
-                            bootstrap_id,
-                            "BOOTSTRAP_TOMBSTONE",
-                        )?;
-                        self.retire_bootstrap_flow(id);
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::BootstrapTombstone {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            reason,
-                            last_valid_seq,
-                        },
-                    );
-                }
-            }
-            FrameKind::HistoryTombstone {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                cursor,
-                reason,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.validate_ready_identity(
-                            id,
-                            stream_id,
-                            bootstrap_id,
-                            "HISTORY_TOMBSTONE",
-                        )?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::HistoryTombstone {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            cursor,
-                            reason,
-                        },
-                    );
-                }
-            }
-            FrameKind::HistoryRejected {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                cursor,
-                reason,
-                required_bytes,
-                required_rows,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    if self.enforce_bootstrap_flow {
-                        self.validate_ready_identity(
-                            id,
-                            stream_id,
-                            bootstrap_id,
-                            "HISTORY_REJECTED",
-                        )?;
-                    }
-                    self.fan_out(
-                        id,
-                        &FrameKind::HistoryRejected {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            stream_id,
-                            bootstrap_id,
-                            cursor,
-                            reason,
-                            required_bytes,
-                            required_rows,
-                        },
-                    );
-                }
-            }
+            } => self.resolve_correlated_error(request_id, code, message),
+            FrameKind::Event { .. }
+            | FrameKind::TerminalOutput { .. }
+            | FrameKind::BootstrapBegin { .. }
+            | FrameKind::BootstrapChunk { .. }
+            | FrameKind::BootstrapReady { .. }
+            | FrameKind::HistoryPage { .. }
+            | FrameKind::BootstrapTombstone { .. }
+            | FrameKind::HistoryTombstone { .. }
+            | FrameKind::HistoryRejected { .. } => self.relay_stream_frame(frame)?,
             FrameKind::TerminalClosed {
                 terminal_id,
                 exit_status,
-            } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    // Best-effort delivery bypassing the snapshot gate
-                    // (phux-v45.14 sub-finding a): the subscriptions are
-                    // reaped on the next line, so a subscriber still awaiting
-                    // its first snapshot must still learn the terminal closed
-                    // rather than be silently dropped.
-                    self.fan_out_ungated(
-                        id,
-                        &FrameKind::TerminalClosed {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                            exit_status,
-                        },
-                    );
-                    // The satellite terminal is gone; its proxy
-                    // subscriptions go with it.
-                    self.subscribers.remove(&id);
-                    self.recalculate_retained_totals();
-                    self.retire_bootstrap_flow(id);
-                }
-            }
-            FrameKind::Bell { terminal_id } => {
-                if let Some(id) = self.retag_inbound(Some(&terminal_id)) {
-                    // Best-effort delivery bypassing the snapshot gate
-                    // (phux-v45.15): a BELL is an ephemeral notification the
-                    // `TERMINAL_SNAPSHOT` does not capture, so gating it behind
-                    // an `AwaitingFirst` subscriber's snapshot would drop it
-                    // permanently — unlike a `TERMINAL_OUTPUT` delta, which the
-                    // snapshot supersedes (freshest full grid wins), so gating
-                    // content is safe but gating a bell loses it. Ordering
-                    // against the snapshot does not matter for a side-channel
-                    // notification, the same rationale as `TERMINAL_CLOSED`.
-                    self.fan_out_ungated(
-                        id,
-                        &FrameKind::Bell {
-                            terminal_id: TerminalId::satellite(self.host.clone(), id),
-                        },
-                    );
-                }
-            }
+            } => self.relay_terminal_closed(&terminal_id, exit_status),
+            FrameKind::Bell { terminal_id } => self.relay_bell(&terminal_id),
             other => {
                 return Err(format!(
                     "satellite {} sent a direction-invalid frame after HELLO_OK: {other:?}",
@@ -1352,6 +1148,167 @@ impl RelaySession {
             }
         }
         Ok(())
+    }
+
+    /// Resolve a correlated `ERROR` against whichever request kind holds the
+    /// id — commands own it in the common case, but a satellite MAY answer a
+    /// relayed spawn with a generic correlated ERROR instead of
+    /// `TERMINAL_SPAWNED`.
+    fn resolve_correlated_error(&mut self, request_id: u32, code: ErrorCode, message: String) {
+        if self.pending_spawns.contains_key(&request_id) {
+            self.resolve_pending_spawn(
+                request_id,
+                SpawnResult::Err(SpawnError::SpawnFailed(format!(
+                    "satellite refused the spawn: {code:?}: {message}"
+                ))),
+            );
+        } else {
+            self.resolve_pending(request_id, CommandResult::Error { code, message });
+        }
+    }
+
+    /// Forward one terminal-scoped return-leg stream frame: resolve its
+    /// satellite-local terminal id, clear the bootstrap-flow gate its kind
+    /// carries, then re-tag the scope and fan it out to subscribers.
+    fn relay_stream_frame(&mut self, frame: FrameKind) -> Result<(), String> {
+        let Some(id) = self.retag_inbound(stream_frame_scope(&frame)) else {
+            return Ok(());
+        };
+        if self.enforce_bootstrap_flow {
+            self.enforce_stream_frame_flow(id, &frame)?;
+        }
+        let retagged = self.retag_stream_frame(frame, id);
+        self.fan_out(id, &retagged);
+        Ok(())
+    }
+
+    /// The bootstrap-flow gate each stream frame kind must clear before it is
+    /// forwarded. `EVENT` carries no flow state and clears trivially.
+    fn enforce_stream_frame_flow(&mut self, id: u32, frame: &FrameKind) -> Result<(), String> {
+        match frame {
+            FrameKind::TerminalOutput {
+                stream_id,
+                bootstrap_id,
+                ..
+            } => self.validate_ready_identity(id, *stream_id, *bootstrap_id, "TERMINAL_OUTPUT"),
+            FrameKind::BootstrapBegin {
+                stream_id,
+                bootstrap_id,
+                profile,
+                ..
+            } => self.begin_bootstrap_flow(id, *stream_id, *bootstrap_id, *profile),
+            FrameKind::BootstrapChunk {
+                stream_id,
+                bootstrap_id,
+                chunk_seq,
+                payload,
+                ..
+            } => self.accept_bootstrap_chunk(
+                id,
+                *stream_id,
+                *bootstrap_id,
+                *chunk_seq,
+                payload.len(),
+            ),
+            FrameKind::BootstrapReady {
+                stream_id,
+                bootstrap_id,
+                ..
+            } => self.finish_bootstrap_flow(id, *stream_id, *bootstrap_id),
+            FrameKind::HistoryPage {
+                stream_id,
+                bootstrap_id,
+                ..
+            } => self.validate_ready_identity(id, *stream_id, *bootstrap_id, "HISTORY_PAGE"),
+            FrameKind::BootstrapTombstone {
+                stream_id,
+                bootstrap_id,
+                ..
+            } => {
+                self.validate_known_identity(id, *stream_id, *bootstrap_id, "BOOTSTRAP_TOMBSTONE")?;
+                self.retire_bootstrap_flow(id);
+                Ok(())
+            }
+            FrameKind::HistoryTombstone {
+                stream_id,
+                bootstrap_id,
+                ..
+            } => self.validate_ready_identity(id, *stream_id, *bootstrap_id, "HISTORY_TOMBSTONE"),
+            FrameKind::HistoryRejected {
+                stream_id,
+                bootstrap_id,
+                ..
+            } => self.validate_ready_identity(id, *stream_id, *bootstrap_id, "HISTORY_REJECTED"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Re-tag one stream frame's terminal scope `Local { id }` ->
+    /// `Satellite { host, id }`. Every other field is forwarded verbatim
+    /// (ADR-0007: opaque relay), so the scope is rewritten in place rather
+    /// than the frame rebuilt field by field.
+    fn retag_stream_frame(&self, mut frame: FrameKind, id: u32) -> FrameKind {
+        let scope = TerminalId::satellite(self.host.clone(), id);
+        match &mut frame {
+            FrameKind::Event { terminal, .. } => *terminal = Some(scope),
+            FrameKind::TerminalOutput { terminal_id, .. }
+            | FrameKind::BootstrapBegin { terminal_id, .. }
+            | FrameKind::BootstrapChunk { terminal_id, .. }
+            | FrameKind::BootstrapReady { terminal_id, .. }
+            | FrameKind::HistoryPage { terminal_id, .. }
+            | FrameKind::BootstrapTombstone { terminal_id, .. }
+            | FrameKind::HistoryTombstone { terminal_id, .. }
+            | FrameKind::HistoryRejected { terminal_id, .. } => *terminal_id = scope,
+            _ => {}
+        }
+        frame
+    }
+
+    /// Deliver `TERMINAL_CLOSED`, then reap everything the satellite terminal
+    /// owned on this link.
+    fn relay_terminal_closed(&mut self, terminal_id: &TerminalId, exit_status: Option<i32>) {
+        let Some(id) = self.retag_inbound(Some(terminal_id)) else {
+            return;
+        };
+        // Best-effort delivery bypassing the snapshot gate
+        // (phux-v45.14 sub-finding a): the subscriptions are
+        // reaped on the next line, so a subscriber still awaiting
+        // its first snapshot must still learn the terminal closed
+        // rather than be silently dropped.
+        self.fan_out_ungated(
+            id,
+            &FrameKind::TerminalClosed {
+                terminal_id: TerminalId::satellite(self.host.clone(), id),
+                exit_status,
+            },
+        );
+        // The satellite terminal is gone; its proxy
+        // subscriptions go with it.
+        self.subscribers.remove(&id);
+        self.recalculate_retained_totals();
+        self.retire_bootstrap_flow(id);
+    }
+
+    /// Deliver one `BELL` side-channel notification.
+    fn relay_bell(&mut self, terminal_id: &TerminalId) {
+        let Some(id) = self.retag_inbound(Some(terminal_id)) else {
+            return;
+        };
+        // Best-effort delivery bypassing the snapshot gate
+        // (phux-v45.15): a BELL is an ephemeral notification the
+        // `TERMINAL_SNAPSHOT` does not capture, so gating it behind
+        // an `AwaitingFirst` subscriber's snapshot would drop it
+        // permanently — unlike a `TERMINAL_OUTPUT` delta, which the
+        // snapshot supersedes (freshest full grid wins), so gating
+        // content is safe but gating a bell loses it. Ordering
+        // against the snapshot does not matter for a side-channel
+        // notification, the same rationale as `TERMINAL_CLOSED`.
+        self.fan_out_ungated(
+            id,
+            &FrameKind::Bell {
+                terminal_id: TerminalId::satellite(self.host.clone(), id),
+            },
+        );
     }
 
     /// Fail every in-flight command and notify every subscribed consumer,
@@ -1628,58 +1585,34 @@ impl RelaySession {
                 self.host
             ));
         };
-        if flow.ready || flow.stream_id != stream_id || flow.bootstrap_id != bootstrap_id {
-            return Err(format!(
-                "satellite {} changed or reused bootstrap identity before READY for terminal {terminal}",
-                self.host
-            ));
-        }
-        if chunk_seq != flow.next_chunk_seq {
-            return Err(format!(
-                "satellite {} sent BOOTSTRAP_CHUNK sequence {chunk_seq}, expected {}",
-                self.host, flow.next_chunk_seq
-            ));
-        }
-        let next_frames = flow
-            .generation_frames
-            .checked_add(1)
-            .filter(|count| *count <= MAX_RELAY_GENERATION_FRAMES)
-            .ok_or_else(|| {
-                format!(
-                    "satellite {} exceeded the per-generation bootstrap frame budget",
-                    self.host
-                )
-            })?;
-        let next_bytes = flow
-            .generation_bytes
-            .checked_add(payload_len)
-            .filter(|bytes| *bytes <= MAX_RELAY_GENERATION_BYTES)
-            .ok_or_else(|| {
-                format!(
-                    "satellite {} exceeded the per-generation bootstrap byte budget",
-                    self.host
-                )
-            })?;
-        let connection_frames = self
-            .inflight_generation_frames
-            .checked_add(1)
-            .filter(|count| *count <= MAX_RELAY_GENERATION_FRAMES * 2)
-            .ok_or_else(|| {
-                format!(
-                    "satellite {} exceeded the connection-wide in-flight bootstrap frame budget",
-                    self.host
-                )
-            })?;
-        let connection_bytes = self
-            .inflight_generation_bytes
-            .checked_add(payload_len)
-            .filter(|bytes| *bytes <= MAX_RELAY_GENERATION_BYTES * 2)
-            .ok_or_else(|| {
-                format!(
-                    "satellite {} exceeded the connection-wide in-flight bootstrap byte budget",
-                    self.host
-                )
-            })?;
+        ensure_chunk_identity(&self.host, terminal, flow, stream_id, bootstrap_id)?;
+        ensure_chunk_sequence(&self.host, flow, chunk_seq)?;
+        let next_frames = charge_frame(
+            &self.host,
+            "per-generation bootstrap frame budget",
+            flow.generation_frames,
+            MAX_RELAY_GENERATION_FRAMES,
+        )?;
+        let next_bytes = charge_bytes(
+            &self.host,
+            "per-generation bootstrap byte budget",
+            flow.generation_bytes,
+            payload_len,
+            MAX_RELAY_GENERATION_BYTES,
+        )?;
+        let connection_frames = charge_frame(
+            &self.host,
+            "connection-wide in-flight bootstrap frame budget",
+            self.inflight_generation_frames,
+            MAX_RELAY_GENERATION_FRAMES * 2,
+        )?;
+        let connection_bytes = charge_bytes(
+            &self.host,
+            "connection-wide in-flight bootstrap byte budget",
+            self.inflight_generation_bytes,
+            payload_len,
+            MAX_RELAY_GENERATION_BYTES * 2,
+        )?;
         flow.next_chunk_seq = flow.next_chunk_seq.checked_add(1).ok_or_else(|| {
             format!(
                 "satellite {} overflowed the bootstrap chunk sequence",

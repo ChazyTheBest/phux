@@ -505,76 +505,111 @@ impl TerminalActor {
         reason = "ADR-0014: TerminalActor owns !Send Terminal; lives on LocalSet"
     )]
     pub(super) async fn terminate_child_group(pty: &mut PtyOwned) {
-        use nix::errno::Errno;
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-
-        let shell_group = pty
-            .child
-            .process_id()
-            .and_then(|id| i32::try_from(id).ok())
-            .map(Pid::from_raw);
-        let foreground_group = pty
-            .master
-            .lock()
-            .ok()
-            .and_then(|master| master.process_group_leader())
-            .filter(|id| *id > 0)
-            .map(Pid::from_raw);
-
-        // Signal the foreground job first. The shell may exit immediately on
-        // SIGHUP, at which point tcgetpgrp can no longer recover this group.
-        let mut groups = Vec::with_capacity(2);
-        if let Some(group) = foreground_group {
-            groups.push(group);
-        }
-        if let Some(group) = shell_group
-            && !groups.contains(&group)
-        {
-            groups.push(group);
-        }
+        let groups = pane_signal_groups(pty);
         if groups.is_empty() {
             let _ = pty.child.kill();
             return;
         }
-
-        let mut delivered = false;
-        for &group in &groups {
-            match killpg(group, Signal::SIGHUP) {
-                Ok(()) => delivered = true,
-                Err(Errno::ESRCH) => {}
-                Err(err) => debug!(?err, ?group, "SIGHUP to pane group failed"),
-            }
-        }
-        if !delivered {
+        if !hangup_pane_groups(&groups) {
             let _ = pty.child.kill();
             return;
         }
-
-        // Poll every snapshotted group, not just the shell child: the shell can
-        // exit while a foreground job remains alive. Reap the shell as it exits
-        // so its zombie does not keep the shell process group looking alive for
-        // the entire grace period.
-        let deadline = tokio::time::Instant::now() + PANE_KILL_GRACE;
-        while tokio::time::Instant::now() < deadline {
-            if let Err(err) = pty.child.try_wait() {
-                debug!(?err, "try_wait during pane-kill grace failed");
-            }
-            if groups
-                .iter()
-                .all(|&group| matches!(killpg(group, None), Err(Errno::ESRCH)))
-            {
-                return;
-            }
-            tokio::time::sleep(PANE_KILL_POLL).await;
+        if await_pane_group_exit(pty, &groups).await {
+            return;
         }
+        hard_kill_pane_groups(&groups);
+    }
+}
 
-        // Backstop: a group ignored the hangup (or is mid-flush past the
-        // budget). Hard-kill every surviving snapshotted group.
-        for group in groups {
-            if !matches!(killpg(group, None), Err(Errno::ESRCH)) {
-                let _ = killpg(group, Signal::SIGKILL);
-            }
+/// Snapshot the process groups a pane hangup must reach.
+///
+/// Signal the foreground job first. The shell may exit immediately on
+/// SIGHUP, at which point tcgetpgrp can no longer recover this group.
+fn pane_signal_groups(pty: &PtyOwned) -> Vec<nix::unistd::Pid> {
+    use nix::unistd::Pid;
+
+    let shell_group = pty
+        .child
+        .process_id()
+        .and_then(|id| i32::try_from(id).ok())
+        .map(Pid::from_raw);
+    let foreground_group = pty
+        .master
+        .lock()
+        .ok()
+        .and_then(|master| master.process_group_leader())
+        .filter(|id| *id > 0)
+        .map(Pid::from_raw);
+
+    let mut groups = Vec::with_capacity(2);
+    if let Some(group) = foreground_group {
+        groups.push(group);
+    }
+    if let Some(group) = shell_group
+        && !groups.contains(&group)
+    {
+        groups.push(group);
+    }
+    groups
+}
+
+/// Send `SIGHUP` to every snapshotted group, in order. `true` when at least
+/// one group actually took the signal (an `ESRCH` group is already gone).
+fn hangup_pane_groups(groups: &[nix::unistd::Pid]) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, killpg};
+
+    let mut delivered = false;
+    for &group in groups {
+        match killpg(group, Signal::SIGHUP) {
+            Ok(()) => delivered = true,
+            Err(Errno::ESRCH) => {}
+            Err(err) => debug!(?err, ?group, "SIGHUP to pane group failed"),
+        }
+    }
+    delivered
+}
+
+/// Wait out the [`PANE_KILL_GRACE`] budget, returning `true` once every
+/// snapshotted group has exited.
+///
+/// Poll every snapshotted group, not just the shell child: the shell can
+/// exit while a foreground job remains alive. Reap the shell as it exits
+/// so its zombie does not keep the shell process group looking alive for
+/// the entire grace period.
+#[allow(
+    clippy::future_not_send,
+    reason = "ADR-0014: TerminalActor owns !Send Terminal; lives on LocalSet"
+)]
+async fn await_pane_group_exit(pty: &mut PtyOwned, groups: &[nix::unistd::Pid]) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+
+    let deadline = tokio::time::Instant::now() + PANE_KILL_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        if let Err(err) = pty.child.try_wait() {
+            debug!(?err, "try_wait during pane-kill grace failed");
+        }
+        if groups
+            .iter()
+            .all(|&group| matches!(killpg(group, None), Err(Errno::ESRCH)))
+        {
+            return true;
+        }
+        tokio::time::sleep(PANE_KILL_POLL).await;
+    }
+    false
+}
+
+/// Backstop: a group ignored the hangup (or is mid-flush past the
+/// budget). Hard-kill every surviving snapshotted group.
+fn hard_kill_pane_groups(groups: &[nix::unistd::Pid]) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, killpg};
+
+    for &group in groups {
+        if !matches!(killpg(group, None), Err(Errno::ESRCH)) {
+            let _ = killpg(group, Signal::SIGKILL);
         }
     }
 }

@@ -1300,6 +1300,570 @@ async fn close_for_protocol_error(
     close_client_writer(out_tx, writer_close, sibling_tasks).await;
 }
 
+/// SPEC §7.4: echo the nonce in PONG.
+async fn reply_pong(
+    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
+    client_id: ClientId,
+    nonce: u64,
+) {
+    debug!(nonce, "PING -> PONG");
+    if out_tx
+        .send(Outbound::Frame(FrameKind::Pong { nonce }))
+        .await
+        .is_err()
+    {
+        trace!(?client_id, nonce, "PONG send dropped: writer gone");
+    }
+}
+
+/// SPEC §7.3: server responds with DETACHED, then closes. For byc.8 we emit
+/// DETACHED and let the read loop continue — actual transport close lands
+/// when the client drops, which is the path the existing socket-lifecycle
+/// tests exercise.
+///
+/// Intentionally silent on send failure: this client is detached on the next
+/// line, so the writer being gone is the next thing to happen anyway. Logging
+/// here would be pure noise.
+async fn detach_on_request(
+    state: &SharedState,
+    client_id: ClientId,
+    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
+    output_pumps: &mut JoinSet<()>,
+) {
+    // Lifecycle event at info so it shows under the default capture filter —
+    // DETACH is a per-client lifecycle edge a trace reader wants to see
+    // without enabling debug.
+    info!(?client_id, "DETACH");
+    abort_output_pumps(output_pumps, client_id, "DETACH").await;
+    let _ = out_tx
+        .send(Outbound::Frame(FrameKind::Detached {
+            reason: Some(DetachReason::Requested),
+            message: String::new(),
+        }))
+        .await;
+    detach_and_release_consumer_state(state, client_id);
+}
+
+/// The verdict on one ATTACH's `attach_id`.
+enum AttachIdVerdict {
+    /// Unused on this connection: the attach proceeds.
+    Fresh,
+    /// Already used here: answered with an `ERROR`, the connection survives.
+    Reused,
+    /// The reserved zero id: a malformed frame, so the connection ends.
+    Reserved,
+}
+
+/// Classify an ATTACH's `attach_id`. An attach id names one immutable
+/// aggregate generation for the life of this connection. Reuse would collide
+/// with a completed stream/bootstrap key even when the replacement otherwise
+/// followed the right barriers.
+fn classify_attach_id(
+    attach_id: u32,
+    used_attach_ids: &mut HashSet<u32>,
+    client_id: ClientId,
+) -> AttachIdVerdict {
+    if attach_id == 0 {
+        warn!(?client_id, "ATTACH used reserved zero attach_id; closing");
+        return AttachIdVerdict::Reserved;
+    }
+    if used_attach_ids.insert(attach_id) {
+        AttachIdVerdict::Fresh
+    } else {
+        AttachIdVerdict::Reused
+    }
+}
+
+/// Hand one `INPUT_TERMINAL_REPLY` to the pane, if the connection advertised
+/// the frame at all.
+///
+/// The frame is additive within protocol 0.7: report the unadvertised type
+/// without killing an otherwise valid connection, and never pass its bytes to
+/// the PTY.
+async fn dispatch_terminal_reply(
+    state: &SharedState,
+    client_id: ClientId,
+    selection: NegotiatedConnection,
+    terminal_id: &phux_protocol::ids::TerminalId,
+    bytes: bytes::Bytes,
+    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
+) {
+    if !selection.accepts_terminal_reply() {
+        let _ = out_tx
+            .send(Outbound::Frame(FrameKind::Error {
+                request_id: None,
+                code: ErrorCode::UnknownMessageType,
+                message: "INPUT_TERMINAL_REPLY was not advertised for this connection".to_owned(),
+            }))
+            .await;
+        return;
+    }
+    handle_terminal_reply(state, client_id, terminal_id, bytes);
+}
+
+/// Why one connection must end, and what the peer is owed on the way out
+/// (SPEC §9: `ERROR`, then `DETACHED`, then close).
+struct ConnectionClose {
+    /// `Some(reason)` once the connection may already be attached: the
+    /// per-attach output pumps and the consumer's registry state are torn down
+    /// first, so no mailbox sender outlives the connection. `None` is the
+    /// handshake phase, where nothing is attached yet and only the goodbye is
+    /// owed.
+    attached_reason: Option<&'static str>,
+    code: ErrorCode,
+    message: String,
+}
+
+/// One connection's outbound plumbing: the mailbox every stage sends through,
+/// the writer task's close signal, and the two task sets whose separation
+/// matters — DETACH/session switch must abort the per-attach pane output pumps
+/// without killing the writer, because the writer still needs to emit DETACHED
+/// and may serve a later ATTACH on the same connection.
+struct ClientPlumbing {
+    out_tx: tokio::sync::mpsc::Sender<Outbound>,
+    writer_close: tokio::sync::watch::Sender<bool>,
+    /// Sibling tasks (today: just the writer).
+    sibling_tasks: JoinSet<()>,
+    /// Per-attach raw-output pumps.
+    output_pumps: JoinSet<()>,
+}
+
+impl ClientPlumbing {
+    /// Allocate the per-client outbound mailbox and spawn the writer task that
+    /// drains it. The writer drains one `Outbound` channel; closure of that one
+    /// channel is the unambiguous signal for the writer to exit.
+    fn spawn<W: FrameWriter + 'static>(writer: W, client_id: ClientId) -> Self {
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Outbound>(DEFAULT_CLIENT_MAILBOX);
+        let (writer_close, writer_close_rx) = tokio::sync::watch::channel(false);
+        let mut sibling_tasks: JoinSet<()> = JoinSet::new();
+        sibling_tasks.spawn_local(writer_task(writer, out_rx, writer_close_rx, client_id));
+        Self {
+            out_tx,
+            writer_close,
+            sibling_tasks,
+            output_pumps: JoinSet::new(),
+        }
+    }
+
+    /// End one connection for a protocol violation, in the order §9 requires.
+    async fn close(mut self, close: ConnectionClose, state: &SharedState, client_id: ClientId) {
+        if let Some(reason) = close.attached_reason {
+            abort_output_pumps(&mut self.output_pumps, client_id, reason).await;
+            detach_and_release_consumer_state(state, client_id);
+        }
+        close_for_protocol_error(
+            self.out_tx,
+            &self.writer_close,
+            &mut self.sibling_tasks,
+            close.code,
+            close.message,
+        )
+        .await;
+    }
+
+    /// End one connection because it was cancelled rather than because the
+    /// peer misbehaved: no `ERROR` is owed, and a server-wide shutdown says so
+    /// in the `DETACHED` reason before the writer drains.
+    async fn close_for_cancellation(
+        mut self,
+        state: &SharedState,
+        client_id: ClientId,
+        root_token: &CancellationToken,
+    ) {
+        abort_output_pumps(&mut self.output_pumps, client_id, "connection cancellation").await;
+        if root_token.is_cancelled() {
+            let _ = self
+                .out_tx
+                .send(Outbound::Frame(FrameKind::Detached {
+                    reason: Some(DetachReason::ServerShutdown),
+                    message: "server is shutting down".to_owned(),
+                }))
+                .await;
+        }
+        detach_and_release_consumer_state(state, client_id);
+        close_client_writer(self.out_tx, &self.writer_close, &mut self.sibling_tasks).await;
+    }
+}
+
+/// SPEC §5: a framing violation obliges this peer to send
+/// `ERROR { code: FRAME_TOO_LARGE }` before closing. Every transport reader
+/// funnels the violation here as an `InvalidData` error with the typed
+/// `FramingError` as its source, so the emission lives in one place instead of
+/// one per transport. The send is best-effort by construction:
+/// `close_for_protocol_error` ignores a dead writer, so a peer that already
+/// vanished cannot error out this close path.
+///
+/// `None` for every other read error: the transport simply died, and there is
+/// nobody left to tell.
+fn framing_violation_close(err: &io::Error, client_id: ClientId) -> Option<ConnectionClose> {
+    let framing = framing_violation(err)?;
+    warn!(?client_id, error = %framing, "client framing violation; closing");
+    Some(ConnectionClose {
+        attached_reason: Some("framing violation"),
+        code: ErrorCode::FrameTooLarge,
+        // One definition of the peer-visible text, next to the type that
+        // describes the violation: the hub's link supervisor owes the same §5
+        // goodbye on its satellite links and builds it from the same place.
+        message: framing.wire_message(),
+    })
+}
+
+/// Decode one framed message. Once HELLO has been negotiated the connection's
+/// selected limits apply, so an oversized borrowed payload is rejected before
+/// the decoder copies it into owned storage.
+fn decode_client_frame(
+    framed: &BytesMut,
+    negotiated: Option<&NegotiatedConnection>,
+) -> Result<FrameKind, ConnectionClose> {
+    let decoded = negotiated.map_or_else(
+        || FrameKind::decode(framed),
+        |selection| FrameKind::decode_with_limits(framed, selection.limits),
+    );
+    match decoded {
+        Ok((frame, _rest)) => Ok(frame),
+        Err(err) => {
+            warn!(error = ?err, "client sent undecodable frame; closing");
+            Err(ConnectionClose {
+                attached_reason: Some("undecodable frame"),
+                code: ErrorCode::MalformedMessage,
+                message: format!("could not decode client frame: {err:?}"),
+            })
+        }
+    }
+}
+
+/// Nothing stateful may precede HELLO.
+///
+/// PING is exempt: a stateless, version-insensitive liveness probe (the
+/// connector's consumer health check is exactly that), and the spec's
+/// close-before-processing clause targets "ATTACH or other stateful frames".
+fn reject_frame_before_hello(
+    frame: &FrameKind,
+    negotiated: bool,
+    client_id: ClientId,
+) -> Option<ConnectionClose> {
+    if negotiated || matches!(frame, FrameKind::Hello { .. } | FrameKind::Ping { .. }) {
+        return None;
+    }
+    warn!(?client_id, "stateful frame before HELLO; closing");
+    Some(ConnectionClose {
+        attached_reason: None,
+        code: ErrorCode::VersionIncompatible,
+        message: "HELLO required before any stateful frame".to_owned(),
+    })
+}
+
+/// The HELLO frame's payload, carried as one value so the negotiation stage
+/// takes the frame rather than five loose fields.
+struct HelloRequest {
+    client_name: String,
+    protocol_major: u16,
+    protocol_minor: u16,
+    protocol_patch: u16,
+    client_caps: ClientCapabilities,
+}
+
+/// Negotiate the connection: version compatibility, the policy engine's
+/// verdict on the authenticated peer, and the bootstrap profile both sides can
+/// speak. All of it is cached in `negotiated` exactly once — before any
+/// stateful frame can be processed — and acknowledged with `HELLO_OK`.
+async fn negotiate_hello(
+    state: &SharedState,
+    client_id: ClientId,
+    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
+    hello: HelloRequest,
+    negotiated: &mut Option<NegotiatedConnection>,
+) -> Result<(), ConnectionClose> {
+    let HelloRequest {
+        client_name,
+        protocol_major,
+        protocol_minor,
+        protocol_patch,
+        client_caps,
+    } = hello;
+    if negotiated.is_some() {
+        warn!(?client_id, "duplicate HELLO; closing");
+        // Never patch a live client's capabilities. Tear down any
+        // attached profile so its mailbox sender cannot keep the
+        // writer alive, flush the protocol-order error, then close.
+        return Err(ConnectionClose {
+            attached_reason: Some("duplicate HELLO"),
+            code: ErrorCode::InvalidCommand,
+            message: "HELLO already completed on this connection".to_owned(),
+        });
+    }
+    debug!(
+        ?client_id,
+        %client_name,
+        protocol_major,
+        protocol_minor,
+        protocol_patch,
+        color_support = ?client_caps.color_support,
+        "HELLO",
+    );
+    if !protocol_is_compatible(protocol_major, protocol_minor) {
+        let message =
+            incompatible_protocol_message(protocol_major, protocol_minor, protocol_patch);
+        warn!(?client_id, %message, "HELLO protocol mismatch");
+        return Err(ConnectionClose {
+            attached_reason: None,
+            code: ErrorCode::VersionIncompatible,
+            message,
+        });
+    }
+    authorize_hello(state, client_id).await?;
+    let (selected_profile, bootstrap_limits) = select_hello_profile(&client_caps, client_id)?;
+
+    let mut effective_client_caps = client_caps;
+    effective_client_caps.output_mode =
+        if matches!(selected_profile, BootstrapProfile::SynthesizedVtStateSync) {
+            phux_protocol::caps::OutputMode::StateSync
+        } else {
+            // NativeState and SynthesizedVtRaw both carry raw live PTY
+            // output regardless of the client's compatibility
+            // preference field.
+            phux_protocol::caps::OutputMode::Raw
+        };
+    let server_features = runtime_server_features();
+
+    // Cache all negotiated state exactly once before any stateful
+    // frame can be processed. Subsequent decoding immediately uses
+    // these bounds, rejecting oversized borrowed payloads before
+    // the protocol decoder copies them into owned storage.
+    *negotiated = Some(NegotiatedConnection {
+        client_caps: effective_client_caps,
+        profile: selected_profile,
+        limits: bootstrap_limits,
+        server_features,
+    });
+    state.with_mut(|s| {
+        // SPEC §6.2: cache the negotiated layer set. The L3
+        // dispatch arms gate METADATA_CHANGED on this value.
+        s.set_client_layers(client_id, client_caps.layers);
+    });
+    let hello_ok = FrameKind::HelloOk {
+        protocol_major: PROTOCOL_VERSION.major,
+        protocol_minor: PROTOCOL_VERSION.minor,
+        protocol_patch: PROTOCOL_VERSION.patch,
+        server_caps: ServerCapabilities::new()
+            .with_layers(LayerSet::all())
+            .with_features(server_features),
+        server_id: state.with(|server| server.server_incarnation().as_bytes().to_vec()),
+        selected_profile,
+        bootstrap_limits,
+    };
+    if out_tx.send(Outbound::Frame(hello_ok)).await.is_err() {
+        trace!(?client_id, "HELLO_OK send dropped: writer gone");
+    }
+    Ok(())
+}
+
+/// Policy check: authorize HELLO only against the identity authenticated by
+/// the accepting transport. A missing registry entry is never equivalent to a
+/// local root peer.
+async fn authorize_hello(
+    state: &SharedState,
+    client_id: ClientId,
+) -> Result<(), ConnectionClose> {
+    let Some(peer) = state.with(|s| s.peer_identity(client_id).cloned()) else {
+        warn!(
+            ?client_id,
+            "HELLO denied: authenticated peer identity missing"
+        );
+        return Err(ConnectionClose {
+            attached_reason: None,
+            code: ErrorCode::PermissionDenied,
+            message: "authenticated peer identity missing".to_owned(),
+        });
+    };
+    let engine = state.with(|s| s.policy_engine().clone());
+    // Placeholder requested-capability set: HELLO carries no
+    // capability request on the wire, so there is nothing to
+    // derive one from yet. phux-pjc5 replaces this with the
+    // scopes minted from the peer's paired credential, and
+    // starts enforcing the granted set the engine returns —
+    // which is why the return value is discarded today
+    // (ADR-0072).
+    let requested_caps = vec![phux_protocol::policy::Capability {
+        layer: phux_protocol::caps::Layer::L1,
+        ops: vec![],
+        terminals: None,
+        groups: None,
+        expires_at: None,
+    }];
+    match engine.authorize_hello(&peer, requested_caps).await {
+        Ok(_granted) => Ok(()),
+        Err(err) => {
+            warn!(?client_id, error = %err, "HELLO denied by policy");
+            Err(ConnectionClose {
+                attached_reason: None,
+                code: ErrorCode::PermissionDenied,
+                message: format!("policy denied: {err}"),
+            })
+        }
+    }
+}
+
+/// Select the protocol-0.7 bootstrap profile both peers can speak. `NativeState`
+/// requires an exact common codec and every required engine feature, so no
+/// common profile is a connection-ending `CodecUnavailable`.
+fn select_hello_profile(
+    client_caps: &ClientCapabilities,
+    client_id: ClientId,
+) -> Result<(BootstrapProfile, BootstrapLimits), ConnectionClose> {
+    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+    let server_bootstrap = crate::native_state::native_bootstrap_capabilities();
+    #[cfg(not(all(feature = "native-engine", not(target_arch = "wasm32"))))]
+    let server_bootstrap = BootstrapCapabilities::new();
+    let Ok(selection) = select_bootstrap_profile(client_caps, &server_bootstrap) else {
+        let message = format!(
+            "no common protocol-0.7 bootstrap profile: client profiles=0x{:02x} native_codecs=0x{:016x} native_features=0x{:08x}; server profiles=0x{:02x} native_codecs=0x{:016x} native_features=0x{:08x}. NativeState requires an exact common codec and every required engine feature; advertise SynthesizedVtRaw/SynthesizedVtStateSync or update the incompatible peer",
+            client_caps.bootstrap.profiles.as_wire(),
+            client_caps.bootstrap.native_codecs.as_wire(),
+            client_caps.bootstrap.native_features.as_wire(),
+            server_bootstrap.profiles.as_wire(),
+            server_bootstrap.native_codecs.as_wire(),
+            server_bootstrap.native_features.as_wire(),
+        );
+        warn!(?client_id, %message, "HELLO codec unavailable");
+        return Err(ConnectionClose {
+            attached_reason: None,
+            code: ErrorCode::CodecUnavailable,
+            message,
+        });
+    };
+    Ok(selection)
+}
+
+/// The `HISTORY_REQUEST` frame's payload, carried as one value so the handler
+/// takes the request rather than six loose fields.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+struct HistoryPageRequest {
+    terminal_id: phux_protocol::ids::TerminalId,
+    stream_id: phux_protocol::ids::StreamId,
+    bootstrap_id: phux_protocol::ids::BootstrapId,
+    cursor: bytes::Bytes,
+    max_bytes: u32,
+    max_rows: u32,
+}
+
+/// Answer one `HISTORY_REQUEST` from the pane's replica.
+///
+/// SPEC L1 s4.5: a history failure names one replica, so it is answered with a
+/// cursor-scoped status frame. An `ERROR` here is uncorrelated and carries no
+/// terminal identity, so a consumer cannot attribute it to a pane and today
+/// takes the whole attach down (phux-ijuj). Every exit below tombstones the
+/// cursor instead.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+async fn serve_history_request(
+    state: &SharedState,
+    client_id: ClientId,
+    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
+    selection: NegotiatedConnection,
+    request: HistoryPageRequest,
+) {
+    let HistoryPageRequest {
+        terminal_id,
+        stream_id,
+        bootstrap_id,
+        cursor,
+        max_bytes,
+        max_rows,
+    } = request;
+    let tombstone = |reason| FrameKind::HistoryTombstone {
+        terminal_id: terminal_id.clone(),
+        stream_id,
+        bootstrap_id,
+        cursor: cursor.clone(),
+        reason,
+    };
+    if !matches!(
+        selection.profile,
+        BootstrapProfile::NativeState {
+            codec: phux_protocol::caps::EngineCodec::LibghosttyCheckpointV2,
+            ..
+        }
+    ) {
+        warn!(
+            ?terminal_id,
+            "HISTORY_REQUEST requires negotiated native checkpoint v2"
+        );
+        let _ = out_tx
+            .send(Outbound::Frame(tombstone(
+                phux_protocol::wire::frame::HistoryTombstoneReason::CodecFailure,
+            )))
+            .await;
+        return;
+    }
+    let handle = state.with(|server| {
+        server
+            .terminal_from_wire(&terminal_id)
+            .and_then(|pane| server.terminal_handle(pane).cloned())
+    });
+    let Some(handle) = handle else {
+        // The terminal is gone, so the cursor's lease died with it.
+        warn!(?terminal_id, "HISTORY_REQUEST for an unknown terminal");
+        let _ = out_tx
+            .send(Outbound::Frame(tombstone(
+                phux_protocol::wire::frame::HistoryTombstoneReason::Released,
+            )))
+            .await;
+        return;
+    };
+    let Ok(permit) = out_tx.clone().reserve_owned().await else {
+        return;
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if handle
+        .native_history
+        .send(crate::terminal_actor::NativeHistoryRequest {
+            permit,
+            owner: client_id.0,
+            // Cloned, not moved: the tombstone fallback below still
+            // needs the identity if the actor answers with an error.
+            terminal_id: terminal_id.clone(),
+            stream_id,
+            bootstrap_id,
+            cursor: cursor.clone(),
+            max_bytes,
+            max_rows,
+            limits: selection.limits,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Ok(reply) = reply_rx.await else {
+        return;
+    };
+    match reply.result {
+        Ok(frame) => {
+            reply.permit.send(Outbound::Frame(frame));
+        }
+        Err(error) => {
+            // Mirrors the actor's own mapping for the errors it
+            // already answers in-band (`handle_native_history`);
+            // these are the residual ones that escaped it.
+            let reason = match error {
+                crate::native_state::NativeStateError::OutOfMemory
+                | crate::native_state::NativeStateError::OutOfSpace { .. }
+                | crate::native_state::NativeStateError::LimitExceeded => {
+                    phux_protocol::wire::frame::HistoryTombstoneReason::Limit
+                }
+                _ => phux_protocol::wire::frame::HistoryTombstoneReason::CodecFailure,
+            };
+            warn!(
+                %error,
+                ?terminal_id,
+                "native history request failed; tombstoning the cursor"
+            );
+            reply.permit.send(Outbound::Frame(tombstone(reason)));
+        }
+    }
+}
+
 /// Per-client task. Reads frames in a loop and dispatches each one.
 ///
 /// Outbound messages are routed through a per-client `mpsc` channel
@@ -1319,11 +1883,11 @@ async fn close_for_protocol_error(
 /// session, emits an `ERROR` frame with `SessionNotFound` (SPEC §14).
 #[allow(
     clippy::too_many_lines,
-    reason = "single per-client dispatch loop; each frame arm is small and the catalog grows linearly. Extracting arms hides the wire→state seam without simplifying it."
+    reason = "read, decode, handshake gating and every stateful arm body are extracted; what is left is one dispatch arm per wire frame variant, and the catalog grows linearly. Splitting on the arm boundary fragments the wire→state seam without simplifying it."
 )]
 #[allow(
     clippy::cognitive_complexity,
-    reason = "see `clippy::too_many_lines` rationale above: the dispatch shape is one match arm per wire frame variant, where each arm is small and self-contained. Splitting on the arm boundary fragments the wire→state seam; merging arms across variants is what generated the complexity score in the first place."
+    reason = "what remains is `loop { read; decode; gate; dispatch }` — the residual score is the dispatch match sitting inside the read loop, which is the shape of a per-connection frame loop, not accidental nesting."
 )]
 pub(crate) async fn handle_client<R, W>(
     mut reader: R,
@@ -1340,23 +1904,10 @@ where
 {
     debug!(?client_id, "client task started");
 
-    // Allocate the per-client outbound mailbox + spawn the writer task.
-    // The writer drains one `Outbound` channel; closure of this one
-    // channel is the unambiguous signal for the writer to exit.
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Outbound>(DEFAULT_CLIENT_MAILBOX);
-    let (writer_close_tx, writer_close_rx) = tokio::sync::watch::channel(false);
-    // Per-client `JoinSet` for sibling tasks (today: just the writer).
-    // Held in this scope so it drops with `handle_client` and the
-    // writer aborts if it hasn't already exited via its own
-    // close-on-EOF path. Keeps lifecycle plumbing local.
-    let mut sibling_tasks: JoinSet<()> = JoinSet::new();
-    sibling_tasks.spawn_local(writer_task(writer, out_rx, writer_close_rx, client_id));
-
-    // Per-attach raw-output pumps. These are deliberately separate from
-    // `sibling_tasks`: DETACH/session switch must abort pane output pumps
-    // without killing the writer, because the writer still needs to emit
-    // DETACHED and may serve a later ATTACH on the same connection.
-    let mut output_pumps: JoinSet<()> = JoinSet::new();
+    // Held in this scope so it drops with `handle_client`: the writer aborts
+    // if it hasn't already exited via its own close-on-EOF path, and the
+    // per-attach pumps go with it. Keeps lifecycle plumbing local.
+    let mut plumbing = ClientPlumbing::spawn(writer, client_id);
     // An attach id names one immutable aggregate generation for the life of
     // this connection. Reuse would collide with a completed stream/bootstrap
     // key even when the replacement otherwise followed the right barriers.
@@ -1376,17 +1927,9 @@ where
             biased;
             () = token.cancelled() => {
                 debug!(?client_id, "client task cancelled");
-                abort_output_pumps(&mut output_pumps, client_id, "connection cancellation").await;
-                if root_token.is_cancelled() {
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Detached {
-                            reason: Some(DetachReason::ServerShutdown),
-                            message: "server is shutting down".to_owned(),
-                        }))
-                        .await;
-                }
-                detach_and_release_consumer_state(&state, client_id);
-                close_client_writer(out_tx, &writer_close_tx, &mut sibling_tasks).await;
+                plumbing
+                    .close_for_cancellation(&state, client_id, &root_token)
+                    .await;
                 return Ok(());
             }
             res = reader.read_frame() => match res {
@@ -1396,80 +1939,26 @@ where
                     return Ok(());
                 }
                 Err(err) => {
-                    // SPEC §5: a framing violation obliges this peer to send
-                    // `ERROR { code: FRAME_TOO_LARGE }` before closing. Every
-                    // transport reader funnels the violation here as an
-                    // `InvalidData` error with the typed `FramingError` as its
-                    // source, so the emission lives in one place instead of
-                    // one per transport. The send is best-effort by
-                    // construction: `close_for_protocol_error` ignores a dead
-                    // writer, so a peer that already vanished cannot error
-                    // out this close path.
-                    if let Some(framing) = framing_violation(&err) {
-                        warn!(?client_id, error = %framing, "client framing violation; closing");
-                        // One definition of the peer-visible text, next to the
-                        // type that describes the violation: the hub's link
-                        // supervisor owes the same §5 goodbye on its satellite
-                        // links and builds it from the same place.
-                        let message = framing.wire_message();
-                        abort_output_pumps(&mut output_pumps, client_id, "framing violation")
-                            .await;
-                        detach_and_release_consumer_state(&state, client_id);
-                        close_for_protocol_error(
-                            out_tx,
-                            &writer_close_tx,
-                            &mut sibling_tasks,
-                            ErrorCode::FrameTooLarge,
-                            message,
-                        )
-                        .await;
+                    let Some(close) = framing_violation_close(&err, client_id) else {
+                        debug!(error = %err, "client read error; closing");
                         return Ok(());
-                    }
-                    debug!(error = %err, "client read error; closing");
+                    };
+                    plumbing.close(close, &state, client_id).await;
                     return Ok(());
                 }
             },
         };
 
-        let decoded = negotiated.as_ref().map_or_else(
-            || FrameKind::decode(&framed),
-            |selection| FrameKind::decode_with_limits(&framed, selection.limits),
-        );
-        let frame = match decoded {
-            Ok((frame, _rest)) => frame,
-            Err(err) => {
-                warn!(error = ?err, "client sent undecodable frame; closing");
-                let message = format!("could not decode client frame: {err:?}");
-                abort_output_pumps(&mut output_pumps, client_id, "undecodable frame").await;
-                detach_and_release_consumer_state(&state, client_id);
-                close_for_protocol_error(
-                    out_tx,
-                    &writer_close_tx,
-                    &mut sibling_tasks,
-                    ErrorCode::MalformedMessage,
-                    message,
-                )
-                .await;
+        let frame = match decode_client_frame(&framed, negotiated.as_ref()) {
+            Ok(frame) => frame,
+            Err(close) => {
+                plumbing.close(close, &state, client_id).await;
                 return Ok(());
             }
         };
 
-        // PING is exempt: a stateless, version-insensitive liveness probe
-        // (the connector's consumer health check is exactly that), and the
-        // spec's close-before-processing clause targets "ATTACH or other
-        // stateful frames".
-        if negotiated.is_none()
-            && !matches!(frame, FrameKind::Hello { .. } | FrameKind::Ping { .. })
-        {
-            warn!(?client_id, "stateful frame before HELLO; closing");
-            close_for_protocol_error(
-                out_tx,
-                &writer_close_tx,
-                &mut sibling_tasks,
-                ErrorCode::VersionIncompatible,
-                "HELLO required before any stateful frame".to_owned(),
-            )
-            .await;
+        if let Some(close) = reject_frame_before_hello(&frame, negotiated.is_some(), client_id) {
+            plumbing.close(close, &state, client_id).await;
             return Ok(());
         }
 
@@ -1481,182 +1970,22 @@ where
                 protocol_patch,
                 client_caps,
             } => {
-                if negotiated.is_some() {
-                    warn!(?client_id, "duplicate HELLO; closing");
-                    // Never patch a live client's capabilities. Tear down any
-                    // attached profile so its mailbox sender cannot keep the
-                    // writer alive, flush the protocol-order error, then close.
-                    abort_output_pumps(&mut output_pumps, client_id, "duplicate HELLO").await;
-                    detach_and_release_consumer_state(&state, client_id);
-                    close_for_protocol_error(
-                        out_tx,
-                        &writer_close_tx,
-                        &mut sibling_tasks,
-                        ErrorCode::InvalidCommand,
-                        "HELLO already completed on this connection".to_owned(),
-                    )
-                    .await;
-                    return Ok(());
-                }
-                debug!(
-                    ?client_id,
-                    %client_name,
+                let hello = HelloRequest {
+                    client_name,
                     protocol_major,
                     protocol_minor,
                     protocol_patch,
-                    color_support = ?client_caps.color_support,
-                    "HELLO",
-                );
-                if !protocol_is_compatible(protocol_major, protocol_minor) {
-                    let message = incompatible_protocol_message(
-                        protocol_major,
-                        protocol_minor,
-                        protocol_patch,
-                    );
-                    warn!(?client_id, %message, "HELLO protocol mismatch");
-                    close_for_protocol_error(
-                        out_tx,
-                        &writer_close_tx,
-                        &mut sibling_tasks,
-                        ErrorCode::VersionIncompatible,
-                        message,
-                    )
-                    .await;
-                    return Ok(());
-                }
-                // Policy check: authorize HELLO only against the identity
-                // authenticated by the accepting transport. A missing registry
-                // entry is never equivalent to a local root peer.
-                let Some(peer) = state.with(|s| s.peer_identity(client_id).cloned()) else {
-                    warn!(
-                        ?client_id,
-                        "HELLO denied: authenticated peer identity missing"
-                    );
-                    close_for_protocol_error(
-                        out_tx,
-                        &writer_close_tx,
-                        &mut sibling_tasks,
-                        ErrorCode::PermissionDenied,
-                        "authenticated peer identity missing".to_owned(),
-                    )
-                    .await;
-                    return Ok(());
+                    client_caps,
                 };
-                let policy_error = {
-                    let engine = state.with(|s| s.policy_engine().clone());
-                    // Placeholder requested-capability set: HELLO carries no
-                    // capability request on the wire, so there is nothing to
-                    // derive one from yet. phux-pjc5 replaces this with the
-                    // scopes minted from the peer's paired credential, and
-                    // starts enforcing the granted set the engine returns —
-                    // which is why the return value is discarded today
-                    // (ADR-0072).
-                    let requested_caps = vec![phux_protocol::policy::Capability {
-                        layer: phux_protocol::caps::Layer::L1,
-                        ops: vec![],
-                        terminals: None,
-                        groups: None,
-                        expires_at: None,
-                    }];
-                    match engine.authorize_hello(&peer, requested_caps).await {
-                        Ok(_granted) => None,
-                        Err(err) => {
-                            warn!(?client_id, error = %err, "HELLO denied by policy");
-                            Some(format!("policy denied: {err}"))
-                        }
-                    }
-                };
-                if let Some(message) = policy_error {
-                    close_for_protocol_error(
-                        out_tx,
-                        &writer_close_tx,
-                        &mut sibling_tasks,
-                        ErrorCode::PermissionDenied,
-                        message,
-                    )
-                    .await;
-                    return Ok(());
-                }
-                #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
-                let server_bootstrap = crate::native_state::native_bootstrap_capabilities();
-                #[cfg(not(all(feature = "native-engine", not(target_arch = "wasm32"))))]
-                let server_bootstrap = BootstrapCapabilities::new();
-                let Ok((selected_profile, bootstrap_limits)) =
-                    select_bootstrap_profile(&client_caps, &server_bootstrap)
-                else {
-                    let message = format!(
-                        "no common protocol-0.7 bootstrap profile: client profiles=0x{:02x} native_codecs=0x{:016x} native_features=0x{:08x}; server profiles=0x{:02x} native_codecs=0x{:016x} native_features=0x{:08x}. NativeState requires an exact common codec and every required engine feature; advertise SynthesizedVtRaw/SynthesizedVtStateSync or update the incompatible peer",
-                        client_caps.bootstrap.profiles.as_wire(),
-                        client_caps.bootstrap.native_codecs.as_wire(),
-                        client_caps.bootstrap.native_features.as_wire(),
-                        server_bootstrap.profiles.as_wire(),
-                        server_bootstrap.native_codecs.as_wire(),
-                        server_bootstrap.native_features.as_wire(),
-                    );
-                    warn!(?client_id, %message, "HELLO codec unavailable");
-                    close_for_protocol_error(
-                        out_tx,
-                        &writer_close_tx,
-                        &mut sibling_tasks,
-                        ErrorCode::CodecUnavailable,
-                        message,
-                    )
-                    .await;
-                    return Ok(());
-                };
-                let mut effective_client_caps = client_caps;
-                effective_client_caps.output_mode =
-                    if matches!(selected_profile, BootstrapProfile::SynthesizedVtStateSync) {
-                        phux_protocol::caps::OutputMode::StateSync
-                    } else {
-                        // NativeState and SynthesizedVtRaw both carry raw live PTY
-                        // output regardless of the client's compatibility
-                        // preference field.
-                        phux_protocol::caps::OutputMode::Raw
-                    };
-                let server_features = runtime_server_features();
-
-                // Cache all negotiated state exactly once before any stateful
-                // frame can be processed. Subsequent decoding immediately uses
-                // these bounds, rejecting oversized borrowed payloads before
-                // the protocol decoder copies them into owned storage.
-                negotiated = Some(NegotiatedConnection {
-                    client_caps: effective_client_caps,
-                    profile: selected_profile,
-                    limits: bootstrap_limits,
-                    server_features,
-                });
-                state.with_mut(|s| {
-                    // SPEC §6.2: cache the negotiated layer set. The L3
-                    // dispatch arms gate METADATA_CHANGED on this value.
-                    s.set_client_layers(client_id, client_caps.layers);
-                });
-                let hello_ok = FrameKind::HelloOk {
-                    protocol_major: PROTOCOL_VERSION.major,
-                    protocol_minor: PROTOCOL_VERSION.minor,
-                    protocol_patch: PROTOCOL_VERSION.patch,
-                    server_caps: ServerCapabilities::new()
-                        .with_layers(LayerSet::all())
-                        .with_features(server_features),
-                    server_id: state.with(|server| server.server_incarnation().as_bytes().to_vec()),
-                    selected_profile,
-                    bootstrap_limits,
-                };
-                if out_tx.send(Outbound::Frame(hello_ok)).await.is_err() {
-                    trace!(?client_id, "HELLO_OK send dropped: writer gone");
-                }
-            }
-            FrameKind::Ping { nonce } => {
-                // SPEC §7.4: echo nonce in PONG.
-                debug!(nonce, "PING -> PONG");
-                if out_tx
-                    .send(Outbound::Frame(FrameKind::Pong { nonce }))
-                    .await
-                    .is_err()
+                if let Err(close) =
+                    negotiate_hello(&state, client_id, &plumbing.out_tx, hello, &mut negotiated)
+                        .await
                 {
-                    trace!(?client_id, nonce, "PONG send dropped: writer gone");
+                    plumbing.close(close, &state, client_id).await;
+                    return Ok(());
                 }
             }
+            FrameKind::Ping { nonce } => reply_pong(&plumbing.out_tx, client_id, nonce).await,
             FrameKind::Attach {
                 attach_id,
                 target,
@@ -1664,31 +1993,29 @@ where
                 request_scrollback,
                 scrollback_limit_lines,
             } => {
-                if attach_id == 0 {
-                    warn!(?client_id, "ATTACH used reserved zero attach_id; closing");
-                    abort_output_pumps(&mut output_pumps, client_id, "zero ATTACH id").await;
-                    detach_and_release_consumer_state(&state, client_id);
-                    close_for_protocol_error(
-                        out_tx,
-                        &writer_close_tx,
-                        &mut sibling_tasks,
-                        ErrorCode::MalformedMessage,
-                        "ATTACH attach_id must be nonzero".to_owned(),
-                    )
-                    .await;
-                    return Ok(());
-                }
-                if !used_attach_ids.insert(attach_id) {
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
+                match classify_attach_id(attach_id, &mut used_attach_ids, client_id) {
+                    AttachIdVerdict::Fresh => {}
+                    AttachIdVerdict::Reused => {
+                        let _ = plumbing.out_tx
+                            .send(Outbound::Frame(FrameKind::Error {
+                                request_id: None,
+                                code: ErrorCode::MalformedMessage,
+                                message: format!(
+                                    "ATTACH attach_id {attach_id} was already used on this connection"
+                                ),
+                            }))
+                            .await;
+                        continue;
+                    }
+                    AttachIdVerdict::Reserved => {
+                        let close = ConnectionClose {
+                            attached_reason: Some("zero ATTACH id"),
                             code: ErrorCode::MalformedMessage,
-                            message: format!(
-                                "ATTACH attach_id {attach_id} was already used on this connection"
-                            ),
-                        }))
-                        .await;
-                    continue;
+                            message: "ATTACH attach_id must be nonzero".to_owned(),
+                        };
+                        plumbing.close(close, &state, client_id).await;
+                        return Ok(());
+                    }
                 }
                 let Some(selection) = negotiated.as_ref() else {
                     continue;
@@ -1709,38 +2036,19 @@ where
                     viewport,
                     request_scrollback,
                     scrollback_limit_lines,
-                    &out_tx,
+                    &plumbing.out_tx,
                     selection.client_caps,
                     selection.profile,
                     selection.limits,
                     &root_token,
-                    &mut output_pumps,
+                    &mut plumbing.output_pumps,
                     &token,
                 )
                 .await;
             }
             FrameKind::Detach => {
-                // Lifecycle event at info so it shows under the default
-                // capture filter — DETACH is a per-client lifecycle edge a
-                // trace reader wants to see without enabling debug.
-                info!(?client_id, "DETACH");
-                // SPEC §7.3: server responds with DETACHED, then closes.
-                // For byc.8 we emit DETACHED and let the read loop
-                // continue — actual transport close lands when the
-                // client drops, which is the path the existing
-                // socket-lifecycle tests exercise.
-                // Intentionally silent on send failure: we are about
-                // to `detach()` this client on the next line, so the
-                // writer being gone is the next thing to happen
-                // anyway. Logging here would be pure noise.
-                abort_output_pumps(&mut output_pumps, client_id, "DETACH").await;
-                let _ = out_tx
-                    .send(Outbound::Frame(FrameKind::Detached {
-                        reason: Some(DetachReason::Requested),
-                        message: String::new(),
-                    }))
+                detach_on_request(&state, client_id, &plumbing.out_tx, &mut plumbing.output_pumps)
                     .await;
-                detach_and_release_consumer_state(&state, client_id);
             }
             FrameKind::ViewportResize { viewport } => {
                 debug!(
@@ -1800,21 +2108,15 @@ where
                 let Some(selection) = negotiated.as_ref() else {
                     continue;
                 };
-                if !selection.accepts_terminal_reply() {
-                    let _ = out_tx
-                        .send(Outbound::Frame(FrameKind::Error {
-                            request_id: None,
-                            code: ErrorCode::UnknownMessageType,
-                            message: "INPUT_TERMINAL_REPLY was not advertised for this connection"
-                                .to_owned(),
-                        }))
-                        .await;
-                    // The frame is additive within protocol 0.7: report the
-                    // unadvertised type without killing an otherwise valid
-                    // connection, and never pass its bytes to the PTY.
-                    continue;
-                }
-                handle_terminal_reply(&state, client_id, &terminal_id, bytes);
+                dispatch_terminal_reply(
+                    &state,
+                    client_id,
+                    *selection,
+                    &terminal_id,
+                    bytes,
+                    &plumbing.out_tx,
+                )
+                .await;
             }
             FrameKind::FrameAck {
                 terminal_id,
@@ -1843,111 +2145,29 @@ where
                 let Some(selection) = negotiated.as_ref() else {
                     continue;
                 };
-                // SPEC L1 s4.5: a history failure names one replica, so it is
-                // answered with a cursor-scoped status frame. An `ERROR` here
-                // is uncorrelated and carries no terminal identity, so a
-                // consumer cannot attribute it to a pane and today takes the
-                // whole attach down (phux-ijuj). Every exit below tombstones
-                // the cursor instead.
-                let tombstone = |reason| FrameKind::HistoryTombstone {
-                    terminal_id: terminal_id.clone(),
-                    stream_id,
-                    bootstrap_id,
-                    cursor: cursor.clone(),
-                    reason,
-                };
-                if !matches!(
-                    selection.profile,
-                    BootstrapProfile::NativeState {
-                        codec: phux_protocol::caps::EngineCodec::LibghosttyCheckpointV2,
-                        ..
-                    }
-                ) {
-                    warn!(
-                        ?terminal_id,
-                        "HISTORY_REQUEST requires negotiated native checkpoint v2"
-                    );
-                    let _ = out_tx
-                        .send(Outbound::Frame(tombstone(
-                            phux_protocol::wire::frame::HistoryTombstoneReason::CodecFailure,
-                        )))
-                        .await;
-                    continue;
-                }
-                let handle = state.with(|server| {
-                    server
-                        .terminal_from_wire(&terminal_id)
-                        .and_then(|pane| server.terminal_handle(pane).cloned())
-                });
-                let Some(handle) = handle else {
-                    // The terminal is gone, so the cursor's lease died with it.
-                    warn!(?terminal_id, "HISTORY_REQUEST for an unknown terminal");
-                    let _ = out_tx
-                        .send(Outbound::Frame(tombstone(
-                            phux_protocol::wire::frame::HistoryTombstoneReason::Released,
-                        )))
-                        .await;
-                    continue;
-                };
-                let Ok(permit) = out_tx.clone().reserve_owned().await else {
-                    continue;
-                };
-                let (reply_tx, reply_rx) = oneshot::channel();
-                if handle
-                    .native_history
-                    .send(crate::terminal_actor::NativeHistoryRequest {
-                        permit,
-                        owner: client_id.0,
-                        // Cloned, not moved: the tombstone fallback below still
-                        // needs the identity if the actor answers with an error.
-                        terminal_id: terminal_id.clone(),
+                serve_history_request(
+                    &state,
+                    client_id,
+                    &plumbing.out_tx,
+                    *selection,
+                    HistoryPageRequest {
+                        terminal_id,
                         stream_id,
                         bootstrap_id,
-                        cursor: cursor.clone(),
+                        cursor,
                         max_bytes,
                         max_rows,
-                        limits: selection.limits,
-                        reply: reply_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                let Ok(reply) = reply_rx.await else {
-                    continue;
-                };
-                match reply.result {
-                    Ok(frame) => {
-                        reply.permit.send(Outbound::Frame(frame));
-                    }
-                    Err(error) => {
-                        // Mirrors the actor's own mapping for the errors it
-                        // already answers in-band (`handle_native_history`);
-                        // these are the residual ones that escaped it.
-                        let reason = match error {
-                            crate::native_state::NativeStateError::OutOfMemory
-                            | crate::native_state::NativeStateError::OutOfSpace { .. }
-                            | crate::native_state::NativeStateError::LimitExceeded => {
-                                phux_protocol::wire::frame::HistoryTombstoneReason::Limit
-                            }
-                            _ => phux_protocol::wire::frame::HistoryTombstoneReason::CodecFailure,
-                        };
-                        warn!(
-                            %error,
-                            ?terminal_id,
-                            "native history request failed; tombstoning the cursor"
-                        );
-                        reply.permit.send(Outbound::Frame(tombstone(reason)));
-                    }
-                }
+                    },
+                )
+                .await;
             }
             FrameKind::GetMetadata {
                 request_id,
                 scope,
                 key,
             } => {
-                handle_get_metadata(&state, client_id, request_id, &scope, &key, &out_tx).await;
+                handle_get_metadata(&state, client_id, request_id, &scope, &key, &plumbing.out_tx)
+                    .await;
             }
             FrameKind::SetMetadata {
                 request_id,
@@ -1973,13 +2193,13 @@ where
                 handle_delete_metadata(&state, client_id, request_id, &scope, &key);
             }
             FrameKind::ListMetadata { request_id, scope } => {
-                handle_list_metadata(&state, client_id, request_id, &scope, &out_tx).await;
+                handle_list_metadata(&state, client_id, request_id, &scope, &plumbing.out_tx).await;
             }
             FrameKind::SubscribeMetadata { scope, key } => {
-                handle_subscribe_metadata(&state, client_id, scope, key, &out_tx);
+                handle_subscribe_metadata(&state, client_id, scope, key, &plumbing.out_tx);
             }
             FrameKind::SubscribeEvents { terminal } => {
-                handle_subscribe_events(&state, client_id, terminal, &out_tx);
+                handle_subscribe_events(&state, client_id, terminal, &plumbing.out_tx);
             }
             FrameKind::SpawnTerminal {
                 request_id,
@@ -2011,12 +2231,12 @@ where
                         agent_session,
                         initial_size,
                     },
-                    &out_tx,
+                    &plumbing.out_tx,
                     selection.profile,
                     selection.limits,
                     &root_token,
                     &token,
-                    &mut output_pumps,
+                    &mut plumbing.output_pumps,
                 )
                 .await;
             }
@@ -2031,7 +2251,7 @@ where
                     request_id,
                     terminal,
                     owner_terminal,
-                    &out_tx,
+                    &plumbing.out_tx,
                 )
                 .await;
             }
@@ -2054,7 +2274,7 @@ where
                     client_id,
                     request_id,
                     command,
-                    &out_tx,
+                    &plumbing.out_tx,
                     selection.client_caps,
                     selection.profile,
                     selection.limits,
@@ -2066,18 +2286,14 @@ where
             }
             other => {
                 warn!(?client_id, kind = ?other, "direction-invalid client frame; closing");
-                let message =
-                    format!("frame is not valid from a client in the negotiated phase: {other:?}");
-                abort_output_pumps(&mut output_pumps, client_id, "direction-invalid frame").await;
-                detach_and_release_consumer_state(&state, client_id);
-                close_for_protocol_error(
-                    out_tx,
-                    &writer_close_tx,
-                    &mut sibling_tasks,
-                    ErrorCode::InvalidCommand,
-                    message,
-                )
-                .await;
+                let close = ConnectionClose {
+                    attached_reason: Some("direction-invalid frame"),
+                    code: ErrorCode::InvalidCommand,
+                    message: format!(
+                        "frame is not valid from a client in the negotiated phase: {other:?}"
+                    ),
+                };
+                plumbing.close(close, &state, client_id).await;
                 return Ok(());
             }
         }
@@ -2352,37 +2568,40 @@ fn reject_unknown_local_terminal_scope(
     true
 }
 
-pub(crate) fn handle_set_metadata(
+/// The writes `SET_METADATA` refuses outright: server-owned keys, a Terminal
+/// scope that names no live pane, and an agent-session record that is not a
+/// 1..=4096-byte value under a local Terminal scope. Every rejection is a
+/// logged no-op — `SET_METADATA` has no reply frame to carry an error.
+fn reject_set_metadata(
     state: &SharedState,
     client_id: ClientId,
     request_id: u32,
     scope: &phux_protocol::wire::frame::Scope,
     key: &str,
-    value: Vec<u8>,
-    root_token: &tokio_util::sync::CancellationToken,
-) {
+    value: &[u8],
+) -> bool {
     use phux_protocol::wire::frame::{
-        MAX_AGENT_SESSION_RECORD_BYTES, SESSION_CREATE_KEY, Scope, TERMINAL_AGENT_SESSION_KEY,
+        MAX_AGENT_SESSION_RECORD_BYTES, Scope, TERMINAL_AGENT_SESSION_KEY,
         TERMINAL_PANE_OCCUPANT_KEY,
     };
-    debug!(?client_id, request_id, ?scope, %key, "SET_METADATA");
+
     if is_reserved_session_create_result(scope, key) {
         warn!(
             ?client_id,
             request_id, "SET_METADATA: reserved session-create result key; ignoring"
         );
-        return;
+        return true;
     }
     if key == TERMINAL_PANE_OCCUPANT_KEY {
         warn!(
             ?client_id,
             request_id, "SET_METADATA: server-owned pane-occupant key; ignoring"
         );
-        return;
+        return true;
     }
     // Terminal scope is an ownership address, not an arbitrary namespace.
     if reject_unknown_local_terminal_scope(state, client_id, request_id, scope, key) {
-        return;
+        return true;
     }
     if key == TERMINAL_AGENT_SESSION_KEY
         && (!matches!(
@@ -2398,86 +2617,87 @@ pub(crate) fn handle_set_metadata(
             value_len = value.len(),
             "SET_METADATA(agent-session): want a local Terminal scope and 1..=4096 bytes; ignoring",
         );
-        return;
+        return true;
     }
-    // v0.3.0 "Option B" re-tier (ADR-0019 / ADR-0027): a create-without-
-    // attach is a `SET_METADATA` write of the conventional
-    // `SESSION_CREATE_KEY` under `Scope::Global`, replacing the removed
-    // `CREATE_SESSION` verb. Its UTF-8 JSON object may carry
-    // `{ name, command?, cwd?, env?, request_token?, agent_session? }`.
-    // The server seeds the session + pane; a nonce-bearing caller reads its exact
-    // key because SET_METADATA has no reply frame. A malformed value or a
-    // duplicate name is a silent no-op (logged), matching the fire-and-forget
-    // shape of metadata writes.
-    if key == SESSION_CREATE_KEY && matches!(scope, Scope::Global) {
-        handle_session_create_metadata(state, client_id, request_id, &value, root_token);
+    false
+}
+
+/// Apply a session rename written as `current_name\0new_name`. The server is
+/// authoritative for session names (they drive `ls` / `attach`), so it applies
+/// the registry rename rather than storing the write as an opaque blob. A
+/// malformed value or unknown session is a silent no-op.
+///
+/// An APPLIED rename still fans out like one: subscribers of the written
+/// `(scope, key)` receive a `METADATA_CHANGED` carrying the `current\0new`
+/// transition (phux-q7ks — before this, a rename notified nobody and the
+/// ADR-0089 roster kept painting the dead name).
+fn apply_session_rename(
+    state: &SharedState,
+    client_id: ClientId,
+    request_id: u32,
+    scope: &phux_protocol::wire::frame::Scope,
+    key: &str,
+    value: &[u8],
+) {
+    let parsed = std::str::from_utf8(value).ok().and_then(|s| {
+        s.split_once('\0')
+            .map(|(cur, new)| (cur.to_owned(), new.to_owned()))
+    });
+    let Some((current, new_name)) = parsed else {
+        warn!(
+            ?client_id,
+            request_id,
+            "SET_METADATA(session-name): malformed value (want current\\0new); ignoring",
+        );
         return;
-    }
-    // v0.3.0 "Option B" re-tier (ADR-0019 / ADR-0027): a session rename is a
-    // `SET_METADATA` write of the conventional `SESSION_NAME_KEY` under
-    // `Scope::Global`, replacing the removed `RENAME_SESSION` verb. The
-    // value is `current_name\0new_name` (NUL-separated UTF-8). The server is
-    // authoritative for session names (they drive `ls` / `attach`), so it
-    // intercepts the write and applies the registry rename rather than
-    // storing it as an opaque blob. A malformed value or unknown session is
-    // a silent no-op — `SET_METADATA` has no reply frame to carry an error,
-    // matching the fire-and-forget shape of every other metadata write.
-    // An APPLIED rename still fans out like one: subscribers of the written
-    // `(scope, key)` receive a `METADATA_CHANGED` carrying the `current\0new`
-    // transition (phux-q7ks — before this, a rename notified nobody and the
-    // ADR-0089 roster kept painting the dead name).
-    if key == phux_protocol::wire::frame::SESSION_NAME_KEY && matches!(scope, Scope::Global) {
-        match std::str::from_utf8(&value).ok().and_then(|s| {
-            s.split_once('\0')
-                .map(|(cur, new)| (cur.to_owned(), new.to_owned()))
-        }) {
-            Some((current, new_name)) => {
-                let (outcome, delivered) = state.with_mut(|s| {
-                    let outcome = s.rename_session(&current, &new_name);
-                    // Broadcast only an *applied name change* to subscribers
-                    // of the written key: `Renamed` also covers the no-op
-                    // rename to the session's existing name, which no
-                    // subscriber can act on (mirroring `metadata_set`'s
-                    // equal-bytes suppression). The `current\0new` payload
-                    // is forwarded as-is so a subscriber can both find the
-                    // stale entry and learn its replacement; it is not
-                    // stored (see `metadata_broadcast`).
-                    let delivered = if matches!(outcome, crate::state::RenameOutcome::Renamed)
-                        && current != new_name
-                    {
-                        s.metadata_broadcast(scope, key, &value)
-                    } else {
-                        Vec::new()
-                    };
-                    (outcome, delivered)
-                });
-                debug!(
-                    ?client_id,
-                    request_id,
-                    %current,
-                    %new_name,
-                    ?outcome,
-                    subscriber_count = delivered.len(),
-                    "SET_METADATA(session-name): applied registry rename",
-                );
-            }
-            None => {
-                warn!(
-                    ?client_id,
-                    request_id,
-                    "SET_METADATA(session-name): malformed value (want current\\0new); ignoring",
-                );
-            }
-        }
-        return;
-    }
-    // ADR-0046 §E. This is the ONLY entry point an *explicit* agent-record
-    // write passes through — the detector's own drain calls `metadata_set`
-    // directly — which is precisely what makes the arbiter's bookkeeping
-    // honest. It cannot be reconstructed from the stored bytes: the client's
-    // `AgentMetaState` decodes an absent `state` and an unrecognized one both
-    // to `Unknown`, and the detector's writes carry a `state` too, so "was
-    // this declared by a human?" is not a question the value can answer.
+    };
+    let (outcome, delivered) = state.with_mut(|s| {
+        let outcome = s.rename_session(&current, &new_name);
+        // Broadcast only an *applied name change* to subscribers
+        // of the written key: `Renamed` also covers the no-op
+        // rename to the session's existing name, which no
+        // subscriber can act on (mirroring `metadata_set`'s
+        // equal-bytes suppression). The `current\0new` payload
+        // is forwarded as-is so a subscriber can both find the
+        // stale entry and learn its replacement; it is not
+        // stored (see `metadata_broadcast`).
+        let delivered = if matches!(outcome, crate::state::RenameOutcome::Renamed)
+            && current != new_name
+        {
+            s.metadata_broadcast(scope, key, value)
+        } else {
+            Vec::new()
+        };
+        (outcome, delivered)
+    });
+    debug!(
+        ?client_id,
+        request_id,
+        %current,
+        %new_name,
+        ?outcome,
+        subscriber_count = delivered.len(),
+        "SET_METADATA(session-name): applied registry rename",
+    );
+}
+
+/// Store an ordinary metadata write and fan it out to subscribers.
+///
+/// ADR-0046 §E. This is the ONLY entry point an *explicit* agent-record
+/// write passes through — the detector's own drain calls `metadata_set`
+/// directly — which is precisely what makes the arbiter's bookkeeping
+/// honest. It cannot be reconstructed from the stored bytes: the client's
+/// `AgentMetaState` decodes an absent `state` and an unrecognized one both
+/// to `Unknown`, and the detector's writes carry a `state` too, so "was
+/// this declared by a human?" is not a question the value can answer.
+fn store_metadata_value(
+    state: &SharedState,
+    client_id: ClientId,
+    request_id: u32,
+    scope: &phux_protocol::wire::frame::Scope,
+    key: &str,
+    value: Vec<u8>,
+) {
     let declared_agent_record = matches!(scope, phux_protocol::wire::frame::Scope::Terminal(_))
         && key == TERMINAL_AGENT_KEY;
     let agent_value = declared_agent_record.then(|| value.clone());
@@ -2498,6 +2718,44 @@ pub(crate) fn handle_set_metadata(
         subscriber_count = delivered.len(),
         "SET_METADATA delivered"
     );
+}
+
+pub(crate) fn handle_set_metadata(
+    state: &SharedState,
+    client_id: ClientId,
+    request_id: u32,
+    scope: &phux_protocol::wire::frame::Scope,
+    key: &str,
+    value: Vec<u8>,
+    root_token: &tokio_util::sync::CancellationToken,
+) {
+    use phux_protocol::wire::frame::{SESSION_CREATE_KEY, Scope};
+
+    debug!(?client_id, request_id, ?scope, %key, "SET_METADATA");
+    if reject_set_metadata(state, client_id, request_id, scope, key, &value) {
+        return;
+    }
+    // v0.3.0 "Option B" re-tier (ADR-0019 / ADR-0027): a create-without-
+    // attach is a `SET_METADATA` write of the conventional
+    // `SESSION_CREATE_KEY` under `Scope::Global`, replacing the removed
+    // `CREATE_SESSION` verb. Its UTF-8 JSON object may carry
+    // `{ name, command?, cwd?, env?, request_token?, agent_session? }`.
+    // The server seeds the session + pane; a nonce-bearing caller reads its exact
+    // key because SET_METADATA has no reply frame. A malformed value or a
+    // duplicate name is a silent no-op (logged), matching the fire-and-forget
+    // shape of metadata writes.
+    if key == SESSION_CREATE_KEY && matches!(scope, Scope::Global) {
+        handle_session_create_metadata(state, client_id, request_id, &value, root_token);
+        return;
+    }
+    // v0.3.0 "Option B" re-tier (ADR-0019 / ADR-0027): a session rename is a
+    // `SET_METADATA` write of the conventional `SESSION_NAME_KEY` under
+    // `Scope::Global`, replacing the removed `RENAME_SESSION` verb.
+    if key == phux_protocol::wire::frame::SESSION_NAME_KEY && matches!(scope, Scope::Global) {
+        apply_session_rename(state, client_id, request_id, scope, key, &value);
+        return;
+    }
+    store_metadata_value(state, client_id, request_id, scope, key, value);
 }
 
 pub(crate) fn handle_delete_metadata(

@@ -4,8 +4,9 @@
 
 use super::{
     ClientId, ConsumerAttachError, ConsumerAttachOutcome, ConsumerAttachRequest, ConsumerReference,
-    ConsumerSyncState, DEFAULT_TICK_INTERVAL, LastAckedCursorMode, Outbound, RenderState,
-    RttEstimator, StateSyncBootstrap, TICK_RESET_DEADBAND, TerminalActor, mpsc, trace, warn, watch,
+    ConsumerSyncState, DEFAULT_TICK_INTERVAL, GhosttyTerminal, LastAckedCursorMode, Outbound,
+    RenderState, RttEstimator, StateSyncBootstrap, TICK_RESET_DEADBAND, TerminalActor, mpsc, trace,
+    warn, watch,
 };
 
 impl TerminalActor {
@@ -362,30 +363,54 @@ impl TerminalActor {
         }
         consumer.last_acked_seq = seq;
 
-        // Loss-tolerant reference advance (phux-v45.8, ADR-0042). A cumulative
-        // ack for `seq` acknowledges every emission up to and including it, so
-        // the consumer's acked reference advances to the grid snapshot of the
-        // highest emitted `seq` this ack covers, and every pending snapshot at
-        // or below `seq` is dropped. This is the eviction the emit-once path
-        // (below, comment retained for contrast) deliberately does NOT do: on a
-        // lossy leg the reference must trail the ack so a dropped frame re-diffs
-        // against the last state the consumer provably has.
         if consumer.loss_tolerant {
-            if let Some((&covered, _)) = consumer.pending_refs.range(..=seq).next_back()
-                && let Some(snapshot) = consumer.pending_refs.remove(&covered)
-            {
-                consumer.acked_reference = snapshot;
-            }
-            // Keep only strictly-newer pending snapshots (still in flight).
-            consumer.pending_refs = consumer.pending_refs.split_off(&seq.saturating_add(1));
+            Self::advance_acked_reference(consumer, seq);
+        }
+        let sampled = Self::fold_rtt_sample(client_id, consumer, seq);
+        // Refresh the informational cursor/mode capture. Uses a one-shot
+        // `RenderState` so it doesn't disturb the per-consumer reference.
+        if let Some(cm) = Self::capture_acked_cursor_mode(&self.terminal.borrow(), client_id, seq) {
+            consumer.last_cursor_mode = cm;
         }
 
-        // RTT sample (phux-q0e.5). Acks are cumulative, so `seq` acknowledges
-        // every emission up to and including it. Find the emit instant for
-        // the highest emitted seq that is `<= seq` (the most recent frame
-        // this ack covers) and time it against now. Then prune every emit
-        // instant `<= seq`: those frames are acked and can never produce a
-        // future sample, so the map stays bounded by the in-flight window.
+        trace!(
+            ?client_id,
+            seq, "FRAME_ACK applied: last_acked_seq advanced"
+        );
+        sampled
+    }
+
+    /// Advance a loss-tolerant consumer's acked reference to cover `seq`
+    /// (phux-v45.8, ADR-0042).
+    ///
+    /// A cumulative ack for `seq` acknowledges every emission up to and
+    /// including it, so the consumer's acked reference advances to the grid
+    /// snapshot of the highest emitted `seq` this ack covers, and every
+    /// pending snapshot at or below `seq` is dropped. This is the eviction the
+    /// emit-once path (see [`Self::fold_rtt_sample`], comment retained for
+    /// contrast) deliberately does NOT do: on a lossy leg the reference must
+    /// trail the ack so a dropped frame re-diffs against the last state the
+    /// consumer provably has.
+    fn advance_acked_reference(consumer: &mut ConsumerSyncState, seq: u64) {
+        if let Some((&covered, _)) = consumer.pending_refs.range(..=seq).next_back()
+            && let Some(snapshot) = consumer.pending_refs.remove(&covered)
+        {
+            consumer.acked_reference = snapshot;
+        }
+        // Keep only strictly-newer pending snapshots (still in flight).
+        consumer.pending_refs = consumer.pending_refs.split_off(&seq.saturating_add(1));
+    }
+
+    /// Turn the ack for `seq` into an RTT sample and prune the acked emit
+    /// instants. `true` when a sample was folded into the EMA.
+    ///
+    /// RTT sample (phux-q0e.5). Acks are cumulative, so `seq` acknowledges
+    /// every emission up to and including it. Find the emit instant for
+    /// the highest emitted seq that is `<= seq` (the most recent frame
+    /// this ack covers) and time it against now. Then prune every emit
+    /// instant `<= seq`: those frames are acked and can never produce a
+    /// future sample, so the map stays bounded by the in-flight window.
+    fn fold_rtt_sample(client_id: ClientId, consumer: &mut ConsumerSyncState, seq: u64) -> bool {
         let now = tokio::time::Instant::now();
         let rtt_sample = consumer
             .emit_instants
@@ -397,36 +422,30 @@ impl TerminalActor {
         // practice (u64 seq at the clamped cadence) but saturate for safety.
         let still_in_flight = consumer.emit_instants.split_off(&seq.saturating_add(1));
         consumer.emit_instants = still_in_flight;
-        let sampled = if let Some(sample) = rtt_sample {
-            consumer.rtt.observe(sample);
-            trace!(
-                ?client_id,
-                seq,
-                rtt_ms = sample.as_secs_f64() * 1000.0,
-                srtt_ms = consumer.rtt.smoothed().map(|d| d.as_secs_f64() * 1000.0),
-                "FRAME_ACK: RTT sample folded into EMA",
-            );
-            true
-        } else {
-            false
+        let Some(sample) = rtt_sample else {
+            return false;
         };
+        consumer.rtt.observe(sample);
+        trace!(
+            ?client_id,
+            seq,
+            rtt_ms = sample.as_secs_f64() * 1000.0,
+            srtt_ms = consumer.rtt.smoothed().map(|d| d.as_secs_f64() * 1000.0),
+            "FRAME_ACK: RTT sample folded into EMA",
+        );
+        true
+    }
 
-        // Refresh the informational cursor/mode capture. Uses a one-shot
-        // `RenderState` so it doesn't disturb the per-consumer reference.
-        let terminal = self.terminal.borrow();
-        let cursor_mode = match RenderState::new() {
-            Ok(mut rs) => match rs.update(&terminal) {
-                Ok(snapshot) => Some(LastAckedCursorMode::capture(&terminal, &snapshot)),
-                Err(err) => {
-                    warn!(
-                        ?client_id,
-                        seq,
-                        error = %err,
-                        "FRAME_ACK: cursor/mode capture update failed; keeping prior capture",
-                    );
-                    None
-                }
-            },
+    /// Capture the informational cursor/mode state an ack should be paired
+    /// with, or `None` when the one-shot `RenderState` could not be built or
+    /// updated (the prior capture is then kept).
+    fn capture_acked_cursor_mode(
+        terminal: &GhosttyTerminal<'_, '_>,
+        client_id: ClientId,
+        seq: u64,
+    ) -> Option<LastAckedCursorMode> {
+        let mut rs = match RenderState::new() {
+            Ok(rs) => rs,
             Err(err) => {
                 warn!(
                     ?client_id,
@@ -434,18 +453,21 @@ impl TerminalActor {
                     error = %err,
                     "FRAME_ACK: cursor/mode RenderState alloc failed; keeping prior capture",
                 );
-                None
+                return None;
             }
         };
-        if let Some(cm) = cursor_mode {
-            consumer.last_cursor_mode = cm;
+        match rs.update(terminal) {
+            Ok(snapshot) => Some(LastAckedCursorMode::capture(terminal, &snapshot)),
+            Err(err) => {
+                warn!(
+                    ?client_id,
+                    seq,
+                    error = %err,
+                    "FRAME_ACK: cursor/mode capture update failed; keeping prior capture",
+                );
+                None
+            }
         }
-
-        trace!(
-            ?client_id,
-            seq, "FRAME_ACK applied: last_acked_seq advanced"
-        );
-        sampled
     }
 
     /// The shared adaptive tick interval for this actor: the minimum over

@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::state::{Outbound, SharedState};
+use crate::upgrade::blob::StateBlob;
 
 pub mod attach;
 pub mod client;
@@ -660,10 +661,6 @@ impl ServerRuntime {
         clippy::future_not_send,
         reason = "ADR-0014: server runs on a LocalSet; per-pane actors are !Send"
     )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "linear server bring-up: resolve config, set up the listener (fresh bind or resume-adopt), mirror config into shared state, then drive the LocalSet accept loop — one straight-line sequence."
-    )]
     pub async fn run_async<F>(self, shutdown: F) -> Result<(), ServerError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -675,75 +672,18 @@ impl ServerRuntime {
         // `state.rs`). Cloning the `SharedState` is cheap (`Arc::clone`).
         let state = SharedState::new();
 
-        // Hub mode (phux-v45.1, ADR-0007): validate the satellite registry
-        // into the runtime hub table before any I/O, so a malformed registry
-        // fails fast — before the socket is bound. Non-hub servers skip the
-        // registry entirely (`resolve_hub_table` returns `Ok(None)`). The
-        // table is kept locally too: the outbound link supervisors
-        // (phux-v45.3) are spawned from it inside the LocalSet below.
-        let hub_table = crate::hub::resolve_hub_table(self.hub, &self.satellites)?;
-        if let Some(table) = &hub_table {
-            info!(
-                satellites = table.len(),
-                "hub mode: satellite registry validated"
-            );
-            for (host, entry) in table.iter() {
-                info!(satellite = %host, target = %entry.target, "hub satellite registered");
-            }
-            state.with_mut(|s| s.set_hub_table(table.clone()));
-        }
+        let hub_table = install_hub_table(&state, self.hub, &self.satellites)?;
 
         // Connector planning is a startup gate, not a retry condition:
         // malformed endpoints and routable entries missing a pin/token fail
-        // before the UDS is bound. Token contents stay on disk and are re-read
-        // by each supervisor attempt.
+        // before the UDS is bound.
         let connector_specs = crate::connector::plan_connectors(&self.connectors)?;
-        let connector_consumer_tokens = if connector_specs.is_empty() {
-            None
-        } else {
-            let path = std::env::var_os("PHUX_WS_TOKENS")
-                .map_or_else(crate::auth::default_token_store_path, PathBuf::from);
-            let store = crate::auth::ReloadingTokenStore::load(path.clone()).map_err(|source| {
-                ServerError::ConnectorTokenStore {
-                    path: path.clone(),
-                    source,
-                }
-            })?;
-            Some(std::sync::Arc::new(store))
-        };
+        let connector_consumer_tokens = load_connector_consumer_tokens(&connector_specs)?;
 
-        // Graceful upgrade (ADR-0032): when resuming, read the handoff blob and
-        // adopt the inherited listener instead of binding a fresh socket. The
-        // session tree is rebuilt from the blob inside the LocalSet below.
-        let resume_blob = match self.resume_fd {
-            Some(fd) => Some(resume::read_blob_from_fd(fd)?),
-            None => None,
-        };
-        if resume_blob.is_some() {
-            upgrade::cleanup_executable_snapshot();
-        }
-
-        let listener = if let Some(blob) = &resume_blob {
-            let listener = resume::adopt_uds_listener(blob.listener_fd)?;
-            info!(
-                path = %socket_path.display(),
-                "phux-server resumed; adopted the inherited UDS listener"
-            );
-            listener
-        } else {
-            // phux-iwuc: fail fast on a path that cannot fit in a
-            // `sockaddr_un` — `bind(2)` would only reject it later with an
-            // opaque `SUN_LEN` error. The resume branch above adopts an
-            // already-bound listener, so only a fresh bind needs the gate.
-            validate_socket_path_len(&socket_path)?;
-            prepare_socket_dir(&socket_path)?;
-            handle_existing_socket(&socket_path).await?;
-            let listener = UnixListener::bind(&socket_path).map_err(ServerError::Bind)?;
-            secure_socket_file(&socket_path)?;
-            let listener = crate::transport::UdsListener::new(listener);
-            info!(path = %socket_path.display(), "phux-server listening on UDS");
-            listener
-        };
+        let resume_blob = read_resume_blob(self.resume_fd)?;
+        let listener =
+            adopt_or_bind_listener(&socket_path, resume_blob.as_ref().map(|blob| blob.listener_fd))
+                .await?;
 
         // phux-zomb.3: remember which inode we bound, so the unlink on the way
         // out can prove the entry at `socket_path` is still ours. See
@@ -754,22 +694,12 @@ impl ServerRuntime {
         // path + effective runtime flags, so `handle_upgrade` can build the
         // handoff blob and re-pass `--socket` / `--listen` / `--quic` /
         // `--webtransport` / `--hub` to the re-exec'd image (phux-v45.10).
-        // The flags come from the runtime's own configuration — what the
-        // builder methods applied — not a stashed copy of the original argv.
-        let runtime_flags = RuntimeFlags {
-            ws_addr: self.ws_addr,
-            quic_addr: self.quic_addr,
-            #[cfg(feature = "webtransport")]
-            wt_addr: self.wt_addr,
-            #[cfg(not(feature = "webtransport"))]
-            wt_addr: None,
-            hub: self.hub,
-            connect: self.connect_override.clone(),
-            exit_after_idle: self.cfg.exit_after_idle,
-        };
+        let runtime_flags = self.runtime_flags();
         state.with_mut(|s| {
             s.set_upgrade_context(listener.as_raw_fd(), socket_path.clone(), runtime_flags);
         });
+
+        mirror_config_into_state(&self.cfg, &socket_path, &state);
 
         // The LocalSet hosts per-client tasks and per-pane actors —
         // both `!Send`. `LocalSet::run_until` drives the set to the
@@ -778,53 +708,7 @@ impl ServerRuntime {
         let pre_seeded = self.cfg.pre_seeded_session.clone();
         let seed_with_pty = self.cfg.seed_with_pty;
         let seed_command = self.cfg.seed_command.clone();
-        // Mirror the PTY *mode* into shared state so `handle_attach`'s
-        // `AttachTarget::CreateIfMissing` branch (phux-k61.3) spawns new
-        // sessions' seed panes with PTYs when the server runs with them.
-        //
-        // phux-07y: the seed *command* is deliberately NOT mirrored as
-        // the CreateIfMissing override. `seed_command` is the pre-seeded
-        // session's program (e.g. `defaults.spawn-on-attach`, the thing
-        // naked `phux` opens with); a CreateIfMissing-created session —
-        // `phux new`, `phux new -- vim` — must instead honor its own
-        // wire `command` (or fall back to `default_shell_command`), not
-        // inherit naked-`phux`'s launcher. So the override stays `None`.
-        state.with_mut(|s| s.set_attach_create_pty(seed_with_pty, None));
-        // Mirror the listening socket path into shared state so every pane
-        // spawn site injects it as `PHUX_SOCKET` (phux-cufw) — an in-pane
-        // `phux` then targets this server even off the default socket path.
-        state.with_mut(|s| s.set_server_socket_path(socket_path.clone()));
-        // Mirror `defaults.history-limit` into shared state so the
-        // attach-time creation path (`CreateIfMissing`) and
-        // `SPAWN_TERMINAL` build their panes with the configured cap.
         let history_limit = self.cfg.history_limit;
-        state.with_mut(|s| s.set_history_limit(history_limit));
-        // Mirror `defaults.cwd-inheritance` into shared state so the
-        // `SPAWN_TERMINAL` handler resolves a new pane's working directory
-        // from the configured policy.
-        let cwd_inheritance = self.cfg.cwd_inheritance;
-        state.with_mut(|s| s.set_cwd_inheritance(cwd_inheritance));
-        // Mirror `defaults.term` into shared state so the seed session,
-        // attach-time `CreateIfMissing`, and `SPAWN_TERMINAL` apply the
-        // configured `TERM` baseline.
-        let term = self.cfg.term.clone();
-        state.with_mut(|s| s.set_term(term));
-        // Mirror the resolved default shell (`defaults.shell` → `$SHELL` →
-        // `/bin/sh`, phux-i0e8.4.1) into shared state so every
-        // command-less spawn path runs the configured shell.
-        let shell = self.cfg.shell.clone();
-        state.with_mut(|s| s.set_shell(shell));
-        // Mirror whether command-less pane spawns should invoke `shell` in
-        // its platform login mode (phux-87rr) — `true` only when the
-        // binary detected this server was started by a service manager's
-        // generated unit; see `ServerConfig::login_shell`'s doc for why.
-        let login_shell = self.cfg.login_shell;
-        state.with_mut(|s| s.set_login_shell(login_shell));
-        // Mirror `defaults.window-size` into shared state so
-        // `handle_viewport_resize` resolves a shared Terminal's geometry from
-        // the configured multi-client policy (phux-nk07).
-        let window_size = self.cfg.window_size;
-        state.with_mut(|s| s.set_window_size(window_size));
         // WebSocket listen address: the `--listen` flag (via `listen_ws`)
         // wins; otherwise fall back to `PHUX_WS_ADDR` inside the accept setup.
         let ws_addr_override = self.ws_addr;
@@ -841,14 +725,11 @@ impl ServerRuntime {
         // see `serve_auto_overlay_listeners` for why calling it anywhere on
         // this path is the defect phux-90j5 removed.
         let overlay_detect = self.overlay_detect;
-        // Wire the policy engine from config into shared state.
-        if let Some(engine) = self.cfg.policy_engine.clone() {
-            state.with_mut(|s| s.set_policy_engine(engine));
-        }
-        // Event-hook catalog (phux-r82.1): moved into the LocalSet block
+        // Event-hook catalog (phux-r82.1): consumed inside the LocalSet block
         // below, where the dispatcher task can `spawn_local`. The listening
         // socket path rides along so hook children get `PHUX_SOCKET` too
-        // (phux-d4rf), matching the pane-spawn injection above (phux-cufw).
+        // (phux-d4rf), matching the pane-spawn injection in
+        // `mirror_config_into_state` (phux-cufw).
         let hook_catalog = self.cfg.hook_catalog.clone();
         let hook_socket_path = socket_path.clone();
         // Ephemeral-server lifetime (ADR-0063). Captured here and consumed
@@ -876,72 +757,17 @@ impl ServerRuntime {
         let root_token = CancellationToken::new();
         let result = local
             .run_until(async move {
-                // Fold the external shutdown future into the root
-                // token. `spawn_local` (not `tokio::spawn`) because
-                // the runtime is current-thread with no worker pool.
-                {
-                    let token = root_token.clone();
-                    tokio::task::spawn_local(async move {
-                        shutdown.await;
-                        debug!("shutdown future resolved; cancelling root token");
-                        token.cancel();
-                    });
-                }
-
-                // Ephemeral-server lifetime (ADR-0063). Armed before the
-                // seed/resume paths so the "nobody ever connected" case is
-                // covered from the earliest possible instant — that is the
-                // leak shape: a harness bootstraps a daemon, dies, and the
-                // daemon it never dialed holds a live PTY forever.
-                if let Some(idle_limit) = exit_after_idle {
-                    info!(
-                        idle_limit_secs = idle_limit.as_secs_f64(),
-                        "ephemeral server: will exit when unattended for the idle limit"
-                    );
-                    spawn_idle_exit_watchdog(state.clone(), idle_limit, root_token.clone());
-                }
-
-                // Event-hook dispatcher (docs/consumers/tui.md §9,
-                // phux-r82.1). Spawned BEFORE the seed/resume paths so a
-                // pre-seeded session's pane fires `after-new-pane` too.
-                // Skipped entirely when nothing is configured: firing an
-                // event with no dispatcher registered is a no-op.
-                if !hook_catalog.is_empty() {
-                    let dispatcher =
-                        crate::hooks::spawn_hook_dispatcher(hook_catalog, Some(hook_socket_path));
-                    state.with_mut(|s| s.set_hook_dispatcher(dispatcher));
-                }
-
-                // Hub outbound dialer (phux-v45.3, ADR-0038): one link
-                // supervisor per validated satellite, spawned on the
-                // LocalSet as children of the root token. Each dials,
-                // authenticates like a remote consumer, and maintains the
-                // connection with capped exponential backoff; fail-closed
-                // refusals (routable endpoint without token/pin) surface as
-                // a `Refused` status without dialing. The status handle is
-                // mirrored into shared state for future LIST aggregation,
-                // and the frame-relay registry (phux-v45.4) alongside it so
-                // command/input dispatch can route satellite-tagged
-                // terminal ids over the established links.
-                if let Some(table) = &hub_table {
-                    let statuses = crate::hub::link::HubLinkStatuses::default();
-                    let relays = crate::hub::relay::HubRelays::default();
-                    state.with_mut(|s| {
-                        s.set_hub_link_statuses(statuses.clone());
-                        s.set_hub_relays(relays.clone());
-                    });
-                    crate::hub::link::spawn_links(table, &statuses, &relays, &root_token);
-                }
-
-                if let Some(tokens) = &connector_consumer_tokens {
-                    crate::connector::spawn_connectors(
-                        connector_specs,
-                        tokens,
-                        &state,
-                        &input_lane_handle,
-                        &root_token,
-                    );
-                }
+                spawn_shutdown_folder(shutdown, &root_token);
+                arm_idle_exit(&state, exit_after_idle, &root_token);
+                install_hook_dispatcher(&state, hook_catalog, hook_socket_path);
+                spawn_hub_links(&state, hub_table.as_ref(), &root_token);
+                spawn_connector_supervisors(
+                    connector_specs,
+                    connector_consumer_tokens.as_ref(),
+                    &state,
+                    &input_lane_handle,
+                    &root_token,
+                );
 
                 // Explicitly configured listeners are resolved BEFORE the
                 // session tree exists (phux-90j5). Nothing here is allowed
@@ -958,22 +784,8 @@ impl ServerRuntime {
                 // — the detected overlay address, which shells out to
                 // `tailscale` — is not resolved here at all; see
                 // `serve_auto_overlay_listeners` below.
-
-                // Optionally also accept WebSocket connections (phux-486.4) so
-                // browser consumers (`phux-web`) can speak the identical wire.
-                // Opt-in via `phux server --listen <ADDR>` or the `PHUX_WS_ADDR`
-                // environment variable (e.g. "127.0.0.1:8787"); UDS is always
-                // on. The flag wins when both are set.
-                let ws_addr = ws_addr_override.or_else(|| env_socket_addr("PHUX_WS_ADDR"));
-                let ws_listener = match ws_addr {
-                    Some(addr) => build_ws_listener(addr).await,
-                    None => None,
-                };
-                // Optionally also accept QUIC connections (phux-y8v6, ADR-0007).
-                // Opt-in via `phux server --quic <ADDR>` or `PHUX_QUIC_ADDR`;
-                // QUIC carries the identical frames over a TLS 1.3 stream.
-                let quic_addr = quic_addr_override.or_else(|| env_socket_addr("PHUX_QUIC_ADDR"));
-                let quic_listener = quic_addr.and_then(build_quic_listener);
+                let configured =
+                    ConfiguredListeners::bind(ws_addr_override, quic_addr_override).await;
                 // Optionally also accept WebTransport connections (phux-0wmf):
                 // HTTP/3 over QUIC, the browser's QUIC-class door (`phux-web`
                 // dials it, falling back to WebSocket). Opt-in via
@@ -983,64 +795,17 @@ impl ServerRuntime {
                     .or_else(|| env_socket_addr("PHUX_WT_ADDR"))
                     .and_then(build_wt_listener);
 
-                // Graceful-upgrade resume (ADR-0032): rebuild the whole
-                // session tree from the handoff blob, re-adopting each pane's
-                // inherited PTY. Runs inside the LocalSet so the rebuilt pane
-                // actors `spawn_local` onto the same thread. A fresh start
-                // pre-seeds its single session instead (the `else` branch).
                 if let Some(blob) = resume_blob {
-                    match state.with_mut(|s| s.rebuild_from_blob(&blob)) {
-                        Ok(exit_watchers) => {
-                            for (pane, exit_notify) in exit_watchers {
-                                spawn_terminal_exit_watcher(
-                                    state.clone(),
-                                    pane,
-                                    Some(exit_notify),
-                                    root_token.clone(),
-                                );
-                            }
-                            info!(
-                                sessions = blob.sessions.len(),
-                                panes = blob.panes.len(),
-                                "resumed session tree from upgrade blob"
-                            );
-                        }
-                        Err(err) => {
-                            error!(error = %err, "failed to rebuild state from upgrade blob");
-                        }
-                    }
+                    resume_session_tree(&state, &blob, &root_token);
                 } else if let Some(name) = pre_seeded.as_deref() {
-                    let seeded = if seed_with_pty {
-                        // Fall back to the resolved default shell
-                        // (`defaults.shell` → `$SHELL` → `/bin/sh`,
-                        // phux-i0e8.4.1) mirrored into state above.
-                        let mut cmd = seed_command.unwrap_or_else(|| {
-                            let (shell, login_shell) =
-                                state.with(|s| (s.shell().to_owned(), s.login_shell()));
-                            crate::terminal_actor::default_shell_command(&shell, login_shell)
-                        });
-                        // Apply the configured `defaults.term` over the
-                        // builder's baseline so the seed pane advertises the
-                        // server-wide `TERM` (phux-ign).
-                        let term = state.with(|s| s.term().to_owned());
-                        crate::terminal_actor::apply_term(&mut cmd, &term);
-                        seed_session_with_pty(&state, name, cmd, history_limit, &root_token)
-                    } else {
-                        seed_session_with_actor(&state, name, history_limit, &root_token)
-                    };
-                    if let Err(err) = seeded {
-                        warn!(
-                            session = name,
-                            error = %err,
-                            "failed to spawn pane actor for pre-seeded session",
-                        );
-                    } else {
-                        debug!(
-                            session = name,
-                            pty = seed_with_pty,
-                            "pre-seeded session in registry"
-                        );
-                    }
+                    seed_initial_session(
+                        &state,
+                        name,
+                        seed_with_pty,
+                        seed_command,
+                        history_limit,
+                        &root_token,
+                    );
                 }
                 // The auto-bound overlay listener (ADR-0081) is the only
                 // startup input that has to ask the outside world a
@@ -1049,10 +814,7 @@ impl ServerRuntime {
                 // joins the accept set as a peer of the real accept loops
                 // and does its detection and binding after they are already
                 // serving.
-                let auto_overlay_ports = AutoOverlayPorts {
-                    ws: ws_addr.is_none(),
-                    quic: quic_addr.is_none(),
-                };
+                let auto_overlay_ports = configured.unclaimed_overlay_ports();
                 // Both gates are evaluated here, on cheap inputs (an
                 // environment lookup and the profile name), and the *answer*
                 // is what travels — never a detection result. `overlay_detect`
@@ -1063,33 +825,8 @@ impl ServerRuntime {
                         phux_config::instance::is_default_profile(),
                     );
 
-                // UDS is always on; WS and QUIC are additive. Each transport's
-                // accept loop runs until the root token cancels. The first
-                // fatal listener result cancels the others; after the first
-                // completion we still join every remaining loop so their
-                // client tasks can flush SERVER_SHUTDOWN before teardown.
-                let mut accepts: Vec<AcceptLoopFuture<'_>> = vec![Box::pin(accept_loop(
-                    &listener,
-                    state.clone(),
-                    root_token.clone(),
-                    Some(input_lane_handle.clone()),
-                ))];
-                if let Some(ws) = &ws_listener {
-                    accepts.push(Box::pin(accept_loop(
-                        ws,
-                        state.clone(),
-                        root_token.clone(),
-                        Some(input_lane_handle.clone()),
-                    )));
-                }
-                if let Some(quic) = &quic_listener {
-                    accepts.push(Box::pin(accept_loop(
-                        quic,
-                        state.clone(),
-                        root_token.clone(),
-                        Some(input_lane_handle.clone()),
-                    )));
-                }
+                let mut accepts =
+                    configured.accept_loops(&listener, &state, &root_token, &input_lane_handle);
                 #[cfg(feature = "webtransport")]
                 if let Some(wt) = &webtransport_listener {
                     accepts.push(Box::pin(accept_loop(
@@ -1112,17 +849,7 @@ impl ServerRuntime {
                     root_token.clone(),
                     input_lane_handle.clone(),
                 )));
-                let (mut result, _index, remaining) =
-                    futures_util::future::select_all(accepts).await;
-                if result.is_err() {
-                    root_token.cancel();
-                }
-                for tail in futures_util::future::join_all(remaining).await {
-                    if result.is_ok() && tail.is_err() {
-                        result = tail;
-                    }
-                }
-                result
+                drive_accept_loops(accepts, &root_token).await
             })
             .await;
 
@@ -1148,6 +875,431 @@ impl ServerRuntime {
 
         result
     }
+
+    /// The server's effective opt-in runtime flags: what the builder methods
+    /// applied, never a stashed copy of the original argv. Re-emitted on the
+    /// resume argv so `--listen` / `--quic` / `--webtransport` / `--connect`
+    /// / `--hub` survive a graceful upgrade (phux-v45.10).
+    fn runtime_flags(&self) -> RuntimeFlags {
+        RuntimeFlags {
+            ws_addr: self.ws_addr,
+            quic_addr: self.quic_addr,
+            #[cfg(feature = "webtransport")]
+            wt_addr: self.wt_addr,
+            #[cfg(not(feature = "webtransport"))]
+            wt_addr: None,
+            hub: self.hub,
+            connect: self.connect_override.clone(),
+            exit_after_idle: self.cfg.exit_after_idle,
+        }
+    }
+}
+
+/// Hub mode (phux-v45.1, ADR-0007): validate the satellite registry into the
+/// runtime hub table before any I/O, so a malformed registry fails fast —
+/// before the socket is bound. Non-hub servers skip the registry entirely
+/// (`resolve_hub_table` returns `Ok(None)`). The table is returned as well as
+/// mirrored: the outbound link supervisors (phux-v45.3) are spawned from it
+/// inside the `LocalSet`.
+fn install_hub_table(
+    state: &SharedState,
+    hub: bool,
+    satellites: &[phux_config::SatelliteConfigEntry],
+) -> Result<Option<crate::hub::HubTable>, ServerError> {
+    let table = crate::hub::resolve_hub_table(hub, satellites)?;
+    if let Some(table) = &table {
+        info!(
+            satellites = table.len(),
+            "hub mode: satellite registry validated"
+        );
+        for (host, entry) in table.iter() {
+            info!(satellite = %host, target = %entry.target, "hub satellite registered");
+        }
+        state.with_mut(|s| s.set_hub_table(table.clone()));
+    }
+    Ok(table)
+}
+
+/// Load the consumer-token store the outbound connector supervisors
+/// authenticate with. Token contents stay on disk and are re-read by each
+/// supervisor attempt; only the store's presence is a startup gate.
+fn load_connector_consumer_tokens(
+    specs: &[crate::connector::ConnectorSpec],
+) -> Result<Option<std::sync::Arc<crate::auth::ReloadingTokenStore>>, ServerError> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let path = std::env::var_os("PHUX_WS_TOKENS")
+        .map_or_else(crate::auth::default_token_store_path, PathBuf::from);
+    let store = crate::auth::ReloadingTokenStore::load(path.clone()).map_err(|source| {
+        ServerError::ConnectorTokenStore {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(Some(std::sync::Arc::new(store)))
+}
+
+/// Graceful upgrade (ADR-0032): when resuming, read the handoff blob from the
+/// inherited descriptor. The previous image's private executable snapshot is
+/// dropped as soon as the blob proves this really is a resume; the session
+/// tree is rebuilt from the blob inside the `LocalSet`.
+fn read_resume_blob(resume_fd: Option<RawFd>) -> Result<Option<StateBlob>, ServerError> {
+    let Some(fd) = resume_fd else {
+        return Ok(None);
+    };
+    let blob = resume::read_blob_from_fd(fd)?;
+    upgrade::cleanup_executable_snapshot();
+    Ok(Some(blob))
+}
+
+/// Adopt the listener inherited across a graceful upgrade (ADR-0032), or bind
+/// a fresh socket when this is a cold start.
+async fn adopt_or_bind_listener(
+    socket_path: &Path,
+    inherited_fd: Option<RawFd>,
+) -> Result<crate::transport::UdsListener, ServerError> {
+    if let Some(fd) = inherited_fd {
+        let listener = resume::adopt_uds_listener(fd)?;
+        info!(
+            path = %socket_path.display(),
+            "phux-server resumed; adopted the inherited UDS listener"
+        );
+        return Ok(listener);
+    }
+    // phux-iwuc: fail fast on a path that cannot fit in a
+    // `sockaddr_un` — `bind(2)` would only reject it later with an
+    // opaque `SUN_LEN` error. The resume branch above adopts an
+    // already-bound listener, so only a fresh bind needs the gate.
+    validate_socket_path_len(socket_path)?;
+    prepare_socket_dir(socket_path)?;
+    handle_existing_socket(socket_path).await?;
+    let listener = UnixListener::bind(socket_path).map_err(ServerError::Bind)?;
+    secure_socket_file(socket_path)?;
+    let listener = crate::transport::UdsListener::new(listener);
+    info!(path = %socket_path.display(), "phux-server listening on UDS");
+    Ok(listener)
+}
+
+/// Mirror the configured defaults into shared state, so every later pane
+/// spawn site — the seed session, attach-time `CreateIfMissing`,
+/// `SPAWN_TERMINAL` — resolves them from one place.
+fn mirror_config_into_state(cfg: &ServerConfig, socket_path: &Path, state: &SharedState) {
+    // Mirror the PTY *mode* so `handle_attach`'s
+    // `AttachTarget::CreateIfMissing` branch (phux-k61.3) spawns new
+    // sessions' seed panes with PTYs when the server runs with them.
+    //
+    // phux-07y: the seed *command* is deliberately NOT mirrored as
+    // the CreateIfMissing override. `seed_command` is the pre-seeded
+    // session's program (e.g. `defaults.spawn-on-attach`, the thing
+    // naked `phux` opens with); a CreateIfMissing-created session —
+    // `phux new`, `phux new -- vim` — must instead honor its own
+    // wire `command` (or fall back to `default_shell_command`), not
+    // inherit naked-`phux`'s launcher. So the override stays `None`.
+    state.with_mut(|s| s.set_attach_create_pty(cfg.seed_with_pty, None));
+    // Mirror the listening socket path so every pane spawn site injects it as
+    // `PHUX_SOCKET` (phux-cufw) — an in-pane `phux` then targets this server
+    // even off the default socket path.
+    state.with_mut(|s| s.set_server_socket_path(socket_path.to_path_buf()));
+    // Mirror `defaults.history-limit` so the attach-time creation path
+    // (`CreateIfMissing`) and `SPAWN_TERMINAL` build their panes with the
+    // configured cap.
+    state.with_mut(|s| s.set_history_limit(cfg.history_limit));
+    // Mirror `defaults.cwd-inheritance` so the `SPAWN_TERMINAL` handler
+    // resolves a new pane's working directory from the configured policy.
+    state.with_mut(|s| s.set_cwd_inheritance(cfg.cwd_inheritance));
+    // Mirror `defaults.term` so the seed session, attach-time
+    // `CreateIfMissing`, and `SPAWN_TERMINAL` apply the configured `TERM`
+    // baseline.
+    state.with_mut(|s| s.set_term(cfg.term.clone()));
+    // Mirror the resolved default shell (`defaults.shell` → `$SHELL` →
+    // `/bin/sh`, phux-i0e8.4.1) so every command-less spawn path runs the
+    // configured shell.
+    state.with_mut(|s| s.set_shell(cfg.shell.clone()));
+    // Mirror whether command-less pane spawns should invoke `shell` in
+    // its platform login mode (phux-87rr) — `true` only when the
+    // binary detected this server was started by a service manager's
+    // generated unit; see `ServerConfig::login_shell`'s doc for why.
+    state.with_mut(|s| s.set_login_shell(cfg.login_shell));
+    // Mirror `defaults.window-size` so `handle_viewport_resize` resolves a
+    // shared Terminal's geometry from the configured multi-client policy
+    // (phux-nk07).
+    state.with_mut(|s| s.set_window_size(cfg.window_size));
+    // Wire the policy engine from config into shared state.
+    if let Some(engine) = cfg.policy_engine.clone() {
+        state.with_mut(|s| s.set_policy_engine(engine));
+    }
+}
+
+/// Fold the external shutdown future into the root token. `spawn_local` (not
+/// `tokio::spawn`) because the runtime is current-thread with no worker pool.
+fn spawn_shutdown_folder<F>(shutdown: F, root_token: &CancellationToken)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let token = root_token.clone();
+    tokio::task::spawn_local(async move {
+        shutdown.await;
+        debug!("shutdown future resolved; cancelling root token");
+        token.cancel();
+    });
+}
+
+/// Ephemeral-server lifetime (ADR-0063). Armed before the seed/resume paths
+/// so the "nobody ever connected" case is covered from the earliest possible
+/// instant — that is the leak shape: a harness bootstraps a daemon, dies, and
+/// the daemon it never dialed holds a live PTY forever.
+fn arm_idle_exit(
+    state: &SharedState,
+    exit_after_idle: Option<Duration>,
+    root_token: &CancellationToken,
+) {
+    let Some(idle_limit) = exit_after_idle else {
+        return;
+    };
+    info!(
+        idle_limit_secs = idle_limit.as_secs_f64(),
+        "ephemeral server: will exit when unattended for the idle limit"
+    );
+    spawn_idle_exit_watchdog(state.clone(), idle_limit, root_token.clone());
+}
+
+/// Event-hook dispatcher (docs/consumers/tui.md §9, phux-r82.1). Spawned
+/// BEFORE the seed/resume paths so a pre-seeded session's pane fires
+/// `after-new-pane` too. Skipped entirely when nothing is configured: firing
+/// an event with no dispatcher registered is a no-op.
+fn install_hook_dispatcher(
+    state: &SharedState,
+    catalog: crate::hooks::HookCatalog,
+    socket_path: PathBuf,
+) {
+    if catalog.is_empty() {
+        return;
+    }
+    let dispatcher = crate::hooks::spawn_hook_dispatcher(catalog, Some(socket_path));
+    state.with_mut(|s| s.set_hook_dispatcher(dispatcher));
+}
+
+/// Hub outbound dialer (phux-v45.3, ADR-0038): one link supervisor per
+/// validated satellite, spawned on the `LocalSet` as children of the root
+/// token. Each dials, authenticates like a remote consumer, and maintains the
+/// connection with capped exponential backoff; fail-closed refusals (routable
+/// endpoint without token/pin) surface as a `Refused` status without dialing.
+/// The status handle is mirrored into shared state for future LIST
+/// aggregation, and the frame-relay registry (phux-v45.4) alongside it so
+/// command/input dispatch can route satellite-tagged terminal ids over the
+/// established links.
+fn spawn_hub_links(
+    state: &SharedState,
+    hub_table: Option<&crate::hub::HubTable>,
+    root_token: &CancellationToken,
+) {
+    let Some(table) = hub_table else {
+        return;
+    };
+    let statuses = crate::hub::link::HubLinkStatuses::default();
+    let relays = crate::hub::relay::HubRelays::default();
+    state.with_mut(|s| {
+        s.set_hub_link_statuses(statuses.clone());
+        s.set_hub_relays(relays.clone());
+    });
+    crate::hub::link::spawn_links(table, &statuses, &relays, root_token);
+}
+
+/// Supervise the planned outbound connectors. Nothing to supervise without a
+/// consumer-token store, which only exists when connectors were configured.
+fn spawn_connector_supervisors(
+    specs: Vec<crate::connector::ConnectorSpec>,
+    consumer_tokens: Option<&std::sync::Arc<crate::auth::ReloadingTokenStore>>,
+    state: &SharedState,
+    input_lane: &input_lane::InputLaneHandle,
+    root_token: &CancellationToken,
+) {
+    let Some(tokens) = consumer_tokens else {
+        return;
+    };
+    crate::connector::spawn_connectors(specs, tokens, state, input_lane, root_token);
+}
+
+/// Graceful-upgrade resume (ADR-0032): rebuild the whole session tree from
+/// the handoff blob, re-adopting each pane's inherited PTY. Runs inside the
+/// `LocalSet` so the rebuilt pane actors `spawn_local` onto the same thread.
+fn resume_session_tree(state: &SharedState, blob: &StateBlob, root_token: &CancellationToken) {
+    match state.with_mut(|s| s.rebuild_from_blob(blob)) {
+        Ok(exit_watchers) => {
+            for (pane, exit_notify) in exit_watchers {
+                spawn_terminal_exit_watcher(
+                    state.clone(),
+                    pane,
+                    Some(exit_notify),
+                    root_token.clone(),
+                );
+            }
+            info!(
+                sessions = blob.sessions.len(),
+                panes = blob.panes.len(),
+                "resumed session tree from upgrade blob"
+            );
+        }
+        Err(err) => {
+            error!(error = %err, "failed to rebuild state from upgrade blob");
+        }
+    }
+}
+
+/// A fresh start pre-seeds its single session instead of resuming one.
+fn seed_initial_session(
+    state: &SharedState,
+    name: &str,
+    seed_with_pty: bool,
+    seed_command: Option<portable_pty::CommandBuilder>,
+    history_limit: u32,
+    root_token: &CancellationToken,
+) {
+    let seeded = if seed_with_pty {
+        seed_session_with_pty(
+            state,
+            name,
+            seed_pane_command(state, seed_command),
+            history_limit,
+            root_token,
+        )
+    } else {
+        seed_session_with_actor(state, name, history_limit, root_token)
+    };
+    if let Err(err) = seeded {
+        warn!(
+            session = name,
+            error = %err,
+            "failed to spawn pane actor for pre-seeded session",
+        );
+    } else {
+        debug!(
+            session = name,
+            pty = seed_with_pty,
+            "pre-seeded session in registry"
+        );
+    }
+}
+
+/// The pre-seeded pane's command: the configured one, else the resolved
+/// default shell (`defaults.shell` → `$SHELL` → `/bin/sh`, phux-i0e8.4.1)
+/// mirrored into state. Either way the configured `defaults.term` is applied
+/// over the builder's baseline so the seed pane advertises the server-wide
+/// `TERM` (phux-ign).
+fn seed_pane_command(
+    state: &SharedState,
+    configured: Option<portable_pty::CommandBuilder>,
+) -> portable_pty::CommandBuilder {
+    let mut cmd = configured.unwrap_or_else(|| {
+        let (shell, login_shell) = state.with(|s| (s.shell().to_owned(), s.login_shell()));
+        crate::terminal_actor::default_shell_command(&shell, login_shell)
+    });
+    let term = state.with(|s| s.term().to_owned());
+    crate::terminal_actor::apply_term(&mut cmd, &term);
+    cmd
+}
+
+/// The explicitly configured additive listeners, alongside the addresses they
+/// were asked for: the auto-bound overlay listener may claim only the ports
+/// no explicit address took.
+struct ConfiguredListeners {
+    ws_addr: Option<SocketAddr>,
+    quic_addr: Option<SocketAddr>,
+    ws: Option<crate::transport::WsListener>,
+    quic: Option<crate::transport::quic::QuicListener>,
+}
+
+impl ConfiguredListeners {
+    /// Resolve each opt-in transport's address — the flag wins, the
+    /// environment variable is the fallback — and bind the ones that were
+    /// asked for.
+    async fn bind(ws_override: Option<SocketAddr>, quic_override: Option<SocketAddr>) -> Self {
+        // Optionally also accept WebSocket connections (phux-486.4) so
+        // browser consumers (`phux-web`) can speak the identical wire.
+        // Opt-in via `phux server --listen <ADDR>` or the `PHUX_WS_ADDR`
+        // environment variable (e.g. "127.0.0.1:8787"); UDS is always
+        // on. The flag wins when both are set.
+        let ws_addr = ws_override.or_else(|| env_socket_addr("PHUX_WS_ADDR"));
+        let ws = match ws_addr {
+            Some(addr) => build_ws_listener(addr).await,
+            None => None,
+        };
+        // Optionally also accept QUIC connections (phux-y8v6, ADR-0007).
+        // Opt-in via `phux server --quic <ADDR>` or `PHUX_QUIC_ADDR`;
+        // QUIC carries the identical frames over a TLS 1.3 stream.
+        let quic_addr = quic_override.or_else(|| env_socket_addr("PHUX_QUIC_ADDR"));
+        let quic = quic_addr.and_then(build_quic_listener);
+        Self {
+            ws_addr,
+            quic_addr,
+            ws,
+            quic,
+        }
+    }
+
+    /// The overlay ports still free for the auto-bound remote listener: the
+    /// ones no explicitly configured address claimed.
+    const fn unclaimed_overlay_ports(&self) -> AutoOverlayPorts {
+        AutoOverlayPorts {
+            ws: self.ws_addr.is_none(),
+            quic: self.quic_addr.is_none(),
+        }
+    }
+
+    /// UDS is always on; WS and QUIC are additive. Each transport's accept
+    /// loop runs until the root token cancels.
+    fn accept_loops<'a>(
+        &'a self,
+        uds: &'a crate::transport::UdsListener,
+        state: &SharedState,
+        root_token: &CancellationToken,
+        input_lane: &input_lane::InputLaneHandle,
+    ) -> Vec<AcceptLoopFuture<'a>> {
+        let mut accepts: Vec<AcceptLoopFuture<'a>> = vec![Box::pin(accept_loop(
+            uds,
+            state.clone(),
+            root_token.clone(),
+            Some(input_lane.clone()),
+        ))];
+        if let Some(ws) = &self.ws {
+            accepts.push(Box::pin(accept_loop(
+                ws,
+                state.clone(),
+                root_token.clone(),
+                Some(input_lane.clone()),
+            )));
+        }
+        if let Some(quic) = &self.quic {
+            accepts.push(Box::pin(accept_loop(
+                quic,
+                state.clone(),
+                root_token.clone(),
+                Some(input_lane.clone()),
+            )));
+        }
+        accepts
+    }
+}
+
+/// Run every accept loop concurrently. The first fatal listener result
+/// cancels the others; after the first completion we still join every
+/// remaining loop so their client tasks can flush `SERVER_SHUTDOWN` before
+/// teardown.
+async fn drive_accept_loops(
+    accepts: Vec<AcceptLoopFuture<'_>>,
+    root_token: &CancellationToken,
+) -> Result<(), ServerError> {
+    let (mut result, _index, remaining) = futures_util::future::select_all(accepts).await;
+    if result.is_err() {
+        root_token.cancel();
+    }
+    for tail in futures_util::future::join_all(remaining).await {
+        if result.is_ok() && tail.is_err() {
+            result = tail;
+        }
+    }
+    result
 }
 
 /// Default WebSocket port for the auto-configured overlay listener.
