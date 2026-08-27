@@ -11,8 +11,8 @@ use super::workspace::{RawPluginManifestWorkspace, WorkspaceSourceSlices, normal
 use super::{
     PluginAgentAttention, PluginAgentState, PluginManifest, PluginManifestAction,
     PluginManifestAgent, PluginManifestBuild, PluginManifestError, PluginManifestEvent,
-    PluginManifestPane, PluginManifestWidget, PluginPanePlacement, PluginPlatform,
-    PluginWidgetSlot,
+    PluginManifestLinkHandler, PluginManifestPane, PluginManifestWidget, PluginManifestWorkspace,
+    PluginPanePlacement, PluginPlatform, PluginWidgetSlot,
 };
 
 #[derive(Debug, Deserialize)]
@@ -136,12 +136,48 @@ pub fn load_plugin_manifest(path: &Path) -> Result<PluginManifest, PluginManifes
         .parent()
         .ok_or_else(|| PluginManifestError::Invalid("manifest path has no parent".to_owned()))?
         .to_path_buf();
-    let raw: RawPluginManifest =
+    let mut raw: RawPluginManifest =
         toml::from_str(&source.input).map_err(|err| PluginManifestError::Parse {
             path: source.display_path,
             message: err.message().to_owned(),
         })?;
 
+    let platforms = raw.platforms.take();
+    let identity = normalize_identity(&raw)?;
+    let sections = normalize_sections(raw)?;
+
+    Ok(PluginManifest {
+        id: identity.id,
+        name: identity.name,
+        version: identity.version,
+        min_phux_version: identity.min_phux_version,
+        description: identity.description,
+        manifest_path,
+        plugin_root,
+        platforms,
+        build: sections.build,
+        agents: sections.agents,
+        actions: sections.actions,
+        events: sections.events,
+        panes: sections.panes,
+        links: sections.links,
+        workspaces: sections.workspaces,
+        widgets: sections.widgets,
+    })
+}
+
+/// The scalar identity fields of a manifest, validated.
+struct ManifestIdentity {
+    id: String,
+    name: String,
+    version: String,
+    min_phux_version: String,
+    description: Option<String>,
+}
+
+/// Validate the manifest's identity fields and enforce the phux version
+/// floor the manifest declares.
+fn normalize_identity(raw: &RawPluginManifest) -> Result<ManifestIdentity, PluginManifestError> {
     let id = normalize_id(&raw.id, true, "plugin id")?;
     let name = non_empty(&raw.name, "plugin name")?;
     let version = non_empty(&raw.version, "plugin version")?;
@@ -151,47 +187,50 @@ pub fn load_plugin_manifest(path: &Path) -> Result<PluginManifest, PluginManifes
         &min_phux_version,
         super::version::CURRENT_PHUX_VERSION,
     )?;
-    let description = raw.description.as_deref().and_then(trim_optional);
 
+    Ok(ManifestIdentity {
+        id,
+        name,
+        version,
+        min_phux_version,
+        description: raw.description.as_deref().and_then(trim_optional),
+    })
+}
+
+/// The repeated sections of a manifest, each normalized and checked for
+/// duplicate ids. Workspaces are last because they resolve references
+/// into the agent, action, event, and pane sections.
+struct ManifestSections {
+    build: Vec<PluginManifestBuild>,
+    agents: Vec<PluginManifestAgent>,
+    actions: Vec<PluginManifestAction>,
+    events: Vec<PluginManifestEvent>,
+    panes: Vec<PluginManifestPane>,
+    links: Vec<PluginManifestLinkHandler>,
+    workspaces: Vec<PluginManifestWorkspace>,
+    widgets: Vec<PluginManifestWidget>,
+}
+
+/// Normalize every repeated section, in the order their cross-references
+/// require: workspaces resolve against the already-normalized agents,
+/// actions, events, and panes.
+fn normalize_sections(raw: RawPluginManifest) -> Result<ManifestSections, PluginManifestError> {
     let build = raw
         .build
         .into_iter()
         .map(normalize_build)
         .collect::<Result<Vec<_>, _>>()?;
-    let agents = raw
-        .agents
-        .into_iter()
-        .map(normalize_agent)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_ids(agents.iter().map(|agent| agent.id.as_str()), "plugin agent")?;
-    let actions = raw
-        .actions
-        .into_iter()
-        .map(normalize_action)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_ids(
-        actions.iter().map(|action| action.id.as_str()),
-        "plugin action",
-    )?;
-    let events = raw
-        .events
-        .into_iter()
-        .map(normalize_event)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_ids(events.iter().map(|event| event.id.as_str()), "plugin event")?;
-    let panes = raw
-        .panes
-        .into_iter()
-        .map(normalize_pane)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_ids(panes.iter().map(|pane| pane.id.as_str()), "plugin pane")?;
-    let links = raw
-        .links
-        .into_iter()
-        .map(normalize_link_handler)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_ids(
-        links.iter().map(|link| link.id.as_str()),
+    let agents =
+        normalize_unique_section(raw.agents, normalize_agent, id_of_agent, "plugin agent")?;
+    let actions =
+        normalize_unique_section(raw.actions, normalize_action, id_of_action, "plugin action")?;
+    let events =
+        normalize_unique_section(raw.events, normalize_event, id_of_event, "plugin event")?;
+    let panes = normalize_unique_section(raw.panes, normalize_pane, id_of_pane, "plugin pane")?;
+    let links = normalize_unique_section(
+        raw.links,
+        normalize_link_handler,
+        id_of_link,
         "plugin link handler",
     )?;
     let workspaces = normalize_workspaces(
@@ -203,25 +242,10 @@ pub fn load_plugin_manifest(path: &Path) -> Result<PluginManifest, PluginManifes
             panes: &panes,
         },
     )?;
-    let widgets = raw
-        .widgets
-        .into_iter()
-        .map(normalize_widget)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_ids(
-        widgets.iter().map(|widget| widget.id.as_str()),
-        "plugin widget",
-    )?;
+    let widgets =
+        normalize_unique_section(raw.widgets, normalize_widget, id_of_widget, "plugin widget")?;
 
-    Ok(PluginManifest {
-        id,
-        name,
-        version,
-        min_phux_version,
-        description,
-        manifest_path,
-        plugin_root,
-        platforms: raw.platforms,
+    Ok(ManifestSections {
         build,
         agents,
         actions,
@@ -231,6 +255,46 @@ pub fn load_plugin_manifest(path: &Path) -> Result<PluginManifest, PluginManifes
         workspaces,
         widgets,
     })
+}
+
+/// Normalize one repeated section entry by entry, then reject duplicate
+/// ids within it. `label` names the section in both error paths.
+fn normalize_unique_section<R, T>(
+    raw: Vec<R>,
+    normalize: fn(R) -> Result<T, PluginManifestError>,
+    id_of: fn(&T) -> &str,
+    label: &str,
+) -> Result<Vec<T>, PluginManifestError> {
+    let entries = raw
+        .into_iter()
+        .map(normalize)
+        .collect::<Result<Vec<_>, _>>()?;
+    reject_duplicate_ids(entries.iter().map(id_of), label)?;
+    Ok(entries)
+}
+
+const fn id_of_agent(agent: &PluginManifestAgent) -> &str {
+    agent.id.as_str()
+}
+
+const fn id_of_action(action: &PluginManifestAction) -> &str {
+    action.id.as_str()
+}
+
+const fn id_of_event(event: &PluginManifestEvent) -> &str {
+    event.id.as_str()
+}
+
+const fn id_of_pane(pane: &PluginManifestPane) -> &str {
+    pane.id.as_str()
+}
+
+const fn id_of_link(link: &PluginManifestLinkHandler) -> &str {
+    link.id.as_str()
+}
+
+const fn id_of_widget(widget: &PluginManifestWidget) -> &str {
+    widget.id.as_str()
 }
 
 fn normalize_widget(

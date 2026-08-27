@@ -86,11 +86,7 @@ impl RouteTokenStore {
     /// malformed line or an invalid route name is an error (fail-fast at
     /// startup rather than silently dropping an enrollment).
     pub fn load(path: &Path) -> Result<Self, RelayError> {
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(err) => return Err(err.into()),
-        };
+        let raw = read_store_or_empty(path)?;
         let mut entries = Vec::new();
         for (idx, line) in raw.lines().enumerate() {
             let line = line.trim();
@@ -200,13 +196,34 @@ pub fn validate_route_name(name: &str) -> Result<(), RelayError> {
 /// complete store; concurrent mints are last-write-wins.
 pub fn mint_route_token(path: &Path, route: &str) -> Result<String, RelayError> {
     validate_route_name(route)?;
-    let existing = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
-    };
-    // Keep every line except the one(s) enrolling this route; parse each
-    // entry line so a malformed store fails before any rewrite.
+    let existing = read_store_or_empty(path)?;
+    let kept = lines_not_enrolling(&existing, route)?;
+
+    let mut token = [0u8; TOKEN_LEN];
+    getrandom::getrandom(&mut token)?;
+    let encoded = hex::encode(token);
+
+    let contents = render_store(&kept, &encoded, route);
+
+    ensure_parent_dir(path)?;
+    replace_store_atomically(path, &contents)?;
+    Ok(encoded)
+}
+
+/// Read the store text at `path`. A missing file reads as an empty store,
+/// so a not-yet-created store fails closed on load and is enrolled into on
+/// mint, rather than erroring.
+fn read_store_or_empty(path: &Path) -> Result<String, RelayError> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(raw),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Keep every line except the one(s) enrolling this route; parse each
+/// entry line so a malformed store fails before any rewrite.
+fn lines_not_enrolling<'a>(existing: &'a str, route: &str) -> Result<Vec<&'a str>, RelayError> {
     let mut kept: Vec<&str> = Vec::new();
     for (idx, line) in existing.lines().enumerate() {
         let trimmed = line.trim();
@@ -219,34 +236,43 @@ pub fn mint_route_token(path: &Path, route: &str) -> Result<String, RelayError> 
             kept.push(line);
         }
     }
+    Ok(kept)
+}
 
-    let mut token = [0u8; TOKEN_LEN];
-    getrandom::getrandom(&mut token)?;
-    let encoded = hex::encode(token);
-
+/// Render the store text: the preserved lines verbatim, then this route's
+/// freshly minted `<token> <route>` entry as the final line.
+fn render_store(kept: &[&str], encoded: &str, route: &str) -> String {
     let mut contents = String::new();
     for line in kept {
         contents.push_str(line);
         contents.push('\n');
     }
-    contents.push_str(&encoded);
+    contents.push_str(encoded);
     contents.push(' ');
     contents.push_str(route);
     contents.push('\n');
+    contents
+}
 
+/// Create the store's parent directory when the path names one.
+fn ensure_parent_dir(path: &Path) -> Result<(), RelayError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
-    // Atomic replacement: write the rebuilt store to an exclusively
-    // created owner-only sibling in the same directory (same filesystem,
-    // so the rename is atomic), fsync, then rename over the store. The
-    // relay re-reads this file per handshake; with rename it observes
-    // either the complete old file or the complete new one — never empty
-    // or torn — and a crash mid-mint leaves the previous store intact.
-    // Concurrent mints remain read-modify-write with no lock: last write
-    // wins (single-writer constraint, documented in docs/operations.md).
+    Ok(())
+}
+
+/// Atomic replacement: write the rebuilt store to an exclusively
+/// created owner-only sibling in the same directory (same filesystem,
+/// so the rename is atomic), fsync, then rename over the store. The
+/// relay re-reads this file per handshake; with rename it observes
+/// either the complete old file or the complete new one — never empty
+/// or torn — and a crash mid-mint leaves the previous store intact.
+/// Concurrent mints remain read-modify-write with no lock: last write
+/// wins (single-writer constraint, documented in docs/operations.md).
+fn replace_store_atomically(path: &Path, contents: &str) -> Result<(), RelayError> {
     let (tmp_path, mut file) = create_exclusive_sibling(path)?;
     let written = file
         .write_all(contents.as_bytes())
@@ -257,7 +283,7 @@ pub fn mint_route_token(path: &Path, route: &str) -> Result<String, RelayError> 
         let _ = fs::remove_file(&tmp_path);
         return Err(err.into());
     }
-    Ok(encoded)
+    Ok(())
 }
 
 /// Create an exclusively named owner-only temp file next to `store`, for

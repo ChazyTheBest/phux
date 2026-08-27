@@ -305,42 +305,57 @@ impl<W: Write> CastWriter<W> {
 /// NDJSON, and nothing has produced one since 2017.
 pub fn read_cast<R: BufRead>(src: R) -> Result<(CastHeader, Vec<CastEvent>), RecordError> {
     let mut lines = src.lines();
-    let mut header_line = None;
-    for line in &mut lines {
+    let header_line = read_header_line(&mut lines)?;
+    let (header, version) = parse_header_line(&header_line)?;
+    let events = read_events(lines, version == CastVersion::V3)?;
+    Ok((header, events))
+}
+
+/// The first non-blank line, which is where the header must be.
+fn read_header_line<R: BufRead>(lines: &mut std::io::Lines<R>) -> Result<String, RecordError> {
+    for line in lines {
         let line = line?;
         if !line.trim().is_empty() {
-            header_line = Some(line);
-            break;
+            return Ok(line);
         }
     }
-    let Some(header_line) = header_line else {
-        return Err(RecordError::Cast("input is empty".to_owned()));
-    };
+    Err(RecordError::Cast("input is empty".to_owned()))
+}
 
-    let raw: serde_json::Value = serde_json::from_str(&header_line)
+/// Parse the header line, dispatching on its declared `version`.
+///
+/// asciicast v1 is rejected outright: it is a single JSON document with a
+/// `stdout` array, not NDJSON, and nothing has produced one since 2017.
+fn parse_header_line(line: &str) -> Result<(CastHeader, CastVersion), RecordError> {
+    let raw: serde_json::Value = serde_json::from_str(line)
         .map_err(|err| RecordError::Cast(format!("header is not JSON: {err}")))?;
     let version = raw
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| RecordError::Cast("header has no numeric `version`".to_owned()))?;
 
-    let header = match version {
-        2 => parse_header_v2(&raw)?,
-        3 => parse_header_v3(&raw)?,
-        1 => {
-            return Err(RecordError::Cast(
-                "asciicast v1 is not supported; re-record or convert with `asciinema convert`"
-                    .to_owned(),
-            ));
-        }
-        other => {
-            return Err(RecordError::Cast(format!(
-                "unknown asciicast version {other}; this build reads v2 and v3"
-            )));
-        }
-    };
-    let relative = version == 3;
+    match version {
+        2 => Ok((parse_header_v2(&raw)?, CastVersion::V2)),
+        3 => Ok((parse_header_v3(&raw)?, CastVersion::V3)),
+        1 => Err(RecordError::Cast(
+            "asciicast v1 is not supported; re-record or convert with `asciinema convert`"
+                .to_owned(),
+        )),
+        other => Err(RecordError::Cast(format!(
+            "unknown asciicast version {other}; this build reads v2 and v3"
+        ))),
+    }
+}
 
+/// Read every event line after the header onto the absolute-millisecond
+/// timebase, given whether this version's stamps are relative intervals.
+///
+/// Unknown event codes are skipped rather than rejected. Blank lines and `#`
+/// comment lines are ignored.
+fn read_events<R: BufRead>(
+    lines: std::io::Lines<R>,
+    relative: bool,
+) -> Result<Vec<CastEvent>, RecordError> {
     let mut events = Vec::new();
     let mut clock = 0_u64;
     for line in lines {
@@ -352,46 +367,76 @@ pub fn read_cast<R: BufRead>(src: R) -> Result<(CastHeader, Vec<CastEvent>), Rec
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let parsed: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|err| RecordError::Cast(format!("event line is not JSON: {err}")))?;
-        let items = parsed
-            .as_array()
-            .ok_or_else(|| RecordError::Cast("event line is not a JSON array".to_owned()))?;
-        let secs = items
-            .first()
-            .and_then(serde_json::Value::as_f64)
-            .ok_or_else(|| RecordError::Cast("event line has no numeric time".to_owned()))?;
-        let code_text = items
-            .get(1)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| RecordError::Cast("event line has no string code".to_owned()))?;
-        let data = items
-            .get(2)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-
-        let ms = secs_to_ms(secs);
-        clock = if relative {
-            clock.saturating_add(ms)
-        } else {
-            // Absolute, but still clamped: a malformed file must not hand the
-            // renderer a timeline that goes backwards.
-            ms.max(clock)
-        };
+        let event = parse_event_line(trimmed)?;
+        clock = advance_clock(clock, event.ms, relative);
         // Advance the clock BEFORE the skip so an unknown code cannot shift
         // every later v3 event.
-        let Some(code) = EventCode::from_code(code_text) else {
+        let Some(code) = EventCode::from_code(&event.code) else {
             continue;
         };
         events.push(CastEvent {
             time_ms: clock,
             code,
-            data,
+            data: event.data,
         });
     }
 
-    Ok((header, events))
+    Ok(events)
+}
+
+/// One event line's fields, before the code is resolved or the clock folded
+/// in.
+#[derive(Debug)]
+struct RawEvent {
+    /// The line's own stamp in milliseconds: absolute in v2, an interval in
+    /// v3.
+    ms: u64,
+    /// The event code as written, which may name a code this build skips.
+    code: String,
+    /// The event payload, absent on codes that carry none.
+    data: String,
+}
+
+/// Split one event line into its three JSON array slots.
+fn parse_event_line(line: &str) -> Result<RawEvent, RecordError> {
+    let parsed: serde_json::Value = serde_json::from_str(line)
+        .map_err(|err| RecordError::Cast(format!("event line is not JSON: {err}")))?;
+    let items = parsed
+        .as_array()
+        .ok_or_else(|| RecordError::Cast("event line is not a JSON array".to_owned()))?;
+    let secs = items
+        .first()
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| RecordError::Cast("event line has no numeric time".to_owned()))?;
+    let code = items
+        .get(1)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RecordError::Cast("event line has no string code".to_owned()))?
+        .to_owned();
+    let data = items
+        .get(2)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    Ok(RawEvent {
+        ms: secs_to_ms(secs),
+        code,
+        data,
+    })
+}
+
+/// Fold one event's stamp into the running clock.
+///
+/// v3 stamps are intervals and accumulate. v2 stamps are absolute, but still
+/// clamped: a malformed file must not hand the renderer a timeline that goes
+/// backwards.
+fn advance_clock(clock: u64, ms: u64, relative: bool) -> u64 {
+    if relative {
+        clock.saturating_add(ms)
+    } else {
+        ms.max(clock)
+    }
 }
 
 fn parse_header_v2(raw: &serde_json::Value) -> Result<CastHeader, RecordError> {

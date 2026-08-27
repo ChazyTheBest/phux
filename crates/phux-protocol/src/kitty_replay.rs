@@ -10,7 +10,9 @@ use std::io::{self, Write};
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
     alloc::{Allocator, Bytes},
-    kitty::graphics::{self, Compression, DecodedImage, Image, ImageFormat, PlacementIterator},
+    kitty::graphics::{
+        self, Compression, DecodedImage, Image, ImageFormat, PlacementIterator, PlacementRenderInfo,
+    },
 };
 
 /// Per-terminal Kitty image storage budget.
@@ -70,54 +72,90 @@ pub fn emit_kitty_graphics_replay(
         };
 
         if placement.is_virtual()? {
-            if !transmitted.contains(&image_id) {
-                write_image_apc(out, &image, ImageAction::TransmitOnly, None)?;
-                transmitted.push(image_id);
-                wrote = true;
+            if transmitted.contains(&image_id) {
+                continue;
             }
-            continue;
+            write_image_apc(out, &image, ImageAction::TransmitOnly, None)?;
+        } else {
+            let info = placement.placement_render_info(&image, terminal)?;
+            let Some(region) = clip_placement(&info, clip) else {
+                continue;
+            };
+            write_placement(out, &image, region, origin)?;
         }
 
-        let info = placement.placement_render_info(&image, terminal)?;
-        if !info.viewport_visible
-            || info.grid_cols == 0
-            || info.grid_rows == 0
-            || info.viewport_col < 0
-            || info.viewport_row < 0
-        {
-            continue;
-        }
-
-        let local_col = match u16::try_from(info.viewport_col) {
-            Ok(col) if col < clip.0 => col,
-            _ => continue,
-        };
-        let local_row = match u16::try_from(info.viewport_row) {
-            Ok(row) if row < clip.1 => row,
-            _ => continue,
-        };
-        let cols = u32::from(clip.0.saturating_sub(local_col)).min(info.grid_cols);
-        let rows = u32::from(clip.1.saturating_sub(local_row)).min(info.grid_rows);
-        if cols == 0 || rows == 0 {
-            continue;
-        }
-
-        write_cup(
-            out,
-            local_row.saturating_add(origin.1),
-            local_col.saturating_add(origin.0),
-        )?;
-        write_image_apc(
-            out,
-            &image,
-            ImageAction::TransmitAndDisplay,
-            Some((cols, rows)),
-        )?;
         transmitted.push(image_id);
         wrote = true;
     }
 
     Ok(wrote)
+}
+
+/// One placement's pane-local cell geometry, already clipped to the pane.
+#[derive(Clone, Copy, Debug)]
+struct PlacementRegion {
+    col: u16,
+    row: u16,
+    cols: u32,
+    rows: u32,
+}
+
+/// Whether a placement is on-screen with a non-degenerate cell footprint.
+const fn is_renderable(info: &PlacementRenderInfo) -> bool {
+    info.viewport_visible
+        && info.grid_cols != 0
+        && info.grid_rows != 0
+        && info.viewport_col >= 0
+        && info.viewport_row >= 0
+}
+
+/// Clip a classic placement's render info to the pane's visible cell extent.
+///
+/// Returns `None` for every case the replay must skip: off-viewport,
+/// degenerate, or starting past the pane's own `clip` bounds.
+fn clip_placement(info: &PlacementRenderInfo, clip: (u16, u16)) -> Option<PlacementRegion> {
+    if !is_renderable(info) {
+        return None;
+    }
+
+    let col = u16::try_from(info.viewport_col)
+        .ok()
+        .filter(|c| *c < clip.0)?;
+    let row = u16::try_from(info.viewport_row)
+        .ok()
+        .filter(|r| *r < clip.1)?;
+    let cols = u32::from(clip.0.saturating_sub(col)).min(info.grid_cols);
+    let rows = u32::from(clip.1.saturating_sub(row)).min(info.grid_rows);
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+
+    Some(PlacementRegion {
+        col,
+        row,
+        cols,
+        rows,
+    })
+}
+
+/// Replay one classic placement with `a=T` at its outer-terminal position.
+fn write_placement(
+    out: &mut impl Write,
+    image: &Image<'_>,
+    region: PlacementRegion,
+    origin: (u16, u16),
+) -> Result<(), KittyReplayError> {
+    write_cup(
+        out,
+        region.row.saturating_add(origin.1),
+        region.col.saturating_add(origin.0),
+    )?;
+    write_image_apc(
+        out,
+        image,
+        ImageAction::TransmitAndDisplay,
+        Some((region.cols, region.rows)),
+    )
 }
 
 #[derive(Debug, Default)]

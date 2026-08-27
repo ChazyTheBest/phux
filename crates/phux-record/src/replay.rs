@@ -43,7 +43,9 @@
 //! crate hosts it because it is the only workspace member that already
 //! depends on all three.
 
-use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RowIterator, Snapshot};
+use libghostty_vt::render::{
+    CellIteration, CellIterator, Dirty, RowIteration, RowIterator, Snapshot,
+};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, Style, StyleColor, Underline};
 use libghostty_vt::{RenderState, Terminal as GhosttyTerminal, TerminalOptions};
@@ -170,79 +172,38 @@ impl Replayer {
             .state
             .update(&self.term)
             .map_err(|err| replay_err("snapshot", &err))?;
-        let dirty = snapshot.dirty().map_err(|err| replay_err("dirty", &err))?;
-        let cols = snapshot.cols().map_err(|err| replay_err("cols", &err))?;
-        let rows = snapshot.rows().map_err(|err| replay_err("rows", &err))?;
-        let cursor = read_cursor(&snapshot, cols, rows)?;
-        let cursor_changed = cursor != self.last_cursor;
-        if !first && !cursor_changed && matches!(dirty, Dirty::Clean) {
+        let view = read_view(&snapshot)?;
+        let cursor_changed = view.cursor != self.last_cursor;
+        if !frame_is_due(first, cursor_changed, view.dirty) {
             return Ok(None);
         }
         self.sampled_once = true;
 
-        let mut frame = RenderedFrame::blank(cols, rows);
+        let mut frame = RenderedFrame::blank(view.cols, view.rows);
 
         // A first frame and a `Dirty::Full` are both "everything moved"; the
         // encoder wants a whole-canvas frame for those, which `None` means.
-        let whole_canvas = first || matches!(dirty, Dirty::Full);
-        let mut band: Option<(u16, u16)> = None;
+        let whole_canvas = first || matches!(view.dirty, Dirty::Full);
 
-        let mut row_iter = self
-            .rows
-            .update(&snapshot)
-            .map_err(|err| replay_err("rows", &err))?;
-        let mut row_index: u16 = 0;
-        while let Some(row) = row_iter.next() {
-            if row_index >= rows {
-                break;
-            }
-            if row.dirty().map_err(|err| replay_err("row dirty", &err))? {
-                band = Some(widen(band, row_index));
-            }
-            // Every row is projected, dirty or not: the frame is dense and
-            // whole, and the caller may be building a keyframe.
-            let mut col: u16 = 0;
-            let mut cell_iter = self
-                .cells
-                .update(row)
-                .map_err(|err| replay_err("cells", &err))?;
-            while let Some(cell) = cell_iter.next() {
-                if col >= cols {
-                    break;
-                }
-                let (grapheme, style) = project_cell(cell)?;
-                if let Some(dst) = frame.cell_mut(row_index, col) {
-                    dst.grapheme = grapheme;
-                    dst.style = style;
-                }
-                col = col.saturating_add(1);
-            }
-            // Clear the per-row dirty bit after reading it, per the
-            // libghostty contract the client renderer follows at
-            // `attach/render.rs`'s `render_at_inner`. Leaving it set makes
-            // every subsequent sample report the row dirty forever, which
-            // defeats sub-rectangle encoding.
-            row.set_dirty(false)
-                .map_err(|err| replay_err("row set_dirty", &err))?;
-            row_index = row_index.saturating_add(1);
-        }
+        let mut band = project_rows(
+            &mut self.rows,
+            &mut self.cells,
+            &snapshot,
+            view.cols,
+            view.rows,
+            &mut frame,
+        )?;
 
-        // The cursor cell is repainted (inverted) by the rasterizer, so both
-        // the row it left and the row it now occupies belong in the band.
-        // libghostty already marks a positional move dirty; this covers the
-        // visibility-only toggle, which it does not.
         if cursor_changed {
-            for row in [self.last_cursor.as_ref(), cursor.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|state| state.y)
-                .filter(|row| *row < rows)
-            {
-                band = Some(widen(band, row));
-            }
+            band = band_with_cursor_rows(
+                band,
+                self.last_cursor.as_ref(),
+                view.cursor.as_ref(),
+                view.rows,
+            );
         }
-        self.last_cursor.clone_from(&cursor);
-        frame.cursor = cursor;
+        self.last_cursor.clone_from(&view.cursor);
+        frame.cursor = view.cursor;
 
         // Clear the snapshot-level bit too, last, once everything has been
         // read. libghostty's dirty state is *sticky*: `RenderState::update`
@@ -295,6 +256,132 @@ impl Replayer {
             palette: colors.palette.map(rgb),
         })
     }
+}
+
+/// What one snapshot reports before any row is walked.
+#[derive(Debug)]
+struct SnapshotView {
+    /// The snapshot-level dirty state.
+    dirty: Dirty,
+    /// Viewport width in columns.
+    cols: u16,
+    /// Viewport height in rows.
+    rows: u16,
+    /// The viewport cursor, or `None` when there is none to draw.
+    cursor: Option<CursorState>,
+}
+
+/// Read the per-sample facts off one snapshot.
+fn read_view(snapshot: &Snapshot<'_, '_>) -> Result<SnapshotView, RecordError> {
+    let dirty = snapshot.dirty().map_err(|err| replay_err("dirty", &err))?;
+    let cols = snapshot.cols().map_err(|err| replay_err("cols", &err))?;
+    let rows = snapshot.rows().map_err(|err| replay_err("rows", &err))?;
+    let cursor = read_cursor(snapshot, cols, rows)?;
+    Ok(SnapshotView {
+        dirty,
+        cols,
+        rows,
+        cursor,
+    })
+}
+
+/// Whether this sample owes the caller a frame.
+///
+/// Three independent reasons, spelled out in [`Replayer::sample`]'s contract:
+/// the first sample always emits (rule 2 of the module docs); a cursor change
+/// counts even when libghostty reports the grid clean, because a `DECTCEM`
+/// visibility toggle dirties no cell; and any dirty state that is not
+/// `Clean`.
+const fn frame_is_due(first: bool, cursor_changed: bool, dirty: Dirty) -> bool {
+    first || cursor_changed || !matches!(dirty, Dirty::Clean)
+}
+
+/// Project every row of the snapshot into `frame`, returning the inclusive
+/// band of rows libghostty reported dirty.
+fn project_rows(
+    rows_iter: &mut RowIterator<'static>,
+    cells_iter: &mut CellIterator<'static>,
+    snapshot: &Snapshot<'static, '_>,
+    cols: u16,
+    rows: u16,
+    frame: &mut RenderedFrame,
+) -> Result<Option<(u16, u16)>, RecordError> {
+    let mut band: Option<(u16, u16)> = None;
+    let mut row_iter = rows_iter
+        .update(snapshot)
+        .map_err(|err| replay_err("rows", &err))?;
+    let mut row_index: u16 = 0;
+    while let Some(row) = row_iter.next() {
+        if row_index >= rows {
+            break;
+        }
+        if row.dirty().map_err(|err| replay_err("row dirty", &err))? {
+            band = Some(widen(band, row_index));
+        }
+        project_row(cells_iter, row, row_index, cols, frame)?;
+        // Clear the per-row dirty bit after reading it, per the
+        // libghostty contract the client renderer follows at
+        // `attach/render.rs`'s `render_at_inner`. Leaving it set makes
+        // every subsequent sample report the row dirty forever, which
+        // defeats sub-rectangle encoding.
+        row.set_dirty(false)
+            .map_err(|err| replay_err("row set_dirty", &err))?;
+        row_index = row_index.saturating_add(1);
+    }
+    Ok(band)
+}
+
+/// Project one row's cells into `frame`.
+///
+/// Every row is projected, dirty or not: the frame is dense and whole, and
+/// the caller may be building a keyframe.
+fn project_row(
+    cells_iter: &mut CellIterator<'static>,
+    row: &RowIteration<'static, '_>,
+    row_index: u16,
+    cols: u16,
+    frame: &mut RenderedFrame,
+) -> Result<(), RecordError> {
+    let mut col: u16 = 0;
+    let mut cell_iter = cells_iter
+        .update(row)
+        .map_err(|err| replay_err("cells", &err))?;
+    while let Some(cell) = cell_iter.next() {
+        if col >= cols {
+            break;
+        }
+        let (grapheme, style) = project_cell(cell)?;
+        if let Some(dst) = frame.cell_mut(row_index, col) {
+            dst.grapheme = grapheme;
+            dst.style = style;
+        }
+        col = col.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Widen `band` to cover the rows the cursor left and now occupies.
+///
+/// The cursor cell is repainted (inverted) by the rasterizer, so both the row
+/// it left and the row it now occupies belong in the band. libghostty already
+/// marks a positional move dirty; this covers the visibility-only toggle,
+/// which it does not.
+fn band_with_cursor_rows(
+    band: Option<(u16, u16)>,
+    last: Option<&CursorState>,
+    current: Option<&CursorState>,
+    rows: u16,
+) -> Option<(u16, u16)> {
+    let mut band = band;
+    for row in [last, current]
+        .into_iter()
+        .flatten()
+        .map(|state| state.y)
+        .filter(|row| *row < rows)
+    {
+        band = Some(widen(band, row));
+    }
+    band
 }
 
 /// Wrap a libghostty failure with the operation that produced it.

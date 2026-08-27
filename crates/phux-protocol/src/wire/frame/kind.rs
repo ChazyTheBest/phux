@@ -896,10 +896,6 @@ impl FrameKind {
     ///
     /// Writes the four-byte big-endian length header, the type byte, and the
     /// payload. The caller owns the `BytesMut` lifecycle.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "single match over the SPEC §7 catalog; splitting would scatter the encoder/decoder symmetry"
-    )]
     pub fn encode(&self, out: &mut BytesMut) {
         // Reserve four bytes for the length header; backfill once we know how
         // many bytes the type + payload consumed.
@@ -909,7 +905,30 @@ impl FrameKind {
         let body_start = out.len();
         let mut enc = Encoder::new(out);
         enc.write_u8(self.type_byte());
+        self.encode_payload(&mut enc);
 
+        // Backfill the length header. The length value excludes the four
+        // header bytes themselves but includes the type byte and payload, per
+        // SPEC §5.
+        let body_len = out.len() - body_start;
+        debug_assert!(
+            u32::try_from(body_len).is_ok_and(|n| n <= MAX_FRAME_LEN),
+            "encoded frame exceeds protocol cap",
+        );
+        let len_u32 = u32::try_from(body_len).unwrap_or(u32::MAX);
+        out[header_pos..header_pos + 4].copy_from_slice(&len_u32.to_be_bytes());
+    }
+
+    /// Write the field-tagged payload of `self`; the type byte is already out.
+    ///
+    /// One arm per SPEC §7 catalog entry, each a single call into the
+    /// `encode_*` helper that owns that frame's field order. The table stays
+    /// in one place so it can be read against the decoder's dispatch.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one call per arm over the whole SPEC §7 catalog; the arms belong in a single table that mirrors the decoder's"
+    )]
+    fn encode_payload(&self, enc: &mut Encoder<'_>) {
         match self {
             Self::Hello {
                 client_name,
@@ -917,48 +936,14 @@ impl FrameKind {
                 protocol_minor,
                 protocol_patch,
                 client_caps,
-            } => {
-                // String fields ride as raw UTF-8 bytes — the field is already
-                // length-delimited by the TLV header, so no inner length prefix.
-                enc.write_field(field::hello::CLIENT_NAME, client_name.as_bytes());
-                enc.write_field_with(field::hello::PROTOCOL_MAJOR, |e| {
-                    e.write_u16_be(*protocol_major);
-                });
-                enc.write_field_with(field::hello::PROTOCOL_MINOR, |e| {
-                    e.write_u16_be(*protocol_minor);
-                });
-                enc.write_field_with(field::hello::PROTOCOL_PATCH, |e| {
-                    e.write_u16_be(*protocol_patch);
-                });
-                // ClientCapabilities remains a positional sub-record inside its
-                // top-level TLV field. Protocol 0.7 fixes the complete order:
-                // legacy render caps, palette presence/value, profile set,
-                // exact native codec set/features, then receive bounds.
-                enc.write_field_with(field::hello::CLIENT_CAPS, |e| {
-                    e.write_u8(client_caps.color_support.as_wire());
-                    e.write_u8(client_caps.layers.as_wire());
-                    e.write_u8(client_caps.image_protocols.as_wire());
-                    e.write_u8(client_caps.kbd_protocols.as_wire());
-                    e.write_u8(u8::from(client_caps.hyperlinks));
-                    e.write_u8(client_caps.output_mode.as_wire());
-                    if let Some(colors) = client_caps.default_colors {
-                        e.write_u8(1);
-                        e.write_u8(colors.foreground.r);
-                        e.write_u8(colors.foreground.g);
-                        e.write_u8(colors.foreground.b);
-                        e.write_u8(colors.background.r);
-                        e.write_u8(colors.background.g);
-                        e.write_u8(colors.background.b);
-                    } else {
-                        e.write_u8(0);
-                    }
-                    e.write_u8(client_caps.bootstrap.profiles.as_wire());
-                    e.write_u64_be(client_caps.bootstrap.native_codecs.as_wire());
-                    e.write_u32_be(client_caps.bootstrap.native_features.as_wire());
-                    e.write_u32_be(client_caps.bootstrap.limits.max_chunk_bytes());
-                    e.write_u32_be(client_caps.bootstrap.limits.max_history_page_bytes());
-                });
-            }
+            } => Self::encode_hello(
+                enc,
+                client_name,
+                *protocol_major,
+                *protocol_minor,
+                *protocol_patch,
+                client_caps,
+            ),
             Self::HelloOk {
                 protocol_major,
                 protocol_minor,
@@ -968,166 +953,82 @@ impl FrameKind {
                 selected_profile,
                 bootstrap_limits,
             } => {
-                enc.write_field_with(field::hello_ok::PROTOCOL_MAJOR, |e| {
-                    e.write_u16_be(*protocol_major);
-                });
-                enc.write_field_with(field::hello_ok::PROTOCOL_MINOR, |e| {
-                    e.write_u16_be(*protocol_minor);
-                });
-                enc.write_field_with(field::hello_ok::PROTOCOL_PATCH, |e| {
-                    e.write_u16_be(*protocol_patch);
-                });
-                enc.write_field_with(field::hello_ok::SERVER_CAPS, |e| {
-                    e.write_u8(server_caps.layers.as_wire());
-                    if !server_caps.features.is_empty() {
-                        e.write_u32_be(server_caps.features.as_wire());
-                    }
-                });
-                // server_id is opaque bytes; the field is already
-                // length-delimited so the raw bytes are the value.
-                enc.write_field(field::hello_ok::SERVER_ID, server_id);
-                enc.write_field_with(field::hello_ok::SELECTED_PROFILE, |e| {
-                    encode_bootstrap_profile(*selected_profile, e);
-                });
-                enc.write_field_with(field::hello_ok::MAX_CHUNK_BYTES, |e| {
-                    e.write_u32_be(bootstrap_limits.max_chunk_bytes());
-                });
-                enc.write_field_with(field::hello_ok::MAX_HISTORY_PAGE_BYTES, |e| {
-                    e.write_u32_be(bootstrap_limits.max_history_page_bytes());
-                });
+                Self::encode_hello_ok_version(
+                    enc,
+                    *protocol_major,
+                    *protocol_minor,
+                    *protocol_patch,
+                );
+                Self::encode_hello_ok_negotiation(
+                    enc,
+                    *server_caps,
+                    server_id,
+                    *selected_profile,
+                    *bootstrap_limits,
+                );
             }
             // `Ping` and `Pong` share a single-`u64` nonce field; merged to
             // satisfy `clippy::match_same_arms`.
-            Self::Ping { nonce } | Self::Pong { nonce } => {
-                enc.write_field_with(field::ping::NONCE, |e| e.write_u64_be(*nonce));
-            }
+            Self::Ping { nonce } | Self::Pong { nonce } => Self::encode_nonce(enc, *nonce),
             Self::TerminalOutput {
                 terminal_id,
                 stream_id,
                 bootstrap_id,
                 seq,
                 bytes,
-            } => {
-                enc.write_field_with(field::terminal_output::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::terminal_output::SEQ, |e| e.write_u64_be(*seq));
-                enc.write_field(field::terminal_output::BYTES, bytes);
-                enc.write_field_with(field::terminal_output::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::terminal_output::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-            }
+            } => Self::encode_terminal_output(
+                enc,
+                terminal_id,
+                *stream_id,
+                *bootstrap_id,
+                *seq,
+                bytes,
+            ),
             Self::Attach {
                 attach_id,
                 target,
                 viewport,
                 request_scrollback,
                 scrollback_limit_lines,
-            } => {
-                enc.write_field_with(field::attach::TARGET, |e| encode_attach_target(target, e));
-                enc.write_field_with(field::attach::VIEWPORT, |e| {
-                    encode_viewport_info(viewport, e);
-                });
-                enc.write_field_with(field::attach::REQUEST_SCROLLBACK, |e| {
-                    e.write_u8(u8::from(*request_scrollback));
-                });
-                enc.write_field_with(field::attach::SCROLLBACK_LIMIT_LINES, |e| {
-                    e.write_u32_be(*scrollback_limit_lines);
-                });
-                enc.write_field_with(field::attach::ATTACH_ID, |e| e.write_u32_be(*attach_id));
-            }
+            } => Self::encode_attach(
+                enc,
+                *attach_id,
+                target,
+                viewport,
+                *request_scrollback,
+                *scrollback_limit_lines,
+            ),
             // `Detach` is a unit variant: type byte only, no fields.
             Self::Detach => {}
-            Self::Detached { reason, message } => {
-                // Both fields are optional-absent (field.rs allocation
-                // discipline): an unstated reason and an empty message encode
-                // as nothing at all, which keeps the common
-                // acknowledge-a-clean-detach frame byte-identical to what
-                // every 0.7.0 peer already emits.
-                if let Some(reason) = reason {
-                    enc.write_field_with(field::detached::REASON, |e| {
-                        e.write_u8(reason.as_wire());
-                    });
-                }
-                if !message.is_empty() {
-                    enc.write_field(field::detached::MESSAGE, message.as_bytes());
-                }
-            }
+            Self::Detached { reason, message } => Self::encode_detached(enc, *reason, message),
             Self::InputKey { terminal_id, event } => {
-                enc.write_field_with(field::input_key::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::input_key::EVENT, |e| encode_key_event(event, e));
+                Self::encode_input_key(enc, terminal_id, event);
             }
             Self::InputMouse { terminal_id, event } => {
-                enc.write_field_with(field::input_mouse::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::input_mouse::EVENT, |e| encode_mouse_event(event, e));
+                Self::encode_input_mouse(enc, terminal_id, event);
             }
             Self::InputFocus { terminal_id, event } => {
-                enc.write_field_with(field::input_focus::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::input_focus::EVENT, |e| {
-                    e.write_u8(encode_focus_event(*event));
-                });
+                Self::encode_input_focus(enc, terminal_id, *event);
             }
             Self::InputPaste { terminal_id, event } => {
-                enc.write_field_with(field::input_paste::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::input_paste::EVENT, |e| encode_paste_event(event, e));
+                Self::encode_input_paste(enc, terminal_id, event);
             }
             Self::InputTerminalReply { terminal_id, bytes } => {
-                enc.write_field_with(field::input_terminal_reply::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field(field::input_terminal_reply::BYTES, bytes.as_ref());
+                Self::encode_input_terminal_reply(enc, terminal_id, bytes);
             }
             Self::FrameAck {
                 terminal_id,
                 stream_id,
                 bootstrap_id,
                 seq,
-            } => {
-                enc.write_field_with(field::frame_ack::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::frame_ack::SEQ, |e| e.write_u64_be(*seq));
-                enc.write_field_with(field::frame_ack::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::frame_ack::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-            }
-            Self::ViewportResize { viewport } => {
-                enc.write_field_with(field::viewport_resize::VIEWPORT, |e| {
-                    encode_viewport_info(viewport, e);
-                });
-            }
+            } => Self::encode_frame_ack(enc, terminal_id, *stream_id, *bootstrap_id, *seq),
+            Self::ViewportResize { viewport } => Self::encode_viewport_resize(enc, viewport),
             Self::Attached {
                 attach_id,
                 snapshot,
                 initial_client_id,
-            } => {
-                enc.write_field_with(field::attached::SNAPSHOT, |e| {
-                    encode_session_snapshot(snapshot, e);
-                });
-                enc.write_field_with(field::attached::INITIAL_CLIENT_ID, |e| {
-                    encode_client_id(*initial_client_id, e);
-                });
-                enc.write_field_with(field::attached::ATTACH_ID, |e| e.write_u32_be(*attach_id));
-            }
-            Self::AttachReady { attach_id } => {
-                enc.write_field_with(field::attach_ready::ATTACH_ID, |e| {
-                    e.write_u32_be(*attach_id);
-                });
-            }
+            } => Self::encode_attached(enc, *attach_id, snapshot, *initial_client_id),
+            Self::AttachReady { attach_id } => Self::encode_attach_ready(enc, *attach_id),
             Self::BootstrapBegin {
                 terminal_id,
                 stream_id,
@@ -1137,37 +1038,8 @@ impl FrameKind {
                 rows,
                 base_seq,
             } => {
-                enc.write_field_with(field::bootstrap_begin::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::bootstrap_begin::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::bootstrap_begin::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                let (codec, output_mode) = match profile {
-                    BootstrapStreamProfile::NativeState { codec } => {
-                        (BootstrapCodec::Native(*codec), OutputMode::Raw)
-                    }
-                    BootstrapStreamProfile::SynthesizedVtRaw => {
-                        (BootstrapCodec::SynthesizedVtV1, OutputMode::Raw)
-                    }
-                    BootstrapStreamProfile::SynthesizedVtStateSync => {
-                        (BootstrapCodec::SynthesizedVtV1, OutputMode::StateSync)
-                    }
-                };
-                enc.write_field_with(field::bootstrap_begin::CODEC, |e| {
-                    encode_bootstrap_codec(codec, e);
-                });
-                enc.write_field_with(field::bootstrap_begin::COLS, |e| e.write_u16_be(*cols));
-                enc.write_field_with(field::bootstrap_begin::ROWS, |e| e.write_u16_be(*rows));
-                enc.write_field_with(field::bootstrap_begin::OUTPUT_MODE, |e| {
-                    e.write_u8(output_mode.as_wire());
-                });
-                enc.write_field_with(field::bootstrap_begin::BASE_SEQ, |e| {
-                    e.write_u64_be(*base_seq);
-                });
+                Self::encode_bootstrap_begin_stream(enc, terminal_id, *stream_id, *bootstrap_id);
+                Self::encode_bootstrap_begin_profile(enc, *profile, *cols, *rows, *base_seq);
             }
             Self::BootstrapChunk {
                 terminal_id,
@@ -1175,40 +1047,26 @@ impl FrameKind {
                 bootstrap_id,
                 chunk_seq,
                 payload,
-            } => {
-                enc.write_field_with(field::bootstrap_chunk::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::bootstrap_chunk::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::bootstrap_chunk::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                enc.write_field_with(field::bootstrap_chunk::CHUNK_SEQ, |e| {
-                    e.write_u32_be(*chunk_seq);
-                });
-                enc.write_field(field::bootstrap_chunk::PAYLOAD, payload);
-            }
+            } => Self::encode_bootstrap_chunk(
+                enc,
+                terminal_id,
+                *stream_id,
+                *bootstrap_id,
+                *chunk_seq,
+                payload,
+            ),
             Self::BootstrapReady {
                 terminal_id,
                 stream_id,
                 bootstrap_id,
                 history_cursor,
-            } => {
-                enc.write_field_with(field::bootstrap_ready::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::bootstrap_ready::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::bootstrap_ready::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                if let Some(cursor) = history_cursor {
-                    enc.write_field(field::bootstrap_ready::HISTORY_CURSOR, cursor);
-                }
-            }
+            } => Self::encode_bootstrap_ready(
+                enc,
+                terminal_id,
+                *stream_id,
+                *bootstrap_id,
+                history_cursor.as_deref(),
+            ),
             Self::HistoryRequest {
                 terminal_id,
                 stream_id,
@@ -1216,24 +1074,15 @@ impl FrameKind {
                 cursor,
                 max_bytes,
                 max_rows,
-            } => {
-                enc.write_field_with(field::history_request::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::history_request::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::history_request::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                enc.write_field(field::history_request::CURSOR, cursor);
-                enc.write_field_with(field::history_request::MAX_BYTES, |e| {
-                    e.write_u32_be(*max_bytes);
-                });
-                enc.write_field_with(field::history_request::MAX_ROWS, |e| {
-                    e.write_u32_be(*max_rows);
-                });
-            }
+            } => Self::encode_history_request(
+                enc,
+                terminal_id,
+                *stream_id,
+                *bootstrap_id,
+                cursor,
+                *max_bytes,
+                *max_rows,
+            ),
             Self::HistoryPage {
                 terminal_id,
                 stream_id,
@@ -1244,26 +1093,15 @@ impl FrameKind {
                 payload,
                 rows,
             } => {
-                enc.write_field_with(field::history_page::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::history_page::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::history_page::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                enc.write_field(field::history_page::CURSOR, cursor);
-                if let Some(next) = next_cursor {
-                    enc.write_field(field::history_page::NEXT_CURSOR, next);
-                }
-                enc.write_field(field::history_page::PAYLOAD, payload);
-                enc.write_field_with(field::history_page::PAGE_SEQ, |e| {
-                    e.write_u64_be(*page_seq);
-                });
-                enc.write_field_with(field::history_page::ROWS, |e| {
-                    e.write_u32_be(*rows);
-                });
+                Self::encode_history_page_stream(enc, terminal_id, *stream_id, *bootstrap_id);
+                Self::encode_history_page_body(
+                    enc,
+                    cursor,
+                    next_cursor.as_deref(),
+                    payload,
+                    *page_seq,
+                    *rows,
+                );
             }
             Self::BootstrapTombstone {
                 terminal_id,
@@ -1271,44 +1109,28 @@ impl FrameKind {
                 bootstrap_id,
                 reason,
                 last_valid_seq,
-            } => {
-                enc.write_field_with(field::bootstrap_tombstone::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::bootstrap_tombstone::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::bootstrap_tombstone::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                enc.write_field_with(field::bootstrap_tombstone::REASON, |e| {
-                    e.write_u8(reason.as_wire());
-                });
-                enc.write_field_with(field::bootstrap_tombstone::LAST_VALID_SEQ, |e| {
-                    e.write_u64_be(*last_valid_seq);
-                });
-            }
+            } => Self::encode_bootstrap_tombstone(
+                enc,
+                terminal_id,
+                *stream_id,
+                *bootstrap_id,
+                *reason,
+                *last_valid_seq,
+            ),
             Self::HistoryTombstone {
                 terminal_id,
                 stream_id,
                 bootstrap_id,
                 cursor,
                 reason,
-            } => {
-                enc.write_field_with(field::history_tombstone::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::history_tombstone::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::history_tombstone::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                enc.write_field(field::history_tombstone::CURSOR, cursor);
-                enc.write_field_with(field::history_tombstone::REASON, |e| {
-                    e.write_u8(reason.as_wire());
-                });
-            }
+            } => Self::encode_history_tombstone(
+                enc,
+                terminal_id,
+                *stream_id,
+                *bootstrap_id,
+                cursor,
+                *reason,
+            ),
             Self::HistoryRejected {
                 terminal_id,
                 stream_id,
@@ -1318,43 +1140,21 @@ impl FrameKind {
                 required_bytes,
                 required_rows,
             } => {
-                enc.write_field_with(field::history_rejected::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::history_rejected::STREAM_ID, |e| {
-                    e.write_u64_be(stream_id.get());
-                });
-                enc.write_field_with(field::history_rejected::BOOTSTRAP_ID, |e| {
-                    e.write_u64_be(bootstrap_id.get());
-                });
-                enc.write_field(field::history_rejected::CURSOR, cursor);
-                enc.write_field_with(field::history_rejected::REASON, |e| {
-                    e.write_u8(reason.as_wire());
-                });
-                enc.write_field_with(field::history_rejected::REQUIRED_BYTES, |e| {
-                    e.write_u32_be(*required_bytes);
-                });
-                enc.write_field_with(field::history_rejected::REQUIRED_ROWS, |e| {
-                    e.write_u32_be(*required_rows);
-                });
+                Self::encode_history_rejected_stream(enc, terminal_id, *stream_id, *bootstrap_id);
+                Self::encode_history_rejected_reason(
+                    enc,
+                    cursor,
+                    *reason,
+                    *required_bytes,
+                    *required_rows,
+                );
             }
-            Self::Bell { terminal_id } => {
-                enc.write_field_with(field::bell::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-            }
+            Self::Bell { terminal_id } => Self::encode_bell(enc, terminal_id),
             Self::Error {
                 request_id,
                 code,
                 message,
-            } => {
-                // Optional request_id: absent field = None.
-                if let Some(id) = request_id {
-                    enc.write_field_with(field::error::REQUEST_ID, |e| e.write_u32_be(*id));
-                }
-                enc.write_field_with(field::error::CODE, |e| e.write_u16_be(code.as_wire()));
-                enc.write_field(field::error::MESSAGE, message.as_bytes());
-            }
+            } => Self::encode_error(enc, *request_id, *code, message),
             // GET / DELETE share `{request_id, scope, key}`; merged to
             // satisfy `clippy::match_same_arms`. The wire bodies are
             // intentionally identical — the discriminating type byte is
@@ -1368,70 +1168,27 @@ impl FrameKind {
                 request_id,
                 scope,
                 key,
-            } => {
-                enc.write_field_with(field::get_metadata::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::get_metadata::SCOPE, |e| encode_scope(scope, e));
-                enc.write_field(field::get_metadata::KEY, key.as_bytes());
-            }
+            } => Self::encode_get_or_delete_metadata(enc, *request_id, scope, key),
             Self::SetMetadata {
                 request_id,
                 scope,
                 key,
                 value,
-            } => {
-                enc.write_field_with(field::set_metadata::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::set_metadata::SCOPE, |e| encode_scope(scope, e));
-                enc.write_field(field::set_metadata::KEY, key.as_bytes());
-                enc.write_field(field::set_metadata::VALUE, value);
-            }
+            } => Self::encode_set_metadata(enc, *request_id, scope, key, value),
             Self::ListMetadata { request_id, scope } => {
-                enc.write_field_with(field::list_metadata::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::list_metadata::SCOPE, |e| encode_scope(scope, e));
+                Self::encode_list_metadata(enc, *request_id, scope);
             }
             Self::SubscribeMetadata { scope, key } => {
-                enc.write_field_with(field::subscribe_metadata::SCOPE, |e| encode_scope(scope, e));
-                enc.write_field(field::subscribe_metadata::KEY, key.as_bytes());
+                Self::encode_subscribe_metadata(enc, scope, key);
             }
             Self::MetadataChanged { scope, key, value } => {
-                enc.write_field_with(field::metadata_changed::SCOPE, |e| encode_scope(scope, e));
-                enc.write_field(field::metadata_changed::KEY, key.as_bytes());
-                // Optional value: absent field = tombstone (None).
-                if let Some(v) = value.as_deref() {
-                    enc.write_field(field::metadata_changed::VALUE, v);
-                }
+                Self::encode_metadata_changed(enc, scope, key, value.as_deref());
             }
             Self::MetadataValue { request_id, value } => {
-                enc.write_field_with(field::metadata_value::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                // Optional value: absent field = key absent (None).
-                if let Some(v) = value.as_deref() {
-                    enc.write_field(field::metadata_value::VALUE, v);
-                }
+                Self::encode_metadata_value(enc, *request_id, value.as_deref());
             }
             Self::MetadataKeys { request_id, keys } => {
-                enc.write_field_with(field::metadata_keys::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                // The keys list is one field whose value is a positional u32
-                // count + N length-prefixed strings (present even when empty).
-                enc.write_field_with(field::metadata_keys::KEYS, |e| {
-                    debug_assert!(
-                        u32::try_from(keys.len()).is_ok(),
-                        "metadata keys list length exceeds u32",
-                    );
-                    let len = u32::try_from(keys.len()).unwrap_or(u32::MAX);
-                    e.write_u32_be(len);
-                    for k in keys {
-                        e.write_str(k);
-                    }
-                });
+                Self::encode_metadata_keys(enc, *request_id, keys);
             }
             Self::SpawnTerminal {
                 request_id,
@@ -1445,144 +1202,845 @@ impl FrameKind {
                 agent_session,
                 initial_size,
             } => {
-                enc.write_field_with(field::spawn_terminal::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::spawn_terminal::GROUP, |e| {
-                    e.write_u32_be(group.get());
-                });
-                // Optional command/cwd/env: absent field = None. An empty list
-                // (`Some(vec![])`) stays distinct: a present field with a zero
-                // count.
-                if let Some(cmd) = command.as_deref() {
-                    enc.write_field_with(field::spawn_terminal::COMMAND, |e| {
-                        encode_string_list(cmd, e);
-                    });
-                }
-                if let Some(c) = cwd.as_deref() {
-                    enc.write_field(field::spawn_terminal::CWD, c.as_bytes());
-                }
-                if let Some(env) = env.as_deref() {
-                    enc.write_field_with(field::spawn_terminal::ENV, |e| encode_env(env, e));
-                }
-                if let Some(t) = term.as_deref() {
-                    enc.write_field(field::spawn_terminal::TERM, t.as_bytes());
-                }
-                if let Some(host) = satellite.as_ref() {
-                    enc.write_field(field::spawn_terminal::SATELLITE, host.as_str().as_bytes());
-                }
-                if let Some(owner) = owner_terminal.as_ref() {
-                    enc.write_field_with(field::spawn_terminal::OWNER_TERMINAL, |e| {
-                        encode_terminal_id(owner, e);
-                    });
-                }
-                if let Some(value) = agent_session {
-                    enc.write_field(field::spawn_terminal::AGENT_SESSION, value);
-                }
-                if let Some((cols, rows)) = initial_size {
-                    enc.write_field_with(field::spawn_terminal::INITIAL_SIZE, |e| {
-                        e.write_u16_be(*cols);
-                        e.write_u16_be(*rows);
-                    });
-                }
+                Self::encode_spawn_terminal_request(enc, *request_id, *group);
+                Self::encode_spawn_terminal_process(
+                    enc,
+                    command.as_deref(),
+                    cwd.as_deref(),
+                    env.as_deref(),
+                    term.as_deref(),
+                );
+                Self::encode_spawn_terminal_placement(
+                    enc,
+                    satellite.as_ref(),
+                    owner_terminal.as_ref(),
+                    agent_session.as_deref(),
+                    *initial_size,
+                );
             }
             Self::TerminalSpawned { request_id, result } => {
-                enc.write_field_with(field::terminal_spawned::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::terminal_spawned::RESULT, |e| {
-                    encode_spawn_result(result, e);
-                });
+                Self::encode_terminal_spawned(enc, *request_id, result);
             }
             Self::MoveTerminal {
                 request_id,
                 terminal,
                 owner_terminal,
-            } => {
-                enc.write_field_with(field::move_terminal::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::move_terminal::TERMINAL, |e| {
-                    encode_terminal_id(terminal, e);
-                });
-                enc.write_field_with(field::move_terminal::OWNER_TERMINAL, |e| {
-                    encode_terminal_id(owner_terminal, e);
-                });
-            }
+            } => Self::encode_move_terminal(enc, *request_id, terminal, owner_terminal),
             Self::TerminalMoved { request_id, result } => {
-                enc.write_field_with(field::terminal_moved::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::terminal_moved::RESULT, |e| {
-                    encode_move_result(result, e);
-                });
+                Self::encode_terminal_moved(enc, *request_id, result);
             }
             Self::TerminalClosed {
                 terminal_id,
                 exit_status,
-            } => {
-                enc.write_field_with(field::terminal_closed::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                // Optional exit status: absent field = signal / unknown.
-                if let Some(status) = exit_status {
-                    enc.write_field_with(field::terminal_closed::EXIT_STATUS, |e| {
-                        e.write_u32_be(u32::from_be_bytes(status.to_be_bytes()));
-                    });
-                }
-            }
+            } => Self::encode_terminal_closed(enc, terminal_id, *exit_status),
             Self::TerminalResize {
                 terminal_id,
                 cols,
                 rows,
-            } => {
-                enc.write_field_with(field::terminal_resize::TERMINAL_ID, |e| {
-                    encode_terminal_id(terminal_id, e);
-                });
-                enc.write_field_with(field::terminal_resize::COLS, |e| e.write_u16_be(*cols));
-                enc.write_field_with(field::terminal_resize::ROWS, |e| e.write_u16_be(*rows));
-            }
+            } => Self::encode_terminal_resize(enc, terminal_id, *cols, *rows),
             Self::Command {
                 request_id,
                 command,
-            } => {
-                enc.write_field_with(field::command::REQUEST_ID, |e| e.write_u32_be(*request_id));
-                enc.write_field_with(field::command::COMMAND, |e| encode_command(command, e));
-            }
+            } => Self::encode_command_frame(enc, *request_id, command),
             Self::CommandResult { request_id, result } => {
-                enc.write_field_with(field::command_result::REQUEST_ID, |e| {
-                    e.write_u32_be(*request_id);
-                });
-                enc.write_field_with(field::command_result::RESULT, |e| {
-                    encode_command_result(result, e);
-                });
+                Self::encode_command_result_frame(enc, *request_id, result);
             }
             Self::SubscribeEvents { terminal } => {
-                // Optional terminal scope: absent field = server-scoped None.
-                if let Some(t) = terminal.as_ref() {
-                    enc.write_field_with(field::subscribe_events::TERMINAL, |e| {
-                        encode_terminal_id(t, e);
-                    });
-                }
+                Self::encode_subscribe_events(enc, terminal.as_ref());
             }
             Self::Event { terminal, event } => {
-                if let Some(t) = terminal.as_ref() {
-                    enc.write_field_with(field::event::TERMINAL, |e| encode_terminal_id(t, e));
-                }
-                enc.write_field_with(field::event::EVENT, |e| encode_agent_event(event, e));
+                Self::encode_event(enc, terminal.as_ref(), event);
             }
         }
+    }
 
-        // Backfill the length header. The length value excludes the four
-        // header bytes themselves but includes the type byte and payload, per
-        // SPEC §5.
-        let body_len = out.len() - body_start;
-        debug_assert!(
-            u32::try_from(body_len).is_ok_and(|n| n <= MAX_FRAME_LEN),
-            "encoded frame exceeds protocol cap",
-        );
-        let len_u32 = u32::try_from(body_len).unwrap_or(u32::MAX);
-        out[header_pos..header_pos + 4].copy_from_slice(&len_u32.to_be_bytes());
+    /// Write the `HELLO` payload (`docs/spec/proto.md` §6.1).
+    fn encode_hello(
+        enc: &mut Encoder<'_>,
+        client_name: &str,
+        protocol_major: u16,
+        protocol_minor: u16,
+        protocol_patch: u16,
+        client_caps: &ClientCapabilities,
+    ) {
+        // String fields ride as raw UTF-8 bytes — the field is already
+        // length-delimited by the TLV header, so no inner length prefix.
+        enc.write_field(field::hello::CLIENT_NAME, client_name.as_bytes());
+        enc.write_field_with(field::hello::PROTOCOL_MAJOR, |e| {
+            e.write_u16_be(protocol_major);
+        });
+        enc.write_field_with(field::hello::PROTOCOL_MINOR, |e| {
+            e.write_u16_be(protocol_minor);
+        });
+        enc.write_field_with(field::hello::PROTOCOL_PATCH, |e| {
+            e.write_u16_be(protocol_patch);
+        });
+        // ClientCapabilities remains a positional sub-record inside its
+        // top-level TLV field. Protocol 0.7 fixes the complete order:
+        // legacy render caps, palette presence/value, profile set,
+        // exact native codec set/features, then receive bounds.
+        enc.write_field_with(field::hello::CLIENT_CAPS, |e| {
+            e.write_u8(client_caps.color_support.as_wire());
+            e.write_u8(client_caps.layers.as_wire());
+            e.write_u8(client_caps.image_protocols.as_wire());
+            e.write_u8(client_caps.kbd_protocols.as_wire());
+            e.write_u8(u8::from(client_caps.hyperlinks));
+            e.write_u8(client_caps.output_mode.as_wire());
+            if let Some(colors) = client_caps.default_colors {
+                e.write_u8(1);
+                e.write_u8(colors.foreground.r);
+                e.write_u8(colors.foreground.g);
+                e.write_u8(colors.foreground.b);
+                e.write_u8(colors.background.r);
+                e.write_u8(colors.background.g);
+                e.write_u8(colors.background.b);
+            } else {
+                e.write_u8(0);
+            }
+            e.write_u8(client_caps.bootstrap.profiles.as_wire());
+            e.write_u64_be(client_caps.bootstrap.native_codecs.as_wire());
+            e.write_u32_be(client_caps.bootstrap.native_features.as_wire());
+            e.write_u32_be(client_caps.bootstrap.limits.max_chunk_bytes());
+            e.write_u32_be(client_caps.bootstrap.limits.max_history_page_bytes());
+        });
+    }
+
+    /// Write the exact protocol version `HELLO_OK` admits the peer at.
+    fn encode_hello_ok_version(
+        enc: &mut Encoder<'_>,
+        protocol_major: u16,
+        protocol_minor: u16,
+        protocol_patch: u16,
+    ) {
+        enc.write_field_with(field::hello_ok::PROTOCOL_MAJOR, |e| {
+            e.write_u16_be(protocol_major);
+        });
+        enc.write_field_with(field::hello_ok::PROTOCOL_MINOR, |e| {
+            e.write_u16_be(protocol_minor);
+        });
+        enc.write_field_with(field::hello_ok::PROTOCOL_PATCH, |e| {
+            e.write_u16_be(protocol_patch);
+        });
+    }
+
+    /// Write the terms `HELLO_OK` negotiates: caps, identity, profile, bounds.
+    fn encode_hello_ok_negotiation(
+        enc: &mut Encoder<'_>,
+        server_caps: ServerCapabilities,
+        server_id: &[u8],
+        selected_profile: BootstrapProfile,
+        bootstrap_limits: BootstrapLimits,
+    ) {
+        enc.write_field_with(field::hello_ok::SERVER_CAPS, |e| {
+            e.write_u8(server_caps.layers.as_wire());
+            if !server_caps.features.is_empty() {
+                e.write_u32_be(server_caps.features.as_wire());
+            }
+        });
+        // server_id is opaque bytes; the field is already
+        // length-delimited so the raw bytes are the value.
+        enc.write_field(field::hello_ok::SERVER_ID, server_id);
+        enc.write_field_with(field::hello_ok::SELECTED_PROFILE, |e| {
+            encode_bootstrap_profile(selected_profile, e);
+        });
+        enc.write_field_with(field::hello_ok::MAX_CHUNK_BYTES, |e| {
+            e.write_u32_be(bootstrap_limits.max_chunk_bytes());
+        });
+        enc.write_field_with(field::hello_ok::MAX_HISTORY_PAGE_BYTES, |e| {
+            e.write_u32_be(bootstrap_limits.max_history_page_bytes());
+        });
+    }
+
+    /// Write the single nonce field shared by `PING` and `PONG`.
+    fn encode_nonce(enc: &mut Encoder<'_>, nonce: u64) {
+        enc.write_field_with(field::ping::NONCE, |e| e.write_u64_be(nonce));
+    }
+
+    /// Write the `TERMINAL_OUTPUT` payload: VT bytes bound to a generation.
+    fn encode_terminal_output(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        seq: u64,
+        bytes: &[u8],
+    ) {
+        enc.write_field_with(field::terminal_output::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::terminal_output::SEQ, |e| e.write_u64_be(seq));
+        enc.write_field(field::terminal_output::BYTES, bytes);
+        enc.write_field_with(field::terminal_output::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::terminal_output::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+    }
+
+    /// Write the `ATTACH` payload.
+    fn encode_attach(
+        enc: &mut Encoder<'_>,
+        attach_id: u32,
+        target: &AttachTarget,
+        viewport: &ViewportInfo,
+        request_scrollback: bool,
+        scrollback_limit_lines: u32,
+    ) {
+        enc.write_field_with(field::attach::TARGET, |e| encode_attach_target(target, e));
+        enc.write_field_with(field::attach::VIEWPORT, |e| {
+            encode_viewport_info(viewport, e);
+        });
+        enc.write_field_with(field::attach::REQUEST_SCROLLBACK, |e| {
+            e.write_u8(u8::from(request_scrollback));
+        });
+        enc.write_field_with(field::attach::SCROLLBACK_LIMIT_LINES, |e| {
+            e.write_u32_be(scrollback_limit_lines);
+        });
+        enc.write_field_with(field::attach::ATTACH_ID, |e| e.write_u32_be(attach_id));
+    }
+
+    /// Write the `DETACHED` payload.
+    ///
+    /// Both fields are optional-absent (field.rs allocation discipline): an
+    /// unstated reason and an empty message encode as nothing at all, which
+    /// keeps the common acknowledge-a-clean-detach frame byte-identical to
+    /// what every 0.7.0 peer already emits.
+    fn encode_detached(enc: &mut Encoder<'_>, reason: Option<DetachReason>, message: &str) {
+        if let Some(reason) = reason {
+            enc.write_field_with(field::detached::REASON, |e| {
+                e.write_u8(reason.as_wire());
+            });
+        }
+        if !message.is_empty() {
+            enc.write_field(field::detached::MESSAGE, message.as_bytes());
+        }
+    }
+
+    /// Write the `INPUT_KEY` payload.
+    fn encode_input_key(enc: &mut Encoder<'_>, terminal_id: &TerminalId, event: &KeyEvent) {
+        enc.write_field_with(field::input_key::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::input_key::EVENT, |e| encode_key_event(event, e));
+    }
+
+    /// Write the `INPUT_MOUSE` payload.
+    fn encode_input_mouse(enc: &mut Encoder<'_>, terminal_id: &TerminalId, event: &MouseEvent) {
+        enc.write_field_with(field::input_mouse::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::input_mouse::EVENT, |e| encode_mouse_event(event, e));
+    }
+
+    /// Write the `INPUT_FOCUS` payload.
+    fn encode_input_focus(enc: &mut Encoder<'_>, terminal_id: &TerminalId, event: FocusEvent) {
+        enc.write_field_with(field::input_focus::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::input_focus::EVENT, |e| {
+            e.write_u8(encode_focus_event(event));
+        });
+    }
+
+    /// Write the `INPUT_PASTE` payload.
+    fn encode_input_paste(enc: &mut Encoder<'_>, terminal_id: &TerminalId, event: &PasteEvent) {
+        enc.write_field_with(field::input_paste::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::input_paste::EVENT, |e| encode_paste_event(event, e));
+    }
+
+    /// Write the `INPUT_TERMINAL_REPLY` payload.
+    fn encode_input_terminal_reply(enc: &mut Encoder<'_>, terminal_id: &TerminalId, bytes: &[u8]) {
+        enc.write_field_with(field::input_terminal_reply::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field(field::input_terminal_reply::BYTES, bytes);
+    }
+
+    /// Write the `FRAME_ACK` payload.
+    fn encode_frame_ack(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        seq: u64,
+    ) {
+        enc.write_field_with(field::frame_ack::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::frame_ack::SEQ, |e| e.write_u64_be(seq));
+        enc.write_field_with(field::frame_ack::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::frame_ack::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+    }
+
+    /// Write the `VIEWPORT_RESIZE` payload.
+    fn encode_viewport_resize(enc: &mut Encoder<'_>, viewport: &ViewportInfo) {
+        enc.write_field_with(field::viewport_resize::VIEWPORT, |e| {
+            encode_viewport_info(viewport, e);
+        });
+    }
+
+    /// Write the `ATTACHED` payload.
+    fn encode_attached(
+        enc: &mut Encoder<'_>,
+        attach_id: u32,
+        snapshot: &SessionSnapshot,
+        initial_client_id: ClientId,
+    ) {
+        enc.write_field_with(field::attached::SNAPSHOT, |e| {
+            encode_session_snapshot(snapshot, e);
+        });
+        enc.write_field_with(field::attached::INITIAL_CLIENT_ID, |e| {
+            encode_client_id(initial_client_id, e);
+        });
+        enc.write_field_with(field::attached::ATTACH_ID, |e| e.write_u32_be(attach_id));
+    }
+
+    /// Write the `ATTACH_READY` payload.
+    fn encode_attach_ready(enc: &mut Encoder<'_>, attach_id: u32) {
+        enc.write_field_with(field::attach_ready::ATTACH_ID, |e| {
+            e.write_u32_be(attach_id);
+        });
+    }
+
+    /// Write the generation binding that opens the `BOOTSTRAP_BEGIN` payload.
+    fn encode_bootstrap_begin_stream(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+    ) {
+        enc.write_field_with(field::bootstrap_begin::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::bootstrap_begin::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::bootstrap_begin::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+    }
+
+    /// Write the profile half of `BOOTSTRAP_BEGIN`: codec, geometry, base seq.
+    ///
+    /// The stream profile projects onto the wire as a `(codec, output_mode)`
+    /// pair; native state always means raw, byte-identical PTY continuation.
+    fn encode_bootstrap_begin_profile(
+        enc: &mut Encoder<'_>,
+        profile: BootstrapStreamProfile,
+        cols: u16,
+        rows: u16,
+        base_seq: u64,
+    ) {
+        let (codec, output_mode) = match profile {
+            BootstrapStreamProfile::NativeState { codec } => {
+                (BootstrapCodec::Native(codec), OutputMode::Raw)
+            }
+            BootstrapStreamProfile::SynthesizedVtRaw => {
+                (BootstrapCodec::SynthesizedVtV1, OutputMode::Raw)
+            }
+            BootstrapStreamProfile::SynthesizedVtStateSync => {
+                (BootstrapCodec::SynthesizedVtV1, OutputMode::StateSync)
+            }
+        };
+        enc.write_field_with(field::bootstrap_begin::CODEC, |e| {
+            encode_bootstrap_codec(codec, e);
+        });
+        enc.write_field_with(field::bootstrap_begin::COLS, |e| e.write_u16_be(cols));
+        enc.write_field_with(field::bootstrap_begin::ROWS, |e| e.write_u16_be(rows));
+        enc.write_field_with(field::bootstrap_begin::OUTPUT_MODE, |e| {
+            e.write_u8(output_mode.as_wire());
+        });
+        enc.write_field_with(field::bootstrap_begin::BASE_SEQ, |e| {
+            e.write_u64_be(base_seq);
+        });
+    }
+
+    /// Write the `BOOTSTRAP_CHUNK` payload.
+    fn encode_bootstrap_chunk(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        chunk_seq: u32,
+        payload: &[u8],
+    ) {
+        enc.write_field_with(field::bootstrap_chunk::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::bootstrap_chunk::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::bootstrap_chunk::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+        enc.write_field_with(field::bootstrap_chunk::CHUNK_SEQ, |e| {
+            e.write_u32_be(chunk_seq);
+        });
+        enc.write_field(field::bootstrap_chunk::PAYLOAD, payload);
+    }
+
+    /// Write the `BOOTSTRAP_READY` payload.
+    fn encode_bootstrap_ready(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        history_cursor: Option<&[u8]>,
+    ) {
+        enc.write_field_with(field::bootstrap_ready::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::bootstrap_ready::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::bootstrap_ready::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+        if let Some(cursor) = history_cursor {
+            enc.write_field(field::bootstrap_ready::HISTORY_CURSOR, cursor);
+        }
+    }
+
+    /// Write the `HISTORY_REQUEST` payload.
+    fn encode_history_request(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        cursor: &[u8],
+        max_bytes: u32,
+        max_rows: u32,
+    ) {
+        enc.write_field_with(field::history_request::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::history_request::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::history_request::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+        enc.write_field(field::history_request::CURSOR, cursor);
+        enc.write_field_with(field::history_request::MAX_BYTES, |e| {
+            e.write_u32_be(max_bytes);
+        });
+        enc.write_field_with(field::history_request::MAX_ROWS, |e| {
+            e.write_u32_be(max_rows);
+        });
+    }
+
+    /// Write the generation binding that opens the `HISTORY_PAGE` payload.
+    fn encode_history_page_stream(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+    ) {
+        enc.write_field_with(field::history_page::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::history_page::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::history_page::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+    }
+
+    /// Write the page half of `HISTORY_PAGE`: cursors, payload, and counts.
+    fn encode_history_page_body(
+        enc: &mut Encoder<'_>,
+        cursor: &[u8],
+        next_cursor: Option<&[u8]>,
+        payload: &[u8],
+        page_seq: u64,
+        rows: u32,
+    ) {
+        enc.write_field(field::history_page::CURSOR, cursor);
+        if let Some(next) = next_cursor {
+            enc.write_field(field::history_page::NEXT_CURSOR, next);
+        }
+        enc.write_field(field::history_page::PAYLOAD, payload);
+        enc.write_field_with(field::history_page::PAGE_SEQ, |e| {
+            e.write_u64_be(page_seq);
+        });
+        enc.write_field_with(field::history_page::ROWS, |e| {
+            e.write_u32_be(rows);
+        });
+    }
+
+    /// Write the `BOOTSTRAP_TOMBSTONE` payload.
+    fn encode_bootstrap_tombstone(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        reason: TombstoneReason,
+        last_valid_seq: u64,
+    ) {
+        enc.write_field_with(field::bootstrap_tombstone::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::bootstrap_tombstone::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::bootstrap_tombstone::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+        enc.write_field_with(field::bootstrap_tombstone::REASON, |e| {
+            e.write_u8(reason.as_wire());
+        });
+        enc.write_field_with(field::bootstrap_tombstone::LAST_VALID_SEQ, |e| {
+            e.write_u64_be(last_valid_seq);
+        });
+    }
+
+    /// Write the `HISTORY_TOMBSTONE` payload.
+    fn encode_history_tombstone(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+        cursor: &[u8],
+        reason: HistoryTombstoneReason,
+    ) {
+        enc.write_field_with(field::history_tombstone::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::history_tombstone::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::history_tombstone::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+        enc.write_field(field::history_tombstone::CURSOR, cursor);
+        enc.write_field_with(field::history_tombstone::REASON, |e| {
+            e.write_u8(reason.as_wire());
+        });
+    }
+
+    /// Write the generation binding that opens the `HISTORY_REJECTED` payload.
+    fn encode_history_rejected_stream(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        stream_id: StreamId,
+        bootstrap_id: BootstrapId,
+    ) {
+        enc.write_field_with(field::history_rejected::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::history_rejected::STREAM_ID, |e| {
+            e.write_u64_be(stream_id.get());
+        });
+        enc.write_field_with(field::history_rejected::BOOTSTRAP_ID, |e| {
+            e.write_u64_be(bootstrap_id.get());
+        });
+    }
+
+    /// Write why `HISTORY_REJECTED` refused the cursor, and what it would need.
+    fn encode_history_rejected_reason(
+        enc: &mut Encoder<'_>,
+        cursor: &[u8],
+        reason: HistoryRejectionReason,
+        required_bytes: u32,
+        required_rows: u32,
+    ) {
+        enc.write_field(field::history_rejected::CURSOR, cursor);
+        enc.write_field_with(field::history_rejected::REASON, |e| {
+            e.write_u8(reason.as_wire());
+        });
+        enc.write_field_with(field::history_rejected::REQUIRED_BYTES, |e| {
+            e.write_u32_be(required_bytes);
+        });
+        enc.write_field_with(field::history_rejected::REQUIRED_ROWS, |e| {
+            e.write_u32_be(required_rows);
+        });
+    }
+
+    /// Write the `BELL` payload.
+    fn encode_bell(enc: &mut Encoder<'_>, terminal_id: &TerminalId) {
+        enc.write_field_with(field::bell::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+    }
+
+    /// Write the `ERROR` payload.
+    fn encode_error(
+        enc: &mut Encoder<'_>,
+        request_id: Option<u32>,
+        code: ErrorCode,
+        message: &str,
+    ) {
+        // Optional request_id: absent field = None.
+        if let Some(id) = request_id {
+            enc.write_field_with(field::error::REQUEST_ID, |e| e.write_u32_be(id));
+        }
+        enc.write_field_with(field::error::CODE, |e| e.write_u16_be(code.as_wire()));
+        enc.write_field(field::error::MESSAGE, message.as_bytes());
+    }
+
+    /// Write the `{request_id, scope, key}` body shared by GET and DELETE.
+    fn encode_get_or_delete_metadata(
+        enc: &mut Encoder<'_>,
+        request_id: u32,
+        scope: &Scope,
+        key: &str,
+    ) {
+        enc.write_field_with(field::get_metadata::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::get_metadata::SCOPE, |e| encode_scope(scope, e));
+        enc.write_field(field::get_metadata::KEY, key.as_bytes());
+    }
+
+    /// Write the `SET_METADATA` payload.
+    fn encode_set_metadata(
+        enc: &mut Encoder<'_>,
+        request_id: u32,
+        scope: &Scope,
+        key: &str,
+        value: &[u8],
+    ) {
+        enc.write_field_with(field::set_metadata::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::set_metadata::SCOPE, |e| encode_scope(scope, e));
+        enc.write_field(field::set_metadata::KEY, key.as_bytes());
+        enc.write_field(field::set_metadata::VALUE, value);
+    }
+
+    /// Write the `LIST_METADATA` payload.
+    fn encode_list_metadata(enc: &mut Encoder<'_>, request_id: u32, scope: &Scope) {
+        enc.write_field_with(field::list_metadata::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::list_metadata::SCOPE, |e| encode_scope(scope, e));
+    }
+
+    /// Write the `SUBSCRIBE_METADATA` payload.
+    fn encode_subscribe_metadata(enc: &mut Encoder<'_>, scope: &Scope, key: &str) {
+        enc.write_field_with(field::subscribe_metadata::SCOPE, |e| encode_scope(scope, e));
+        enc.write_field(field::subscribe_metadata::KEY, key.as_bytes());
+    }
+
+    /// Write the `METADATA_CHANGED` payload.
+    fn encode_metadata_changed(
+        enc: &mut Encoder<'_>,
+        scope: &Scope,
+        key: &str,
+        value: Option<&[u8]>,
+    ) {
+        enc.write_field_with(field::metadata_changed::SCOPE, |e| encode_scope(scope, e));
+        enc.write_field(field::metadata_changed::KEY, key.as_bytes());
+        // Optional value: absent field = tombstone (None).
+        if let Some(v) = value {
+            enc.write_field(field::metadata_changed::VALUE, v);
+        }
+    }
+
+    /// Write the `METADATA_VALUE` payload.
+    fn encode_metadata_value(enc: &mut Encoder<'_>, request_id: u32, value: Option<&[u8]>) {
+        enc.write_field_with(field::metadata_value::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        // Optional value: absent field = key absent (None).
+        if let Some(v) = value {
+            enc.write_field(field::metadata_value::VALUE, v);
+        }
+    }
+
+    /// Write the `METADATA_KEYS` payload.
+    fn encode_metadata_keys(enc: &mut Encoder<'_>, request_id: u32, keys: &[String]) {
+        enc.write_field_with(field::metadata_keys::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        // The keys list is one field whose value is a positional u32
+        // count + N length-prefixed strings (present even when empty).
+        enc.write_field_with(field::metadata_keys::KEYS, |e| {
+            debug_assert!(
+                u32::try_from(keys.len()).is_ok(),
+                "metadata keys list length exceeds u32",
+            );
+            let len = u32::try_from(keys.len()).unwrap_or(u32::MAX);
+            e.write_u32_be(len);
+            for k in keys {
+                e.write_str(k);
+            }
+        });
+    }
+
+    /// Write the request identity that opens the `SPAWN_TERMINAL` payload.
+    fn encode_spawn_terminal_request(enc: &mut Encoder<'_>, request_id: u32, group: GroupId) {
+        enc.write_field_with(field::spawn_terminal::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::spawn_terminal::GROUP, |e| {
+            e.write_u32_be(group.get());
+        });
+    }
+
+    /// Write the process shape `SPAWN_TERMINAL` asks the server to launch.
+    ///
+    /// Optional command/cwd/env: absent field = None. An empty list
+    /// (`Some(vec![])`) stays distinct: a present field with a zero count.
+    fn encode_spawn_terminal_process(
+        enc: &mut Encoder<'_>,
+        command: Option<&[String]>,
+        cwd: Option<&str>,
+        env_vars: Option<&[(String, String)]>,
+        term: Option<&str>,
+    ) {
+        if let Some(cmd) = command {
+            enc.write_field_with(field::spawn_terminal::COMMAND, |e| {
+                encode_string_list(cmd, e);
+            });
+        }
+        if let Some(c) = cwd {
+            enc.write_field(field::spawn_terminal::CWD, c.as_bytes());
+        }
+        if let Some(vars) = env_vars {
+            enc.write_field_with(field::spawn_terminal::ENV, |e| encode_env(vars, e));
+        }
+        if let Some(t) = term {
+            enc.write_field(field::spawn_terminal::TERM, t.as_bytes());
+        }
+    }
+
+    /// Write where the spawned terminal lands: host, owner, session, size.
+    fn encode_spawn_terminal_placement(
+        enc: &mut Encoder<'_>,
+        satellite: Option<&SatelliteHost>,
+        owner_terminal: Option<&TerminalId>,
+        agent_session: Option<&[u8]>,
+        initial_size: Option<(u16, u16)>,
+    ) {
+        if let Some(host) = satellite {
+            enc.write_field(field::spawn_terminal::SATELLITE, host.as_str().as_bytes());
+        }
+        if let Some(owner) = owner_terminal {
+            enc.write_field_with(field::spawn_terminal::OWNER_TERMINAL, |e| {
+                encode_terminal_id(owner, e);
+            });
+        }
+        if let Some(value) = agent_session {
+            enc.write_field(field::spawn_terminal::AGENT_SESSION, value);
+        }
+        if let Some((cols, rows)) = initial_size {
+            enc.write_field_with(field::spawn_terminal::INITIAL_SIZE, |e| {
+                e.write_u16_be(cols);
+                e.write_u16_be(rows);
+            });
+        }
+    }
+
+    /// Write the `TERMINAL_SPAWNED` payload.
+    fn encode_terminal_spawned(enc: &mut Encoder<'_>, request_id: u32, result: &SpawnResult) {
+        enc.write_field_with(field::terminal_spawned::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::terminal_spawned::RESULT, |e| {
+            encode_spawn_result(result, e);
+        });
+    }
+
+    /// Write the `MOVE_TERMINAL` payload.
+    fn encode_move_terminal(
+        enc: &mut Encoder<'_>,
+        request_id: u32,
+        terminal: &TerminalId,
+        owner_terminal: &TerminalId,
+    ) {
+        enc.write_field_with(field::move_terminal::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::move_terminal::TERMINAL, |e| {
+            encode_terminal_id(terminal, e);
+        });
+        enc.write_field_with(field::move_terminal::OWNER_TERMINAL, |e| {
+            encode_terminal_id(owner_terminal, e);
+        });
+    }
+
+    /// Write the `TERMINAL_MOVED` payload.
+    fn encode_terminal_moved(enc: &mut Encoder<'_>, request_id: u32, result: &MoveResult) {
+        enc.write_field_with(field::terminal_moved::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::terminal_moved::RESULT, |e| {
+            encode_move_result(result, e);
+        });
+    }
+
+    /// Write the `TERMINAL_CLOSED` payload.
+    fn encode_terminal_closed(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        exit_status: Option<i32>,
+    ) {
+        enc.write_field_with(field::terminal_closed::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        // Optional exit status: absent field = signal / unknown.
+        if let Some(status) = exit_status {
+            enc.write_field_with(field::terminal_closed::EXIT_STATUS, |e| {
+                e.write_u32_be(u32::from_be_bytes(status.to_be_bytes()));
+            });
+        }
+    }
+
+    /// Write the `TERMINAL_RESIZE` payload.
+    fn encode_terminal_resize(
+        enc: &mut Encoder<'_>,
+        terminal_id: &TerminalId,
+        cols: u16,
+        rows: u16,
+    ) {
+        enc.write_field_with(field::terminal_resize::TERMINAL_ID, |e| {
+            encode_terminal_id(terminal_id, e);
+        });
+        enc.write_field_with(field::terminal_resize::COLS, |e| e.write_u16_be(cols));
+        enc.write_field_with(field::terminal_resize::ROWS, |e| e.write_u16_be(rows));
+    }
+
+    /// Write the `COMMAND` payload.
+    fn encode_command_frame(enc: &mut Encoder<'_>, request_id: u32, command: &Command) {
+        enc.write_field_with(field::command::REQUEST_ID, |e| e.write_u32_be(request_id));
+        enc.write_field_with(field::command::COMMAND, |e| encode_command(command, e));
+    }
+
+    /// Write the `COMMAND_RESULT` payload.
+    fn encode_command_result_frame(enc: &mut Encoder<'_>, request_id: u32, result: &CommandResult) {
+        enc.write_field_with(field::command_result::REQUEST_ID, |e| {
+            e.write_u32_be(request_id);
+        });
+        enc.write_field_with(field::command_result::RESULT, |e| {
+            encode_command_result(result, e);
+        });
+    }
+
+    /// Write the `SUBSCRIBE_EVENTS` payload.
+    fn encode_subscribe_events(enc: &mut Encoder<'_>, terminal: Option<&TerminalId>) {
+        // Optional terminal scope: absent field = server-scoped None.
+        if let Some(t) = terminal {
+            enc.write_field_with(field::subscribe_events::TERMINAL, |e| {
+                encode_terminal_id(t, e);
+            });
+        }
+    }
+
+    /// Write the `EVENT` payload.
+    fn encode_event(enc: &mut Encoder<'_>, terminal: Option<&TerminalId>, event: &AgentEvent) {
+        if let Some(t) = terminal {
+            enc.write_field_with(field::event::TERMINAL, |e| encode_terminal_id(t, e));
+        }
+        enc.write_field_with(field::event::EVENT, |e| encode_agent_event(event, e));
     }
 
     /// Decode a single frame from `input`. Returns the decoded frame and the
