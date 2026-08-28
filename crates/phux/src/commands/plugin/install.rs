@@ -115,42 +115,114 @@ fn install(
     std::fs::create_dir_all(&plugins_dir)
         .map_err(|err| format!("could not create {}: {err}", plugins_dir.display()))?;
 
-    let mut staging = StagingGuard::claim(&plugins_dir);
-    let resolved_rev = fetch_into_staging(&source, staging.path())?;
-    let plugin_root = locate_plugin_root(staging.path())?;
-    let manifest = load_fetched_manifest(&plugin_root, reference)?;
-    run_build_steps(runtime, &manifest)?;
-
-    let final_dir = plugins_dir.join(install_dir_name(&manifest.id));
-    if final_dir.exists() {
-        return Err(format!(
-            "plugin {} is already installed at {}; run `phux plugin update {}` to refresh it",
-            manifest.id,
-            final_dir.display(),
-            manifest.id,
-        ));
-    }
-    promote(staging.path(), &plugin_root, &final_dir)?;
-    staging.disarm();
+    let mut staged = stage_plugin(runtime, &source, &plugins_dir, reference)?;
+    let final_dir = plugins_dir.join(install_dir_name(&staged.manifest.id));
+    promote_staged_plugin(&mut staged, &final_dir)?;
 
     // Reload from the managed location so the linked manifest path (and
     // the plugin root actions execute from) is the installed copy.
     let manifest = load_fetched_manifest(&final_dir, reference)?;
 
-    let mut lockfile = read_lockfile(&plugins_dir)?;
+    record_install_in_lockfile(
+        &plugins_dir,
+        &source,
+        &manifest.id,
+        staged.resolved_rev.as_deref(),
+    )?;
+
+    let entry = upsert_config_entry(manifest, enabled)?;
+    Ok(report_installed(
+        &entry,
+        &final_dir,
+        &source,
+        staged.resolved_rev.as_deref(),
+        json,
+    ))
+}
+
+/// A plugin fetched into the staging directory and built, but not yet moved
+/// into its managed location.
+struct StagedPlugin {
+    /// Removes the staging directory unless the promotion disarms it.
+    staging: StagingGuard,
+    /// The plugin root inside the staging directory.
+    root: PathBuf,
+    /// The manifest as fetched, before the reload from the managed location.
+    manifest: PluginManifest,
+    /// The commit the fetch resolved to, when the source names one.
+    resolved_rev: Option<String>,
+}
+
+/// Fetch the source into staging, validate its manifest, and run its
+/// `[[build]]` steps — everything that happens before anything under the
+/// managed plugins directory is touched.
+fn stage_plugin(
+    runtime: &tokio::runtime::Runtime,
+    source: &InstallSource,
+    plugins_dir: &Path,
+    reference: &str,
+) -> Result<StagedPlugin, String> {
+    let staging = StagingGuard::claim(plugins_dir);
+    let resolved_rev = fetch_into_staging(source, staging.path())?;
+    let root = locate_plugin_root(staging.path())?;
+    let manifest = load_fetched_manifest(&root, reference)?;
+    run_build_steps(runtime, &manifest)?;
+    Ok(StagedPlugin {
+        staging,
+        root,
+        manifest,
+        resolved_rev,
+    })
+}
+
+/// Move the staged plugin into its managed location, refusing to install over
+/// a plugin that is already there — `phux plugin update` is the way to refresh
+/// one, so an install can never clobber an existing tree.
+fn promote_staged_plugin(staged: &mut StagedPlugin, final_dir: &Path) -> Result<(), String> {
+    if final_dir.exists() {
+        return Err(format!(
+            "plugin {} is already installed at {}; run `phux plugin update {}` to refresh it",
+            staged.manifest.id,
+            final_dir.display(),
+            staged.manifest.id,
+        ));
+    }
+    promote(staged.staging.path(), &staged.root, final_dir)?;
+    staged.staging.disarm();
+    Ok(())
+}
+
+/// Record the install's provenance (ref, branch, resolved commit) in the
+/// managed dir's `plugins.lock`, so `phux plugin update` can re-fetch without
+/// re-asking the user.
+fn record_install_in_lockfile(
+    plugins_dir: &Path,
+    source: &InstallSource,
+    id: &str,
+    resolved_rev: Option<&str>,
+) -> Result<(), String> {
+    let mut lockfile = read_lockfile(plugins_dir)?;
     upsert_entry(
         &mut lockfile,
         PluginLockEntry {
-            id: manifest.id.clone(),
+            id: id.to_owned(),
             source: source.kind(),
             source_ref: source.source_ref(),
             branch: source.branch(),
-            rev: resolved_rev.clone(),
+            rev: resolved_rev.map(str::to_owned),
         },
     );
-    write_lockfile(&plugins_dir, &lockfile)?;
+    write_lockfile(plugins_dir, &lockfile)
+}
 
-    let entry = upsert_config_entry(manifest, enabled)?;
+/// Report the finished install, as the `--json` document or the human line.
+fn report_installed(
+    entry: &super::registry::RegistryEntry,
+    final_dir: &Path,
+    source: &InstallSource,
+    resolved_rev: Option<&str>,
+    json: bool,
+) -> ExitCode {
     if json {
         let doc = serde_json::json!({
             "schema_version": 1,
@@ -165,19 +237,17 @@ fn install(
                 "enabled": entry.enabled,
             },
         });
-        return Ok(print_json(&doc));
+        return print_json(&doc);
     }
     let state = if entry.enabled { "enabled" } else { "disabled" };
-    let rev_note = resolved_rev
-        .as_deref()
-        .map_or_else(String::new, |rev| format!(" at {rev}"));
+    let rev_note = resolved_rev.map_or_else(String::new, |rev| format!(" at {rev}"));
     outln!(
         "installed {} {}{rev_note} -> {} ({state})",
         entry.manifest.id,
         entry.manifest.version,
         final_dir.display(),
     );
-    Ok(ExitCode::SUCCESS)
+    ExitCode::SUCCESS
 }
 
 /// One `phux plugin update` result line.

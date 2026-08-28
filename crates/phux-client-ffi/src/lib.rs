@@ -260,41 +260,8 @@ pub unsafe extern "C" fn phux_client_new(
             mem::size_of::<PhuxClientOptions>(),
             options.version,
         )?;
-        let limits = BootstrapLimits::new(
-            options.max_bootstrap_chunk_bytes,
-            options.max_history_page_bytes,
-        )
-        .ok_or_else(|| {
-            BridgeError::invalid("bootstrap/history bounds are zero or exceed protocol limits")
-        })?;
-        if options.max_history_page_rows == 0
-            || options.max_history_page_rows > phux_client_core::history::MAX_HISTORY_PAGE_ROWS
-        {
-            return Err(BridgeError::invalid(
-                "history page row bound is zero or exceeds the protocol limit",
-            ));
-        }
-        if options.max_history_cache_bytes == 0
-            || options.max_history_materialized_rows == 0
-            || usize::try_from(options.max_history_page_bytes).is_err()
-            || usize::try_from(options.max_history_page_bytes)
-                .is_ok_and(|bytes| bytes > options.max_history_cache_bytes)
-            || usize::try_from(options.max_history_page_rows)
-                .is_ok_and(|rows| rows > options.max_history_materialized_rows)
-        {
-            return Err(BridgeError::invalid(
-                "history cache bounds cannot retain one requested page",
-            ));
-        }
         let client = Box::new(PhuxClient {
-            inner: Client::new(Limits {
-                bootstrap_chunk: limits.max_chunk_bytes(),
-                history_page: limits.max_history_page_bytes(),
-                history_page_rows: options.max_history_page_rows,
-                history_cache_bytes: options.max_history_cache_bytes,
-                history_materialized_rows: options.max_history_materialized_rows,
-                history_prefetch_rows: options.history_prefetch_rows,
-            }),
+            inner: Client::new(client_limits(options)?),
             _not_send_sync: std::marker::PhantomData,
         });
         *out = Box::into_raw(client);
@@ -304,6 +271,53 @@ pub unsafe extern "C" fn phux_client_new(
         Ok(Err(error)) => error.result,
         Err(_) => PhuxClientResult::Panic,
     }
+}
+
+/// True when the requested history page row bound is zero or above the
+/// protocol limit.
+const fn history_page_rows_out_of_range(rows: u32) -> bool {
+    rows == 0 || rows > phux_client_core::history::MAX_HISTORY_PAGE_ROWS
+}
+
+/// True when the requested cache bounds cannot retain one page of the
+/// requested size.
+fn history_cache_cannot_retain_page(options: &PhuxClientOptions) -> bool {
+    options.max_history_cache_bytes == 0
+        || options.max_history_materialized_rows == 0
+        || usize::try_from(options.max_history_page_bytes).is_err()
+        || usize::try_from(options.max_history_page_bytes)
+            .is_ok_and(|bytes| bytes > options.max_history_cache_bytes)
+        || usize::try_from(options.max_history_page_rows)
+            .is_ok_and(|rows| rows > options.max_history_materialized_rows)
+}
+
+/// Resolves the bootstrap and history bounds a new client will enforce.
+fn client_limits(options: &PhuxClientOptions) -> Result<Limits, BridgeError> {
+    let limits = BootstrapLimits::new(
+        options.max_bootstrap_chunk_bytes,
+        options.max_history_page_bytes,
+    )
+    .ok_or_else(|| {
+        BridgeError::invalid("bootstrap/history bounds are zero or exceed protocol limits")
+    })?;
+    if history_page_rows_out_of_range(options.max_history_page_rows) {
+        return Err(BridgeError::invalid(
+            "history page row bound is zero or exceeds the protocol limit",
+        ));
+    }
+    if history_cache_cannot_retain_page(options) {
+        return Err(BridgeError::invalid(
+            "history cache bounds cannot retain one requested page",
+        ));
+    }
+    Ok(Limits {
+        bootstrap_chunk: limits.max_chunk_bytes(),
+        history_page: limits.max_history_page_bytes(),
+        history_page_rows: options.max_history_page_rows,
+        history_cache_bytes: options.max_history_cache_bytes,
+        history_materialized_rows: options.max_history_materialized_rows,
+        history_prefetch_rows: options.history_prefetch_rows,
+    })
 }
 
 /// Replaces the client's lifecycle callbacks, or clears them when `callbacks` is null.
@@ -454,11 +468,7 @@ pub unsafe extern "C" fn phux_client_queue_attach(
     options: *const PhuxAttachOptions,
 ) -> PhuxClientResult {
     with_client_mut(client, |client| {
-        if !client.protocol_ready || client.attached || client.attach_queued || client.detached {
-            return Err(BridgeError::state(
-                "ATTACH is not valid in the current lifecycle state",
-            ));
-        }
+        ensure_attach_allowed(client)?;
         let options =
             unsafe { options.as_ref() }.ok_or_else(|| BridgeError::invalid("options is null"))?;
         check_struct(
@@ -466,57 +476,93 @@ pub unsafe extern "C" fn phux_client_queue_attach(
             mem::size_of::<PhuxAttachOptions>(),
             options.version,
         )?;
-        if options.attach_id == 0 {
-            return Err(BridgeError::invalid("attach_id must be non-zero"));
-        }
-        if options.cols == 0 || options.rows == 0 {
-            return Err(BridgeError::invalid("attach geometry must be non-zero"));
-        }
-        if options.has_pixel_size {
-            if options.pixel_width == 0 || options.pixel_height == 0 {
-                return Err(BridgeError::invalid(
-                    "attach pixel geometry must be non-zero when present",
-                ));
-            }
-        } else if options.pixel_width != 0 || options.pixel_height != 0 {
-            return Err(BridgeError::invalid(
-                "attach pixel geometry is present without its discriminator",
-            ));
-        }
+        validate_attach_options(options)?;
         let name_bytes =
             unsafe { outbound_bytes_in(options.name.data, options.name.len, "attach name") }?;
-        let name = std::str::from_utf8(name_bytes)
-            .map_err(|_| BridgeError::invalid("attach name is not UTF-8"))?;
-        let target = match options.target_kind {
-            0 => AttachTarget::Last,
-            1 => AttachTarget::ByName(name.to_owned()),
-            2 => AttachTarget::ById(SessionId::new(options.session_id)),
-            3 => AttachTarget::CreateIfMissing {
-                name: name.to_owned(),
-                command: None,
-                cwd: None,
-            },
-            _ => return Err(BridgeError::invalid("unknown attach target kind")),
-        };
-        if matches!(options.target_kind, 1 | 3) && name.is_empty() {
-            return Err(BridgeError::invalid("named attach target is empty"));
-        }
-        let pixels = options
-            .has_pixel_size
-            .then_some((options.pixel_width, options.pixel_height));
-        let viewport = ViewportInfo::new(options.cols, options.rows)
-            .with_pixels(pixels.map(|value| value.0), pixels.map(|value| value.1));
-        client.queue_frame(&FrameKind::Attach {
-            attach_id: options.attach_id,
-            target,
-            viewport,
-            request_scrollback: options.request_scrollback,
-            scrollback_limit_lines: options.scrollback_limit_lines,
-        })?;
-        client.attach_queued = true;
-        client.expected_attach_id = Some(options.attach_id);
-        Ok(())
+        let target = attach_target(options, name_bytes)?;
+        queue_attach_frame(client, options, target)
     })
+}
+
+/// Rejects an ATTACH the client's lifecycle cannot accept.
+fn ensure_attach_allowed(client: &Client) -> Result<(), BridgeError> {
+    if !client.protocol_ready || client.attached || client.attach_queued || client.detached {
+        return Err(BridgeError::state(
+            "ATTACH is not valid in the current lifecycle state",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects attach options whose identifier or geometry is unusable, including
+/// pixel geometry that disagrees with its `has_pixel_size` discriminator.
+fn validate_attach_options(options: &PhuxAttachOptions) -> Result<(), BridgeError> {
+    if options.attach_id == 0 {
+        return Err(BridgeError::invalid("attach_id must be non-zero"));
+    }
+    if options.cols == 0 || options.rows == 0 {
+        return Err(BridgeError::invalid("attach geometry must be non-zero"));
+    }
+    if options.has_pixel_size {
+        if options.pixel_width == 0 || options.pixel_height == 0 {
+            return Err(BridgeError::invalid(
+                "attach pixel geometry must be non-zero when present",
+            ));
+        }
+    } else if options.pixel_width != 0 || options.pixel_height != 0 {
+        return Err(BridgeError::invalid(
+            "attach pixel geometry is present without its discriminator",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves the session an ATTACH addresses, rejecting an unknown target kind
+/// and an empty name for the kinds that address a session by name.
+fn attach_target(
+    options: &PhuxAttachOptions,
+    name_bytes: &[u8],
+) -> Result<AttachTarget, BridgeError> {
+    let name = std::str::from_utf8(name_bytes)
+        .map_err(|_| BridgeError::invalid("attach name is not UTF-8"))?;
+    let target = match options.target_kind {
+        0 => AttachTarget::Last,
+        1 => AttachTarget::ByName(name.to_owned()),
+        2 => AttachTarget::ById(SessionId::new(options.session_id)),
+        3 => AttachTarget::CreateIfMissing {
+            name: name.to_owned(),
+            command: None,
+            cwd: None,
+        },
+        _ => return Err(BridgeError::invalid("unknown attach target kind")),
+    };
+    if matches!(options.target_kind, 1 | 3) && name.is_empty() {
+        return Err(BridgeError::invalid("named attach target is empty"));
+    }
+    Ok(target)
+}
+
+/// Queues the ATTACH frame and records the attach the client now expects.
+fn queue_attach_frame(
+    client: &mut Client,
+    options: &PhuxAttachOptions,
+    target: AttachTarget,
+) -> Result<(), BridgeError> {
+    let pixels = options
+        .has_pixel_size
+        .then_some((options.pixel_width, options.pixel_height));
+    let viewport = ViewportInfo::new(options.cols, options.rows)
+        .with_pixels(pixels.map(|value| value.0), pixels.map(|value| value.1));
+    client.queue_frame(&FrameKind::Attach {
+        attach_id: options.attach_id,
+        target,
+        viewport,
+        request_scrollback: options.request_scrollback,
+        scrollback_limit_lines: options.scrollback_limit_lines,
+    })?;
+    client.attach_queued = true;
+    client.expected_attach_id = Some(options.attach_id);
+    Ok(())
 }
 
 /// Processes one complete server frame.
@@ -526,10 +572,6 @@ pub unsafe extern "C" fn phux_client_queue_attach(
 /// When non-null, `client` must be a live client on its owning thread with
 /// exclusive access for the call. When `len` is nonzero, `data` must be
 /// readable for `len` bytes for the call.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the frame dispatcher keeps ordered protocol validation and effects in one auditable transaction"
-)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phux_client_feed_frame(
     client: *mut PhuxClient,
@@ -539,391 +581,666 @@ pub unsafe extern "C" fn phux_client_feed_frame(
     let mut notify_attached = false;
     let result = with_client_mut(client, |client| {
         let data = unsafe { bytes_in(data, len) }?;
-        let decode_limits =
-            BootstrapLimits::new(client.limits.bootstrap_chunk, client.limits.history_page)
-                .ok_or_else(|| BridgeError::state("stored bootstrap limits are invalid"))?;
-        let (frame, remaining) = FrameKind::decode_with_limits(data, decode_limits)
-            .map_err(|error| BridgeError::protocol(error.to_string()))?;
-        if !remaining.is_empty() {
-            return Err(BridgeError::protocol(
-                "feed_frame accepts exactly one complete frame",
-            ));
-        }
-        if client.detached {
-            return Err(BridgeError::protocol("server frame arrived after DETACHED"));
-        }
-        if !client.protocol_ready
-            && !matches!(
-                &frame,
-                FrameKind::HelloOk { .. } | FrameKind::Error { .. } | FrameKind::Detached { .. }
-            )
-        {
-            return Err(BridgeError::state("server frame arrived before HELLO_OK"));
-        }
-        match frame {
-            FrameKind::HelloOk {
-                protocol_major,
-                protocol_minor,
-                server_caps,
-                selected_profile,
-                bootstrap_limits,
-                ..
-            } => {
-                if protocol_major != PROTOCOL_VERSION.major
-                    || protocol_minor != PROTOCOL_VERSION.minor
-                {
-                    return Err(BridgeError::protocol(
-                        "server selected an unsupported protocol version",
-                    ));
-                }
-                if bootstrap_limits.max_chunk_bytes() > client.limits.bootstrap_chunk
-                    || bootstrap_limits.max_history_page_bytes() > client.limits.history_page
-                {
-                    return Err(BridgeError::protocol(
-                        "server selected payload limits above the client advertisement",
-                    ));
-                }
-                if !client.hello_queued || client.protocol_ready {
-                    return Err(BridgeError::protocol("unsolicited or duplicate HELLO_OK"));
-                }
-                let advertised = native_bootstrap_capabilities(bootstrap_limits);
-                let profile_supported = match selected_profile {
-                    phux_protocol::BootstrapProfile::NativeState { codec, features } => {
-                        advertised.native_codecs.contains(codec) && features.supports_native()
-                    }
-                    phux_protocol::BootstrapProfile::SynthesizedVtRaw => advertised
-                        .profiles
-                        .contains(phux_protocol::BootstrapProfileKind::SynthesizedVtRaw),
-                    phux_protocol::BootstrapProfile::SynthesizedVtStateSync => advertised
-                        .profiles
-                        .contains(phux_protocol::BootstrapProfileKind::SynthesizedVtStateSync),
-                    _ => false,
-                };
-                if !profile_supported {
-                    return Err(BridgeError::protocol(
-                        "server selected a bootstrap profile the client did not advertise",
-                    ));
-                }
-                client.install_profile(selected_profile, bootstrap_limits);
-                client.selected_profile = Some(selected_profile);
-                client.terminal_reply = server_caps
-                    .features
-                    .contains(phux_protocol::ServerFeature::TerminalReply);
-                client.protocol_ready = true;
-            }
-            FrameKind::Ping { nonce } => client.queue_frame(&FrameKind::Pong { nonce })?,
-            FrameKind::Attached {
-                attach_id,
-                snapshot,
-                ..
-            } => {
-                if !client.attach_queued {
-                    return Err(BridgeError::protocol("unsolicited ATTACHED"));
-                }
-                if client.expected_attach_id != Some(attach_id) {
-                    return Err(BridgeError::protocol(
-                        "ATTACHED attach_id does not match the request",
-                    ));
-                }
-                let focused_session = snapshot.focused_session;
-                client.sessions = snapshot
-                    .sessions
-                    .into_iter()
-                    .map(|session| SessionSummary {
-                        session_id: session.id.get(),
-                        name: session.name.into_bytes(),
-                        created_at_unix_secs: session.created_at_unix_secs,
-                        window_count: session.window_count,
-                        attached_client_count: session.attached_client_count,
-                        focused: session.id == focused_session,
-                    })
-                    .collect();
-                let terminals: Vec<_> = snapshot.panes.into_iter().map(|pane| pane.id).collect();
-                apply_kernel_input(
-                    client,
-                    KernelInput::AttachStarted {
-                        attach_id,
-                        terminals: &terminals,
-                    },
-                )?;
-            }
-            FrameKind::AttachReady { attach_id } => {
-                if !client.attach_queued {
-                    return Err(BridgeError::protocol("unsolicited ATTACH_READY"));
-                }
-                if client.expected_attach_id != Some(attach_id) {
-                    return Err(BridgeError::protocol(
-                        "ATTACH_READY attach_id does not match the request",
-                    ));
-                }
-                apply_kernel_input(client, KernelInput::AttachReady { attach_id })?;
-                client.attach_queued = false;
-                client.attached = true;
-                notify_attached = true;
-            }
-            FrameKind::BootstrapBegin {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                profile,
-                cols,
-                rows,
-                base_seq,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                let selected_profile = client.selected_profile.ok_or_else(|| {
-                    BridgeError::state("BOOTSTRAP_BEGIN arrived before profile negotiation")
-                })?;
-                if !stream_profile_matches(selected_profile, profile) {
-                    return Err(BridgeError::protocol(
-                        "BOOTSTRAP_BEGIN profile differs from HELLO_OK selection",
-                    ));
-                }
-                let geometry = CanonicalGeometry::new(cols, rows)
-                    .ok_or_else(|| BridgeError::protocol("BOOTSTRAP_BEGIN geometry is zero"))?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::BootstrapBegin {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        profile,
-                        geometry,
-                        base_seq,
-                    },
-                )?;
-            }
-            FrameKind::BootstrapChunk {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                chunk_seq,
-                payload,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::BootstrapChunk {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        chunk_seq,
-                        payload: payload.as_ref(),
-                    },
-                )?;
-            }
-            FrameKind::BootstrapReady {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                history_cursor,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::BootstrapReady {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        history_cursor: history_cursor.as_deref(),
-                    },
-                )?;
-                client.invalidate_terminal_handles(&terminal_id);
-                client.bump_document_revision(&terminal_id)?;
-            }
-            FrameKind::HistoryPage {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                page_seq,
-                cursor,
-                next_cursor,
-                payload,
-                rows,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                let before = client.session.history_cache(&terminal_id).map(|cache| {
-                    let status = cache.status();
-                    (
-                        status.loaded_pages,
-                        status.loaded_bytes,
-                        status.materialized_rows,
-                    )
-                });
-                apply_kernel_input(
-                    client,
-                    KernelInput::HistoryPage {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        page_seq,
-                        rows,
-                        payload: payload.as_ref(),
-                        cursor: cursor.as_ref(),
-                        next_cursor: next_cursor.as_deref(),
-                    },
-                )?;
-                let after = client.session.history_cache(&terminal_id).map(|cache| {
-                    let status = cache.status();
-                    (
-                        status.loaded_pages,
-                        status.loaded_bytes,
-                        status.materialized_rows,
-                    )
-                });
-                if before != after {
-                    client.bump_document_revision(&terminal_id)?;
-                }
-            }
-            FrameKind::HistoryTombstone {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                cursor,
-                reason,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::HistoryTombstone {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        cursor: cursor.as_ref(),
-                        reason: history_unavailable_reason(reason)?,
-                    },
-                )?;
-            }
-            FrameKind::HistoryRejected {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                cursor,
-                reason,
-                required_bytes,
-                required_rows,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::HistoryRejected {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        cursor: cursor.as_ref(),
-                        reason: history_rejection_reason(reason)?,
-                        required_bytes,
-                        required_rows,
-                    },
-                )?;
-            }
-            FrameKind::TerminalOutput {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                seq,
-                bytes,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                let before = client
-                    .session
-                    .published(&terminal_id)
-                    .map(|published| published.last_seq());
-                apply_kernel_input(
-                    client,
-                    KernelInput::TerminalOutput {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        seq,
-                        payload: bytes.as_ref(),
-                    },
-                )?;
-                let after = client
-                    .session
-                    .published(&terminal_id)
-                    .map(|published| published.last_seq());
-                if before != after {
-                    client.bump_document_revision(&terminal_id)?;
-                }
-            }
-            FrameKind::BootstrapTombstone {
-                terminal_id,
-                stream_id,
-                bootstrap_id,
-                reason,
-                last_valid_seq,
-            } => {
-                client.ensure_participant(&terminal_id)?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::Tombstone {
-                        terminal_id: &terminal_id,
-                        stream_id,
-                        bootstrap_id,
-                        reason,
-                        last_valid_seq,
-                    },
-                )?;
-                client.render.remove(&terminal_id);
-                client.document_revisions.remove(&terminal_id);
-                client.invalidate_terminal_handles(&terminal_id);
-            }
-            FrameKind::TerminalClosed { terminal_id, .. } => {
-                client.ensure_participant(&terminal_id)?;
-                apply_kernel_input(
-                    client,
-                    KernelInput::TerminalClosed {
-                        terminal_id: &terminal_id,
-                    },
-                )?;
-                client.render.remove(&terminal_id);
-                client.document_revisions.remove(&terminal_id);
-                client.invalidate_terminal_handles(&terminal_id);
-            }
-            FrameKind::Bell { terminal_id } => {
-                client.ensure_participant(&terminal_id)?;
-                client
-                    .owned_effects
-                    .push(OwnedEffect::simple(2, 1, terminal_id));
-                client.rebuild_effect_views();
-            }
-            FrameKind::Error { code, message, .. } => {
-                let mut effect = OwnedEffect::simple(2, 4, phux_protocol::TerminalId::local(0));
-                effect.bytes = format!("{code:?}: {message}").into_bytes();
-                client.owned_effects.push(effect);
-                client.rebuild_effect_views();
-            }
-            FrameKind::Detached { reason, message } => {
-                client.detach();
-                let mut effect = OwnedEffect::simple(2, 5, phux_protocol::TerminalId::local(0));
-                // phux-l83x: carry the ending's reason across the bridge as a
-                // stable wire value, the way RESYNC_REQUIRED carries its
-                // `TombstoneReason`. A consumer that only sees "detached"
-                // cannot tell a requested detach from a server that died
-                // under it. `DETACH_REASON_UNSTATED` is distinct from every
-                // wire value precisely so absence stays legible: `REQUESTED`
-                // is `0`, so a zero default would have claimed the user asked
-                // for an ending they did not.
-                effect.status_code =
-                    reason.map_or(DETACH_REASON_UNSTATED, |reason| u32::from(reason.as_wire()));
-                effect.bytes = message.into_bytes();
-                client.owned_effects.push(effect);
-                client.rebuild_effect_views();
-            }
-            _ => {
-                return Err(BridgeError::protocol(
-                    "server sent a frame not accepted by the client session kernel",
-                ));
-            }
-        }
-        Ok(())
+        let frame = decode_one_frame(client, data)?;
+        ensure_frame_accepted(client, &frame)?;
+        dispatch_frame(client, frame, &mut notify_attached)
     });
     if result == PhuxClientResult::Ok && notify_attached {
         invoke_attached(client)
     } else {
         result
     }
+}
+
+/// The bootstrap stream a terminal-scoped server frame belongs to.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the fields carry the wire frame's own field names, which is what makes the frame-to-KernelInput mapping checkable by eye"
+)]
+#[derive(Clone, Copy, Debug)]
+struct StreamRef<'a> {
+    terminal_id: &'a phux_protocol::TerminalId,
+    stream_id: phux_protocol::StreamId,
+    bootstrap_id: phux_protocol::BootstrapId,
+}
+
+impl<'a> StreamRef<'a> {
+    const fn new(
+        terminal_id: &'a phux_protocol::TerminalId,
+        stream_id: phux_protocol::StreamId,
+        bootstrap_id: phux_protocol::BootstrapId,
+    ) -> Self {
+        Self {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+        }
+    }
+}
+
+/// Decodes the one complete frame a `feed_frame` call must carry, under the
+/// payload bounds this client negotiated.
+fn decode_one_frame(client: &Client, data: &[u8]) -> Result<FrameKind, BridgeError> {
+    let decode_limits =
+        BootstrapLimits::new(client.limits.bootstrap_chunk, client.limits.history_page)
+            .ok_or_else(|| BridgeError::state("stored bootstrap limits are invalid"))?;
+    let (frame, remaining) = FrameKind::decode_with_limits(data, decode_limits)
+        .map_err(|error| BridgeError::protocol(error.to_string()))?;
+    if !remaining.is_empty() {
+        return Err(BridgeError::protocol(
+            "feed_frame accepts exactly one complete frame",
+        ));
+    }
+    Ok(frame)
+}
+
+/// Rejects a frame that arrives outside the window the client's lifecycle
+/// accepts it in: after DETACHED, or before `HELLO_OK` has been answered.
+fn ensure_frame_accepted(client: &Client, frame: &FrameKind) -> Result<(), BridgeError> {
+    if client.detached {
+        return Err(BridgeError::protocol("server frame arrived after DETACHED"));
+    }
+    if !client.protocol_ready
+        && !matches!(
+            frame,
+            FrameKind::HelloOk { .. } | FrameKind::Error { .. } | FrameKind::Detached { .. }
+        )
+    {
+        return Err(BridgeError::state("server frame arrived before HELLO_OK"));
+    }
+    Ok(())
+}
+
+/// Applies a connection-lifecycle or notification frame, deferring every
+/// terminal-stream frame to [`dispatch_bootstrap_frame`].
+fn dispatch_frame(
+    client: &mut Client,
+    frame: FrameKind,
+    notify_attached: &mut bool,
+) -> Result<(), BridgeError> {
+    match frame {
+        FrameKind::HelloOk {
+            protocol_major,
+            protocol_minor,
+            server_caps,
+            selected_profile,
+            bootstrap_limits,
+            ..
+        } => apply_hello_ok(
+            client,
+            protocol_major,
+            protocol_minor,
+            server_caps,
+            selected_profile,
+            bootstrap_limits,
+        ),
+        FrameKind::Ping { nonce } => client.queue_frame(&FrameKind::Pong { nonce }),
+        FrameKind::Attached {
+            attach_id,
+            snapshot,
+            ..
+        } => apply_attached(client, attach_id, snapshot),
+        FrameKind::AttachReady { attach_id } => {
+            apply_attach_ready(client, attach_id)?;
+            *notify_attached = true;
+            Ok(())
+        }
+        FrameKind::Bell { terminal_id } => apply_bell(client, terminal_id),
+        FrameKind::Error { code, message, .. } => {
+            apply_error(client, code, &message);
+            Ok(())
+        }
+        FrameKind::Detached { reason, message } => {
+            apply_detached(client, reason, message);
+            Ok(())
+        }
+        frame => dispatch_bootstrap_frame(client, frame),
+    }
+}
+
+/// Applies a bootstrap-stream frame, deferring the remaining terminal-stream
+/// frames to [`dispatch_history_frame`].
+fn dispatch_bootstrap_frame(client: &mut Client, frame: FrameKind) -> Result<(), BridgeError> {
+    match frame {
+        FrameKind::BootstrapBegin {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            profile,
+            cols,
+            rows,
+            base_seq,
+        } => apply_bootstrap_begin(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            profile,
+            cols,
+            rows,
+            base_seq,
+        ),
+        FrameKind::BootstrapChunk {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            chunk_seq,
+            payload,
+        } => apply_bootstrap_chunk(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            chunk_seq,
+            payload.as_ref(),
+        ),
+        FrameKind::BootstrapReady {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            history_cursor,
+        } => apply_bootstrap_ready(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            history_cursor.as_deref(),
+        ),
+        FrameKind::BootstrapTombstone {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            reason,
+            last_valid_seq,
+        } => apply_bootstrap_tombstone(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            reason,
+            last_valid_seq,
+        ),
+        frame => dispatch_history_frame(client, frame),
+    }
+}
+
+/// Applies a history-stream frame, deferring the live terminal frames to
+/// [`dispatch_terminal_frame`].
+fn dispatch_history_frame(client: &mut Client, frame: FrameKind) -> Result<(), BridgeError> {
+    match frame {
+        FrameKind::HistoryPage {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            page_seq,
+            cursor,
+            next_cursor,
+            payload,
+            rows,
+        } => apply_history_page(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            page_seq,
+            cursor.as_ref(),
+            next_cursor.as_deref(),
+            payload.as_ref(),
+            rows,
+        ),
+        FrameKind::HistoryTombstone {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            cursor,
+            reason,
+        } => apply_history_tombstone(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            cursor.as_ref(),
+            reason,
+        ),
+        FrameKind::HistoryRejected {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            cursor,
+            reason,
+            required_bytes,
+            required_rows,
+        } => apply_history_rejected(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            cursor.as_ref(),
+            reason,
+            required_bytes,
+            required_rows,
+        ),
+        frame => dispatch_terminal_frame(client, frame),
+    }
+}
+
+/// Applies a live terminal frame, and rejects every frame the client session
+/// kernel does not accept.
+fn dispatch_terminal_frame(client: &mut Client, frame: FrameKind) -> Result<(), BridgeError> {
+    match frame {
+        FrameKind::TerminalOutput {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            seq,
+            bytes,
+        } => apply_terminal_output(
+            client,
+            StreamRef::new(&terminal_id, stream_id, bootstrap_id),
+            seq,
+            bytes.as_ref(),
+        ),
+        FrameKind::TerminalClosed { terminal_id, .. } => {
+            apply_terminal_closed(client, &terminal_id)
+        }
+        _ => Err(BridgeError::protocol(
+            "server sent a frame not accepted by the client session kernel",
+        )),
+    }
+}
+
+/// Rejects a `HELLO_OK` that does not answer this client's handshake on the
+/// terms it advertised.
+fn ensure_hello_ok_accepted(
+    client: &Client,
+    protocol_major: u16,
+    protocol_minor: u16,
+    bootstrap_limits: BootstrapLimits,
+) -> Result<(), BridgeError> {
+    if protocol_major != PROTOCOL_VERSION.major || protocol_minor != PROTOCOL_VERSION.minor {
+        return Err(BridgeError::protocol(
+            "server selected an unsupported protocol version",
+        ));
+    }
+    if bootstrap_limits.max_chunk_bytes() > client.limits.bootstrap_chunk
+        || bootstrap_limits.max_history_page_bytes() > client.limits.history_page
+    {
+        return Err(BridgeError::protocol(
+            "server selected payload limits above the client advertisement",
+        ));
+    }
+    if !client.hello_queued || client.protocol_ready {
+        return Err(BridgeError::protocol("unsolicited or duplicate HELLO_OK"));
+    }
+    Ok(())
+}
+
+/// True when the selected bootstrap profile is one this client advertised.
+const fn profile_is_advertised(
+    advertised: &phux_protocol::BootstrapCapabilities,
+    selected_profile: phux_protocol::BootstrapProfile,
+) -> bool {
+    match selected_profile {
+        phux_protocol::BootstrapProfile::NativeState { codec, features } => {
+            advertised.native_codecs.contains(codec) && features.supports_native()
+        }
+        phux_protocol::BootstrapProfile::SynthesizedVtRaw => advertised
+            .profiles
+            .contains(phux_protocol::BootstrapProfileKind::SynthesizedVtRaw),
+        phux_protocol::BootstrapProfile::SynthesizedVtStateSync => advertised
+            .profiles
+            .contains(phux_protocol::BootstrapProfileKind::SynthesizedVtStateSync),
+        _ => false,
+    }
+}
+
+/// Closes the handshake and installs the negotiated bootstrap profile.
+fn apply_hello_ok(
+    client: &mut Client,
+    protocol_major: u16,
+    protocol_minor: u16,
+    server_caps: phux_protocol::caps::ServerCapabilities,
+    selected_profile: phux_protocol::BootstrapProfile,
+    bootstrap_limits: BootstrapLimits,
+) -> Result<(), BridgeError> {
+    ensure_hello_ok_accepted(client, protocol_major, protocol_minor, bootstrap_limits)?;
+    let advertised = native_bootstrap_capabilities(bootstrap_limits);
+    if !profile_is_advertised(&advertised, selected_profile) {
+        return Err(BridgeError::protocol(
+            "server selected a bootstrap profile the client did not advertise",
+        ));
+    }
+    client.install_profile(selected_profile, bootstrap_limits);
+    client.selected_profile = Some(selected_profile);
+    client.terminal_reply = server_caps
+        .features
+        .contains(phux_protocol::ServerFeature::TerminalReply);
+    client.protocol_ready = true;
+    Ok(())
+}
+
+/// Rejects an attach-lifecycle frame that answers an attach this client never
+/// requested, naming the frame in the error the way the caller knows it.
+fn ensure_expected_attach(client: &Client, attach_id: u32, frame: &str) -> Result<(), BridgeError> {
+    if !client.attach_queued {
+        return Err(BridgeError::protocol(format!("unsolicited {frame}")));
+    }
+    if client.expected_attach_id != Some(attach_id) {
+        return Err(BridgeError::protocol(format!(
+            "{frame} attach_id does not match the request"
+        )));
+    }
+    Ok(())
+}
+
+/// Records the session catalog the server attached this client to and starts
+/// the attach in the session kernel.
+fn apply_attached(
+    client: &mut Client,
+    attach_id: u32,
+    snapshot: phux_protocol::wire::info::SessionSnapshot,
+) -> Result<(), BridgeError> {
+    ensure_expected_attach(client, attach_id, "ATTACHED")?;
+    let focused_session = snapshot.focused_session;
+    client.sessions = snapshot
+        .sessions
+        .into_iter()
+        .map(|session| SessionSummary {
+            session_id: session.id.get(),
+            name: session.name.into_bytes(),
+            created_at_unix_secs: session.created_at_unix_secs,
+            window_count: session.window_count,
+            attached_client_count: session.attached_client_count,
+            focused: session.id == focused_session,
+        })
+        .collect();
+    let terminals: Vec<_> = snapshot.panes.into_iter().map(|pane| pane.id).collect();
+    apply_kernel_input(
+        client,
+        KernelInput::AttachStarted {
+            attach_id,
+            terminals: &terminals,
+        },
+    )
+}
+
+/// Completes the attach the client requested.
+fn apply_attach_ready(client: &mut Client, attach_id: u32) -> Result<(), BridgeError> {
+    ensure_expected_attach(client, attach_id, "ATTACH_READY")?;
+    apply_kernel_input(client, KernelInput::AttachReady { attach_id })?;
+    client.attach_queued = false;
+    client.attached = true;
+    Ok(())
+}
+
+/// Opens a bootstrap stream, holding the server to the profile `HELLO_OK` chose.
+fn apply_bootstrap_begin(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    profile: phux_protocol::BootstrapStreamProfile,
+    cols: u16,
+    rows: u16,
+    base_seq: u64,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    let selected_profile = client
+        .selected_profile
+        .ok_or_else(|| BridgeError::state("BOOTSTRAP_BEGIN arrived before profile negotiation"))?;
+    if !stream_profile_matches(selected_profile, profile) {
+        return Err(BridgeError::protocol(
+            "BOOTSTRAP_BEGIN profile differs from HELLO_OK selection",
+        ));
+    }
+    let geometry = CanonicalGeometry::new(cols, rows)
+        .ok_or_else(|| BridgeError::protocol("BOOTSTRAP_BEGIN geometry is zero"))?;
+    apply_kernel_input(
+        client,
+        KernelInput::BootstrapBegin {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            profile,
+            geometry,
+            base_seq,
+        },
+    )
+}
+
+/// Feeds one bootstrap payload chunk to the session kernel.
+fn apply_bootstrap_chunk(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    chunk_seq: u32,
+    payload: &[u8],
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    apply_kernel_input(
+        client,
+        KernelInput::BootstrapChunk {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            chunk_seq,
+            payload,
+        },
+    )
+}
+
+/// Closes a bootstrap stream and republishes the terminal's document.
+fn apply_bootstrap_ready(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    history_cursor: Option<&[u8]>,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    apply_kernel_input(
+        client,
+        KernelInput::BootstrapReady {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            history_cursor,
+        },
+    )?;
+    client.invalidate_terminal_handles(stream.terminal_id);
+    client.bump_document_revision(stream.terminal_id)
+}
+
+/// The history cache counters that decide whether a page changed the document.
+fn history_cache_counters(
+    client: &Client,
+    terminal_id: &phux_protocol::TerminalId,
+) -> Option<(usize, usize, usize)> {
+    client.session.history_cache(terminal_id).map(|cache| {
+        let status = cache.status();
+        (
+            status.loaded_pages,
+            status.loaded_bytes,
+            status.materialized_rows,
+        )
+    })
+}
+
+/// Admits one history page, republishing the document only when the page
+/// actually moved the cache.
+fn apply_history_page(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    page_seq: u64,
+    cursor: &[u8],
+    next_cursor: Option<&[u8]>,
+    payload: &[u8],
+    rows: u32,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    let before = history_cache_counters(client, stream.terminal_id);
+    apply_kernel_input(
+        client,
+        KernelInput::HistoryPage {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            page_seq,
+            rows,
+            payload,
+            cursor,
+            next_cursor,
+        },
+    )?;
+    let after = history_cache_counters(client, stream.terminal_id);
+    if before != after {
+        client.bump_document_revision(stream.terminal_id)?;
+    }
+    Ok(())
+}
+
+/// Records that a history range the client asked for is gone for good.
+fn apply_history_tombstone(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    cursor: &[u8],
+    reason: phux_protocol::wire::frame::HistoryTombstoneReason,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    apply_kernel_input(
+        client,
+        KernelInput::HistoryTombstone {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            cursor,
+            reason: history_unavailable_reason(reason)?,
+        },
+    )
+}
+
+/// Records a history request the server declined, with the bounds it wanted.
+fn apply_history_rejected(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    cursor: &[u8],
+    reason: phux_protocol::wire::frame::HistoryRejectionReason,
+    required_bytes: u32,
+    required_rows: u32,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    apply_kernel_input(
+        client,
+        KernelInput::HistoryRejected {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            cursor,
+            reason: history_rejection_reason(reason)?,
+            required_bytes,
+            required_rows,
+        },
+    )
+}
+
+/// Feeds live terminal output, republishing the document only when the applied
+/// bytes advanced the published sequence.
+fn apply_terminal_output(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    seq: u64,
+    payload: &[u8],
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    let before = published_last_seq(client, stream.terminal_id);
+    apply_kernel_input(
+        client,
+        KernelInput::TerminalOutput {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            seq,
+            payload,
+        },
+    )?;
+    let after = published_last_seq(client, stream.terminal_id);
+    if before != after {
+        client.bump_document_revision(stream.terminal_id)?;
+    }
+    Ok(())
+}
+
+/// The published sequence a terminal's replica has reached, when it has one.
+fn published_last_seq(client: &Client, terminal_id: &phux_protocol::TerminalId) -> Option<u64> {
+    client
+        .session
+        .published(terminal_id)
+        .map(|published| published.last_seq())
+}
+
+/// Drops the client-side state of a terminal the bridge can no longer serve.
+fn forget_terminal(client: &mut Client, terminal_id: &phux_protocol::TerminalId) {
+    client.render.remove(terminal_id);
+    client.document_revisions.remove(terminal_id);
+    client.invalidate_terminal_handles(terminal_id);
+}
+
+/// Records a bootstrap stream the server invalidated and drops its state.
+fn apply_bootstrap_tombstone(
+    client: &mut Client,
+    stream: StreamRef<'_>,
+    reason: phux_protocol::wire::frame::TombstoneReason,
+    last_valid_seq: u64,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(stream.terminal_id)?;
+    apply_kernel_input(
+        client,
+        KernelInput::Tombstone {
+            terminal_id: stream.terminal_id,
+            stream_id: stream.stream_id,
+            bootstrap_id: stream.bootstrap_id,
+            reason,
+            last_valid_seq,
+        },
+    )?;
+    forget_terminal(client, stream.terminal_id);
+    Ok(())
+}
+
+/// Records a terminal whose process exited and drops its state.
+fn apply_terminal_closed(
+    client: &mut Client,
+    terminal_id: &phux_protocol::TerminalId,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(terminal_id)?;
+    apply_kernel_input(client, KernelInput::TerminalClosed { terminal_id })?;
+    forget_terminal(client, terminal_id);
+    Ok(())
+}
+
+/// Publishes a bell as an effect the embedder can observe.
+fn apply_bell(
+    client: &mut Client,
+    terminal_id: phux_protocol::TerminalId,
+) -> Result<(), BridgeError> {
+    client.ensure_participant(&terminal_id)?;
+    client
+        .owned_effects
+        .push(OwnedEffect::simple(2, 1, terminal_id));
+    client.rebuild_effect_views();
+    Ok(())
+}
+
+/// Publishes a server error as an effect the embedder can observe.
+fn apply_error(client: &mut Client, code: phux_protocol::wire::frame::ErrorCode, message: &str) {
+    let mut effect = OwnedEffect::simple(2, 4, phux_protocol::TerminalId::local(0));
+    effect.bytes = format!("{code:?}: {message}").into_bytes();
+    client.owned_effects.push(effect);
+    client.rebuild_effect_views();
+}
+
+/// Ends the session and publishes the ending as an effect.
+fn apply_detached(
+    client: &mut Client,
+    reason: Option<phux_protocol::wire::frame::DetachReason>,
+    message: String,
+) {
+    client.detach();
+    let mut effect = OwnedEffect::simple(2, 5, phux_protocol::TerminalId::local(0));
+    // phux-l83x: carry the ending's reason across the bridge as a
+    // stable wire value, the way RESYNC_REQUIRED carries its
+    // `TombstoneReason`. A consumer that only sees "detached"
+    // cannot tell a requested detach from a server that died
+    // under it. `DETACH_REASON_UNSTATED` is distinct from every
+    // wire value precisely so absence stays legible: `REQUESTED`
+    // is `0`, so a zero default would have claimed the user asked
+    // for an ending they did not.
+    effect.status_code =
+        reason.map_or(DETACH_REASON_UNSTATED, |reason| u32::from(reason.as_wire()));
+    effect.bytes = message.into_bytes();
+    client.owned_effects.push(effect);
+    client.rebuild_effect_views();
 }
 
 /// Returns the number of sessions advertised by the latest accepted ATTACHED.
@@ -1186,61 +1503,95 @@ pub unsafe extern "C" fn phux_client_send_key(
         let event =
             unsafe { event.as_ref() }.ok_or_else(|| BridgeError::invalid("event is null"))?;
         check_struct(event.size, mem::size_of::<PhuxKeyEvent>(), event.version)?;
-        let text = if event.has_text {
-            let bytes = unsafe { outbound_bytes_in(event.text.data, event.text.len, "key text") }?;
-            let text = std::str::from_utf8(bytes)
-                .map_err(|_| BridgeError::invalid("key text is not UTF-8"))?;
-            if text.chars().any(|ch| {
-                ch <= '\u{1f}' || ch == '\u{7f}' || ('\u{f700}'..='\u{f8ff}').contains(&ch)
-            }) {
-                return Err(BridgeError::invalid(
-                    "key text contains forbidden control or platform function codepoints",
-                ));
-            }
-            Some(text.to_owned())
-        } else {
-            if event.text.len != 0 {
-                return Err(BridgeError::invalid(
-                    "key text bytes present when has_text is false",
-                ));
-            }
-            None
-        };
-        let mods = ModSet::from_bits(event.modifiers)
-            .ok_or_else(|| BridgeError::invalid("unknown key modifier bits"))?;
-        let consumed_mods = ModSet::from_bits(event.consumed_modifiers)
-            .ok_or_else(|| BridgeError::invalid("unknown consumed modifier bits"))?;
-        if !mods.contains(consumed_mods) {
-            return Err(BridgeError::invalid(
-                "consumed modifiers are not a subset of modifiers",
-            ));
-        }
-        let unshifted_codepoint = if event.has_unshifted_codepoint {
-            char::from_u32(event.unshifted_codepoint).ok_or_else(|| {
-                BridgeError::invalid("unshifted codepoint is not a Unicode scalar")
-            })?;
-            Some(event.unshifted_codepoint)
-        } else {
-            if event.unshifted_codepoint != 0 {
-                return Err(BridgeError::invalid(
-                    "unshifted codepoint is present without its discriminator",
-                ));
-            }
-            None
-        };
-        let event = InputEvent::Key(KeyEvent {
-            action: KeyAction::try_from(event.action)
-                .map_err(|_| BridgeError::invalid("unknown key action"))?,
-            key: PhysicalKey::try_from(event.key)
-                .map_err(|_| BridgeError::invalid("unknown physical key"))?,
-            mods,
-            consumed_mods,
-            composing: event.composing,
-            text,
-            unshifted_codepoint,
-        });
+        let event = unsafe { key_input_event(event) }?;
         apply_input(client, &terminal_id, &event)
     })
+}
+
+/// True when the text carries a control codepoint, DEL, or a codepoint from
+/// the private-use block platforms map their function keys into.
+fn is_forbidden_key_text(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ch <= '\u{1f}' || ch == '\u{7f}' || ('\u{f700}'..='\u{f8ff}').contains(&ch))
+}
+
+/// Reads the committed text a key event carries, if it carries any.
+///
+/// # Safety
+///
+/// Any non-empty `event.text` span selected by `event.has_text` must be
+/// readable for the call.
+unsafe fn key_event_text(event: &PhuxKeyEvent) -> Result<Option<String>, BridgeError> {
+    if !event.has_text {
+        if event.text.len != 0 {
+            return Err(BridgeError::invalid(
+                "key text bytes present when has_text is false",
+            ));
+        }
+        return Ok(None);
+    }
+    let bytes = unsafe { outbound_bytes_in(event.text.data, event.text.len, "key text") }?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| BridgeError::invalid("key text is not UTF-8"))?;
+    if is_forbidden_key_text(text) {
+        return Err(BridgeError::invalid(
+            "key text contains forbidden control or platform function codepoints",
+        ));
+    }
+    Ok(Some(text.to_owned()))
+}
+
+/// Resolves the held and consumed modifier sets, rejecting unknown bits and a
+/// consumed set that is not a subset of the held one.
+fn key_event_modifiers(event: &PhuxKeyEvent) -> Result<(ModSet, ModSet), BridgeError> {
+    let mods = ModSet::from_bits(event.modifiers)
+        .ok_or_else(|| BridgeError::invalid("unknown key modifier bits"))?;
+    let consumed_mods = ModSet::from_bits(event.consumed_modifiers)
+        .ok_or_else(|| BridgeError::invalid("unknown consumed modifier bits"))?;
+    if !mods.contains(consumed_mods) {
+        return Err(BridgeError::invalid(
+            "consumed modifiers are not a subset of modifiers",
+        ));
+    }
+    Ok((mods, consumed_mods))
+}
+
+/// Resolves the unshifted codepoint a key event carries, if it carries one.
+fn key_event_unshifted_codepoint(event: &PhuxKeyEvent) -> Result<Option<u32>, BridgeError> {
+    if !event.has_unshifted_codepoint {
+        if event.unshifted_codepoint != 0 {
+            return Err(BridgeError::invalid(
+                "unshifted codepoint is present without its discriminator",
+            ));
+        }
+        return Ok(None);
+    }
+    char::from_u32(event.unshifted_codepoint)
+        .ok_or_else(|| BridgeError::invalid("unshifted codepoint is not a Unicode scalar"))?;
+    Ok(Some(event.unshifted_codepoint))
+}
+
+/// Builds the key input event a validated `PhuxKeyEvent` describes.
+///
+/// # Safety
+///
+/// Any non-empty `event.text` span selected by `event.has_text` must be
+/// readable for the call.
+unsafe fn key_input_event(event: &PhuxKeyEvent) -> Result<InputEvent, BridgeError> {
+    let text = unsafe { key_event_text(event) }?;
+    let (mods, consumed_mods) = key_event_modifiers(event)?;
+    let unshifted_codepoint = key_event_unshifted_codepoint(event)?;
+    Ok(InputEvent::Key(KeyEvent {
+        action: KeyAction::try_from(event.action)
+            .map_err(|_| BridgeError::invalid("unknown key action"))?,
+        key: PhysicalKey::try_from(event.key)
+            .map_err(|_| BridgeError::invalid("unknown physical key"))?,
+        mods,
+        consumed_mods,
+        composing: event.composing,
+        text,
+        unshifted_codepoint,
+    }))
 }
 
 /// Sends a mouse event to a terminal.

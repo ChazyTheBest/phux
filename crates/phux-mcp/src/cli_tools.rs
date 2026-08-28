@@ -206,6 +206,14 @@ async fn launch(args: &Value, adapter: &CliAdapter) -> Result<Value, ToolError> 
         ],
         &[],
     )?;
+    let argv = launch_argv(args)?;
+    adapter.run_json(argv, DEFAULT_CALL_TIMEOUT).await
+}
+
+/// `phux launch` is two verbs behind one tool: enumerate the configured
+/// integrations, or start exactly one. Placement is parsed for both so an
+/// ill-formed `split`/`ratio` is rejected the same way either way.
+fn launch_argv(args: &Value) -> Result<Vec<String>, ToolError> {
     let list = optional_bool(args, "list")?.unwrap_or(false);
     let integration = bounded_string(args, "integration", false)?;
     if list == integration.is_some() {
@@ -213,6 +221,22 @@ async fn launch(args: &Value, adapter: &CliAdapter) -> Result<Value, ToolError> 
             "provide exactly one of `integration` or `list: true`",
         ));
     }
+    let placement = launch_placement(args)?;
+    if list {
+        return launch_list_argv(args);
+    }
+    launch_one_argv(args, integration.unwrap_or_default(), placement)
+}
+
+/// The exact local placement the launched pane takes, if any. `split` and
+/// `ratio` are meaningless without a `target` to place against.
+struct Placement {
+    target: Option<String>,
+    split: String,
+    ratio: Option<f64>,
+}
+
+fn launch_placement(args: &Value) -> Result<Placement, ToolError> {
     let target = bounded_string(args, "target", false)?;
     let split = enum_string(
         args,
@@ -224,26 +248,46 @@ async fn launch(args: &Value, adapter: &CliAdapter) -> Result<Value, ToolError> 
     if target.is_none() && (args.get("split").is_some() || ratio.is_some()) {
         return Err(ToolError::new("`split` and `ratio` require `target`"));
     }
-    let mut argv = vec!["launch".to_owned()];
-    if list {
-        reject_present(
-            args,
-            &["target", "split", "ratio", "cwd", "extra", "socket"],
-        )?;
-        argv.extend(["--list".to_owned(), "--json".to_owned()]);
-    } else {
-        argv.push(integration.unwrap_or_default());
-        argv.push("--json".to_owned());
-        push_placement(&mut argv, target, &split, ratio);
-        push_option(&mut argv, "-c", bounded_string(args, "cwd", false)?);
-        push_socket(&mut argv, args)?;
-        let extra = bounded_strings(args, "extra", false)?;
-        if !extra.is_empty() {
-            argv.push("--".to_owned());
-            argv.extend(extra);
-        }
+    Ok(Placement {
+        target,
+        split,
+        ratio,
+    })
+}
+
+/// Enumeration takes no argument that only makes sense while launching.
+fn launch_list_argv(args: &Value) -> Result<Vec<String>, ToolError> {
+    reject_present(
+        args,
+        &["target", "split", "ratio", "cwd", "extra", "socket"],
+    )?;
+    Ok(vec![
+        "launch".to_owned(),
+        "--list".to_owned(),
+        "--json".to_owned(),
+    ])
+}
+
+fn launch_one_argv(
+    args: &Value,
+    integration: String,
+    placement: Placement,
+) -> Result<Vec<String>, ToolError> {
+    let mut argv = vec!["launch".to_owned(), integration, "--json".to_owned()];
+    push_placement(
+        &mut argv,
+        placement.target,
+        &placement.split,
+        placement.ratio,
+    );
+    push_option(&mut argv, "-c", bounded_string(args, "cwd", false)?);
+    push_socket(&mut argv, args)?;
+    let extra = bounded_strings(args, "extra", false)?;
+    if !extra.is_empty() {
+        argv.push("--".to_owned());
+        argv.extend(extra);
     }
-    adapter.run_json(argv, DEFAULT_CALL_TIMEOUT).await
+    Ok(argv)
 }
 
 async fn spawn(args: &Value, adapter: &CliAdapter) -> Result<Value, ToolError> {

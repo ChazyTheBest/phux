@@ -200,93 +200,31 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     let mut line = String::new();
-    let mut tasks = JoinSet::<(String, Value)>::new();
-    let mut pending = HashMap::<String, (Value, AbortHandle)>::new();
+    let mut in_flight = InFlight {
+        tasks: JoinSet::new(),
+        pending: HashMap::new(),
+    };
 
     loop {
         tokio::select! {
             read = reader.read_line(&mut line) => {
                 match read {
                     Ok(0) => {
-                        abort_pending(&mut tasks, &mut pending).await;
+                        in_flight.abort_all().await;
                         return Ok(());
                     }
                     Err(err) => {
-                        abort_pending(&mut tasks, &mut pending).await;
+                        in_flight.abort_all().await;
                         return Err(err);
                     }
                     Ok(_) => {}
                 }
-
-                let message = line.trim();
-                if !message.is_empty() {
-                    let request: Request = match serde_json::from_str(message) {
-                        Ok(request) => request,
-                        Err(err) => {
-                            let response = jsonrpc::error(
-                                Value::Null,
-                                PARSE_ERROR,
-                                format!("parse error: {err}"),
-                            );
-                            write_response(&mut writer, &response).await?;
-                            line.clear();
-                            continue;
-                        }
-                    };
-
-                    if request.method == "notifications/cancelled" {
-                        if let Some(cancelled_id) = request
-                            .params
-                            .as_ref()
-                            .and_then(|params| params.get("requestId"))
-                        {
-                            let key = request_key(cancelled_id);
-                            if let Some((id, task)) = pending.remove(&key) {
-                                task.abort();
-                                let response = jsonrpc::error(
-                                    id,
-                                    REQUEST_CANCELLED,
-                                    "request cancelled",
-                                );
-                                write_response(&mut writer, &response).await?;
-                            }
-                        }
-                    } else if request.method == "tools/call" && !request.is_notification() {
-                        let id = request.id.clone().unwrap_or(Value::Null);
-                        let key = request_key(&id);
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            pending.entry(key.clone())
-                        {
-                            let params = request.params;
-                            let dispatcher = Arc::clone(&dispatcher);
-                            let task_id = id.clone();
-                            let abort = tasks.spawn(async move {
-                                let response = handle_tools_call_with(
-                                    task_id,
-                                    params.as_ref(),
-                                    dispatcher.as_ref(),
-                                )
-                                .await;
-                                (key, response)
-                            });
-                            entry.insert((id, abort));
-                        } else {
-                            let response = jsonrpc::error(
-                                id,
-                                INVALID_REQUEST,
-                                "duplicate in-flight request id",
-                            );
-                            write_response(&mut writer, &response).await?;
-                        }
-                    } else if let Some(response) = handle_request(request).await {
-                        write_response(&mut writer, &response).await?;
-                    }
-                }
+                handle_message(&line, &mut writer, &dispatcher, &mut in_flight).await?;
                 line.clear();
             }
-            joined = tasks.join_next(), if !tasks.is_empty() => {
+            joined = in_flight.tasks.join_next(), if !in_flight.tasks.is_empty() => {
                 if let Some(Ok((key, response))) = joined
-                    && pending.remove(&key).is_some()
+                    && in_flight.pending.remove(&key).is_some()
                 {
                     write_response(&mut writer, &response).await?;
                 }
@@ -295,15 +233,109 @@ where
     }
 }
 
-async fn abort_pending(
-    tasks: &mut JoinSet<(String, Value)>,
-    pending: &mut HashMap<String, (Value, AbortHandle)>,
-) {
-    for (_, task) in pending.drain().map(|(_, value)| value) {
-        task.abort();
+/// The tool calls running as independently abortable tasks, indexed by the
+/// JSON-RPC request id each one will answer.
+struct InFlight {
+    tasks: JoinSet<(String, Value)>,
+    pending: HashMap<String, (Value, AbortHandle)>,
+}
+
+impl InFlight {
+    /// Drop every tracked call: abort the handles, abort the set, and drain
+    /// it so no task outlives the loop that was going to answer for it.
+    async fn abort_all(&mut self) {
+        for (_, task) in self.pending.drain().map(|(_, value)| value) {
+            task.abort();
+        }
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
     }
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+}
+
+/// Parse one newline-delimited message and route it, writing whatever reply
+/// it owes. A blank line is not a message; a malformed one is a JSON-RPC
+/// parse error with a null id (the request id is unrecoverable from
+/// unparseable JSON) and the loop carries on.
+async fn handle_message(
+    line: &str,
+    writer: &mut (impl AsyncWrite + Unpin),
+    dispatcher: &Dispatcher,
+    in_flight: &mut InFlight,
+) -> std::io::Result<()> {
+    let message = line.trim();
+    if message.is_empty() {
+        return Ok(());
+    }
+    let request: Request = match serde_json::from_str(message) {
+        Ok(request) => request,
+        Err(err) => {
+            let response = jsonrpc::error(Value::Null, PARSE_ERROR, format!("parse error: {err}"));
+            return write_response(writer, &response).await;
+        }
+    };
+
+    if request.method == "notifications/cancelled" {
+        return cancel_request(&request, writer, in_flight).await;
+    }
+    if request.method == "tools/call" && !request.is_notification() {
+        return spawn_tools_call(request, writer, dispatcher, in_flight).await;
+    }
+    // Everything else is a plain request/response method; a notification
+    // yields no reply.
+    let Some(response) = handle_request(request).await else {
+        return Ok(());
+    };
+    write_response(writer, &response).await
+}
+
+/// Abort the task tracked for the cancelled request id and close that request
+/// out with a cancellation error carrying its original id. An id we are not
+/// tracking is silently ignored: the call already finished or never existed.
+async fn cancel_request(
+    request: &Request,
+    writer: &mut (impl AsyncWrite + Unpin),
+    in_flight: &mut InFlight,
+) -> std::io::Result<()> {
+    let Some(cancelled_id) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("requestId"))
+    else {
+        return Ok(());
+    };
+    let Some((id, task)) = in_flight.pending.remove(&request_key(cancelled_id)) else {
+        return Ok(());
+    };
+    task.abort();
+    let response = jsonrpc::error(id, REQUEST_CANCELLED, "request cancelled");
+    write_response(writer, &response).await
+}
+
+/// Start a `tools/call` as its own abortable task, keyed by request id so a
+/// later `notifications/cancelled` can find it. Reusing an id that is still
+/// in flight is an invalid request, not a second task.
+async fn spawn_tools_call(
+    request: Request,
+    writer: &mut (impl AsyncWrite + Unpin),
+    dispatcher: &Dispatcher,
+    in_flight: &mut InFlight,
+) -> std::io::Result<()> {
+    let id = request.id.clone().unwrap_or(Value::Null);
+    let key = request_key(&id);
+    let std::collections::hash_map::Entry::Vacant(entry) = in_flight.pending.entry(key.clone())
+    else {
+        let response = jsonrpc::error(id, INVALID_REQUEST, "duplicate in-flight request id");
+        return write_response(writer, &response).await;
+    };
+    let params = request.params;
+    let dispatcher = Arc::clone(dispatcher);
+    let task_id = id.clone();
+    let abort = in_flight.tasks.spawn(async move {
+        let response = handle_tools_call_with(task_id, params.as_ref(), dispatcher.as_ref()).await;
+        (key, response)
+    });
+    entry.insert((id, abort));
+    Ok(())
 }
 
 fn request_key(id: &Value) -> String {

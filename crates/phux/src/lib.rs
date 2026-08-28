@@ -553,17 +553,16 @@ fn json_output_requested() -> bool {
     std::env::args_os().any(|arg| arg == "--json")
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one match arm per CLI subcommand; the dispatch is a flat verb table, clearer whole than split."
-)]
-pub fn run() -> ExitCode {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+/// Endpoints answered straight from argv, before clap parses anything.
+///
+/// Returns `Some(code)` when this invocation is one of them and no further
+/// setup should run.
+fn preparse_endpoint(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     // Recognize the canonical launcher spelling before clap so every trailing
     // byte belongs to the companion, including names that overlap root flags
     // today or are introduced by the MCP binary in a future release.
     if args.first().is_some_and(|arg| arg == "mcp") {
-        return commands::mcp::run(&args[1..]);
+        return Some(commands::mcp::run(&args[1..]));
     }
 
     let wants_capabilities = args.iter().any(|arg| arg == "--capabilities");
@@ -573,65 +572,53 @@ pub fn run() -> ExitCode {
             eprintln!(
                 "phux: --capabilities --json is a standalone endpoint and cannot be combined with other arguments"
             );
-            return ExitCode::from(2);
+            return Some(ExitCode::from(2));
         }
-        return capabilities::run(&Cli::command());
+        return Some(capabilities::run(&Cli::command()));
     }
 
     if short_help_requested() {
         output::bytes(SHORT_HELP.as_bytes());
-        return ExitCode::SUCCESS;
+        return Some(ExitCode::SUCCESS);
     }
 
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(err) => return report_parse_error(&err),
-    };
+    None
+}
 
-    // Clap's root args intentionally coexist with subcommands so the global
-    // --socket works on either side of a verb. That also means `exclusive`
-    // alone does not reject a following subcommand, so close that edge here
-    // rather than silently ignoring the verb.
-    if let Some(scope) = cli.skill {
-        if cli.command.is_some() {
-            eprintln!(
-                "phux: --skill is a standalone endpoint and cannot be combined with a command"
-            );
-            return ExitCode::from(2);
-        }
-        // Like clap's built-in --help and --version actions, this socketless
-        // endpoint exits before tracing, config, or TTY setup.
-        return skill::run(scope);
-    }
-
+/// The usage refusals clap's own grammar cannot express, reported once the
+/// CLI has parsed and before any process-global setup runs.
+///
+/// Covers the `--capabilities` spelling that needs `--json`, the `--rec` and
+/// `--remote` scope rules (see `root_rec_before_verb` and
+/// `root_remote_before_verb`), a malformed `--remote` target, the
+/// `--socket`/`--remote` collision, and a `--socket` handed to a verb that
+/// never dials a server. Each is a refusal with the remedy named, and each
+/// uses clap's usage-error exit code.
+fn usage_refusal(cli: &Cli) -> Option<ExitCode> {
     if cli.capabilities {
         eprintln!("phux: --capabilities requires --json");
-        return ExitCode::from(2);
+        return Some(ExitCode::from(2));
     }
 
-    // Usage errors caught after clap: the `--rec` scope rule (see
-    // `root_rec_before_verb`) and a `--socket` handed to a verb that never
-    // dials a server. Both are refusals with the remedy named, and both use
-    // clap's usage-error exit code.
-    if let Some(message) = root_rec_before_verb(&cli) {
+    if let Some(message) = root_rec_before_verb(cli) {
         eprintln!("{message}");
-        return ExitCode::from(2);
+        return Some(ExitCode::from(2));
     }
-    if let Some(message) = root_remote_before_verb(&cli) {
+    if let Some(message) = root_remote_before_verb(cli) {
         eprintln!("{message}");
-        return ExitCode::from(2);
+        return Some(ExitCode::from(2));
     }
     // A malformed `--remote` target is a usage error, so it is reported here
     // — before the interactive TTY preflight below. Otherwise a typo in a
     // script would surface as "interactive use requires a terminal", which
     // names the wrong problem entirely.
-    if let Some(message) = malformed_remote_target(&cli) {
+    if let Some(message) = malformed_remote_target(cli) {
         eprintln!("phux: {message}");
-        return ExitCode::from(2);
+        return Some(ExitCode::from(2));
     }
-    if socket_and_remote_collide(&cli) {
+    if socket_and_remote_collide(cli) {
         eprintln!("phux: --socket dials a local UDS and cannot combine with --remote; drop one");
-        return ExitCode::from(2);
+        return Some(ExitCode::from(2));
     }
     if cli.socket.is_some()
         && let Some(verb) = cli.command.as_ref().and_then(commands::socketless_verb)
@@ -639,42 +626,30 @@ pub fn run() -> ExitCode {
         eprintln!(
             "phux: `phux {verb}` never dials a server, so --socket has no effect here; drop it"
         );
-        return ExitCode::from(2);
+        return Some(ExitCode::from(2));
     }
 
-    // The launcher must be transparent: replace this process before tracing,
-    // config, socket, or TTY setup can alter the MCP stdio contract.
-    if let Some(Command::Mcp { args }) = &cli.command {
-        return commands::mcp::run(args);
-    }
+    None
+}
 
-    // Refuse every alt-screen path before telemetry, dialing, server spawn,
-    // filesystem mutation, or terminal-control output can happen.
-    if is_interactive_client(&cli)
-        && let Err(code) = commands::attach::interactive_tty_preflight()
-    {
-        return code;
-    }
-
-    let json_output = json_output_requested();
-
-    // Install the process-global tracing subscriber once, before any
-    // runtime spins up. Without this, every `tracing::{info,debug,...}`
-    // call site is a no-op.
-    //
-    // The choice of sink depends on whether this invocation will enter
-    // the TUI (raw mode + alt screen). An interactive client owns the
-    // alt screen, so it MUST log to a file only — a stray stderr line
-    // corrupts the display. Every other command (foreground server,
-    // one-shot control verbs, `--json` paths) keeps the historical
-    // stderr layer (plus an optional `PHUX_LOG` file tee).
-    //
-    // The returned `WorkerGuard` (when a file sink is involved) keeps
-    // the non-blocking writer's background thread alive; bind it for the
-    // lifetime of `main` so logs flush on exit. An init failure is
-    // non-fatal: the binary should keep working even if a future test
-    // harness or library already installed its own subscriber.
-    let _log_guard: Option<phux_server::telemetry::WorkerGuard> = if is_interactive_client(&cli) {
+/// Install the process-global tracing subscriber once, before any
+/// runtime spins up. Without this, every `tracing::{info,debug,...}`
+/// call site is a no-op.
+///
+/// The choice of sink depends on whether this invocation will enter
+/// the TUI (raw mode + alt screen). An interactive client owns the
+/// alt screen, so it MUST log to a file only — a stray stderr line
+/// corrupts the display. Every other command (foreground server,
+/// one-shot control verbs, `--json` paths) keeps the historical
+/// stderr layer (plus an optional `PHUX_LOG` file tee).
+///
+/// The returned `WorkerGuard` (when a file sink is involved) keeps
+/// the non-blocking writer's background thread alive; bind it for the
+/// lifetime of `main` so logs flush on exit. An init failure is
+/// non-fatal: the binary should keep working even if a future test
+/// harness or library already installed its own subscriber.
+fn init_tracing(cli: &Cli) -> Option<phux_server::telemetry::WorkerGuard> {
+    if is_interactive_client(cli) {
         // The client uses a synchronous file writer (no guard) so its trace
         // survives the `process::exit` detach path; see `init_client`.
         if let Err(err) = phux_server::telemetry::init_client() {
@@ -683,30 +658,171 @@ pub fn run() -> ExitCode {
             // beats a silent no-op subscriber.
             eprintln!("phux: client tracing init failed (continuing): {err}");
         }
-        None
-    } else {
-        match phux_server::telemetry::init() {
-            Ok(guard) => guard,
-            Err(err) => {
-                if !json_output {
-                    eprintln!("phux: tracing init failed (continuing): {err}");
-                }
-                None
+        return None;
+    }
+
+    match phux_server::telemetry::init() {
+        Ok(guard) => guard,
+        Err(err) => {
+            if !json_output_requested() {
+                eprintln!("phux: tracing init failed (continuing): {err}");
             }
+            None
         }
-    };
+    }
+}
 
-    // `command` is moved into the match; `socket` is the root global every
-    // arm shares (each arm consumes it at most once, and only one arm runs).
-    let Cli {
-        rec: root_rec,
-        skill: _,
-        remote: root_remote,
-        capabilities: _,
+/// The fully-parsed inputs of `phux attach`, carried as one value so the
+/// verb's body can live in [`run_attach`] rather than inline in the dispatch
+/// table. The field names mirror the clap variant's, so the arm builds this
+/// by field shorthand.
+struct AttachInvocation {
+    session: Option<String>,
+    quic: Option<String>,
+    ws: Option<String>,
+    token: Option<String>,
+    cert_fingerprint: Option<String>,
+    tls_server_name: Option<String>,
+    remote: Option<String>,
+    code: Option<String>,
+    no_enroll: bool,
+    rec: commands::RecOpts,
+    socket: Option<std::path::PathBuf>,
+}
+
+/// Run `phux attach`: resolve the recording plan, then dial whichever
+/// transport the flags named.
+fn run_attach(invocation: AttachInvocation) -> ExitCode {
+    let AttachInvocation {
+        session,
+        quic,
+        ws,
+        token,
+        cert_fingerprint,
+        tls_server_name,
+        remote,
+        code,
+        no_enroll,
+        rec,
         socket,
-        command,
-    } = cli;
+    } = invocation;
 
+    // `phux attach` owns its own `--rec`; the root copy is reserved
+    // for the naked invocation below.
+    let rec_spec = match plan_rec(&rec) {
+        Ok(spec) => spec,
+        Err(code) => return code,
+    };
+    let rec_spec = rec_spec.as_ref();
+    // `--socket` is a local UDS path; the remote transports do not
+    // read it. The old per-verb clap conflict could not survive the
+    // move to a root global (clap validates conflicts per parser, so
+    // `phux --socket X attach --quic Y` would slip through), so the
+    // refusal is explicit here and covers both flag positions.
+    // The `--remote` half of this rule is enforced post-parse (see
+    // `socket_and_remote_collide`), ahead of the TTY preflight.
+    if socket.is_some() && (quic.is_some() || ws.is_some()) {
+        eprintln!("phux: --socket dials a local UDS and cannot combine with --quic/--ws; drop one");
+        return ExitCode::from(2);
+    }
+    if let Some(target) = remote {
+        return attach_remote_target(&target, session, code.as_deref(), no_enroll, rec_spec);
+    }
+    match (quic, ws) {
+        (Some(addr), None) => commands::attach::run_attach_quic(
+            session,
+            addr,
+            token,
+            cert_fingerprint,
+            tls_server_name,
+            rec_spec,
+        ),
+        (None, Some(url)) => commands::attach::run_attach_ws(
+            session,
+            url,
+            token,
+            cert_fingerprint,
+            tls_server_name,
+            rec_spec,
+        ),
+        (None, None) => commands::attach::run_attach_rec(session, socket, rec_spec),
+        (Some(_), Some(_)) => {
+            eprintln!("phux: choose only one remote attach transport (--quic or --ws)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run `phux service`: the installed-supervisor lifecycle verbs.
+fn run_service(action: commands::ServiceAction, socket: Option<std::path::PathBuf>) -> ExitCode {
+    match action {
+        commands::ServiceAction::Install {
+            quic,
+            listen,
+            restore,
+            hub,
+            adopt,
+            print,
+        } => commands::service::run_install(
+            quic,
+            listen,
+            restore,
+            socket,
+            hub,
+            if adopt {
+                commands::service::Takeover::Adopt
+            } else {
+                commands::service::Takeover::Refuse
+            },
+            print,
+        ),
+        commands::ServiceAction::Reconcile { print } => commands::service::run_reconcile(print),
+        commands::ServiceAction::Uninstall => commands::service::run_uninstall(),
+        commands::ServiceAction::Status => commands::service::run_status(),
+        commands::ServiceAction::Logs { follow, lines } => {
+            commands::service::run_logs(follow, lines)
+        }
+        commands::ServiceAction::PruneLogs { dry_run } => {
+            commands::service::run_prune_logs(dry_run)
+        }
+    }
+}
+
+/// Run the naked `phux` — no verb, so attach to the user's session, locally
+/// or at the root `--remote` target.
+fn run_naked_invocation(
+    root_rec: &commands::RecOpts,
+    root_remote: Option<String>,
+    socket: Option<std::path::PathBuf>,
+) -> ExitCode {
+    let rec_spec = match plan_rec(root_rec) {
+        Ok(spec) => spec,
+        Err(code) => return code,
+    };
+    if let Some(target) = root_remote {
+        // The `--socket` collision was already refused post-parse.
+        return attach_remote_target(&target, None, None, false, rec_spec.as_ref());
+    }
+    commands::attach::run_naked(socket, rec_spec.as_ref())
+}
+
+/// The verb table: one arm per CLI subcommand, each delegating to the
+/// command module that owns it.
+///
+/// `command` is moved into the match; `socket` is the root global every
+/// arm shares (each arm consumes it at most once, and only one arm runs).
+/// `root_rec` and `root_remote` are the naked-invocation halves of their
+/// root flags, and the `None` arm alone reads them.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per CLI subcommand; the dispatch is a flat verb table, clearer whole than split."
+)]
+fn dispatch(
+    command: Option<Command>,
+    socket: Option<std::path::PathBuf>,
+    root_rec: &commands::RecOpts,
+    root_remote: Option<String>,
+) -> ExitCode {
     match command {
         Some(Command::Attach {
             session,
@@ -719,60 +835,19 @@ pub fn run() -> ExitCode {
             code,
             no_enroll,
             rec,
-        }) => {
-            // `phux attach` owns its own `--rec`; the root copy is reserved
-            // for the naked invocation below.
-            let rec_spec = match plan_rec(&rec) {
-                Ok(spec) => spec,
-                Err(code) => return code,
-            };
-            let rec_spec = rec_spec.as_ref();
-            // `--socket` is a local UDS path; the remote transports do not
-            // read it. The old per-verb clap conflict could not survive the
-            // move to a root global (clap validates conflicts per parser, so
-            // `phux --socket X attach --quic Y` would slip through), so the
-            // refusal is explicit here and covers both flag positions.
-            // The `--remote` half of this rule is enforced post-parse (see
-            // `socket_and_remote_collide`), ahead of the TTY preflight.
-            if socket.is_some() && (quic.is_some() || ws.is_some()) {
-                eprintln!(
-                    "phux: --socket dials a local UDS and cannot combine with --quic/--ws; drop one"
-                );
-                return ExitCode::from(2);
-            }
-            if let Some(target) = remote {
-                return attach_remote_target(
-                    &target,
-                    session,
-                    code.as_deref(),
-                    no_enroll,
-                    rec_spec,
-                );
-            }
-            match (quic, ws) {
-                (Some(addr), None) => commands::attach::run_attach_quic(
-                    session,
-                    addr,
-                    token,
-                    cert_fingerprint,
-                    tls_server_name,
-                    rec_spec,
-                ),
-                (None, Some(url)) => commands::attach::run_attach_ws(
-                    session,
-                    url,
-                    token,
-                    cert_fingerprint,
-                    tls_server_name,
-                    rec_spec,
-                ),
-                (None, None) => commands::attach::run_attach_rec(session, socket, rec_spec),
-                (Some(_), Some(_)) => {
-                    eprintln!("phux: choose only one remote attach transport (--quic or --ws)");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        }) => run_attach(AttachInvocation {
+            session,
+            quic,
+            ws,
+            token,
+            cert_fingerprint,
+            tls_server_name,
+            remote,
+            code,
+            no_enroll,
+            rec,
+            socket,
+        }),
         Some(Command::Server {
             session,
             listen,
@@ -1065,52 +1140,76 @@ pub fn run() -> ExitCode {
             json,
         }) => commands::logs::run_logs(server, client, pid, follow, lines, json),
         Some(Command::Host { action }) => commands::host::run_host(&action),
-        Some(Command::Service { action }) => match action {
-            commands::ServiceAction::Install {
-                quic,
-                listen,
-                restore,
-                hub,
-                adopt,
-                print,
-            } => commands::service::run_install(
-                quic,
-                listen,
-                restore,
-                socket,
-                hub,
-                if adopt {
-                    commands::service::Takeover::Adopt
-                } else {
-                    commands::service::Takeover::Refuse
-                },
-                print,
-            ),
-            commands::ServiceAction::Reconcile { print } => commands::service::run_reconcile(print),
-            commands::ServiceAction::Uninstall => commands::service::run_uninstall(),
-            commands::ServiceAction::Status => commands::service::run_status(),
-            commands::ServiceAction::Logs { follow, lines } => {
-                commands::service::run_logs(follow, lines)
-            }
-            commands::ServiceAction::PruneLogs { dry_run } => {
-                commands::service::run_prune_logs(dry_run)
-            }
-        },
+        Some(Command::Service { action }) => run_service(action, socket),
         Some(Command::GenReferenceDocs { out }) => {
             commands::gen_reference_docs::run_gen_reference_docs(out)
         }
-        None => {
-            let rec_spec = match plan_rec(&root_rec) {
-                Ok(spec) => spec,
-                Err(code) => return code,
-            };
-            if let Some(target) = root_remote {
-                // The `--socket` collision was already refused post-parse.
-                return attach_remote_target(&target, None, None, false, rec_spec.as_ref());
-            }
-            commands::attach::run_naked(socket, rec_spec.as_ref())
-        }
+        None => run_naked_invocation(root_rec, root_remote, socket),
     }
+}
+
+#[must_use]
+pub fn run() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(code) = preparse_endpoint(&args) {
+        return code;
+    }
+
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => return report_parse_error(&err),
+    };
+
+    // Clap's root args intentionally coexist with subcommands so the global
+    // --socket works on either side of a verb. That also means `exclusive`
+    // alone does not reject a following subcommand, so close that edge here
+    // rather than silently ignoring the verb.
+    if let Some(scope) = cli.skill {
+        if cli.command.is_some() {
+            eprintln!(
+                "phux: --skill is a standalone endpoint and cannot be combined with a command"
+            );
+            return ExitCode::from(2);
+        }
+        // Like clap's built-in --help and --version actions, this socketless
+        // endpoint exits before tracing, config, or TTY setup.
+        return skill::run(scope);
+    }
+
+    // Usage errors caught after clap: the `--rec` scope rule (see
+    // `root_rec_before_verb`) and a `--socket` handed to a verb that never
+    // dials a server. Both are refusals with the remedy named, and both use
+    // clap's usage-error exit code.
+    if let Some(code) = usage_refusal(&cli) {
+        return code;
+    }
+
+    // The launcher must be transparent: replace this process before tracing,
+    // config, socket, or TTY setup can alter the MCP stdio contract.
+    if let Some(Command::Mcp { args }) = &cli.command {
+        return commands::mcp::run(args);
+    }
+
+    // Refuse every alt-screen path before telemetry, dialing, server spawn,
+    // filesystem mutation, or terminal-control output can happen.
+    if is_interactive_client(&cli)
+        && let Err(code) = commands::attach::interactive_tty_preflight()
+    {
+        return code;
+    }
+
+    let _log_guard: Option<phux_server::telemetry::WorkerGuard> = init_tracing(&cli);
+
+    let Cli {
+        rec: root_rec,
+        skill: _,
+        remote: root_remote,
+        capabilities: _,
+        socket,
+        command,
+    } = cli;
+
+    dispatch(command, socket, &root_rec, root_remote)
 }
 
 #[cfg(test)]

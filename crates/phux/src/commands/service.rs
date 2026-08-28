@@ -617,9 +617,9 @@ fn reconcile_launchd(body: &str) -> Reconcile {
             index = end;
             continue;
         }
-        if trimmed == "<dict>" || trimmed == "<array>" {
+        if opens_plist_container(trimmed) {
             depth += 1;
-        } else if trimmed == "</dict>" || trimmed == "</array>" {
+        } else if closes_plist_container(trimmed) {
             depth = depth.saturating_sub(1);
         }
         kept.push(line.to_owned());
@@ -651,6 +651,46 @@ fn reconcile_launchd(body: &str) -> Reconcile {
     settled(body, &kept)
 }
 
+/// Whether a trimmed plist line opens a nested container element.
+fn opens_plist_container(trimmed: &str) -> bool {
+    matches!(trimmed, "<dict>" | "<array>")
+}
+
+/// Whether a trimmed plist line closes a nested container element.
+fn closes_plist_container(trimmed: &str) -> bool {
+    matches!(trimmed, "</dict>" | "</array>")
+}
+
+/// `<true/>`, `<dict/>`: one tag, self-closing.
+fn is_self_closing_element(trimmed: &str) -> bool {
+    trimmed.starts_with('<') && trimmed.ends_with("/>") && trimmed.matches('<').count() == 1
+}
+
+/// `<integer>30</integer>`: opens and closes on the same line.
+fn is_one_line_element(trimmed: &str) -> bool {
+    trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.matches('<').count() == 2
+}
+
+/// Index just past the balanced `<dict>`/`<array>` block that opens at
+/// `start`, or `None` when it never closes.
+fn plist_container_end(lines: &[&str], start: usize) -> Option<usize> {
+    let mut index = start;
+    let mut depth = 0_usize;
+    while let Some(line) = lines.get(index) {
+        let trimmed = line.trim();
+        if opens_plist_container(trimmed) {
+            depth += 1;
+        } else if closes_plist_container(trimmed) {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index + 1);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Index just past the plist value element starting at or after `start`, or
 /// `None` when it is a shape [`reconcile_launchd`] must not touch.
 ///
@@ -666,29 +706,10 @@ fn plist_value_end(lines: &[&str], start: usize) -> Option<usize> {
     }
     let first = lines.get(index)?.trim();
 
-    if first == "<dict>" || first == "<array>" {
-        let mut depth = 0_usize;
-        while let Some(line) = lines.get(index) {
-            let trimmed = line.trim();
-            if trimmed == "<dict>" || trimmed == "<array>" {
-                depth += 1;
-            } else if trimmed == "</dict>" || trimmed == "</array>" {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(index + 1);
-                }
-            }
-            index += 1;
-        }
-        return None;
+    if opens_plist_container(first) {
+        return plist_container_end(lines, index);
     }
-
-    // `<true/>`, `<dict/>`: one tag, self-closing.
-    if first.starts_with('<') && first.ends_with("/>") && first.matches('<').count() == 1 {
-        return Some(index + 1);
-    }
-    // `<integer>30</integer>`: opens and closes on the same line.
-    if first.starts_with('<') && first.ends_with('>') && first.matches('<').count() == 2 {
+    if is_self_closing_element(first) || is_one_line_element(first) {
         return Some(index + 1);
     }
     None

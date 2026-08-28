@@ -12,12 +12,12 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::tools::ToolError;
 #[cfg(test)]
@@ -109,6 +109,23 @@ impl CliAdapter {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let (mut child, stdout, stderr) = self.spawn_capturing(args)?;
+        let (status, stdout, stderr) = drain_within(&mut child, stdout, stderr, timeout).await?;
+        let output = CliOutput {
+            stdout: decode_bounded(&stdout, "stdout", STDOUT_LIMIT)?,
+            stderr: decode_bounded(&stderr, "stderr", STDERR_LIMIT)?,
+        };
+        check_exit(status, &output.stderr, allowed)?;
+        Ok(output)
+    }
+
+    /// Spawn the CLI with argv only — never through a shell — and take both
+    /// pipes so the caller can drain them under its own deadline.
+    fn spawn_capturing<I, S>(&self, args: I) -> Result<CapturedChild, ToolError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut child = Command::new(&self.program)
             .args(args)
             .stdin(Stdio::null())
@@ -125,47 +142,64 @@ impl CliAdapter {
             .stderr
             .take()
             .ok_or_else(|| ToolError::new("could not capture phux stderr"))?;
-
-        let execution = async {
-            let (status, stdout, stderr) = tokio::join!(
-                child.wait(),
-                read_bounded(stdout, STDOUT_LIMIT),
-                read_bounded(stderr, STDERR_LIMIT),
-            );
-            Ok::<_, std::io::Error>((status?, stdout?, stderr?))
-        };
-        let result = Box::pin(tokio::time::timeout(timeout, execution)).await;
-        let (status, stdout, stderr) = if let Ok(result) = result {
-            result.map_err(|err| ToolError::new(format!("phux CLI I/O failed: {err}")))?
-        } else {
-            let _ = child.kill().await;
-            return Err(ToolError::new(format!(
-                "phux CLI exceeded the {}s tool deadline",
-                timeout.as_secs_f64()
-            )));
-        };
-        if stdout.truncated {
-            return Err(ToolError::new(format!(
-                "phux CLI stdout exceeded {STDOUT_LIMIT} bytes"
-            )));
-        }
-        if stderr.truncated {
-            return Err(ToolError::new(format!(
-                "phux CLI stderr exceeded {STDERR_LIMIT} bytes"
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
-        if !status.success() && !status.code().is_some_and(|code| allowed.contains(&code)) {
-            let message = stderr.trim();
-            return Err(ToolError::new(if message.is_empty() {
-                format!("phux CLI exited with {status}")
-            } else {
-                message.to_owned()
-            }));
-        }
-        Ok(CliOutput { stdout, stderr })
+        Ok((child, stdout, stderr))
     }
+}
+
+/// A spawned CLI child together with the two pipes taken from it.
+type CapturedChild = (Child, ChildStdout, ChildStderr);
+
+/// Wait for the child while draining both pipes, killing it if `timeout`
+/// elapses first. Child lifetime is bounded here and nowhere else.
+async fn drain_within(
+    child: &mut Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    timeout: Duration,
+) -> Result<(ExitStatus, BoundedBytes, BoundedBytes), ToolError> {
+    let execution = async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            read_bounded(stdout, STDOUT_LIMIT),
+            read_bounded(stderr, STDERR_LIMIT),
+        );
+        Ok::<_, std::io::Error>((status?, stdout?, stderr?))
+    };
+    let result = Box::pin(tokio::time::timeout(timeout, execution)).await;
+    if let Ok(result) = result {
+        result.map_err(|err| ToolError::new(format!("phux CLI I/O failed: {err}")))
+    } else {
+        let _ = child.kill().await;
+        Err(ToolError::new(format!(
+            "phux CLI exceeded the {}s tool deadline",
+            timeout.as_secs_f64()
+        )))
+    }
+}
+
+/// Decode one drained stream, rejecting it when the fixed memory cap clipped
+/// it — a truncated document is not a document.
+fn decode_bounded(drained: &BoundedBytes, stream: &str, limit: usize) -> Result<String, ToolError> {
+    if drained.truncated {
+        return Err(ToolError::new(format!(
+            "phux CLI {stream} exceeded {limit} bytes"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&drained.bytes).into_owned())
+}
+
+/// A non-zero exit is a failure unless the caller allowed that exact code;
+/// the child's own stderr line becomes the error message when it wrote one.
+fn check_exit(status: ExitStatus, stderr: &str, allowed: &[i32]) -> Result<(), ToolError> {
+    if status.success() || status.code().is_some_and(|code| allowed.contains(&code)) {
+        return Ok(());
+    }
+    let message = stderr.trim();
+    Err(ToolError::new(if message.is_empty() {
+        format!("phux CLI exited with {status}")
+    } else {
+        message.to_owned()
+    }))
 }
 
 #[derive(Debug)]

@@ -1122,37 +1122,19 @@ pub(crate) fn run_attach_ws(
         }
     };
 
-    if !target.secure && !target.is_loopback() {
-        eprintln!("phux: refusing plaintext WebSocket attach to non-loopback URL {url}.");
-        eprintln!("      Use wss:// plus `phux pair` credentials for remote devices.");
-        return ExitCode::FAILURE;
-    }
-    if target.secure && !target.is_loopback() && cert_fingerprint.is_none() {
-        eprintln!(
-            "phux: refusing to dial non-loopback WebSocket server {url} without --cert-fingerprint."
-        );
-        eprintln!("      Run `phux pair` on the server host, then pass the printed fingerprint.");
-        return ExitCode::FAILURE;
-    }
-    if target.secure && !target.is_loopback() && token.is_none() {
-        eprintln!("phux: refusing remote WebSocket attach to {url} without --token.");
-        eprintln!("      Run `phux pair` on the server host and pass the printed token once.");
-        return ExitCode::FAILURE;
+    if let Err(code) =
+        require_ws_dial_credentials(&target, &url, token.as_deref(), cert_fingerprint.as_deref())
+    {
+        return code;
     }
 
     // Captured before `target` is shadowed by the AttachTarget below; the
     // failure hint needs to know whether the dial left the machine.
     let loopback = target.is_loopback();
 
-    let token = match token {
-        Some(token) => match attach::quic::parse_token_hex(&token) {
-            Ok(_) => Some(token.trim().to_owned()),
-            Err(err) => {
-                eprintln!("phux: {err}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
+    let token = match validated_ws_token(token) {
+        Ok(token) => token,
+        Err(code) => return code,
     };
 
     let trust = cert_fingerprint.map_or(CertTrust::SkipVerify, CertTrust::Pinned);
@@ -1174,15 +1156,7 @@ pub(crate) fn run_attach_ws(
         }
     };
 
-    let predict_cfg = match config_loader::load() {
-        Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo,
-        },
-        Err(err) => {
-            eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig::disabled()
-        }
-    };
+    let predict_cfg = predictive_config_or_defaults();
 
     let default_name = resolved_default_session_name();
     let (target, default) = session.map_or_else(
@@ -1198,6 +1172,73 @@ pub(crate) fn run_attach_ws(
         rec,
     ));
     finalize_recording(rec);
+    report_ws_attach_outcome(result, loopback)
+}
+
+/// Refuse a WebSocket dial that leaves the machine without the credentials
+/// `phux pair` mints for it.
+///
+/// Three separate refusals, each naming the one flag that clears it: a
+/// plaintext remote dial at all, a remote `wss://` dial with no pinned
+/// fingerprint (MITM defense), and a remote dial with no bearer token. A
+/// loopback dial needs none of them.
+fn require_ws_dial_credentials(
+    target: &attach::ws::WsTarget,
+    url: &str,
+    token: Option<&str>,
+    cert_fingerprint: Option<&str>,
+) -> Result<(), ExitCode> {
+    if !target.secure && !target.is_loopback() {
+        eprintln!("phux: refusing plaintext WebSocket attach to non-loopback URL {url}.");
+        eprintln!("      Use wss:// plus `phux pair` credentials for remote devices.");
+        return Err(ExitCode::FAILURE);
+    }
+    if target.secure && !target.is_loopback() && cert_fingerprint.is_none() {
+        eprintln!(
+            "phux: refusing to dial non-loopback WebSocket server {url} without --cert-fingerprint."
+        );
+        eprintln!("      Run `phux pair` on the server host, then pass the printed fingerprint.");
+        return Err(ExitCode::FAILURE);
+    }
+    if target.secure && !target.is_loopback() && token.is_none() {
+        eprintln!("phux: refusing remote WebSocket attach to {url} without --token.");
+        eprintln!("      Run `phux pair` on the server host and pass the printed token once.");
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(())
+}
+
+/// Check that a supplied bearer token is well-formed hex before it is dialed
+/// with, and normalize its surrounding whitespace away.
+fn validated_ws_token(token: Option<String>) -> Result<Option<String>, ExitCode> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    match attach::quic::parse_token_hex(&token) {
+        Ok(_) => Ok(Some(token.trim().to_owned())),
+        Err(err) => {
+            eprintln!("phux: {err}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// The predictive-echo setting from the config file, falling back to the
+/// defaults (and saying so) when the config cannot be read.
+fn predictive_config_or_defaults() -> PredictiveConfig {
+    match config_loader::load() {
+        Ok(cfg) => PredictiveConfig {
+            enabled: cfg.experimental.predictive_echo,
+        },
+        Err(err) => {
+            eprintln!("phux: config load failed ({err}); using defaults");
+            PredictiveConfig::disabled()
+        }
+    }
+}
+
+/// Turn a finished WebSocket attach into its exit code, reporting the ending.
+fn report_ws_attach_outcome(result: Result<AttachEnd, AttachError>, loopback: bool) -> ExitCode {
     match result {
         Ok(end) => {
             report_attach_end(end);

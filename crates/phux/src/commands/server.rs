@@ -82,32 +82,16 @@ fn select_connectors(
     }
 }
 
-/// Build a current-thread tokio runtime and drive `ServerRuntime`
-/// until Ctrl-C.
+/// Arm the process-wide server concerns and resolve the socket path, or
+/// report why the server refuses to start.
 ///
-/// The runtime pre-seeds a session named `session` whose initial pane
-/// is backed by a real PTY running the resolved default shell
-/// (`defaults.shell`, falling back to `$SHELL`, then `/bin/sh`). On
-/// Ctrl-C, `run_async` returns `Ok(())` and the process exits 0.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::fn_params_excessive_bools,
-    clippy::too_many_lines,
-    reason = "1:1 mirror of the `phux server` clap surface; bundling into a struct would just restate the clap enum"
-)]
-pub(crate) fn run_server(
-    session: &str,
+/// Everything here runs before the config load and the runtime bring-up, so
+/// a refusal costs nothing and reads on the terminal that asked for it.
+fn prepare_process(
     socket: Option<PathBuf>,
-    listen: Option<std::net::SocketAddr>,
-    quic: Option<std::net::SocketAddr>,
-    webtransport: Option<std::net::SocketAddr>,
-    connect: Option<String>,
-    hub: bool,
-    exit_after_idle: Option<u64>,
     daemonize: bool,
-    seed_command: Option<&str>,
     resume: Option<std::os::fd::RawFd>,
-) -> ExitCode {
+) -> Result<PathBuf, ExitCode> {
     // Arm durable crash capture. This is a long-running, often daemonized
     // process whose panic has to survive in `PHUX_LOG` — nobody is watching
     // its stderr. `telemetry::init` deliberately does not install this for
@@ -120,9 +104,7 @@ pub(crate) fn run_server(
     // phux-iwuc: fail before the banner and the runtime bring-up when the
     // path cannot fit in a sockaddr_un — the bind inside `run_async` would
     // gate it too, but only after "listening on ..." has already printed.
-    if let Err(code) = crate::commands::ensure_socket_path_fits(&socket_path) {
-        return code;
-    }
+    crate::commands::ensure_socket_path_fits(&socket_path)?;
 
     // Banner only for a hand-started foreground server (a human watching
     // a long-running process). The `--daemonize` child of the auto-spawn
@@ -144,42 +126,57 @@ pub(crate) fn run_server(
         let _ = rustix::process::setsid();
     }
 
-    // phux-i0e8.1.1: the config is loaded exactly ONCE, here. Every
-    // consumer below (seed command, `defaults.*`, hook catalog, connector
-    // registry, hub satellites) binds from this one snapshot, so an edit
-    // mid-startup cannot yield a torn read. A missing file is not an
-    // error — the loader returns the shipped defaults (loader.rs, NotFound
-    // arm). A file that exists but fails to load is fatal: silently
-    // disabling every configured hook and reverting scrollback/TERM/
-    // window-size policy behind a normal "listening on ..." banner is
-    // strictly worse than refusing to start. The connector registry's
-    // security stance (malformed must not read as empty) already made a
-    // parse error fatal; this makes the reported error the real one.
-    let config = match config_loader::load() {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            let msg = broken_config_message(&config_loader::config_path(), &err);
-            // Both surfaces on purpose: stderr reaches a human who
-            // hand-started a foreground server; the auto-spawn path nulls
-            // stdout/stdin and points stderr at a log file, so the
-            // `tracing::error!` line is the durable trace either way.
-            eprintln!("{msg}");
-            tracing::error!(
-                path = %config_loader::config_path().display(),
-                error = %err,
-                "refusing to start: config failed to load; run: phux config check"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    Ok(socket_path)
+}
 
+/// Load the one config snapshot every consumer binds from, or report why
+/// the server refuses to start.
+///
+/// phux-i0e8.1.1: the config is loaded exactly ONCE, here. Every
+/// consumer downstream (seed command, `defaults.*`, hook catalog, connector
+/// registry, hub satellites) binds from this one snapshot, so an edit
+/// mid-startup cannot yield a torn read. A missing file is not an
+/// error — the loader returns the shipped defaults (loader.rs, `NotFound`
+/// arm). A file that exists but fails to load is fatal: silently
+/// disabling every configured hook and reverting scrollback/TERM/
+/// window-size policy behind a normal "listening on ..." banner is
+/// strictly worse than refusing to start. The connector registry's
+/// security stance (malformed must not read as empty) already made a
+/// parse error fatal; this makes the reported error the real one.
+fn load_config() -> Result<phux_config::Config, ExitCode> {
+    config_loader::load().map_err(|err| {
+        let msg = broken_config_message(&config_loader::config_path(), &err);
+        // Both surfaces on purpose: stderr reaches a human who
+        // hand-started a foreground server; the auto-spawn path nulls
+        // stdout/stdin and points stderr at a log file, so the
+        // `tracing::error!` line is the durable trace either way.
+        eprintln!("{msg}");
+        tracing::error!(
+            path = %config_loader::config_path().display(),
+            error = %err,
+            "refusing to start: config failed to load; run: phux config check"
+        );
+        ExitCode::FAILURE
+    })
+}
+
+/// Compose the `ServerConfig` the runtime binds from, out of the single
+/// config snapshot's `defaults` and the flags that override them.
+fn build_server_config(
+    session: &str,
+    socket_path: &Path,
+    defaults: phux_config::DefaultsCfg,
+    hook_catalog: phux_server::hooks::HookCatalog,
+    seed_command: Option<&str>,
+    exit_after_idle: Option<u64>,
+) -> ServerConfig {
     // phux-i0e8.4.1: resolve the default shell exactly once, from the
     // single config snapshot above — `defaults.shell` when set, else
     // `$SHELL`, else `/bin/sh` — and thread it into every server-owned
     // spawn path (seed session, `--seed-command`, `CreateIfMissing`,
     // `SESSION_CREATE_KEY`, command-less `SPAWN_TERMINAL`). This bind
     // must stay below the config load.
-    let shell = phux_server::terminal_actor::resolve_shell(config.defaults.shell.as_deref());
+    let shell = phux_server::terminal_actor::resolve_shell(defaults.shell.as_deref());
 
     // phux-87rr: a server started via `phux service install`'s generated
     // launchd/systemd unit inherits the init system's minimal environment
@@ -209,13 +206,6 @@ pub(crate) fn run_server(
     let seed_command = seed_command
         .map(|command| phux_server::terminal_actor::shell_command(&shell, command, login_shell));
 
-    // `[[hooks.<name>]]` entries plus enabled plugin manifests' `[[events]]`
-    // feed the server-side hook dispatcher (docs/consumers/tui.md §9,
-    // phux-r82.1). Relative manifest paths resolve against the config file's
-    // directory.
-    let hook_catalog =
-        phux_server::hooks::HookCatalog::from_config(&config, &config_loader::config_path());
-
     // `defaults.history-limit` bounds each pane's retained scrollback.
     // `defaults.cwd-inheritance` selects how `SPAWN_TERMINAL` resolves a
     // new pane's working directory. `defaults.term` is the `TERM`
@@ -223,35 +213,17 @@ pub(crate) fn run_server(
     // `SPAWN_TERMINAL.env` entry for `TERM` overrides it).
     // `defaults.window-size` picks the multi-client geometry policy
     // (phux-nk07).
-    let history_limit = config.defaults.history_limit;
-    let cwd_inheritance = config.defaults.cwd_inheritance;
-    let term = config.defaults.term;
-    let window_size = config.defaults.window_size;
-
-    // `[[satellites]]` registry, consumed below only when `--hub` was
-    // asked for.
-    let satellites = config.satellites;
-
-    // Connector registry — same single snapshot; a malformed config never
-    // reads as an empty registry because it never gets this far.
-    let configured_connectors = config.connector;
-    let connector_entries = select_connectors(configured_connectors, connect.as_deref());
-    if let Err(err) = phux_server::connector::plan_connectors(&connector_entries) {
-        eprintln!("phux server failed: connector: {err}");
-        return ExitCode::FAILURE;
-    }
-
-    let cfg = ServerConfig {
-        socket_path: socket_path.clone(),
+    ServerConfig {
+        socket_path: socket_path.to_path_buf(),
         pre_seeded_session: Some(session.to_owned()),
         seed_with_pty: true,
         seed_command,
-        history_limit,
-        cwd_inheritance,
-        term,
+        history_limit: defaults.history_limit,
+        cwd_inheritance: defaults.cwd_inheritance,
+        term: defaults.term,
         shell,
         login_shell,
-        window_size,
+        window_size: defaults.window_size,
         // Permissive HELLO authorization (ADR-0072): the local trust model
         // is "same OS user, kernel-enforced". phux-pjc5 installs the
         // scope-enforcing engine here for paired/remote deployments.
@@ -261,19 +233,31 @@ pub(crate) fn run_server(
         // contract — live until the last pane is gone — is what a human
         // expects and is deliberately untouched.
         exit_after_idle: exit_after_idle.map(Duration::from_secs),
-    };
+    }
+}
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
+/// Build the current-thread tokio runtime, or report why it could not be
+/// built.
+fn build_runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(err) => {
+        .map_err(|err| {
             eprintln!("failed to build runtime: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+            ExitCode::FAILURE
+        })
+}
 
+/// The listener/feature suffix of the "phux server listening on ..." line:
+/// every extra endpoint and mode this server was asked for.
+fn listener_summary(
+    listen: Option<std::net::SocketAddr>,
+    quic: Option<std::net::SocketAddr>,
+    webtransport: Option<std::net::SocketAddr>,
+    hub: bool,
+    connector_count: usize,
+    exit_after_idle: Option<u64>,
+) -> String {
     let mut extra = match (listen, quic) {
         (Some(ws), Some(q)) => format!(" + ws://{ws} + quic://{q}"),
         (Some(ws), None) => format!(" + ws://{ws}"),
@@ -288,11 +272,9 @@ pub(crate) fn run_server(
     if hub {
         extra.push_str(" [hub]");
     }
-    if !connector_entries.is_empty() {
-        let _ = std::fmt::Write::write_fmt(
-            &mut extra,
-            format_args!(" + connectors={}", connector_entries.len()),
-        );
+    if connector_count > 0 {
+        let _ =
+            std::fmt::Write::write_fmt(&mut extra, format_args!(" + connectors={connector_count}"));
     }
     // An ephemeral server has a lifetime a human would otherwise have to
     // infer from a flag they may not have typed themselves (a wrapper
@@ -300,16 +282,16 @@ pub(crate) fn run_server(
     if let Some(secs) = exit_after_idle {
         let _ = std::fmt::Write::write_fmt(&mut extra, format_args!(" [exit-after-idle={secs}s]"));
     }
-    eprintln!(
-        "phux server listening on {}{extra} (session={session}; Ctrl-C to stop)",
-        socket_path.display()
-    );
-    // Attribution line for the (possibly shared) server log — see
-    // `log_startup`. After the human banner so an interactive stderr
-    // reads banner-first.
-    log_startup(&socket_path);
+    extra
+}
 
-    let mut server = ServerRuntime::new(cfg);
+/// Attach the optional network listeners the flags asked for.
+const fn with_network_listeners(
+    mut server: ServerRuntime,
+    listen: Option<std::net::SocketAddr>,
+    quic: Option<std::net::SocketAddr>,
+    webtransport: Option<std::net::SocketAddr>,
+) -> ServerRuntime {
     if let Some(addr) = listen {
         server = server.listen_ws(addr);
     }
@@ -319,6 +301,110 @@ pub(crate) fn run_server(
     if let Some(addr) = webtransport {
         server = server.listen_webtransport(addr);
     }
+    server
+}
+
+/// Report how the runtime stopped and map it to the process exit code.
+fn report_shutdown<E: std::fmt::Display>(result: Result<(), E>) -> ExitCode {
+    match result {
+        Ok(()) => {
+            eprintln!("phux server: shutting down cleanly");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("phux server failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Build a current-thread tokio runtime and drive `ServerRuntime`
+/// until Ctrl-C.
+///
+/// The runtime pre-seeds a session named `session` whose initial pane
+/// is backed by a real PTY running the resolved default shell
+/// (`defaults.shell`, falling back to `$SHELL`, then `/bin/sh`). On
+/// Ctrl-C, `run_async` returns `Ok(())` and the process exits 0.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "1:1 mirror of the `phux server` clap surface; bundling into a struct would just restate the clap enum"
+)]
+pub(crate) fn run_server(
+    session: &str,
+    socket: Option<PathBuf>,
+    listen: Option<std::net::SocketAddr>,
+    quic: Option<std::net::SocketAddr>,
+    webtransport: Option<std::net::SocketAddr>,
+    connect: Option<String>,
+    hub: bool,
+    exit_after_idle: Option<u64>,
+    daemonize: bool,
+    seed_command: Option<&str>,
+    resume: Option<std::os::fd::RawFd>,
+) -> ExitCode {
+    let socket_path = match prepare_process(socket, daemonize, resume) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+
+    // `[[hooks.<name>]]` entries plus enabled plugin manifests' `[[events]]`
+    // feed the server-side hook dispatcher (docs/consumers/tui.md §9,
+    // phux-r82.1). Relative manifest paths resolve against the config file's
+    // directory.
+    let hook_catalog =
+        phux_server::hooks::HookCatalog::from_config(&config, &config_loader::config_path());
+
+    // `[[satellites]]` registry, consumed below only when `--hub` was
+    // asked for.
+    let satellites = config.satellites;
+
+    // Connector registry — same single snapshot; a malformed config never
+    // reads as an empty registry because it never gets this far.
+    let configured_connectors = config.connector;
+    let connector_entries = select_connectors(configured_connectors, connect.as_deref());
+    if let Err(err) = phux_server::connector::plan_connectors(&connector_entries) {
+        eprintln!("phux server failed: connector: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let cfg = build_server_config(
+        session,
+        &socket_path,
+        config.defaults,
+        hook_catalog,
+        seed_command,
+        exit_after_idle,
+    );
+
+    let rt = match build_runtime() {
+        Ok(rt) => rt,
+        Err(code) => return code,
+    };
+
+    let extra = listener_summary(
+        listen,
+        quic,
+        webtransport,
+        hub,
+        connector_entries.len(),
+        exit_after_idle,
+    );
+    eprintln!(
+        "phux server listening on {}{extra} (session={session}; Ctrl-C to stop)",
+        socket_path.display()
+    );
+    // Attribution line for the (possibly shared) server log — see
+    // `log_startup`. After the human banner so an interactive stderr
+    // reads banner-first.
+    log_startup(&socket_path);
+
+    let mut server = with_network_listeners(ServerRuntime::new(cfg), listen, quic, webtransport);
     if !connector_entries.is_empty() {
         server = server.connectors(connector_entries, connect);
     }
@@ -343,18 +429,7 @@ pub(crate) fn run_server(
     // alongside `server.run_async`.
     rt.spawn(phux_server::telemetry::run_log_rotation_task());
 
-    let result = rt.block_on(async move { server.run_async(shutdown_signal()).await });
-
-    match result {
-        Ok(()) => {
-            eprintln!("phux server: shutting down cleanly");
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("phux server failed: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    report_shutdown(rt.block_on(async move { server.run_async(shutdown_signal()).await }))
 }
 
 /// Resolve when the process is asked to stop, by any route a supervisor or a

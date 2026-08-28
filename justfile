@@ -379,6 +379,41 @@ e2e-lane-check:
 # skips with exit 0 when there is no store, and never prints a verdict about
 # labels it could not read. See the header of the script for the full argument.
 
+# Cyclomatic-complexity report for production code, worst function first.
+#
+# The enforced ceiling is `cognitive-complexity-threshold` in clippy.toml,
+# which `just lint` applies on every run and CI therefore gates. This recipe
+# is the richer second opinion: clippy measures *cognitive* complexity, which
+# discounts a flat `match` arm, while lizard measures classic cyclomatic
+# complexity and counts every decision point. A dispatch table that clippy is
+# content with still shows up here, which is what you want when deciding
+# whether a function has grown a second responsibility.
+#
+# DELIBERATELY NOT IN `ci`. lizard is fetched on demand with `uvx` rather than
+# pinned in the dev shell, so it needs a network on first run and cannot be a
+# hard gate without making a CI checkout depend on PyPI. clippy.toml carries
+# the gate; this carries the detail.
+#
+# Reads its threshold from the argument, defaulting to the ceiling the
+# codebase was brought to in the complexity pass: no production function
+# exceeds 15. Tests, benches and examples are excluded — a long table-driven
+# test is not the same defect as a long handler.
+#
+#   just complexity        # anything over CCN 15
+#   just complexity 10     # tighter sweep, for finding the next candidates
+
+# Cyclomatic complexity of production code over a CCN ceiling — advisory, local-only.
+complexity CCN="15":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v uvx >/dev/null 2>&1; then
+      echo "complexity: uvx not found; install uv to run this report" >&2
+      exit 1
+    fi
+    uvx --from lizard==1.24.0 lizard -l rust crates --CCN {{CCN}} -w \
+      | grep -v -e '/tests/' -e '/benches/' -e '/examples/' \
+      || echo "no production function exceeds CCN {{CCN}}"
+
 # Every non-closed bead carries exactly one of rc-1.0 / post-1.0 — advisory, local-only.
 milestone-check:
     node scripts/check-milestone-labels.mjs

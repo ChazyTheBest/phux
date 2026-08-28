@@ -335,31 +335,78 @@ pub(crate) async fn create_session_via_metadata(
     let allow_legacy_result = agent_session.is_none();
     let request_token = uuid::Uuid::new_v4().to_string();
     let result_key = format!("{SESSION_CREATE_RESULT_KEY_PREFIX}{request_token}");
-    let create_bytes = serde_json::to_vec(&serde_json::json!({
-        "name": name,
-        "command": command,
-        "cwd": cwd,
-        "env": env,
-        "request_token": request_token.clone(),
-        "agent_session": agent_session,
-    }))
-    .map_err(|err| {
-        eprintln!("phux: failed to serialize create request: {err}");
-        ExitCode::FAILURE
-    })?;
+    let create_bytes = encode_create_request(
+        name,
+        command.as_deref(),
+        cwd.as_deref(),
+        &env,
+        &request_token,
+        agent_session.as_deref(),
+    )?;
 
     let mut conn = Connection::connect(socket_path)
         .await
         .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))?;
 
-    // Reject a duplicate name before writing (the server also refuses it, but
-    // silently — SET_METADATA has no reply frame).
-    //
-    // Same reasoning as the human path above: only `panes` aggregate across a
-    // federation, so a partial fleet cannot hide a session name. The notice
-    // still goes to stderr — `phux new --json` puts its *result* on stdout,
-    // and a warning has no place in that document.
-    let (pre, degradation) = phux_client::state::get_state_on(&mut conn)
+    reject_duplicate_session_name(&mut conn, socket_path, name, json).await?;
+
+    if !allow_legacy_result && !agent_session_preflighted {
+        require_atomic_agent_session_create(&mut conn, socket_path, json).await?;
+    }
+
+    send_create_request(&mut conn, socket_path, create_bytes, json).await?;
+
+    let (bytes, correlated) = read_create_result(
+        &mut conn,
+        socket_path,
+        name,
+        json,
+        result_key,
+        allow_legacy_result,
+    )
+    .await?;
+
+    seed_pane_id_from_result(&bytes, name, &request_token, correlated)
+        .ok_or_else(|| report_session_not_registered(name))
+}
+
+/// Encode the `SESSION_CREATE_KEY` request document.
+fn encode_create_request(
+    name: &str,
+    command: Option<&[String]>,
+    cwd: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
+    request_token: &str,
+    agent_session: Option<&[u8]>,
+) -> Result<Vec<u8>, ExitCode> {
+    serde_json::to_vec(&serde_json::json!({
+        "name": name,
+        "command": command,
+        "cwd": cwd,
+        "env": env,
+        "request_token": request_token,
+        "agent_session": agent_session,
+    }))
+    .map_err(|err| {
+        eprintln!("phux: failed to serialize create request: {err}");
+        ExitCode::FAILURE
+    })
+}
+
+/// Reject a duplicate name before writing (the server also refuses it, but
+/// silently — `SET_METADATA` has no reply frame).
+///
+/// Same reasoning as the human path: only `panes` aggregate across a
+/// federation, so a partial fleet cannot hide a session name. The notice
+/// still goes to stderr — `phux new --json` puts its *result* on stdout,
+/// and a warning has no place in that document.
+async fn reject_duplicate_session_name(
+    conn: &mut Connection,
+    socket_path: &Path,
+    name: &str,
+    json: bool,
+) -> Result<(), ExitCode> {
+    let (pre, degradation) = phux_client::state::get_state_on(conn)
         .await
         .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))?
         .into_parts();
@@ -368,14 +415,20 @@ pub(crate) async fn create_session_via_metadata(
         eprintln!("phux: session '{name}' already exists");
         return Err(ExitCode::FAILURE);
     }
+    Ok(())
+}
 
-    if !allow_legacy_result && !agent_session_preflighted {
-        require_atomic_agent_session_create(&mut conn, socket_path, json).await?;
-    }
-
-    // Request the create, then read only this request's one-shot result.
-    // Frames are ordered on the connection, while the nonce prevents another
-    // concurrent creator from supplying a stale or unrelated Terminal id.
+/// Request the create.
+///
+/// Frames are ordered on the connection, while the nonce inside the request
+/// prevents another concurrent creator from supplying a stale or unrelated
+/// Terminal id to the read-back that follows.
+async fn send_create_request(
+    conn: &mut Connection,
+    socket_path: &Path,
+    create_bytes: Vec<u8>,
+    json: bool,
+) -> Result<(), ExitCode> {
     conn.send(&FrameKind::SetMetadata {
         request_id: 1,
         scope: Scope::Global,
@@ -383,67 +436,104 @@ pub(crate) async fn create_session_via_metadata(
         value: create_bytes,
     })
     .await
-    .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))?;
-    // The read-back rides `request_metadata`, not a hand-rolled wait. The
-    // loop that used to be here matched METADATA_VALUE on request id 2 and
-    // dropped everything else, so a server that refused the read with a
-    // correlated ERROR (`proto.md` §9) left `phux new` hanging with the
-    // session possibly already created — the worst shape of this bug, because
-    // the user's Ctrl-C then looks like the create failed.
+    .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))
+}
+
+/// Read only this request's one-shot result, falling back to the legacy
+/// uncorrelated key when the caller allows it. The `bool` reports whether the
+/// bytes came from the correlated key.
+///
+/// The read-back rides `request_metadata`, not a hand-rolled wait. The
+/// loop that used to be here matched `METADATA_VALUE` on request id 2 and
+/// dropped everything else, so a server that refused the read with a
+/// correlated ERROR (`proto.md` §9) left `phux new` hanging with the
+/// session possibly already created — the worst shape of this bug, because
+/// the user's Ctrl-C then looks like the create failed.
+async fn read_create_result(
+    conn: &mut Connection,
+    socket_path: &Path,
+    name: &str,
+    json: bool,
+    result_key: String,
+    allow_legacy_result: bool,
+) -> Result<(Vec<u8>, bool), ExitCode> {
     let (answer, interleaved) = conn
         .request_metadata(2, Scope::Global, result_key)
         .await
         .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))?
         .into_parts();
-    for message in phux_client::state::degradation_notices(&interleaved) {
-        eprintln!("phux: warning: partial results — {message}");
-    }
+    warn_partial_results(&interleaved);
     let result_value = answer.map_err(|refusal| {
         // Distinct from "no value": the server declined to answer at all, so
         // saying "did not register" below would be a guess stated as a fact.
         eprintln!("phux: create-session failed: server refused the read-back: {refusal}");
         ExitCode::FAILURE
     })?;
-    let not_registered = || {
-        eprintln!("phux: create-session failed: server did not register session '{name}'");
-        ExitCode::FAILURE
-    };
-    let (bytes, correlated) = if let Some(bytes) = result_value {
-        (bytes, true)
-    } else if allow_legacy_result {
-        let (legacy_answer, legacy_interleaved) = conn
-            .request_metadata(3, Scope::Global, SESSION_CREATE_RESULT_KEY.to_owned())
-            .await
-            .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))?
-            .into_parts();
-        for message in phux_client::state::degradation_notices(&legacy_interleaved) {
-            eprintln!("phux: warning: partial results — {message}");
-        }
-        let legacy = legacy_answer
-            .map_err(|refusal| {
-                eprintln!(
-                    "phux: create-session failed: server refused legacy read-back: {refusal}"
-                );
-                ExitCode::FAILURE
-            })?
-            .ok_or_else(not_registered)?;
-        (legacy, false)
-    } else {
-        return Err(not_registered());
-    };
-    serde_json::from_slice::<serde_json::Value>(&bytes)
+    if let Some(bytes) = result_value {
+        return Ok((bytes, true));
+    }
+    if !allow_legacy_result {
+        return Err(report_session_not_registered(name));
+    }
+    let legacy = read_legacy_create_result(conn, socket_path, name, json).await?;
+    Ok((legacy, false))
+}
+
+/// Read the uncorrelated `SESSION_CREATE_RESULT_KEY` a server that predates
+/// the nonce still answers on.
+async fn read_legacy_create_result(
+    conn: &mut Connection,
+    socket_path: &Path,
+    name: &str,
+    json: bool,
+) -> Result<Vec<u8>, ExitCode> {
+    let (legacy_answer, legacy_interleaved) = conn
+        .request_metadata(3, Scope::Global, SESSION_CREATE_RESULT_KEY.to_owned())
+        .await
+        .map_err(|err| json_err::report_no_server(json, &err, socket_path, "new"))?
+        .into_parts();
+    warn_partial_results(&legacy_interleaved);
+    legacy_answer
+        .map_err(|refusal| {
+            eprintln!("phux: create-session failed: server refused legacy read-back: {refusal}");
+            ExitCode::FAILURE
+        })?
+        .ok_or_else(|| report_session_not_registered(name))
+}
+
+/// Report every degradation notice that rode along with a metadata answer.
+fn warn_partial_results(interleaved: &[FrameKind]) {
+    for message in phux_client::state::degradation_notices(interleaved) {
+        eprintln!("phux: warning: partial results — {message}");
+    }
+}
+
+/// The failure reported when no create result names the requested session.
+fn report_session_not_registered(name: &str) -> ExitCode {
+    eprintln!("phux: create-session failed: server did not register session '{name}'");
+    ExitCode::FAILURE
+}
+
+/// Read the seed pane's Terminal id out of a create-result document, rejecting
+/// one that does not answer for this request: the name must match, and the
+/// nonce must be present on a correlated read and absent on a legacy one.
+fn seed_pane_id_from_result(
+    bytes: &[u8],
+    name: &str,
+    request_token: &str,
+    correlated: bool,
+) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
         .filter(|v| v.get("name").and_then(serde_json::Value::as_str) == Some(name))
         .filter(|v| {
             if correlated {
-                v.get("request_token").and_then(serde_json::Value::as_str)
-                    == Some(request_token.as_str())
+                v.get("request_token").and_then(serde_json::Value::as_str) == Some(request_token)
             } else {
                 v.get("request_token").is_none()
             }
         })
         .and_then(|v| v.get("terminal_id").and_then(serde_json::Value::as_u64))
-        .ok_or_else(not_registered)
 }
 
 /// Build the `CreateIfMissing` target for `phux new` (phux-0db).

@@ -68,13 +68,9 @@ pub(super) fn run_save(socket: Option<PathBuf>, output: Option<&PathBuf>) -> Exi
 }
 
 pub(super) fn run_restore(archive_path: &Path, socket: Option<PathBuf>) -> ExitCode {
-    let input = match read_archive_text(archive_path) {
-        Ok(input) => input,
-        Err(err) => return fail(&err),
-    };
-    let archive = match parse_archive(&input) {
+    let archive = match load_archive(archive_path) {
         Ok(archive) => archive,
-        Err(err) => return fail(&err),
+        Err(code) => return code,
     };
     let socket_path = socket.unwrap_or_else(default_socket_path);
     let rt = match cli_runtime() {
@@ -89,73 +85,110 @@ pub(super) fn run_restore(archive_path: &Path, socket: Option<PathBuf>) -> ExitC
         Ok(plan) => plan,
         Err(err) => return fail(&err),
     };
-    let mut prepared_creates = Vec::with_capacity(plan.creates.len());
-    for create in plan.creates {
-        let prepared = match create.agent_session.as_ref() {
-            Some(record) => match prepare_archived_agent(record, create.cwd.as_deref()) {
-                Ok(prepared) => Some(prepared),
-                Err(err) => return fail(&err),
-            },
-            None => None,
-        };
-        prepared_creates.push((create, prepared));
-    }
-    if prepared_creates
-        .iter()
-        .any(|(_, prepared)| prepared.is_some())
-        && let Err(code) = rt.block_on(preflight_atomic_agent_session_create(&socket_path))
-    {
+    let prepared_creates = match prepare_archived_creates(plan.creates) {
+        Ok(prepared_creates) => prepared_creates,
+        Err(code) => return code,
+    };
+    if let Err(code) = preflight_agent_creates(&rt, &socket_path, &prepared_creates) {
         return code;
     }
 
     let mut restored = Vec::with_capacity(prepared_creates.len());
     for (create, prepared) in prepared_creates {
-        let command = prepared
-            .as_ref()
-            .map_or(create.command, |session| Some(session.argv.clone()));
-        let env = prepared
-            .as_ref()
-            .map_or_else(BTreeMap::new, |session| session.env.clone());
-        let cwd = prepared.as_ref().map_or(create.cwd, |session| {
-            Some(session.cwd.display().to_string())
-        });
-        let agent_session = match prepared
-            .as_ref()
-            .map(|session| session.record.encode())
-            .transpose()
-        {
-            Ok(record) => record,
-            Err(err) => return fail(&err),
-        };
-        let agent_session_preflighted = prepared.is_some();
-        match rt.block_on(create_session_via_metadata(
-            &socket_path,
-            &create.name,
-            command,
-            cwd,
-            env,
-            agent_session,
-            agent_session_preflighted,
-            false,
-        )) {
-            Ok(pane_id) => {
-                if let Some(prepared) = &prepared
-                    && let Err(err) =
-                        rt.block_on(confirm_restored_agent(&socket_path, pane_id, prepared))
-                {
-                    return fail(&err);
-                }
-                restored.push(create.name);
-            }
+        match restore_one_session(&rt, &socket_path, create, prepared.as_ref()) {
+            Ok(name) => restored.push(name),
             Err(code) => return code,
         }
     }
-    let summary = RestoreSummary {
+    render_restore_summary(&RestoreSummary {
         schema_version: ARCHIVE_SCHEMA_VERSION,
         restored,
         skipped_existing: plan.skipped_existing,
+    })
+}
+
+/// Read the archive document (a path or `-` for stdin) and parse it.
+fn load_archive(archive_path: &Path) -> Result<model::WorkspaceArchive, ExitCode> {
+    let input = read_archive_text(archive_path).map_err(|err| fail(&err))?;
+    parse_archive(&input).map_err(|err| fail(&err))
+}
+
+/// Resolve every create's archived native agent session before anything is
+/// created, so a plugin that no longer resolves fails the whole restore
+/// instead of leaving half a workspace behind.
+fn prepare_archived_creates(
+    creates: Vec<model::CreateRequest>,
+) -> Result<Vec<(model::CreateRequest, Option<PreparedAgentSession>)>, ExitCode> {
+    let mut prepared_creates = Vec::with_capacity(creates.len());
+    for create in creates {
+        let prepared = match create.agent_session.as_ref() {
+            Some(record) => match prepare_archived_agent(record, create.cwd.as_deref()) {
+                Ok(prepared) => Some(prepared),
+                Err(err) => return Err(fail(&err)),
+            },
+            None => None,
+        };
+        prepared_creates.push((create, prepared));
+    }
+    Ok(prepared_creates)
+}
+
+/// Run the atomic-create preflight once for the whole batch, and only when the
+/// restore actually carries a native agent session.
+fn preflight_agent_creates(
+    rt: &tokio::runtime::Runtime,
+    socket_path: &Path,
+    prepared_creates: &[(model::CreateRequest, Option<PreparedAgentSession>)],
+) -> Result<(), ExitCode> {
+    if prepared_creates
+        .iter()
+        .any(|(_, prepared)| prepared.is_some())
+        && let Err(code) = rt.block_on(preflight_atomic_agent_session_create(socket_path))
+    {
+        return Err(code);
+    }
+    Ok(())
+}
+
+/// Create one archived session, confirming its native agent record when it has
+/// one. Returns the restored session's name.
+fn restore_one_session(
+    rt: &tokio::runtime::Runtime,
+    socket_path: &Path,
+    create: model::CreateRequest,
+    prepared: Option<&PreparedAgentSession>,
+) -> Result<String, ExitCode> {
+    let command = prepared.map_or(create.command, |session| Some(session.argv.clone()));
+    let env = prepared.map_or_else(BTreeMap::new, |session| session.env.clone());
+    let cwd = prepared.map_or(create.cwd, |session| {
+        Some(session.cwd.display().to_string())
+    });
+    let agent_session = match prepared.map(|session| session.record.encode()).transpose() {
+        Ok(record) => record,
+        Err(err) => return Err(fail(&err)),
     };
-    match serde_json::to_string_pretty(&summary) {
+    let agent_session_preflighted = prepared.is_some();
+    let pane_id = rt.block_on(create_session_via_metadata(
+        socket_path,
+        &create.name,
+        command,
+        cwd,
+        env,
+        agent_session,
+        agent_session_preflighted,
+        false,
+    ))?;
+    if let Some(prepared) = prepared
+        && let Err(err) = rt.block_on(confirm_restored_agent(socket_path, pane_id, prepared))
+    {
+        return Err(fail(&err));
+    }
+    Ok(create.name)
+}
+
+/// Emit the restore summary document on stdout.
+fn render_restore_summary(summary: &RestoreSummary) -> ExitCode {
+    match serde_json::to_string_pretty(summary) {
         Ok(rendered) => {
             outln!("{rendered}");
             ExitCode::SUCCESS

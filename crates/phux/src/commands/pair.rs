@@ -326,10 +326,6 @@ fn render_qr(payload: &str) -> Result<String, String> {
     clippy::too_many_arguments,
     reason = "the existing mint options remain flat for CLI compatibility while the optional action selects lifecycle operations"
 )]
-#[allow(
-    clippy::too_many_lines,
-    reason = "pairing keeps address, certificate, secret, and output sequencing together so diagnostics cannot leak into JSON stdout"
-)]
 pub(crate) fn run_pair(
     action: Option<PairAction>,
     tokens: Option<PathBuf>,
@@ -346,60 +342,18 @@ pub(crate) fn run_pair(
     if let Some(action) = action {
         return run_credential_action(&tokens, action, json);
     }
-    let operator_cert = cert.is_some() || std::env::var_os("PHUX_WS_TLS_CERT").is_some();
-    let cert = cert
-        .or_else(|| std::env::var_os("PHUX_WS_TLS_CERT").map(PathBuf::from))
-        .unwrap_or_else(phux_server::transport::tls::default_cert_path);
-    let key = std::env::var_os("PHUX_WS_TLS_KEY")
-        .map_or_else(phux_server::transport::tls::default_key_path, PathBuf::from);
+    let certificate = resolve_certificate_paths(cert);
 
     if migrate_legacy && !migrate_legacy_credentials(&tokens) {
         return ExitCode::FAILURE;
     }
 
-    // Address resolution comes FIRST, before the certificate is provisioned,
-    // because SANs can only be chosen at generation time (phux-q9a0,
-    // ADR-0091). This is the one place that knows the address the link will
-    // advertise, so it is the one place that can name it in the certificate.
-    //
-    // Best-effort (ADR-0037): `detect` is infallible by construction — it
-    // returns an empty vec when nothing is detected — so this block can
-    // never affect the exit code.
-    let overlay = phux_config::overlay::detect();
+    let addresses = resolve_pair_addresses(host.as_deref());
+    provision_pairing_certificate(&certificate, &addresses.advertised);
 
-    // phux-onbd: fall back to the port the server auto-binds on the overlay
-    // address when `PHUX_WS_ADDR` is unset. Without this, pairing on an
-    // otherwise perfectly working host printed "--qr needs a server address"
-    // and left the user to discover a port number and pass `--host` by hand —
-    // while the server was already listening on exactly that address.
-    let ws_addr = std::env::var("PHUX_WS_ADDR").ok().or_else(|| {
-        (!overlay.is_empty()).then(|| format!(":{}", phux_server::runtime::DEFAULT_WS_PORT))
-    });
-    let server_url = resolve_server_url(host.as_deref(), &overlay, ws_addr.as_deref());
-    let advertised = advertised_names(server_url.as_deref(), &overlay);
-
-    // Provision the self-signed cert at the default paths if it isn't there yet,
-    // so the fingerprint below is the one the server will actually present. An
-    // operator-supplied cert is used as-is, never generated over.
-    if !operator_cert
-        && let Err(err) =
-            phux_server::transport::tls::ensure_self_signed_for(&cert, &key, &advertised)
-    {
-        eprintln!("phux pair: warning: could not provision certificate: {err}");
-    }
-
-    let minted = match phux_server::auth::mint_token(&tokens) {
-        Ok(minted) => minted,
-        Err(err) => {
-            eprintln!("phux pair: failed to mint token: {err}");
-            return ExitCode::FAILURE;
-        }
+    let Some(minted) = mint_pairing_credential(&tokens) else {
+        return ExitCode::FAILURE;
     };
-    if !minted.is_durable() {
-        eprintln!(
-            "phux pair: warning: credential is active, but the store directory could not be synced; do not retry pairing"
-        );
-    }
     let token = minted.secret().to_owned();
 
     // `--json` keeps stdout a single document (the repo-wide contract in
@@ -407,15 +361,167 @@ pub(crate) fn run_pair(
     // every diagnostic still goes to stderr. `phux host enroll` consumes
     // this over ssh, which is what keeps a 64-hex token out of human hands.
     if !json {
-        outln!("Credential ID (use with `phux pair rotate|revoke`):");
-        outln!("  {}", minted.id);
-        outln!();
-        outln!("Pairing token (a secret — give it to the device once):");
-        outln!("  {token}");
-        outln!();
+        print_credential_block(&minted.id, &token);
     }
 
-    let fingerprint = match phux_server::transport::tls::cert_fingerprint(&cert) {
+    let fingerprint = read_pairing_fingerprint(&certificate.cert, json);
+    warn_on_uncovered_names(&certificate.cert, &certificate.key, &addresses.advertised);
+
+    if !json {
+        print_overlay_addresses(&addresses.overlay);
+    }
+
+    // The one-tap link (and its QR form) carries the token — it is as much
+    // a secret as the token line above, shown once on the same terminal.
+    let link = addresses
+        .server_url
+        .as_deref()
+        .map(|url| build_connect_link(url, name.as_deref(), fingerprint.as_deref(), &token));
+
+    if json {
+        return print_pair_json(
+            &token,
+            fingerprint.as_deref(),
+            &addresses.overlay,
+            addresses.ws_addr.as_deref(),
+            link.as_deref(),
+            &tokens,
+            &minted.id,
+            minted.generation,
+        );
+    }
+
+    print_connect_link(link.as_deref(), qr);
+
+    outln!("Token written to {}", tokens.display());
+    ExitCode::SUCCESS
+}
+
+/// The certificate material one pairing run reads and may provision.
+struct CertificatePaths {
+    /// Whether the operator named the certificate (`--cert` or
+    /// `PHUX_WS_TLS_CERT`). An operator-supplied cert is used as-is, never
+    /// generated over.
+    operator_supplied: bool,
+    /// The certificate whose fingerprint pairing prints.
+    cert: PathBuf,
+    /// The private key beside it.
+    key: PathBuf,
+}
+
+/// Resolve the certificate and key paths pairing works against.
+///
+/// Defaults match the server's seamless path (ADR-0031): with no flag and no
+/// environment override, both land on the shared paths under the state dir
+/// that the server itself reads, so `phux pair` pairs against the same
+/// material the server will read.
+fn resolve_certificate_paths(cert: Option<PathBuf>) -> CertificatePaths {
+    let operator_supplied = cert.is_some() || std::env::var_os("PHUX_WS_TLS_CERT").is_some();
+    let cert = cert
+        .or_else(|| std::env::var_os("PHUX_WS_TLS_CERT").map(PathBuf::from))
+        .unwrap_or_else(phux_server::transport::tls::default_cert_path);
+    let key = std::env::var_os("PHUX_WS_TLS_KEY")
+        .map_or_else(phux_server::transport::tls::default_key_path, PathBuf::from);
+    CertificatePaths {
+        operator_supplied,
+        cert,
+        key,
+    }
+}
+
+/// Every address a single pairing run knows about.
+struct PairAddresses {
+    /// Detected overlay addresses, printed as "dial one of these".
+    overlay: Vec<IpAddr>,
+    /// The server's configured (or derived) `HOST:PORT` bind.
+    ws_addr: Option<String>,
+    /// The ws(s):// URL the connect link embeds, when one can be resolved.
+    server_url: Option<String>,
+    /// The names a certificate minted for this run must claim.
+    advertised: Vec<String>,
+}
+
+/// Resolve every address this pairing run advertises.
+///
+/// Address resolution comes FIRST, before the certificate is provisioned,
+/// because SANs can only be chosen at generation time (phux-q9a0,
+/// ADR-0091). This is the one place that knows the address the link will
+/// advertise, so it is the one place that can name it in the certificate.
+///
+/// Best-effort (ADR-0037): `detect` is infallible by construction — it
+/// returns an empty vec when nothing is detected — so this block can
+/// never affect the exit code.
+///
+/// phux-onbd: fall back to the port the server auto-binds on the overlay
+/// address when `PHUX_WS_ADDR` is unset. Without this, pairing on an
+/// otherwise perfectly working host printed "--qr needs a server address"
+/// and left the user to discover a port number and pass `--host` by hand —
+/// while the server was already listening on exactly that address.
+fn resolve_pair_addresses(host: Option<&str>) -> PairAddresses {
+    let overlay = phux_config::overlay::detect();
+    let ws_addr = std::env::var("PHUX_WS_ADDR").ok().or_else(|| {
+        (!overlay.is_empty()).then(|| format!(":{}", phux_server::runtime::DEFAULT_WS_PORT))
+    });
+    let server_url = resolve_server_url(host, &overlay, ws_addr.as_deref());
+    let advertised = advertised_names(server_url.as_deref(), &overlay);
+    PairAddresses {
+        overlay,
+        ws_addr,
+        server_url,
+        advertised,
+    }
+}
+
+/// Provision the self-signed cert at the default paths if it isn't there yet,
+/// so the fingerprint printed later is the one the server will actually
+/// present. An operator-supplied cert is used as-is, never generated over.
+fn provision_pairing_certificate(certificate: &CertificatePaths, advertised: &[String]) {
+    if certificate.operator_supplied {
+        return;
+    }
+    if let Err(err) = phux_server::transport::tls::ensure_self_signed_for(
+        &certificate.cert,
+        &certificate.key,
+        advertised,
+    ) {
+        eprintln!("phux pair: warning: could not provision certificate: {err}");
+    }
+}
+
+/// Mint a credential into the store, reporting a failure and the non-durable
+/// case on stderr. `None` means the caller must exit with a failure code.
+fn mint_pairing_credential(
+    tokens: &std::path::Path,
+) -> Option<phux_server::auth::MintedCredential> {
+    let minted = match phux_server::auth::mint_token(tokens) {
+        Ok(minted) => minted,
+        Err(err) => {
+            eprintln!("phux pair: failed to mint token: {err}");
+            return None;
+        }
+    };
+    if !minted.is_durable() {
+        eprintln!(
+            "phux pair: warning: credential is active, but the store directory could not be synced; do not retry pairing"
+        );
+    }
+    Some(minted)
+}
+
+/// Print the credential ID and its secret for a human operator.
+fn print_credential_block(credential_id: &str, token: &str) {
+    outln!("Credential ID (use with `phux pair rotate|revoke`):");
+    outln!("  {credential_id}");
+    outln!();
+    outln!("Pairing token (a secret — give it to the device once):");
+    outln!("  {token}");
+    outln!();
+}
+
+/// Read the certificate fingerprint the device pins, printing it for a human
+/// operator and reporting an unreadable certificate on stderr.
+fn read_pairing_fingerprint(cert: &std::path::Path, json: bool) -> Option<String> {
+    match phux_server::transport::tls::cert_fingerprint(cert) {
         Ok(fingerprint) => {
             if !json {
                 outln!("Server certificate SHA-256 (verify on the device to defeat MITM):");
@@ -428,60 +534,50 @@ pub(crate) fn run_pair(
             eprintln!("phux pair: warning: could not read certificate fingerprint: {err}");
             None
         }
-    };
-    warn_on_uncovered_names(&cert, &key, &advertised);
-
-    if !json && !overlay.is_empty() {
-        outln!("Overlay network addresses (dial one of these from the device):");
-        for addr in &overlay {
-            outln!("  {addr}");
-        }
-        outln!();
     }
+}
 
-    // The one-tap link (and its QR form) carries the token — it is as much
-    // a secret as the token line above, shown once on the same terminal.
-    let link = server_url
-        .as_deref()
-        .map(|url| build_connect_link(url, name.as_deref(), fingerprint.as_deref(), &token));
-
-    if json {
-        return print_pair_json(
-            &token,
-            fingerprint.as_deref(),
-            &overlay,
-            ws_addr.as_deref(),
-            link.as_deref(),
-            &tokens,
-            &minted.id,
-            minted.generation,
-        );
+/// List the overlay addresses a device can dial.
+fn print_overlay_addresses(overlay: &[IpAddr]) {
+    if overlay.is_empty() {
+        return;
     }
+    outln!("Overlay network addresses (dial one of these from the device):");
+    for addr in overlay {
+        outln!("  {addr}");
+    }
+    outln!();
+}
 
-    if let Some(link) = &link {
-        outln!("One-tap connect link (open on the device — carries the token):");
-        outln!("  {link}");
-        outln!();
+/// Print the one-tap connect link, and its QR form when `--qr` asked for one.
+///
+/// Without an address there is no link to print, and `--qr` then has nothing
+/// to encode — that is the one case the operator has to be told about.
+fn print_connect_link(link: Option<&str>, qr: bool) {
+    let Some(link) = link else {
         if qr {
-            match render_qr(link) {
-                Ok(art) => {
-                    outln!("Scan to pair:");
-                    outln!();
-                    out!("{art}");
-                    outln!();
-                }
-                Err(err) => eprintln!("phux pair: warning: {err}"),
-            }
+            eprintln!(
+                "phux pair: warning: --qr needs a server address; pass --host HOST:PORT \
+                 (no overlay address + PHUX_WS_ADDR port to derive one from)"
+            );
         }
-    } else if qr {
-        eprintln!(
-            "phux pair: warning: --qr needs a server address; pass --host HOST:PORT \
-             (no overlay address + PHUX_WS_ADDR port to derive one from)"
-        );
+        return;
+    };
+    outln!("One-tap connect link (open on the device — carries the token):");
+    outln!("  {link}");
+    outln!();
+    if !qr {
+        return;
     }
-
-    outln!("Token written to {}", tokens.display());
-    ExitCode::SUCCESS
+    match render_qr(link) {
+        Ok(art) => {
+            outln!("Scan to pair:");
+            outln!();
+            out!("{art}");
+            outln!();
+        }
+        Err(err) => eprintln!("phux pair: warning: {err}"),
+    }
 }
 
 fn run_credential_action(tokens: &std::path::Path, action: PairAction, json: bool) -> ExitCode {
