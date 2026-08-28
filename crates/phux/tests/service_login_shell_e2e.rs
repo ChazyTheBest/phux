@@ -224,8 +224,53 @@ fn service_managed_pane_resolves_a_profile_provided_command() {
     assert!(
         contents.contains("PHUX_PROFILE_MARKER_FOUND"),
         "a service-managed server's seed pane must resolve a command \
-         `~/.profile` adds to PATH via login-shell treatment; got: {contents:?}"
+         `~/.profile` adds to PATH via login-shell treatment; got: {contents:?}\n\
+         \n\
+         Diagnostics — this assertion depends on the host's /bin/sh, so a \
+         failure here is usually the image, not the code:\n\
+         \x20 fixture HOME      : {home_dir}\n\
+         \x20 ~/.profile exists : {profile_exists}\n\
+         \x20 marker executable : {marker_exec}\n\
+         \x20 /bin/sh resolves  : {sh_target}\n\
+         \x20 sh -l -c PATH     : {probe_login}\n\
+         \x20 sh -c PATH        : {probe_plain}\n\
+         \n\
+         If `sh -l -c PATH` already lacks the fixture's bin directory, the \
+         host's /bin/sh does not source ~/.profile in login mode and the \
+         runner image is at fault. If it contains it, the pane was not given \
+         the login flag and the defect is in phux.",
+        home_dir = home.path().display(),
+        profile_exists = home.path().join(".profile").exists(),
+        marker_exec = home.path().join("bin/phux-profile-marker").exists(),
+        sh_target = std::fs::read_link("/bin/sh").map_or_else(
+            |_| "(not a symlink)".to_owned(),
+            |p| p.display().to_string()
+        ),
+        probe_login = probe_shell_path(home.path(), true),
+        probe_plain = probe_shell_path(home.path(), false),
     );
+}
+
+/// Run `/bin/sh [-l] -c 'echo $PATH'` against the fixture `$HOME` and return
+/// what the shell resolved `PATH` to.
+///
+/// This exists because the assertion above cannot otherwise distinguish "phux
+/// failed to apply login treatment" from "this host's /bin/sh does not source
+/// ~/.profile in login mode" — two failures with identical symptoms and
+/// opposite owners. Diagnosing that split once cost a CI bisect.
+fn probe_shell_path(home: &Path, login: bool) -> String {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.env_clear();
+    cmd.env("HOME", home);
+    cmd.env("PATH", LAUNCHD_DEFAULT_PATH);
+    if login {
+        cmd.arg("-l");
+    }
+    cmd.arg("-c").arg("printf %s \"$PATH\"");
+    cmd.output().map_or_else(
+        |e| format!("(probe failed: {e})"),
+        |out| String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
 /// phux-87rr acceptance criterion 6: existing direct/server-in-terminal
