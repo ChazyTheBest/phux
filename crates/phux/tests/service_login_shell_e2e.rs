@@ -210,57 +210,119 @@ fn read_result_file(path: &Path, deadline: Duration) -> String {
 }
 
 /// phux-87rr acceptance criterion 5: an end-to-end regression that starts
-/// the service under a minimal environment and proves a profile-provided
-/// command resolves.
+/// the service under a minimal environment and proves the seed pane got
+/// login-shell treatment.
+///
+/// The assertion is "the pane's `PATH` is the one a login `/bin/sh` produces
+/// on this host, and not the one a plain `/bin/sh` produces" — measured
+/// against this host rather than assumed. The older form asserted a fixed
+/// outcome instead (a `~/.profile`-provided command must resolve), which
+/// silently encoded an assumption about the host: that nothing between
+/// `/etc/profile` and `$HOME/.profile` interferes with the fixture.
+///
+/// That assumption broke on a CI image whose `/etc/profile.d` exports
+/// `HOME=/home/runner`. `/etc/profile` runs BEFORE `$HOME/.profile`, so dash
+/// then expanded `$HOME/.profile` to the runner's profile and never read the
+/// fixture's — producing a failure that looked exactly like phux forgetting
+/// the login flag, and cost a five-run CI bisect to tell apart. No behaviour
+/// of phux's can survive that, and no assertion phrased as a fixed outcome
+/// can distinguish it from a real regression.
+///
+/// Comparing against the host's own login shell keeps the full end-to-end
+/// path (real binary, real env detection, real `-l` argv, real PTY, real
+/// shell) while testing only the part phux owns. Where the host does let the
+/// fixture through, the stronger original assertion still runs — see
+/// [`fixture_profile_is_reachable`].
 #[test]
 fn service_managed_pane_resolves_a_profile_provided_command() {
     let home = write_profile_fixture();
     let result_path = home.path().join("result");
-    let seed = format!("phux-profile-marker >'{}' 2>&1", result_path.display());
+    let seed = format!(
+        "{{ printf '%s\\n' \"$PATH\"; phux-profile-marker; }} >'{}' 2>&1",
+        result_path.display()
+    );
 
     let _server = ServerGuard::start(home.path(), &seed, true);
 
     let contents = read_result_file(&result_path, RESULT_DEADLINE);
-    assert!(
-        contents.contains("PHUX_PROFILE_MARKER_FOUND"),
-        "a service-managed server's seed pane must resolve a command \
-         `~/.profile` adds to PATH via login-shell treatment; got: {contents:?}\n\
-         \n\
-         Diagnostics — this assertion depends on the host's /bin/sh, so a \
-         failure here is usually the image, not the code:\n\
+    let pane_path = contents.lines().next().unwrap_or_default().to_owned();
+
+    let login = probe_shell_path(home.path(), true);
+    let plain = probe_shell_path(home.path(), false);
+    let diagnostics = diagnostics(home.path(), &login, &plain);
+
+    assert_ne!(
+        pane_path, plain,
+        "a service-managed server's seed pane must NOT get a plain shell's \
+         PATH — login-shell treatment was not applied.\n{diagnostics}"
+    );
+    assert_eq!(
+        pane_path, login,
+        "a service-managed server's seed pane must get the same PATH a login \
+         `/bin/sh` produces on this host.\n{diagnostics}"
+    );
+
+    // Where the host lets the fixture's `~/.profile` through, hold the
+    // stronger line too: the profile-provided command must actually resolve.
+    if fixture_profile_is_reachable(home.path(), &login) {
+        assert!(
+            contents.contains("PHUX_PROFILE_MARKER_FOUND"),
+            "the host's login shell does source the fixture `~/.profile` (its \
+             bin directory is on the login PATH), so the profile-provided \
+             command must resolve in the pane; got: {contents:?}\n{diagnostics}"
+        );
+    }
+}
+
+/// Whether this host's login shell actually reached the fixture's
+/// `~/.profile` — true when the login `PATH` contains the fixture's `bin`.
+///
+/// False on a host whose `/etc/profile` interferes with `$HOME` before dash
+/// expands `$HOME/.profile`; there the fixture cannot be observed at all and
+/// the marker assertion would be testing the image, not phux.
+fn fixture_profile_is_reachable(home: &Path, login_probe: &str) -> bool {
+    login_probe.contains(&home.join("bin").display().to_string())
+}
+
+/// The host facts that decide who owns a failure here, rendered once.
+fn diagnostics(home: &Path, login: &str, plain: &str) -> String {
+    format!(
+        "\nHost diagnostics:\n\
          \x20 fixture HOME      : {home_dir}\n\
          \x20 ~/.profile exists : {profile_exists}\n\
          \x20 marker executable : {marker_exec}\n\
          \x20 /bin/sh resolves  : {sh_target}\n\
-         \x20 sh -l -c          : {probe_login}\n\
-         \x20 sh -c             : {probe_plain}\n\
+         \x20 sh -l -c $HOME    : {login_home}\n\
+         \x20 sh -l -c $PATH    : {login}\n\
+         \x20 sh -c    $PATH    : {plain}\n\
          \x20 /etc/profile.d    : {profile_d}\n\
          \n\
-         If `sh -l -c PATH` already lacks the fixture's bin directory, the \
-         host's /bin/sh does not source ~/.profile in login mode and the \
-         runner image is at fault. If it contains it, the pane was not given \
-         the login flag and the defect is in phux.",
-        home_dir = home.path().display(),
-        profile_exists = home.path().join(".profile").exists(),
-        marker_exec = home.path().join("bin/phux-profile-marker").exists(),
+         If the two probes above are identical, this host's `/bin/sh` gives a \
+         login shell nothing extra and the comparison cannot detect the flag \
+         at all. If `sh -l -c` reports a HOME other than the fixture, the \
+         host's /etc/profile is resetting it and the fixture is unreachable \
+         by construction.",
+        home_dir = home.display(),
+        profile_exists = home.join(".profile").exists(),
+        marker_exec = home.join("bin/phux-profile-marker").exists(),
         sh_target = std::fs::read_link("/bin/sh").map_or_else(
             |_| "(not a symlink)".to_owned(),
             |p| p.display().to_string()
         ),
-        probe_login = probe_shell_path(home.path(), true),
-        probe_plain = probe_shell_path(home.path(), false),
+        login_home = probe_shell(home, true, "$HOME"),
         profile_d = probe_system_profile(),
-    );
+    )
 }
 
-/// Run `/bin/sh [-l] -c 'echo $PATH'` against the fixture `$HOME` and return
-/// what the shell resolved `PATH` to.
+/// Run `/bin/sh [-l] -c` against the fixture `$HOME` under exactly the
+/// environment [`ServerGuard::start`] gives the server, and return what the
+/// shell expanded `expr` to.
 ///
-/// This exists because the assertion above cannot otherwise distinguish "phux
-/// failed to apply login treatment" from "this host's /bin/sh does not source
-/// ~/.profile in login mode" — two failures with identical symptoms and
-/// opposite owners. Diagnosing that split once cost a CI bisect.
-fn probe_shell_path(home: &Path, login: bool) -> String {
+/// This is the reference the pane is compared against: it isolates "what does
+/// a login shell do on THIS host" from "what did phux ask for", two questions
+/// whose answers used to be conflated in one assertion. Telling them apart
+/// once cost a five-run CI bisect.
+fn probe_shell(home: &Path, login: bool, expr: &str) -> String {
     let mut cmd = Command::new("/bin/sh");
     cmd.env_clear();
     cmd.env("HOME", home);
@@ -268,12 +330,16 @@ fn probe_shell_path(home: &Path, login: bool) -> String {
     if login {
         cmd.arg("-l");
     }
-    cmd.arg("-c")
-        .arg("printf 'HOME=%s PATH=%s' \"$HOME\" \"$PATH\"");
+    cmd.arg("-c").arg(format!("printf %s \"{expr}\""));
     cmd.output().map_or_else(
         |e| format!("(probe failed: {e})"),
         |out| String::from_utf8_lossy(&out.stdout).into_owned(),
     )
+}
+
+/// The `PATH` a `[-l]` `/bin/sh` produces against the fixture home.
+fn probe_shell_path(home: &Path, login: bool) -> String {
+    probe_shell(home, login, "$PATH")
 }
 
 /// What the host's system profile does to a login shell, listed so a failure
@@ -304,15 +370,30 @@ fn probe_system_profile() -> String {
 fn ordinary_pane_does_not_source_the_profile_twice() {
     let home = write_profile_fixture();
     let result_path = home.path().join("result");
-    let seed = format!("phux-profile-marker >'{}' 2>&1", result_path.display());
+    let seed = format!(
+        "{{ printf '%s\\n' \"$PATH\"; phux-profile-marker; }} >'{}' 2>&1",
+        result_path.display()
+    );
 
     let _server = ServerGuard::start(home.path(), &seed, false);
 
     let contents = read_result_file(&result_path, RESULT_DEADLINE);
+    let pane_path = contents.lines().next().unwrap_or_default().to_owned();
+
+    let login = probe_shell_path(home.path(), true);
+    let plain = probe_shell_path(home.path(), false);
+    let diagnostics = diagnostics(home.path(), &login, &plain);
+
+    assert_eq!(
+        pane_path, plain,
+        "an ordinary (non-service) server's seed pane must get a plain \
+         shell's PATH — login-shell treatment must stay conditional on the \
+         service marker.\n{diagnostics}"
+    );
     assert!(
         !contents.contains("PHUX_PROFILE_MARKER_FOUND"),
         "an ordinary (non-service) server's seed pane must NOT get \
          login-shell treatment — `~/.profile` must stay unsourced; \
-         got: {contents:?}"
+         got: {contents:?}\n{diagnostics}"
     );
 }
