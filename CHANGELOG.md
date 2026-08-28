@@ -9,6 +9,20 @@ It is exempt from the `docs/` frontmatter and TL;DR gates in
 at `docs/spec/CHANGELOG.md` and is hand-maintained; it is a different file and
 keeps every gate.
 
+## [0.23.3](https://github.com/phall1/phux/compare/v0.23.2...v0.23.3) (2026-08-28)
+
+
+### Bug Fixes
+
+* **test:** measure login-shell treatment against the host, not a fixed outcome ([17f9c3a](https://github.com/phall1/phux/commit/17f9c3a7))
+
+
+### Refactors
+
+* **cli:** split the FFI bridge and CLI dispatch, then ratchet the gate shut ([950b70d](https://github.com/phall1/phux/commit/950b70d3))
+* **client:** split the event loop and input dispatch into named handlers ([ec911be](https://github.com/phall1/phux/commit/ec911be8))
+* **server:** split the request handlers and grid synthesis into named stages ([ce877df](https://github.com/phall1/phux/commit/ce877df9))
+
 ## [0.23.2](https://github.com/phall1/phux/compare/v0.23.1...v0.23.2) (2026-08-27)
 
 
