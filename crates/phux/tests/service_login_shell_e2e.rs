@@ -232,8 +232,9 @@ fn service_managed_pane_resolves_a_profile_provided_command() {
          \x20 ~/.profile exists : {profile_exists}\n\
          \x20 marker executable : {marker_exec}\n\
          \x20 /bin/sh resolves  : {sh_target}\n\
-         \x20 sh -l -c PATH     : {probe_login}\n\
-         \x20 sh -c PATH        : {probe_plain}\n\
+         \x20 sh -l -c          : {probe_login}\n\
+         \x20 sh -c             : {probe_plain}\n\
+         \x20 /etc/profile.d    : {profile_d}\n\
          \n\
          If `sh -l -c PATH` already lacks the fixture's bin directory, the \
          host's /bin/sh does not source ~/.profile in login mode and the \
@@ -248,6 +249,7 @@ fn service_managed_pane_resolves_a_profile_provided_command() {
         ),
         probe_login = probe_shell_path(home.path(), true),
         probe_plain = probe_shell_path(home.path(), false),
+        profile_d = probe_system_profile(),
     );
 }
 
@@ -266,11 +268,31 @@ fn probe_shell_path(home: &Path, login: bool) -> String {
     if login {
         cmd.arg("-l");
     }
-    cmd.arg("-c").arg("printf %s \"$PATH\"");
+    cmd.arg("-c")
+        .arg("printf 'HOME=%s PATH=%s' \"$HOME\" \"$PATH\"");
     cmd.output().map_or_else(
         |e| format!("(probe failed: {e})"),
         |out| String::from_utf8_lossy(&out.stdout).into_owned(),
     )
+}
+
+/// What the host's system profile does to a login shell, listed so a failure
+/// names the file responsible instead of leaving it to be guessed.
+fn probe_system_profile() -> String {
+    let mut entries: Vec<String> = std::fs::read_dir("/etc/profile.d").map_or_else(
+        |_| Vec::new(),
+        |dir| {
+            dir.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        },
+    );
+    entries.sort();
+    if entries.is_empty() {
+        "(none)".to_owned()
+    } else {
+        entries.join(" ")
+    }
 }
 
 /// phux-87rr acceptance criterion 6: existing direct/server-in-terminal
