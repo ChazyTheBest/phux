@@ -36,10 +36,30 @@
 #   as a GitHub App, whose events DO trigger workflows.
 #
 # ONE-TIME SETUP (without it, this workflow fails closed at the token step):
-#   1. Create a GitHub App on the phall1 account: repo permissions
-#      `contents: write` + `pull requests: write`. Install it on phall1/phux.
+#   1. Create a GitHub App with repo permissions `contents: write` +
+#      `pull requests: write`, and INSTALL IT ON THE ORG THAT OWNS THIS REPO
+#      (`no-phux`), granting it access to `no-phux/phux`.
 #   2. Repo secret  RELEASE_APP_PRIVATE_KEY = the App's generated .pem
 #      Repo variable RELEASE_APP_ID          = the App's numeric App ID
+#
+# AN APP INSTALLATION DOES NOT SURVIVE A REPO TRANSFER. This repo moved from
+# the phall1 user account to the no-phux org, and the App stayed installed on
+# the account it was installed on, which no longer owns anything here. Every
+# push to main then failed at the token step with:
+#
+#     Failed to create token for "no-phux/phux": Not Found
+#     https://api.github.com/repos/no-phux/phux/installation
+#
+# That error means the App credentials are FINE — create-github-app-token
+# authenticates with the private key first and only then looks up the
+# installation, so reaching a 404 there proves the key and App ID are valid
+# and only the installation is missing. Do not regenerate the key; install the
+# App on the owning org. `gh api /orgs/<org>/installations` lists what is
+# actually installed, which is the fastest way to confirm.
+#
+# While this is broken there is no release PR at all, and a release has to be
+# cut by hand (bump + changelog + tag + draft release + dispatch release.yml),
+# which is how v0.23.3 shipped.
 #
 # DO NOT REINTRODUCE `last-release-sha` (this is the bug that produced #419):
 #   It is a BOOTSTRAP-ONLY setting. Upstream is explicit that it "is never
