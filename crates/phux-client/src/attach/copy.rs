@@ -15,6 +15,7 @@ use std::io::{self, Write};
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
     fmt::Format,
+    screen::GridRef,
     selection::{FormatOptions, SelectLineOptions, SelectWordOptions, Selection},
     terminal::{Point, PointCoordinate},
 };
@@ -49,50 +50,7 @@ pub fn extract_selection_text(
     terminal: &GhosttyTerminal<'_, '_>,
     req: CopyRequest,
 ) -> Option<String> {
-    let point = |col: u16, row: u16| {
-        Point::Viewport(PointCoordinate {
-            x: col,
-            y: u32::from(row),
-        })
-    };
-
-    let selection = match req.grab {
-        SelectionGrab::Rect => {
-            // Endpoints are inclusive (see `Selection::new`); the overlay's
-            // CellRange is already normalized so start <= end and both ends
-            // name real cells.
-            let start = terminal
-                .grid_ref(point(req.start_col, req.start_row))
-                .ok()?;
-            let end = terminal.grid_ref(point(req.end_col, req.end_row)).ok()?;
-            Selection::new(start, end, req.rectangle)
-        }
-        SelectionGrab::All => terminal.select_all().ok()??,
-        SelectionGrab::Word => {
-            let cursor = terminal
-                .grid_ref(point(req.cursor_col, req.cursor_row))
-                .ok()?;
-            terminal
-                .select_word(SelectWordOptions::new(cursor))
-                .ok()??
-        }
-        SelectionGrab::Line | SelectionGrab::LineSemantic => {
-            let cursor = terminal
-                .grid_ref(point(req.cursor_col, req.cursor_row))
-                .ok()?;
-            let opts = SelectLineOptions::new(cursor)
-                .with_semantic_prompt_boundary(req.grab == SelectionGrab::LineSemantic);
-            terminal.select_line(opts).ok()??
-        }
-        SelectionGrab::Output => {
-            let cursor = terminal
-                .grid_ref(point(req.cursor_col, req.cursor_row))
-                .ok()?;
-            // Best-effort: no OSC-133 zones -> `None` -> silent no-op copy.
-            terminal.select_output(cursor).ok()??
-        }
-    };
-
+    let selection = resolve_selection(terminal, req)?;
     let bytes = terminal
         .format_selection_alloc(
             None,
@@ -104,6 +62,104 @@ pub fn extract_selection_text(
         )
         .ok()??;
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Build the one-shot [`Selection`] `req`'s grab names, or `None` when the
+/// engine reports nothing selectable or a libghostty call fails.
+///
+/// Branches on [`CopyRequest::grab`] (phux-7143): `Rect` builds a two-corner
+/// selection from the overlay's own rectangle; every other grab delegates to
+/// libghostty's matching `select_*` helper at the overlay cursor. `select_all`
+/// ignores the cursor.
+fn resolve_selection<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    req: CopyRequest,
+) -> Option<Selection<'t>> {
+    match req.grab {
+        SelectionGrab::Rect => select_viewport_rect(terminal, req),
+        SelectionGrab::All => terminal.select_all().ok().flatten(),
+        SelectionGrab::Word => select_word_at_cursor(terminal, req),
+        SelectionGrab::Line | SelectionGrab::LineSemantic => select_line_at_cursor(terminal, req),
+        SelectionGrab::Output => select_output_at_cursor(terminal, req),
+    }
+}
+
+/// Map the overlay's inclusive `(row, col)` viewport rectangle onto two
+/// [`Point::Viewport`] grid references and build the two-corner [`Selection`]
+/// (rectangular when `req.rectangle`).
+fn select_viewport_rect<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    req: CopyRequest,
+) -> Option<Selection<'t>> {
+    // Endpoints are inclusive (see `Selection::new`); the overlay's
+    // CellRange is already normalized so start <= end and both ends
+    // name real cells.
+    let start = viewport_grid_ref(terminal, req.start_col, req.start_row)?;
+    let end = viewport_grid_ref(terminal, req.end_col, req.end_row)?;
+    Some(Selection::new(start, end, req.rectangle))
+}
+
+/// libghostty's own word selection at the overlay cursor.
+fn select_word_at_cursor<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    req: CopyRequest,
+) -> Option<Selection<'t>> {
+    let cursor = viewport_cursor_ref(terminal, req)?;
+    terminal
+        .select_word(SelectWordOptions::new(cursor))
+        .ok()
+        .flatten()
+}
+
+/// libghostty's own line selection at the overlay cursor, honoring the
+/// OSC-133 semantic-prompt boundary for [`SelectionGrab::LineSemantic`].
+fn select_line_at_cursor<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    req: CopyRequest,
+) -> Option<Selection<'t>> {
+    let cursor = viewport_cursor_ref(terminal, req)?;
+    let opts = SelectLineOptions::new(cursor)
+        .with_semantic_prompt_boundary(req.grab == SelectionGrab::LineSemantic);
+    terminal.select_line(opts).ok().flatten()
+}
+
+/// libghostty's own command-output selection at the overlay cursor.
+///
+/// Best-effort: no OSC-133 zones -> `None` -> silent no-op copy.
+fn select_output_at_cursor<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    req: CopyRequest,
+) -> Option<Selection<'t>> {
+    let cursor = viewport_cursor_ref(terminal, req)?;
+    terminal.select_output(cursor).ok().flatten()
+}
+
+/// The grid reference under the overlay cursor
+/// (`req.cursor_row`/`req.cursor_col`) — the anchor every engine-derived grab
+/// resolves from.
+fn viewport_cursor_ref<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    req: CopyRequest,
+) -> Option<GridRef<'t>> {
+    viewport_grid_ref(terminal, req.cursor_col, req.cursor_row)
+}
+
+/// Resolve an overlay `(col, row)` into a libghostty grid reference.
+///
+/// `Point::Viewport` (not `Active`) is deliberate: the overlay coordinates
+/// index the *visible* viewport the client rendered, which is what the user
+/// selected.
+fn viewport_grid_ref<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    col: u16,
+    row: u16,
+) -> Option<GridRef<'t>> {
+    terminal
+        .grid_ref(Point::Viewport(PointCoordinate {
+            x: col,
+            y: u32::from(row),
+        }))
+        .ok()
 }
 
 /// Build an OSC 52 "set clipboard" sequence carrying `text`.

@@ -8,7 +8,7 @@
 
 use std::io::{self, Write};
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 
 /// Emit the SGR for one ratatui cell.
 ///
@@ -23,10 +23,7 @@ pub(super) fn emit_cell_sgr(
     cell: &ratatui::buffer::Cell,
     prev_styled: &mut bool,
 ) -> io::Result<()> {
-    use ratatui::style::Modifier;
-    let styled = cell.modifier != Modifier::empty()
-        || !matches!(cell.fg, Color::Reset)
-        || !matches!(cell.bg, Color::Reset);
+    let styled = cell_is_styled(cell);
     if !styled && !*prev_styled {
         return Ok(());
     }
@@ -35,49 +32,90 @@ pub(super) fn emit_cell_sgr(
     if !styled {
         return Ok(());
     }
-    let mut wrote_any = false;
-    let sep = |w: &mut dyn Write, wrote: &mut bool| -> io::Result<()> {
-        if *wrote {
-            w.write_all(b";")?;
-        } else {
-            w.write_all(b"\x1b[")?;
-            *wrote = true;
+    let mut params = SgrParams::new(out);
+    params.modifiers(cell.modifier)?;
+    params.color(cell.fg, true)?;
+    params.color(cell.bg, false)?;
+    params.finish()
+}
+
+/// Whether a cell carries any styling at all: a non-empty modifier set, or a
+/// foreground/background that overrides the terminal default.
+fn cell_is_styled(cell: &ratatui::buffer::Cell) -> bool {
+    cell.modifier != Modifier::empty()
+        || !matches!(cell.fg, Color::Reset)
+        || !matches!(cell.bg, Color::Reset)
+}
+
+/// The ratatui modifier bits this chrome renders, each paired with the SGR
+/// parameter that carries it, in the order they are emitted.
+const MODIFIER_CODES: [(Modifier, &[u8]); 5] = [
+    (Modifier::BOLD, b"1"),
+    (Modifier::DIM, b"2"),
+    (Modifier::ITALIC, b"3"),
+    (Modifier::UNDERLINED, b"4"),
+    (Modifier::REVERSED, b"7"),
+];
+
+/// Accumulator for one `\x1b[<params>m` sequence.
+///
+/// Writes the `\x1b[` introducer lazily with the first parameter and a `;`
+/// before every one after it, so a cell that contributes no parameter emits
+/// nothing at all. Borrows the sink instead of buffering: this runs per
+/// changed cell and has to stay allocation-free.
+struct SgrParams<'w, W: Write> {
+    out: &'w mut W,
+    wrote_any: bool,
+}
+
+impl<'w, W: Write> SgrParams<'w, W> {
+    const fn new(out: &'w mut W) -> Self {
+        Self {
+            out,
+            wrote_any: false,
+        }
+    }
+
+    /// Open the sequence, or separate this parameter from the previous one.
+    fn separator(&mut self) -> io::Result<()> {
+        if self.wrote_any {
+            return self.out.write_all(b";");
+        }
+        self.out.write_all(b"\x1b[")?;
+        self.wrote_any = true;
+        Ok(())
+    }
+
+    /// Emit one parameter per set modifier bit, in [`MODIFIER_CODES`] order.
+    fn modifiers(&mut self, m: Modifier) -> io::Result<()> {
+        for (bit, code) in MODIFIER_CODES {
+            if m.contains(bit) {
+                self.separator()?;
+                self.out.write_all(code)?;
+            }
         }
         Ok(())
-    };
-    let m = cell.modifier;
-    if m.contains(Modifier::BOLD) {
-        sep(out, &mut wrote_any)?;
-        out.write_all(b"1")?;
     }
-    if m.contains(Modifier::DIM) {
-        sep(out, &mut wrote_any)?;
-        out.write_all(b"2")?;
+
+    /// Emit the 24-bit foreground (`fg`) or background parameter for `color`,
+    /// or nothing when it does not override the terminal default.
+    fn color(&mut self, color: Color, fg: bool) -> io::Result<()> {
+        let Some((kind, r, g, b)) = color_rgb(color, fg) else {
+            return Ok(());
+        };
+        self.separator()?;
+        write!(self.out, "{kind};2;{r};{g};{b}")
     }
-    if m.contains(Modifier::ITALIC) {
-        sep(out, &mut wrote_any)?;
-        out.write_all(b"3")?;
+
+    /// Close the sequence with the `m` terminator; a no-op when the cell
+    /// contributed no parameter.
+    fn finish(self) -> io::Result<()> {
+        if self.wrote_any {
+            self.out.write_all(b"m")
+        } else {
+            Ok(())
+        }
     }
-    if m.contains(Modifier::UNDERLINED) {
-        sep(out, &mut wrote_any)?;
-        out.write_all(b"4")?;
-    }
-    if m.contains(Modifier::REVERSED) {
-        sep(out, &mut wrote_any)?;
-        out.write_all(b"7")?;
-    }
-    if let Some((kind, r, g, b)) = color_rgb(cell.fg, true) {
-        sep(out, &mut wrote_any)?;
-        write!(out, "{kind};2;{r};{g};{b}")?;
-    }
-    if let Some((kind, r, g, b)) = color_rgb(cell.bg, false) {
-        sep(out, &mut wrote_any)?;
-        write!(out, "{kind};2;{r};{g};{b}")?;
-    }
-    if wrote_any {
-        out.write_all(b"m")?;
-    }
-    Ok(())
 }
 
 /// Emit a standalone foreground (`fg = true`) or background SGR for `color`.

@@ -209,6 +209,93 @@ pub async fn run_with_stdout_predict<W: crate::attach::RenderSink>(
     .await
 }
 
+/// STAGE 1 — the pre-handshake, on the cooked outer terminal: HELLO ->
+/// ATTACH -> ATTACHED.
+///
+/// We deliberately do NOT install `RawModeGuard` around this. If anything
+/// here fails (no server, refused, signal during connect) the user's terminal
+/// stays in its original state and `Err(_)` carries the actionable cause up
+/// to the CLI.
+#[allow(
+    clippy::future_not_send,
+    reason = "client-side libghostty Terminal is !Send; ADR-0003 binds us to current-thread"
+)]
+async fn handshake(
+    dial: &Dial,
+    target: AttachTarget,
+    probe_default_colors: bool,
+) -> Result<(Connection, FrameKind, OutputMode), AttachError> {
+    let default_colors = probe_default_colors
+        .then(crate::attach::terminal_probe::default_colors)
+        .flatten();
+    let client_caps = attach_client_caps(default_colors);
+    let conn = Connection::connect_dial_with_hello(dial, attach_client_name(), client_caps).await?;
+    let negotiated = conn.negotiated_bootstrap().ok_or_else(|| {
+        AttachError::Protocol(
+            "production connection returned before bootstrap negotiation".to_owned(),
+        )
+    })?;
+    let output_mode = if matches!(
+        negotiated.profile,
+        phux_protocol::BootstrapProfile::SynthesizedVtStateSync
+    ) {
+        OutputMode::StateSync
+    } else {
+        OutputMode::Raw
+    };
+    let mut conn = conn;
+    let attach_id = send_attach(&mut conn, target).await?;
+    let attached = wait_for_attached(&mut conn, attach_id).await?;
+    Ok((conn, attached, output_mode))
+}
+
+/// ADR-0048: read the `mouse` config (default on) to decide whether the
+/// [`RawModeGuard`] also enables the client's own outer-terminal mouse
+/// tracking, so divider drag-to-resize works by default. A load failure or an
+/// explicit `mouse = false` falls back to pass-through-only — no DECSET, host
+/// native selection untouched.
+fn mouse_capture_enabled() -> bool {
+    phux_config::loader::load()
+        .map(|c| c.defaults.mouse)
+        .unwrap_or(true)
+}
+
+/// Drain queued output and stop the off-loop stdout writer, if this attach
+/// has one, so nothing is lost and later terminal-reset writes aren't
+/// garbled by an in-flight frame.
+fn stop_writer(writer: &mut Option<crate::attach::stdout_writer::WriterHandle>) {
+    if let Some(writer) = writer.take() {
+        writer.shutdown_and_join();
+    }
+}
+
+/// Re-handshake against `target` on the SAME connection and clear the glass
+/// for the session it lands on.
+///
+/// Returns the new `ATTACHED` frame for the next `main_loop` entry, which
+/// rebuilds ALL session-scoped state fresh (pane mirrors, workspace, predict,
+/// overlays, pending-spawn maps, layout subscription) from it, then repaints.
+/// A full repaint of the new session's grid happens via the replayed
+/// negotiated bootstrap frames inside the loop.
+#[allow(
+    clippy::future_not_send,
+    reason = "client-side libghostty Terminal is !Send; ADR-0003 binds us to current-thread"
+)]
+async fn switch_session<W: crate::attach::RenderSink>(
+    conn: &mut Connection,
+    out: &mut W,
+    target: ReattachTarget,
+    pending_window: &mut Option<usize>,
+    pending_pane: &mut Option<usize>,
+) -> Result<FrameKind, AttachError> {
+    // Lifecycle transition (info): switching sessions on the same
+    // connection. `?target` names the destination.
+    tracing::info!(?target, "attach loop: SWITCH_TO; re-attaching");
+    let attached = reattach_on_same_connection(conn, target, pending_window, pending_pane).await?;
+    let _ = write_terminal_clear(out);
+    Ok(attached)
+}
+
 /// The attach session body shared by the production
 /// ([`run_with_predict_dial`]) and test-injectable
 /// ([`run_with_stdout_predict`]) entry points.
@@ -241,43 +328,13 @@ async fn attach_session<W: crate::attach::RenderSink>(
     initial_notice: Option<Notice>,
     recorder: Option<Rc<RefCell<SessionRecorder>>>,
 ) -> Result<AttachEnd, AttachError> {
-    // STAGE 1 — pre-handshake, on the cooked outer terminal.
-    //
-    // We deliberately do NOT install RawModeGuard here. If anything in
-    // this block fails (no server, refused, signal during connect) the
-    // user's terminal stays in its original state and `Err(_)` carries
-    // the actionable cause up to the CLI.
     // Attach-handshake timing (info): HELLO -> ATTACH -> ATTACHED. The
     // span's CLOSE duration is the end-to-end attach latency a trace reader
     // wants for "why was the first paint slow." Lifecycle-rate, so info.
     let handshake_span = tracing::info_span!("attach_handshake", ?target);
-    let (mut conn, attached, output_mode) = async {
-        let default_colors = probe_default_colors
-            .then(crate::attach::terminal_probe::default_colors)
-            .flatten();
-        let client_caps = attach_client_caps(default_colors);
-        let conn =
-            Connection::connect_dial_with_hello(dial, attach_client_name(), client_caps).await?;
-        let negotiated = conn.negotiated_bootstrap().ok_or_else(|| {
-            AttachError::Protocol(
-                "production connection returned before bootstrap negotiation".to_owned(),
-            )
-        })?;
-        let output_mode = if matches!(
-            negotiated.profile,
-            phux_protocol::BootstrapProfile::SynthesizedVtStateSync
-        ) {
-            OutputMode::StateSync
-        } else {
-            OutputMode::Raw
-        };
-        let mut conn = conn;
-        let attach_id = send_attach(&mut conn, target).await?;
-        let attached = wait_for_attached(&mut conn, attach_id).await?;
-        Ok::<_, AttachError>((conn, attached, output_mode))
-    }
-    .instrument(handshake_span)
-    .await?;
+    let (mut conn, attached, output_mode) = handshake(dial, target, probe_default_colors)
+        .instrument(handshake_span)
+        .await?;
     // The output mode is a per-connection HELLO property; construction
     // negotiates exactly once and the re-attach loop below reuses the same
     // `conn`, so this bool is stable across an in-connection session switch.
@@ -289,15 +346,7 @@ async fn attach_session<W: crate::attach::RenderSink>(
     // the outer terminal into raw + alt screen. The guard's Drop runs
     // on unwinding; the signal-handler path inside `main_loop` runs
     // `write_terminal_reset` explicitly to cover SIGINT/SIGTERM/SIGHUP.
-    //
-    // ADR-0048: read the `mouse` config (default on) to decide whether the
-    // guard also enables the client's own outer-terminal mouse tracking, so
-    // divider drag-to-resize works by default. A load failure or an
-    // explicit `mouse = false` falls back to pass-through-only — no DECSET,
-    // host native selection untouched.
-    let mouse_capture = phux_config::loader::load()
-        .map(|c| c.defaults.mouse)
-        .unwrap_or(true);
+    let mouse_capture = mouse_capture_enabled();
     // Register the fatal-signal handler BEFORE raw mode is entered. The
     // handler snapshots termios at install time, so installing it after
     // `RawModeGuard` would capture the *raw* flags and "restore" the user
@@ -381,9 +430,7 @@ async fn attach_session<W: crate::attach::RenderSink>(
             Err(err) => {
                 // Drain + stop the off-loop writer before propagating; the
                 // RawModeGuard's Drop restores the terminal as we unwind.
-                if let Some(writer) = writer.take() {
-                    writer.shutdown_and_join();
-                }
+                stop_writer(&mut writer);
                 return Err(err);
             }
         };
@@ -404,9 +451,7 @@ async fn attach_session<W: crate::attach::RenderSink>(
                 // Drain queued output + stop the writer FIRST so nothing is
                 // lost and the reset writes in `exit_after_detach` aren't
                 // garbled by an in-flight frame.
-                if let Some(writer) = writer.take() {
-                    writer.shutdown_and_join();
-                }
+                stop_writer(&mut writer);
                 exit_after_detach(end, locally_requested, &onboarding_path, recorder.as_ref());
             }
             LoopExit::SwitchTo {
@@ -417,23 +462,14 @@ async fn attach_session<W: crate::attach::RenderSink>(
                 // the toggle into the next entry so the strip does not blink
                 // shut on every space switch.
                 carried_sidebar_enabled = Some(sidebar_enabled);
-                // Lifecycle transition (info): switching sessions on the
-                // same connection. `?target` names the destination.
-                tracing::info!(?target, "attach loop: SWITCH_TO; re-attaching");
-                attached = reattach_on_same_connection(
+                attached = switch_session(
                     &mut conn,
+                    out,
                     target,
                     &mut pending_window,
                     &mut pending_pane,
                 )
                 .await?;
-                // Re-enter `main_loop`, which rebuilds ALL session-scoped
-                // state fresh (pane mirrors, workspace, predict, overlays,
-                // pending-spawn maps, layout subscription) from the new
-                // ATTACHED frame, then repaints. A full repaint of the new
-                // session's grid happens via the replayed negotiated bootstrap
-                // frames inside the loop.
-                let _ = write_terminal_clear(out);
             }
         }
     }

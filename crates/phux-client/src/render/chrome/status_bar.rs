@@ -901,24 +901,8 @@ impl StatusBarPainter {
         if cols == 0 {
             return Ok(false);
         }
-        // phux-9vf: an error-line painter bypasses the widget pipeline and
-        // paints the fixed diagnostic. It takes priority over the normal
-        // "empty bar with no windows is a no-op" short-circuit below.
-        if self.error.is_some() {
-            return self.paint_error_line(out, x, cols, rows);
-        }
-        // phux-i0e8.2.1: an active transient notice takes the row over from
-        // the widget pipeline until it expires. Full-row like the error
-        // strip; only reachable on a non-empty bar (see `set_notice`).
-        if let Some((notice, _)) = self.notice.clone() {
-            return self.paint_full_row_message(
-                out,
-                &notice.text,
-                notice.severity.style(),
-                x,
-                cols,
-                rows,
-            );
+        if let Some(outcome) = self.paint_row_takeover(out, x, cols, rows)? {
+            return Ok(outcome);
         }
         // The supervisory badge rides the normal bar row, so it only paints
         // when there is a bar to host it. An empty configured bar with no
@@ -927,48 +911,108 @@ impl StatusBarPainter {
         if self.bar.is_empty() && self.windows.is_empty() {
             return Ok(false);
         }
-        // The window list is owned by the painter (the driver sets it
-        // from the Workspace); inject it into the render context so
-        // callers don't have to thread it through every paint path.
-        // Injected BEFORE the cache compose (phux-foz.12) so `last_row`
-        // holds the strip actually painted — window tabs included — and
-        // [`Self::window_hit_at`] hit-tests against what is on screen.
-        let ctx = StatusBarContext {
-            prefix: &self.prefix,
-            windows: &self.windows,
-            cwd: self.focused_cwd.as_deref().unwrap_or(""),
-            last_exit: self.last_exit,
-            ..*ctx
-        };
+        let ctx = self.ctx_with_window_list(ctx);
         let new_row = self.bar.render(&ctx.as_widget(), cols);
-        let viewport_changed = self.last_viewport != Some((cols, rows));
-        // The origin is part of the key: toggling a sidebar can leave the
-        // composed row byte-identical while moving the columns it belongs in.
-        let row_changed = match &self.last_row {
-            Some((prev_x, w, prev)) => *prev_x != x || *w != cols || prev != &new_row,
-            None => true,
-        };
-        if !viewport_changed && !row_changed {
+        if !self.needs_repaint(x, cols, rows, &new_row) {
             return Ok(false);
         }
-        let row_index: u16 = match self.position {
-            Position::Bottom => rows.saturating_sub(1),
-            Position::Top => 0,
-        };
+        let row_index = self.row_index(rows);
         // Delegate to the ratatui-backed renderer. We pre-composed
         // `new_row` for cache-keying; the renderer recomposes — cheap
         // (same inputs, deterministic) and keeps `render_status_bar`
         // usable standalone in tests.
         render_status_bar(out, &self.bar, &ctx, row_index, x, cols)?;
-        // ADR-0033: overlay the supervisory badge atop the freshly-painted
-        // widget row (right-aligned). Emitted after the row so it wins; the
-        // full-row repaint above erases any stale/cleared badge first.
+        self.paint_row_overlays(out, row_index, x, cols)?;
+        self.last_row = Some((x, cols, new_row));
+        self.last_viewport = Some((cols, rows));
+        Ok(true)
+    }
+
+    /// Paint whichever full-row message has taken the bar over, if any, and
+    /// report its outcome; `None` when the widget pipeline still owns the row.
+    ///
+    /// phux-9vf: an error-line painter bypasses the widget pipeline and
+    /// paints the fixed diagnostic. It takes priority over the normal
+    /// "empty bar with no windows is a no-op" short-circuit in the caller.
+    /// phux-i0e8.2.1: an active transient notice likewise takes the row over
+    /// from the widget pipeline until it expires. Full-row like the error
+    /// strip; only reachable on a non-empty bar (see `set_notice`).
+    fn paint_row_takeover<W: Write>(
+        &mut self,
+        out: &mut W,
+        x: u16,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<Option<bool>> {
+        if self.error.is_some() {
+            return self.paint_error_line(out, x, cols, rows).map(Some);
+        }
+        let Some((notice, _)) = self.notice.clone() else {
+            return Ok(None);
+        };
+        self.paint_full_row_message(out, &notice.text, notice.severity.style(), x, cols, rows)
+            .map(Some)
+    }
+
+    /// Inject the painter-owned window list (and the rest of its own state)
+    /// into the caller's render context.
+    ///
+    /// The window list is owned by the painter (the driver sets it
+    /// from the Workspace); inject it into the render context so
+    /// callers don't have to thread it through every paint path.
+    /// Injected BEFORE the cache compose (phux-foz.12) so `last_row`
+    /// holds the strip actually painted — window tabs included — and
+    /// [`Self::window_hit_at`] hit-tests against what is on screen.
+    fn ctx_with_window_list<'a>(&'a self, ctx: &StatusBarContext<'a>) -> StatusBarContext<'a> {
+        StatusBarContext {
+            prefix: &self.prefix,
+            windows: &self.windows,
+            cwd: self.focused_cwd.as_deref().unwrap_or(""),
+            last_exit: self.last_exit,
+            ..*ctx
+        }
+    }
+
+    /// Whether the freshly composed row differs from the cached paint, in
+    /// content, origin, or viewport.
+    ///
+    /// The origin is part of the key: toggling a sidebar can leave the
+    /// composed row byte-identical while moving the columns it belongs in.
+    fn needs_repaint(&self, x: u16, cols: u16, rows: u16, new_row: &[WidgetCell]) -> bool {
+        let viewport_changed = self.last_viewport != Some((cols, rows));
+        let row_changed = match &self.last_row {
+            Some((prev_x, w, prev)) => *prev_x != x || *w != cols || prev.as_slice() != new_row,
+            None => true,
+        };
+        viewport_changed || row_changed
+    }
+
+    /// The viewport row the bar occupies, given its configured position.
+    const fn row_index(&self, rows: u16) -> u16 {
+        match self.position {
+            Position::Bottom => rows.saturating_sub(1),
+            Position::Top => 0,
+        }
+    }
+
+    /// Overlay the badge and attention hint atop the freshly-painted row.
+    ///
+    /// ADR-0033: the supervisory badge overlays the widget row
+    /// (right-aligned). Emitted after the row so it wins; the full-row
+    /// repaint in the caller erases any stale/cleared badge first.
+    /// phux-foz.1: the attention hint chips in immediately left of the
+    /// badge (or at the right edge when no badge is up). Same repaint
+    /// discipline: the full-row repaint erased any cleared hint.
+    fn paint_row_overlays<W: Write>(
+        &self,
+        out: &mut W,
+        row_index: u16,
+        x: u16,
+        cols: u16,
+    ) -> io::Result<()> {
         if let Some(badge) = &self.supervisory {
             paint_supervisory_overlay(out, badge, row_index, x, cols)?;
         }
-        // phux-foz.1: the attention hint chips in immediately left of the
-        // badge (or at the right edge when no badge is up). Same repaint
-        // discipline: the full-row repaint erased any cleared hint.
         if let Some(hint) = &self.attention {
             paint_attention_overlay(
                 out,
@@ -980,9 +1024,7 @@ impl StatusBarPainter {
                 self.attention_fg,
             )?;
         }
-        self.last_row = Some((x, cols, new_row));
-        self.last_viewport = Some((cols, rows));
-        Ok(true)
+        Ok(())
     }
 
     /// Compose the status row into a fresh ratatui [`Buffer`] the width of the

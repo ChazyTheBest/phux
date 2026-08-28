@@ -10,15 +10,17 @@
 //! `PendingWindow`) that bridges a local `split-pane` / `new-window`
 //! chord to its remote `SPAWN_TERMINAL` reply.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use phux_protocol::TerminalId;
 use phux_protocol::wire::frame::{FrameKind, SESSION_NAME_KEY, Scope};
 
 use crate::attach::actions::{self, PendingSplit, PendingWindow};
 use crate::attach::connection::Connection;
+use crate::attach::focus::FocusHistory;
 use crate::attach::outcome::AttachError;
 use crate::attach::pane_state::{PaneSlot, reanchor_predict_to_pane};
+use crate::attach::plugin_actions::PluginRunResult;
 use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::PredictionState;
@@ -34,6 +36,10 @@ use super::dispatch::apply_focus_transition;
 /// so a rename committed from the prompt broadcasts and repaints exactly
 /// like a keybinding would. Returns `true` if the layout changed (the
 /// caller repaints).
+///
+/// The body is a flat, ordered sequence of per-effect appliers. The order
+/// effects are applied in is observable in the rendered result, so that
+/// order is the one thing this function encodes on its own.
 #[allow(
     clippy::future_not_send,
     reason = "client-side libghostty Terminal is !Send; ADR-0003 binds us to current-thread"
@@ -41,14 +47,6 @@ use super::dispatch::apply_focus_transition;
 #[allow(
     clippy::too_many_arguments,
     reason = "shares the dispatch loop's transport + render + predict context; phux-7ry0 added the focused-pane map for the predict re-anchor"
-)]
-#[allow(
-    clippy::cognitive_complexity,
-    reason = "flat per-effect dispatch — one guarded block per ActionEffects field (zoom, focus, metadata, bell, detach, spawn, kill); splitting would thread the same transport + render context through helpers"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "same flat per-effect dispatch; phux-r82.5 added the plugin-run spawn block"
 )]
 pub(super) async fn apply_action_effects<W: crate::attach::RenderSink>(
     effects: ActionEffects,
@@ -61,168 +59,315 @@ pub(super) async fn apply_action_effects<W: crate::attach::RenderSink>(
     panes: &HashMap<TerminalId, PaneSlot>,
 ) -> Result<bool, AttachError> {
     let layout_changed = effects.layout_mutated;
-    if effects.toggle_zoom {
-        // phux-x2hm: flip pane-zoom. Un-zoom if zoomed; otherwise zoom the
-        // focused pane. `run_action` already gated single-pane windows.
-        *ctx.zoomed = if ctx.zoomed.is_some() {
-            None
-        } else {
-            focused_pane.clone()
-        };
-    }
-    if effects.toggle_sidebar {
-        // phux-4h5a: flip the window-sidebar on/off state. The driver re-folds
-        // `sidebar_enabled` into the per-frame reservation after dispatch, so
-        // the `layout_mutated` repaint tiles into the new content rect.
-        *ctx.sidebar_enabled = !*ctx.sidebar_enabled;
-    }
-    if let Some(target) = effects.set_focus {
-        apply_focus_transition(&mut ctx.focus_history, focused_pane, target);
-        // Focus moved (keybinding pane navigation) — re-anchor predict to
-        // the new pane: reset its cursor + viewport and drop the old pane's
-        // queue, so a keystroke before the next reconcile echoes at the
-        // right place rather than the old pane's (mid-screen) coordinates
-        // (phux-7ry0). Subsumes the plain `clear_predict` drop below.
-        if let Some(fid) = focused_pane.as_ref() {
-            reanchor_predict_to_pane(predict, panes, fid);
-        }
-    } else if effects.clear_predict {
-        predict.clear();
-    }
-    if effects.set_metadata
-        && let Some(session) = ctx.focused_session
-    {
-        // Encoding can fail only on an empty workspace (we just produced
-        // it — shouldn't happen), but propagate cleanly if it ever does.
-        // phux-jy4t: keyed per session so a split here persists to THIS
-        // session's layout, not a key every session shares.
-        if let Some(bytes) = encode_layout_or_log(ctx.workspace) {
-            let request_id = *ctx.next_request_id;
-            *ctx.next_request_id = ctx.next_request_id.wrapping_add(1);
-            conn.send(&FrameKind::SetMetadata {
-                request_id,
-                scope: Scope::Group(DEFAULT_GROUP_ID),
-                key: layout_key(session),
-                value: bytes,
-            })
-            .await?;
-        }
-    }
+    apply_zoom_toggle(effects.toggle_zoom, ctx.zoomed, focused_pane.as_ref());
+    apply_sidebar_toggle(effects.toggle_sidebar, ctx.sidebar_enabled);
+    apply_focus_effect(
+        effects.set_focus,
+        effects.clear_predict,
+        &mut ctx.focus_history,
+        focused_pane,
+        predict,
+        panes,
+    );
+    send_layout_metadata(
+        effects.set_metadata,
+        conn,
+        ctx.workspace,
+        ctx.focused_session,
+        ctx.next_request_id,
+    )
+    .await?;
     if effects.bell {
         let _ = actions::write_bell(out);
     }
-    if effects.detach && !*detach_pending {
-        conn.send(&FrameKind::Detach).await?;
-        *detach_pending = true;
-    }
-    // Parked split — send the SPAWN_TERMINAL and remember the intent.
-    if let Some((request_id, pending, frame)) = effects.spawn_terminal {
-        ctx.pending_splits.insert(request_id, pending);
-        conn.send(&frame).await?;
-    }
-    // Parked new-window — same SPAWN flow; the reply opens a window.
-    if let Some((request_id, pending, frame)) = effects.spawn_window {
-        ctx.pending_windows.insert(request_id, pending);
-        conn.send(&frame).await?;
-    }
-    // kill-pane / kill-window keystroke sequences; the TERMINAL_CLOSED
-    // fold-out happens when each shell exits. Park the targets FIRST
-    // (phux-i0e8.2.2): once the frames are on the wire the close can
-    // race back, and an unmarked close would notice-spam the user about
-    // a death they ordered.
-    ctx.expected_closes.extend(effects.expected_closes);
-    for frame in effects.kill_frames {
-        conn.send(&frame).await?;
-    }
-    // ADR-0033: supervisory COMMAND frames (take/give the wheel, signal the
-    // pane). Fire-and-forward — the server's COMMAND_RESULT + TerminalControl
-    // broadcast drive the chrome; the input loop does not block on the reply.
-    for frame in effects.command_frames {
-        conn.send(&frame).await?;
-    }
-    // phux-r82.5: a plugin action runs as a spawned child-process task —
-    // fire-and-forget from the input loop's perspective. The driver's
-    // `select!` picks up the completion report and toasts failures. All
-    // client-local (config + exec); nothing goes on the wire (ADR-0017).
-    if let Some((plugin_id, action_id)) = effects.run_plugin {
-        if let Some(tx) = ctx.plugin_tx {
-            crate::attach::plugin_actions::spawn_plugin_action(tx.clone(), plugin_id, action_id);
-        } else {
-            tracing::warn!(
-                plugin = %plugin_id,
-                action = %action_id,
-                "plugin-action dispatched with no plugin runtime channel; dropping",
-            );
-        }
-    }
+    send_detach(effects.detach, conn, detach_pending).await?;
+    send_parked_spawns(
+        effects.spawn_terminal,
+        effects.spawn_window,
+        conn,
+        ctx.pending_splits,
+        ctx.pending_windows,
+    )
+    .await?;
+    send_kill_frames(
+        effects.kill_frames,
+        effects.expected_closes,
+        conn,
+        ctx.expected_closes,
+    )
+    .await?;
+    send_command_frames(effects.command_frames, conn).await?;
+    spawn_plugin_run(effects.run_plugin, ctx.plugin_tx);
     // phux-foz.5: hand a `reload-config` up to the driver, which owns the
     // config-derived state (resolver, theme, keybindings snapshot, status
     // bar) this batch is still borrowing.
     if effects.reload_config {
         *ctx.reload_request = true;
     }
-    // phux-eb0 / new-session: an in-process re-attach request. Hand the
-    // target up to the driver via `ctx.switch_request`; `main_loop` reads
-    // it after this dispatch batch and returns a `SwitchTo` exit so the
-    // outer loop tears down the current session and re-attaches.
-    //
-    // Switching to the CURRENT session without a window/pane target is a
-    // silent no-op. The session picker includes that row for orientation;
-    // committing it has already dismissed the overlay, so no reattach is
-    // needed. `new-session` is never a no-op — naming an existing session
-    // just attaches to it.
-    if let Some(target) = effects.reattach {
-        match target {
-            ReattachTarget::Existing {
-                name,
-                window: None,
-                pane: None,
-            } if &name == ctx.session_name => {
-                tracing::debug!(target_session = %name, "switch-session to current session; no-op");
-            }
-            ReattachTarget::Existing { name, window, pane } => {
-                tracing::info!(target_session = %name, target_window = ?window, target_pane = ?pane, "switch-session requested");
-                *ctx.switch_request = Some(ReattachTarget::Existing { name, window, pane });
-            }
-            ReattachTarget::Create(name) => {
-                tracing::info!(session = %name, "new-session requested");
-                *ctx.switch_request = Some(ReattachTarget::Create(name));
-            }
-        }
-    }
-    // rename-session: since the v0.3.0 "Option B" re-tier (ADR-0019 /
-    // ADR-0027) removed the RENAME_SESSION verb, a rename is a SET_METADATA
-    // write of the conventional SESSION_NAME_KEY (Scope::Global, value
-    // `current\0new`); the server intercepts it and applies the registry
-    // rename. We optimistically reflect the new name locally — the server is
-    // authoritative, and the next ATTACHED snapshot overwrites `session_name`
-    // (also how other attached clients learn the rename; a live
-    // SESSION_RENAMED push is out of scope for this pass). A no-op rename
-    // (new == current) is dropped: nothing to send, nothing to repaint.
-    let renamed = if let Some(new_name) = effects.rename_session.filter(|n| n != &*ctx.session_name)
-    {
-        let request_id = *ctx.next_request_id;
-        *ctx.next_request_id = ctx.next_request_id.wrapping_add(1);
-        let mut value = ctx.session_name.as_bytes().to_vec();
-        value.push(0);
-        value.extend_from_slice(new_name.as_bytes());
-        conn.send(&FrameKind::SetMetadata {
-            request_id,
-            scope: Scope::Global,
-            key: SESSION_NAME_KEY.to_owned(),
-            value,
-        })
-        .await?;
-        tracing::info!(new_name = %new_name, "rename-session sent; optimistically updating local name");
-        *ctx.session_name = new_name;
-        true
-    } else {
-        false
-    };
+    record_reattach_request(effects.reattach, ctx.switch_request, ctx.session_name);
+    let renamed = send_session_rename(
+        effects.rename_session,
+        conn,
+        ctx.session_name,
+        ctx.next_request_id,
+    )
+    .await?;
     // A rename repaints the status bar (it carries the session name) the
     // same way a layout mutation does; fold it into the caller's repaint
     // signal so the new name shows immediately.
     Ok(layout_changed || renamed)
+}
+
+/// phux-x2hm: flip pane-zoom. Un-zoom if zoomed; otherwise zoom the
+/// focused pane. `run_action` already gated single-pane windows.
+fn apply_zoom_toggle(
+    toggle: bool,
+    zoomed: &mut Option<TerminalId>,
+    focused_pane: Option<&TerminalId>,
+) {
+    if !toggle {
+        return;
+    }
+    *zoomed = if zoomed.is_some() {
+        None
+    } else {
+        focused_pane.cloned()
+    };
+}
+
+/// phux-4h5a: flip the window-sidebar on/off state. The driver re-folds
+/// `sidebar_enabled` into the per-frame reservation after dispatch, so
+/// the `layout_mutated` repaint tiles into the new content rect.
+const fn apply_sidebar_toggle(toggle: bool, sidebar_enabled: &mut bool) {
+    if toggle {
+        *sidebar_enabled = !*sidebar_enabled;
+    }
+}
+
+/// Move the driver's focused pane, or — when the action only invalidated
+/// the prediction queue — drop that queue.
+///
+/// Focus moved (keybinding pane navigation) — re-anchor predict to
+/// the new pane: reset its cursor + viewport and drop the old pane's
+/// queue, so a keystroke before the next reconcile echoes at the
+/// right place rather than the old pane's (mid-screen) coordinates
+/// (phux-7ry0). Subsumes the plain `clear_predict` drop.
+fn apply_focus_effect(
+    set_focus: Option<TerminalId>,
+    clear_predict: bool,
+    focus_history: &mut FocusHistory,
+    focused_pane: &mut Option<TerminalId>,
+    predict: &mut PredictionState,
+    panes: &HashMap<TerminalId, PaneSlot>,
+) {
+    let Some(target) = set_focus else {
+        if clear_predict {
+            predict.clear();
+        }
+        return;
+    };
+    apply_focus_transition(focus_history, focused_pane, target);
+    if let Some(fid) = focused_pane.as_ref() {
+        reanchor_predict_to_pane(predict, panes, fid);
+    }
+}
+
+/// Broadcast the mutated layout envelope as a `SET_METADATA`.
+///
+/// Encoding can fail only on an empty workspace (we just produced
+/// it — shouldn't happen), but propagate cleanly if it ever does.
+/// phux-jy4t: keyed per session so a split here persists to THIS
+/// session's layout, not a key every session shares.
+async fn send_layout_metadata(
+    set_metadata: bool,
+    conn: &mut Connection,
+    workspace: &Workspace,
+    focused_session: Option<phux_protocol::ids::SessionId>,
+    next_request_id: &mut u32,
+) -> Result<(), AttachError> {
+    if !set_metadata {
+        return Ok(());
+    }
+    let Some(session) = focused_session else {
+        return Ok(());
+    };
+    let Some(bytes) = encode_layout_or_log(workspace) else {
+        return Ok(());
+    };
+    let request_id = *next_request_id;
+    *next_request_id = next_request_id.wrapping_add(1);
+    conn.send(&FrameKind::SetMetadata {
+        request_id,
+        scope: Scope::Group(DEFAULT_GROUP_ID),
+        key: layout_key(session),
+        value: bytes,
+    })
+    .await
+}
+
+/// Emit `DETACH` and wait for `DETACHED`; a detach already in flight is
+/// not re-sent.
+async fn send_detach(
+    detach: bool,
+    conn: &mut Connection,
+    detach_pending: &mut bool,
+) -> Result<(), AttachError> {
+    if !detach || *detach_pending {
+        return Ok(());
+    }
+    conn.send(&FrameKind::Detach).await?;
+    *detach_pending = true;
+    Ok(())
+}
+
+/// Send the parked `SPAWN_TERMINAL` requests and remember their intent.
+///
+/// Parked split — send the `SPAWN_TERMINAL` and remember the intent.
+/// Parked new-window — same SPAWN flow; the reply opens a window.
+async fn send_parked_spawns(
+    spawn_terminal: Option<(u32, PendingSplit, FrameKind)>,
+    spawn_window: Option<(u32, PendingWindow, FrameKind)>,
+    conn: &mut Connection,
+    pending_splits: &mut HashMap<u32, PendingSplit>,
+    pending_windows: &mut HashMap<u32, PendingWindow>,
+) -> Result<(), AttachError> {
+    if let Some((request_id, pending, frame)) = spawn_terminal {
+        pending_splits.insert(request_id, pending);
+        conn.send(&frame).await?;
+    }
+    if let Some((request_id, pending, frame)) = spawn_window {
+        pending_windows.insert(request_id, pending);
+        conn.send(&frame).await?;
+    }
+    Ok(())
+}
+
+/// kill-pane / kill-window keystroke sequences; the `TERMINAL_CLOSED`
+/// fold-out happens when each shell exits. Park the targets FIRST
+/// (phux-i0e8.2.2): once the frames are on the wire the close can
+/// race back, and an unmarked close would notice-spam the user about
+/// a death they ordered.
+async fn send_kill_frames(
+    kill_frames: Vec<FrameKind>,
+    targets: Vec<TerminalId>,
+    conn: &mut Connection,
+    expected_closes: &mut HashSet<TerminalId>,
+) -> Result<(), AttachError> {
+    expected_closes.extend(targets);
+    for frame in kill_frames {
+        conn.send(&frame).await?;
+    }
+    Ok(())
+}
+
+/// ADR-0033: supervisory COMMAND frames (take/give the wheel, signal the
+/// pane). Fire-and-forward — the server's `COMMAND_RESULT` + `TerminalControl`
+/// broadcast drive the chrome; the input loop does not block on the reply.
+async fn send_command_frames(
+    command_frames: Vec<FrameKind>,
+    conn: &mut Connection,
+) -> Result<(), AttachError> {
+    for frame in command_frames {
+        conn.send(&frame).await?;
+    }
+    Ok(())
+}
+
+/// phux-r82.5: a plugin action runs as a spawned child-process task —
+/// fire-and-forget from the input loop's perspective. The driver's
+/// `select!` picks up the completion report and toasts failures. All
+/// client-local (config + exec); nothing goes on the wire (ADR-0017).
+fn spawn_plugin_run(
+    run_plugin: Option<(String, String)>,
+    plugin_tx: Option<&tokio::sync::mpsc::UnboundedSender<PluginRunResult>>,
+) {
+    let Some((plugin_id, action_id)) = run_plugin else {
+        return;
+    };
+    let Some(tx) = plugin_tx else {
+        tracing::warn!(
+            plugin = %plugin_id,
+            action = %action_id,
+            "plugin-action dispatched with no plugin runtime channel; dropping",
+        );
+        return;
+    };
+    crate::attach::plugin_actions::spawn_plugin_action(tx.clone(), plugin_id, action_id);
+}
+
+/// phux-eb0 / new-session: an in-process re-attach request. Hand the
+/// target up to the driver via `ctx.switch_request`; `main_loop` reads
+/// it after this dispatch batch and returns a `SwitchTo` exit so the
+/// outer loop tears down the current session and re-attaches.
+///
+/// Switching to the CURRENT session without a window/pane target is a
+/// silent no-op. The session picker includes that row for orientation;
+/// committing it has already dismissed the overlay, so no reattach is
+/// needed. `new-session` is never a no-op — naming an existing session
+/// just attaches to it.
+fn record_reattach_request(
+    reattach: Option<ReattachTarget>,
+    switch_request: &mut Option<ReattachTarget>,
+    session_name: &str,
+) {
+    let Some(target) = reattach else {
+        return;
+    };
+    match target {
+        ReattachTarget::Existing {
+            name,
+            window: None,
+            pane: None,
+        } if name == session_name => {
+            tracing::debug!(target_session = %name, "switch-session to current session; no-op");
+        }
+        ReattachTarget::Existing { name, window, pane } => {
+            tracing::info!(target_session = %name, target_window = ?window, target_pane = ?pane, "switch-session requested");
+            *switch_request = Some(ReattachTarget::Existing { name, window, pane });
+        }
+        ReattachTarget::Create(name) => {
+            tracing::info!(session = %name, "new-session requested");
+            *switch_request = Some(ReattachTarget::Create(name));
+        }
+    }
+}
+
+/// rename-session: since the v0.3.0 "Option B" re-tier (ADR-0019 /
+/// ADR-0027) removed the `RENAME_SESSION` verb, a rename is a `SET_METADATA`
+/// write of the conventional `SESSION_NAME_KEY` (`Scope::Global`, value
+/// `current\0new`); the server intercepts it and applies the registry
+/// rename. We optimistically reflect the new name locally — the server is
+/// authoritative, and the next ATTACHED snapshot overwrites `session_name`
+/// (also how other attached clients learn the rename; a live
+/// `SESSION_RENAMED` push is out of scope for this pass). A no-op rename
+/// (new == current) is dropped: nothing to send, nothing to repaint.
+///
+/// Returns `true` when a rename went on the wire — the caller folds that
+/// into its repaint signal.
+async fn send_session_rename(
+    rename_session: Option<String>,
+    conn: &mut Connection,
+    session_name: &mut String,
+    next_request_id: &mut u32,
+) -> Result<bool, AttachError> {
+    let Some(new_name) = rename_session.filter(|n| n != &*session_name) else {
+        return Ok(false);
+    };
+    let request_id = *next_request_id;
+    *next_request_id = next_request_id.wrapping_add(1);
+    let mut value = session_name.as_bytes().to_vec();
+    value.push(0);
+    value.extend_from_slice(new_name.as_bytes());
+    conn.send(&FrameKind::SetMetadata {
+        request_id,
+        scope: Scope::Global,
+        key: SESSION_NAME_KEY.to_owned(),
+        value,
+    })
+    .await?;
+    tracing::info!(new_name = %new_name, "rename-session sent; optimistically updating local name");
+    *session_name = new_name;
+    Ok(true)
 }
 
 /// Result of feeding a key event through the resolver.

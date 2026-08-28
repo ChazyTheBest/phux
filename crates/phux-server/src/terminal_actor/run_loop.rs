@@ -61,17 +61,84 @@ enum TickOutcome {
     Emitted(usize),
 }
 
+/// The cooperative native-bootstrap pump's position for one `run` turn.
+///
+/// While a native bootstrap is in flight the loop alternates a yield to the
+/// runtime with exactly one record step, so prefix capture advances between
+/// ingress turns without starving sibling `LocalSet` tasks. The two pump
+/// arms are the two halves of that alternation; this enum names which half
+/// (if either) the current turn owes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootstrapPump {
+    /// No bootstrap in flight: both pump arms stay disabled.
+    Idle,
+    /// This turn owes the in-flight bootstrap one record step.
+    StepDue,
+    /// This turn owes the runtime a yield before the next record step.
+    YieldDue,
+}
+
+impl BootstrapPump {
+    /// Resolve the pump from the actor's bootstrap state plus whether the
+    /// previous turn left a step owed.
+    const fn resolve(bootstrap_pending: bool, step_owed: bool) -> Self {
+        if !bootstrap_pending {
+            return Self::Idle;
+        }
+        if step_owed {
+            Self::StepDue
+        } else {
+            Self::YieldDue
+        }
+    }
+}
+
+/// phux-8v1 drag fix: the debounced post-resize client resync owned by the
+/// `run` loop. (Re)armed on each resync-requesting resize; when the timer
+/// fires we broadcast ONE snapshot at the settled size.
+struct ResyncDebounce {
+    /// A resync is owed once the debounce deadline lands. False until a
+    /// resize arms it, which is why the idle far-future deadline the loop
+    /// starts with is never observed.
+    pending: bool,
+    /// Why the owed resync was armed; broadcast when the deadline fires.
+    reason: ResyncReason,
+}
+
+impl ResyncDebounce {
+    /// Whether the settled-resize snapshot may fire this turn: one is owed,
+    /// and no native bootstrap is holding the loop's broadcast arms closed.
+    const fn may_fire(&self, bootstrap_pending: bool) -> bool {
+        self.pending && !bootstrap_pending
+    }
+
+    /// Owe a resync for `reason` and (re)start the debounce, so a drag storm
+    /// — or a burst of lag-resync requests — coalesces into a single
+    /// snapshot rather than flooding the client.
+    fn arm(&mut self, reason: ResyncReason, deadline: std::pin::Pin<&mut tokio::time::Sleep>) {
+        self.pending = true;
+        self.reason = reason;
+        deadline.reset(tokio::time::Instant::now() + RESIZE_RESYNC_DEBOUNCE);
+    }
+
+    /// Clear the owed resync and hand back the reason to broadcast it with.
+    const fn take_reason(&mut self) -> ResyncReason {
+        self.pending = false;
+        self.reason
+    }
+}
+
 impl TerminalActor {
     /// Run the actor's event loop until shutdown.
     ///
     /// Native prefix capture advances by one record between ingress turns.
+    ///
+    /// Every arm is a one-line dispatch into a named handler; what remains
+    /// inline is the `select!`'s own arm/guard scaffolding plus the
+    /// rationale comments that must sit next to the guard they explain.
     #[allow(
         clippy::future_not_send,
         reason = "ADR-0014: TerminalActor owns !Send Terminal; lives on LocalSet"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the arms are one-line dispatches into named handlers; the length that remains is the select!'s own arm/guard scaffolding plus the load-bearing rationale comments that must sit next to the guard they explain"
     )]
     #[allow(
         clippy::cognitive_complexity,
@@ -100,16 +167,15 @@ impl TerminalActor {
         let mut detect_interval = crate::agent_detect::TICK_UNIDENTIFIED;
         let mut detect_tick = armed_interval(detect_interval).await;
 
-        // phux-8v1 drag fix: debounce timer for the post-resize client
-        // resync. (Re)armed on each resync-requesting resize; when it
-        // fires we broadcast ONE snapshot at the settled size. Init far
-        // out — `resync_pending` is false until a resize arms it, and we
-        // always `reset()` the deadline when arming, so the initial
-        // instant is never observed.
-        let resync_debounce = tokio::time::sleep(std::time::Duration::from_secs(3600));
-        tokio::pin!(resync_debounce);
-        let mut resync_pending = false;
-        let mut resync_reason = ResyncReason::Resize;
+        // Init the debounce deadline far out — `resync.pending` is false
+        // until a resize arms it, and arming always resets the deadline, so
+        // the initial instant is never observed.
+        let resync_deadline = tokio::time::sleep(std::time::Duration::from_secs(3600));
+        tokio::pin!(resync_deadline);
+        let mut resync = ResyncDebounce {
+            pending: false,
+            reason: ResyncReason::Resize,
+        };
         // Native control and PTY output are one outer select arm so the actor
         // never borrows either receiver twice. Preference swaps after every
         // selected ingress, but both sources remain enabled: a silent PTY can
@@ -118,6 +184,13 @@ impl TerminalActor {
         let mut native_step_due = false;
 
         loop {
+            // Resolved once per turn. `select!` evaluates every precondition
+            // below in one pass as it is entered, and nothing runs between
+            // here and there, so one read stands in for the ~ten separate
+            // reads the guards used to make.
+            let bootstrap_pending = self.native_bootstrap_pending();
+            let pump = BootstrapPump::resolve(bootstrap_pending, native_step_due);
+
             tokio::select! {
                 biased;
 
@@ -130,9 +203,8 @@ impl TerminalActor {
                 // Bytes already encoded on the dedicated input lane. This
                 // bounded mailbox is the production input path and shares the
                 // actor's highest scheduling priority.
-                Some(request) = self.encoded_input_rx.recv() => {
-                    self.service_encoded_input_batch(request);
-                }
+                Some(request) = self.encoded_input_rx.recv() =>
+                    self.service_encoded_input_batch(request),
 
                 // Legacy inline input → PTY, retained for direct-drive tests
                 // that intentionally construct the runtime without a lane.
@@ -145,13 +217,9 @@ impl TerminalActor {
                 // so a paste the encoder expands cannot inflate one turn
                 // without limit. The PTY-output arm's structural bound is
                 // `MAX_PTY_COALESCE_BYTES`.
-                Some(input) = self.input_rx.recv() => {
-                    self.service_input_batch(&input);
-                }
+                Some(input) = self.input_rx.recv() => self.service_input_batch(&input),
 
-                () = std::future::ready(()),
-                    if native_step_due && self.native_bootstrap_pending() =>
-                {
+                () = std::future::ready(()), if pump == BootstrapPump::StepDue => {
                     self.cooperative_native_step();
                     native_step_due = false;
                 }
@@ -161,84 +229,44 @@ impl TerminalActor {
                     self.pty_rx.as_mut(),
                     prefer_native,
                 ) => {
-                    match ingress {
-                        NativeOrPty::Native(req) => {
-                            prefer_native = false;
-                            self.handle_native_actor_request(req);
-                            native_step_due = false;
-                        }
-                        NativeOrPty::Pty(evt) => {
-                            prefer_native = true;
-                            // PTY -> Terminal + broadcast. One bounded parse
-                            // returns to this combined ingress arm so native
-                            // control and live output alternate when both are
-                            // continuously ready.
-                            match self.service_pty_event(evt).await {
-                                PtyTurn::Continue => {}
-                                PtyTurn::Stepped(due) => native_step_due = due,
-                                PtyTurn::Shutdown => return,
-                            }
-                        }
+                    if self
+                        .service_ingress_turn(ingress, &mut prefer_native, &mut native_step_due)
+                        .await
+                        .is_break()
+                    {
+                        return;
                     }
                 }
 
-                Some(req) = self.snapshot_rx.recv(), if !self.native_bootstrap_pending() => {
-                    self.reply_bounded_snapshot(req);
-                }
+                Some(req) = self.snapshot_rx.recv(), if !bootstrap_pending =>
+                    self.reply_bounded_snapshot(req),
 
-                Some(req) = self.set_default_colors_rx.recv(), if !self.native_bootstrap_pending() => {
-                    self.install_client_default_colors(req);
-                }
+                Some(req) = self.set_default_colors_rx.recv(), if !bootstrap_pending =>
+                    self.install_client_default_colors(req),
 
-                Some(req) = self.screen_rx.recv(), if !self.native_bootstrap_pending() => {
-                    self.reply_screen_state(req);
-                }
+                Some(req) = self.screen_rx.recv(), if !bootstrap_pending =>
+                    self.reply_screen_state(req),
 
-                Some(req) = self.upgrade_rx.recv(), if !self.native_bootstrap_pending() => {
-                    self.reply_upgrade_handle(req);
-                }
+                Some(req) = self.upgrade_rx.recv(), if !bootstrap_pending =>
+                    self.reply_upgrade_handle(req),
 
-                Some(req) = self.pwd_rx.recv() => {
-                    self.reply_pane_cwd(req);
-                }
+                Some(req) = self.pwd_rx.recv() => self.reply_pane_cwd(req),
 
-                Some(req) = self.resize_rx.recv(), if !self.native_bootstrap_pending() => {
-                    // Arming the debounce timer is the caller's half of the
-                    // resync decision; `apply_resize_request` owns the reflow
-                    // and the "does this deserve a resync" rules.
-                    if let Some(reason) = self.apply_resize_request(req) {
-                        resync_pending = true;
-                        resync_reason = reason;
-                        resync_debounce
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + RESIZE_RESYNC_DEBOUNCE);
-                    }
-                }
+                Some(req) = self.resize_rx.recv(), if !bootstrap_pending =>
+                    self.service_resize_request(req, &mut resync, resync_deadline.as_mut()),
 
                 // phux-8v1: debounced resize resync — fires once the
                 // resize storm settles (RESIZE_RESYNC_DEBOUNCE after the
-                // last resync-requesting resize). Guarded by
-                // `resync_pending` so the idle far-future timer never
-                // fires spuriously.
-                () = &mut resync_debounce, if resync_pending && !self.native_bootstrap_pending() => {
-                    resync_pending = false;
-                    self.broadcast_resync(resync_reason);
-                }
+                // last resync-requesting resize). Guarded by the owed-resync
+                // flag so the idle far-future timer never fires spuriously.
+                () = &mut resync_deadline, if resync.may_fire(bootstrap_pending) =>
+                    self.broadcast_resync(resync.take_reason()),
 
-                Some(req) = self.consumer_attach_rx.recv(), if !self.native_bootstrap_pending() => {
-                    self.handle_consumer_attach(req);
-                }
+                Some(req) = self.consumer_attach_rx.recv(), if !bootstrap_pending =>
+                    self.handle_consumer_attach(req),
 
-                Some(req) = self.consumer_detach_rx.recv() => {
-                    let ConsumerDetachRequest { client_id, reply } = req;
-                    self.unregister_consumer(client_id);
-                    trace!(?client_id, "consumer detached: per-consumer RenderState freed");
-                    // phux-q0e.5: losing a consumer can raise the minimum
-                    // desired interval (e.g. the fastest peer left), so
-                    // re-evaluate the shared cadence.
-                    Self::rearm_tick(&mut tick, &mut tick_interval, self.adaptive_tick_interval());
-                    let _ = reply.send(());
-                }
+                Some(req) = self.consumer_detach_rx.recv() =>
+                    self.service_consumer_detach(req, &mut tick, &mut tick_interval),
 
                 // ADR-0018 / phux-q0e.4: inbound FRAME_ACK. Clears the
                 // per-consumer dirty cache so the next tick re-diffs
@@ -246,57 +274,25 @@ impl TerminalActor {
                 // dropped ack just means the next tick re-emits a larger
                 // diff against the same older reference — no
                 // retransmit machinery here.
-                Some(req) = self.consumer_ack_rx.recv() => {
-                    let ConsumerAckRequest {
-                        client_id,
-                        stream_id,
-                        bootstrap_id,
-                        seq,
-                    } = req;
-                    // phux-q0e.5: a fresh RTT sample may shift the adaptive
-                    // cadence. Rebuild the shared tick only when the new
-                    // minimum-desired interval moves beyond the deadband, so
-                    // a steady RTT does not churn the scheduler.
-                    if self.on_generation_frame_ack(client_id, stream_id, bootstrap_id, seq) {
-                        Self::rearm_tick(&mut tick, &mut tick_interval, self.adaptive_tick_interval());
-                    }
-                }
+                Some(req) = self.consumer_ack_rx.recv() =>
+                    self.service_frame_ack(&req, &mut tick, &mut tick_interval),
 
                 // Semantic event subscription request. Register the subscriber
                 // and begin broadcasting matching events to their outbound mailbox.
-                Some(req) = self.subscribe_to_events_rx.recv() => {
-                    self.subscribe_to_events(req);
-                }
+                Some(req) = self.subscribe_to_events_rx.recv() => self.subscribe_to_events(req),
 
                 // Semantic event unsubscription request. Remove the subscriber
                 // from the broadcast list. Silent no-op if already unsubscribed.
-                Some(req) = self.unsubscribe_from_events_rx.recv() => {
-                    self.unsubscribe_from_events(&req);
-                }
+                Some(req) = self.unsubscribe_from_events_rx.recv() =>
+                    self.unsubscribe_from_events(&req),
 
                 // Supervisory control (ADR-0033): lease-change broadcasts and
                 // process signals. The lease itself lives in `ServerState`; the
                 // actor is the emitter (it owns the subscriber list + lifecycle)
                 // and the signal deliverer (it owns the PTY child pid).
-                Some(req) = self.control_rx.recv() => {
-                    self.handle_control_request(req);
-                }
+                Some(req) = self.control_rx.recv() => self.handle_control_request(req),
 
-                // State-sync tick driver (phux-q0e.3, phux-ia4, ADR-0018).
-                // Iterates each attached consumer, diffs the live terminal
-                // against that consumer's own reference grid, and pushes a
-                // `TerminalOutput` frame onto its outbound mailbox whenever
-                // `synthesize_against_reference` returns non-empty bytes.
-                _ = tick.tick(), if !self.native_bootstrap_pending() => {
-                    // phux-y2t: close an output burst with an `idle` event
-                    // when no PTY output arrived since the previous tick.
-                    // This bookkeeping is independent of the state-sync
-                    // emitter gate, so headless watchers settle raw panes too.
-                    self.maybe_emit_idle();
-                    self.tick_emit();
-                    #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
-                    self.expire_native_cursors();
-                }
+                _ = tick.tick(), if !bootstrap_pending => self.service_state_tick(),
 
                 // Agent-state detector (ADR-0046). This interval is the SOLE
                 // driver: PTY bytes deliberately do NOT wake it. A chatty
@@ -307,22 +303,146 @@ impl TerminalActor {
                 // confirming a working -> idle transition) and is re-armed
                 // through the existing `rearm_tick`, whose deadband keeps a
                 // steady cadence from churning the scheduler.
-                _ = detect_tick.tick(),
-                    if self.agent_detect.is_some() && !self.native_bootstrap_pending() =>
-                {
-                    if let Some(next) = self.detect_tick() {
-                        Self::rearm_tick(&mut detect_tick, &mut detect_interval, next);
-                    }
-                }
+                _ = detect_tick.tick(), if self.detector_tick_armed(bootstrap_pending) =>
+                    self.service_detect_tick(&mut detect_tick, &mut detect_interval),
 
-                () = tokio::task::yield_now(),
-                    if self.native_bootstrap_pending() && !native_step_due =>
-                {
+                () = tokio::task::yield_now(), if pump == BootstrapPump::YieldDue => {
                     native_step_due = true;
                 }
 
                 else => break,
             }
+        }
+    }
+
+    /// Service one combined native-control / PTY-output ingress turn.
+    ///
+    /// Owns the source-preference swap and the cooperative-step bookkeeping
+    /// that follow each selected ingress. Returns `ControlFlow::Break` when
+    /// the actor-global raw output sequence is exhausted: the PTY has already
+    /// been torn down and the loop must return.
+    #[allow(
+        clippy::future_not_send,
+        reason = "ADR-0014: TerminalActor owns !Send Terminal; lives on LocalSet"
+    )]
+    async fn service_ingress_turn(
+        &mut self,
+        ingress: NativeOrPty,
+        prefer_native: &mut bool,
+        native_step_due: &mut bool,
+    ) -> std::ops::ControlFlow<()> {
+        match ingress {
+            NativeOrPty::Native(req) => {
+                *prefer_native = false;
+                self.handle_native_actor_request(req);
+                *native_step_due = false;
+            }
+            NativeOrPty::Pty(evt) => {
+                *prefer_native = true;
+                // PTY -> Terminal + broadcast. One bounded parse
+                // returns to this combined ingress arm so native
+                // control and live output alternate when both are
+                // continuously ready.
+                match self.service_pty_event(evt).await {
+                    PtyTurn::Continue => {}
+                    PtyTurn::Stepped(due) => *native_step_due = due,
+                    PtyTurn::Shutdown => return std::ops::ControlFlow::Break(()),
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    /// Apply one resize request and arm the debounced resync it earns.
+    ///
+    /// Arming the debounce timer is this caller's half of the resync
+    /// decision; `apply_resize_request` owns the reflow and the "does this
+    /// deserve a resync" rules.
+    fn service_resize_request(
+        &mut self,
+        req: ResizeRequest,
+        resync: &mut ResyncDebounce,
+        deadline: std::pin::Pin<&mut tokio::time::Sleep>,
+    ) {
+        if let Some(reason) = self.apply_resize_request(req) {
+            resync.arm(reason, deadline);
+        }
+    }
+
+    /// Reap a detached consumer's per-consumer state and re-evaluate the
+    /// shared tick cadence.
+    fn service_consumer_detach(
+        &mut self,
+        req: ConsumerDetachRequest,
+        tick: &mut tokio::time::Interval,
+        tick_interval: &mut std::time::Duration,
+    ) {
+        let ConsumerDetachRequest { client_id, reply } = req;
+        self.unregister_consumer(client_id);
+        trace!(
+            ?client_id,
+            "consumer detached: per-consumer RenderState freed"
+        );
+        // phux-q0e.5: losing a consumer can raise the minimum
+        // desired interval (e.g. the fastest peer left), so
+        // re-evaluate the shared cadence.
+        Self::rearm_tick(tick, tick_interval, self.adaptive_tick_interval());
+        let _ = reply.send(());
+    }
+
+    /// Fold one inbound `FRAME_ACK` into its consumer's state.
+    ///
+    /// phux-q0e.5: a fresh RTT sample may shift the adaptive cadence. Rebuild
+    /// the shared tick only when the new minimum-desired interval moves
+    /// beyond the deadband, so a steady RTT does not churn the scheduler.
+    fn service_frame_ack(
+        &mut self,
+        req: &ConsumerAckRequest,
+        tick: &mut tokio::time::Interval,
+        tick_interval: &mut std::time::Duration,
+    ) {
+        let &ConsumerAckRequest {
+            client_id,
+            stream_id,
+            bootstrap_id,
+            seq,
+        } = req;
+        if self.on_generation_frame_ack(client_id, stream_id, bootstrap_id, seq) {
+            Self::rearm_tick(tick, tick_interval, self.adaptive_tick_interval());
+        }
+    }
+
+    /// One state-sync tick (phux-q0e.3, phux-ia4, ADR-0018): iterate each
+    /// attached consumer, diff the live terminal against that consumer's own
+    /// reference grid, and push a `TerminalOutput` frame onto its outbound
+    /// mailbox whenever `synthesize_against_reference` returns non-empty
+    /// bytes.
+    fn service_state_tick(&mut self) {
+        // phux-y2t: close an output burst with an `idle` event
+        // when no PTY output arrived since the previous tick.
+        // This bookkeeping is independent of the state-sync
+        // emitter gate, so headless watchers settle raw panes too.
+        self.maybe_emit_idle();
+        self.tick_emit();
+        #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+        self.expire_native_cursors();
+    }
+
+    /// Whether the agent-state detector arm may run this turn: a detector was
+    /// installed (see [`Self::install_agent_detector`]) and no native
+    /// bootstrap is holding the loop's non-ingress arms closed.
+    const fn detector_tick_armed(&self, bootstrap_pending: bool) -> bool {
+        self.agent_detect.is_some() && !bootstrap_pending
+    }
+
+    /// Re-derive agent state and re-arm the detector cadence it asks for.
+    fn service_detect_tick(
+        &mut self,
+        detect_tick: &mut tokio::time::Interval,
+        detect_interval: &mut std::time::Duration,
+    ) {
+        if let Some(next) = self.detect_tick() {
+            Self::rearm_tick(detect_tick, detect_interval, next);
         }
     }
 

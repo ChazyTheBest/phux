@@ -1310,10 +1310,8 @@ const fn empty_history_outcome(
 /// Take the live post-READY stream, restoring and rejecting every other decoder state.
 fn take_after_ready_stream(
     native: &mut NativeReplica,
-) -> Result<
-    libghostty_vt::snapshot::incremental::DecodedStream<'static, 'static>,
-    GhosttyEngineError,
-> {
+) -> Result<libghostty_vt::snapshot::incremental::DecodedStream<'static, 'static>, GhosttyEngineError>
+{
     match std::mem::replace(&mut native.decoder, NativeDecoderState::Failed(None)) {
         NativeDecoderState::AfterReady(stream) => Ok(stream),
         NativeDecoderState::Finished(terminal) => {

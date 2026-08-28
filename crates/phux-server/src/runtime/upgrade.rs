@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::RuntimeFlags;
 use crate::state::SharedState;
-use crate::upgrade::blob::StateBlob;
 use crate::terminal_actor::{PaneUpgradeHandle, UpgradeHandleRequest};
+use crate::upgrade::blob::StateBlob;
 
 const PANE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 const UPGRADE_SOURCE_EXE: &str = "PHUX_UPGRADE_SOURCE_EXE";

@@ -789,6 +789,161 @@ async fn read_pre_submit_record(
     Ok(latest)
 }
 
+/// Re-verify the pane's occupant from the published record.
+///
+/// Not a fresh syscall (no wire verb exposes one) and not a server-side gate:
+/// detection fails safe toward `idle`, but input must fail safe toward
+/// delivery, so a text-matching manifest must never be able to make a pane
+/// start refusing keystrokes.
+#[allow(
+    clippy::future_not_send,
+    reason = "the verifier is a bare `&dyn Fn`, so this future is thread-bound; \
+              ADR-0003 binds the CLI to a current-thread runtime"
+)]
+async fn verified_occupant(
+    conn: &mut Connection,
+    terminal: &TerminalId,
+    verify: &dyn Fn(&AgentRecord) -> Option<String>,
+) -> Result<AgentRecord, PromptError> {
+    let Some(record) = read_pre_submit_record(conn, terminal).await? else {
+        return Err(PromptError::Refused(Refusal::NoAgentRecord));
+    };
+    if let Some(mismatch) = verify(&record) {
+        return Err(PromptError::Refused(Refusal::AgentMismatch(mismatch)));
+    }
+    Ok(record)
+}
+
+/// What one `APPLY_INPUT` submit produced, with everything the report needs
+/// from it.
+struct Submitted {
+    /// The verdict the last attempt read.
+    verdict: ApplyVerdict,
+    /// How many attempts the batch took.
+    attempts: u32,
+    /// The retry budget the schedule allowed, in milliseconds.
+    budget_ms: u64,
+    /// Wall time the whole submit took, in milliseconds.
+    submit_ms: u64,
+    /// Frames the server pushed ahead of the result.
+    interleaved: Vec<FrameKind>,
+}
+
+/// Submit the batch under `operation_id`, retried only on
+/// `RESOURCE_EXHAUSTED` and only under that same id.
+async fn submit_batch(
+    conn: &mut Connection,
+    terminal: &TerminalId,
+    operation_id: InputOperationId,
+    events: Vec<InputEvent>,
+) -> Result<Submitted, AttachError> {
+    let schedule = backoff_schedule(&operation_id);
+    let budget_ms = schedule
+        .iter()
+        .map(|step| u64::try_from(step.as_millis()).unwrap_or(u64::MAX))
+        .sum();
+    let started = Instant::now();
+    let mut interleaved: Vec<FrameKind> = Vec::new();
+    let (verdict, attempts) = submit_with_backoff(operation_id, &schedule, async |id| {
+        let (verdict, frames) =
+            apply_input_once(&mut *conn, terminal, id, events.clone(), SUBMIT_REQUEST_ID).await?;
+        interleaved.extend(frames);
+        Ok::<_, AttachError>(verdict)
+    })
+    .await?;
+    let submit_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(Submitted {
+        verdict,
+        attempts,
+        budget_ms,
+        submit_ms,
+        interleaved,
+    })
+}
+
+/// Read the submit's verdict as a delivery, or as the failure it reports.
+fn delivery_from_verdict(
+    verdict: ApplyVerdict,
+    attempts: u32,
+    budget_ms: u64,
+    hex: &str,
+) -> Result<Delivery, PromptError> {
+    match verdict {
+        ApplyVerdict::Acked => Ok(Delivery::Acked),
+        ApplyVerdict::Busy(message) => Err(PromptError::LaneBusy {
+            attempts,
+            budget_ms,
+            message,
+            operation_id: hex.to_owned(),
+        }),
+        ApplyVerdict::NotWritten(message) => Err(PromptError::NotWritten {
+            operation_id: hex.to_owned(),
+            message,
+        }),
+        ApplyVerdict::Refused(refusal) => Err(PromptError::Refused(refusal)),
+        ApplyVerdict::NotFound(message) => Err(PromptError::NotFound(message)),
+        ApplyVerdict::Unknown(message) => Err(PromptError::DeliveryUnknown {
+            operation_id: hex.to_owned(),
+            message,
+        }),
+    }
+}
+
+/// The bytes went somewhere, but not provably to the occupant the ownership
+/// check passed on.
+fn occupant_changed(detail: String, hex: &str, delivery: Delivery) -> PromptError {
+    PromptError::OccupantChanged {
+        detail,
+        operation_id: hex.to_owned(),
+        delivery,
+    }
+}
+
+/// The last record observed before the result, having checked every frame the
+/// server pushed ahead of it for an occupant change.
+///
+/// Anything the server pushed ahead of the result is, by ADR-0076 point 6,
+/// incapable of satisfying a completion gate — it may be pre-write. It is
+/// still evidence about *who* the bytes went to, which is the one thing point
+/// 4 asks it for.
+fn confirm_occupant(
+    interleaved: &[FrameKind],
+    terminal: &TerminalId,
+    record: &AgentRecord,
+    hex: &str,
+    delivery: Delivery,
+) -> Result<AgentRecord, PromptError> {
+    let mut level = record.clone();
+    for frame in interleaved {
+        let Some(observed) = record_from_frame(frame, terminal) else {
+            continue;
+        };
+        let Some(observed) = observed else {
+            return Err(occupant_changed(
+                "the phux.agent/v1 record was deleted".to_owned(),
+                hex,
+                delivery,
+            ));
+        };
+        if !observed.name.eq_ignore_ascii_case(&record.name) {
+            return Err(occupant_changed(
+                format!("'{}' replaced '{}'", observed.name, record.name),
+                hex,
+                delivery,
+            ));
+        }
+        if observed.state == AgentMetaState::Unknown && record.state != AgentMetaState::Unknown {
+            return Err(occupant_changed(
+                format!("'{}' withdrew its state to unknown", observed.name),
+                hex,
+                delivery,
+            ));
+        }
+        level = observed;
+    }
+    Ok(level)
+}
+
 /// Deliver an already-built, already-validated batch to `terminal` with a
 /// receipt, re-verifying the pane's occupant on the same connection first.
 ///
@@ -816,16 +971,6 @@ async fn read_pre_submit_record(
 ///
 /// See [`PromptError`]. `verify` returning `Some(description)` is
 /// [`Refusal::AgentMismatch`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one call site per verb, and every argument is a distinct \
-              contract knob the caller must choose deliberately"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the subscribe / read / submit / wait ordering is the contract \
-              and is only auditable as one sequence"
-)]
 #[allow(
     clippy::future_not_send,
     reason = "ADR-0003 binds the CLI to a current-thread runtime; the wait \
@@ -863,94 +1008,21 @@ pub async fn deliver_acknowledged(
         return Err(PromptError::Refused(Refusal::NoAcknowledgedInput));
     }
 
-    // 4. Ownership re-verification from the published record. Not a fresh
-    //    syscall (no wire verb exposes one) and not a server-side gate:
-    //    detection fails safe toward `idle`, but input must fail safe toward
-    //    delivery, so a text-matching manifest must never be able to make a
-    //    pane start refusing keystrokes.
-    let Some(record) = read_pre_submit_record(&mut conn, terminal).await? else {
-        return Err(PromptError::Refused(Refusal::NoAgentRecord));
-    };
-    if let Some(mismatch) = verify(&record) {
-        return Err(PromptError::Refused(Refusal::AgentMismatch(mismatch)));
-    }
+    // 4. Ownership re-verification from the published record.
+    let record = verified_occupant(&mut conn, terminal, verify).await?;
     let pre_submit_state = record.state;
 
     // 5. The submit. One id, every attempt.
-    let schedule = backoff_schedule(&operation_id);
-    let budget_ms = schedule
-        .iter()
-        .map(|step| u64::try_from(step.as_millis()).unwrap_or(u64::MAX))
-        .sum();
-    let started = Instant::now();
-    let mut interleaved: Vec<FrameKind> = Vec::new();
-    let (verdict, attempts) = submit_with_backoff(operation_id, &schedule, async |id| {
-        let (verdict, frames) =
-            apply_input_once(&mut conn, terminal, id, events.clone(), SUBMIT_REQUEST_ID).await?;
-        interleaved.extend(frames);
-        Ok::<_, AttachError>(verdict)
-    })
-    .await?;
-    let submit_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let submitted = submit_batch(&mut conn, terminal, operation_id, events).await?;
+    let delivery = delivery_from_verdict(
+        submitted.verdict,
+        submitted.attempts,
+        submitted.budget_ms,
+        &hex,
+    )?;
 
-    let delivery = match verdict {
-        ApplyVerdict::Acked => Delivery::Acked,
-        ApplyVerdict::Busy(message) => {
-            return Err(PromptError::LaneBusy {
-                attempts,
-                budget_ms,
-                message,
-                operation_id: hex,
-            });
-        }
-        ApplyVerdict::NotWritten(message) => {
-            return Err(PromptError::NotWritten {
-                operation_id: hex,
-                message,
-            });
-        }
-        ApplyVerdict::Refused(refusal) => return Err(PromptError::Refused(refusal)),
-        ApplyVerdict::NotFound(message) => return Err(PromptError::NotFound(message)),
-        ApplyVerdict::Unknown(message) => {
-            return Err(PromptError::DeliveryUnknown {
-                operation_id: hex,
-                message,
-            });
-        }
-    };
-
-    // 6. Anything the server pushed ahead of the result is, by ADR-0076 point
-    //    6, incapable of satisfying a completion gate — it may be pre-write.
-    //    It is still evidence about *who* the bytes went to, which is the one
-    //    thing point 4 asks it for.
-    let mut level = record.clone();
-    for frame in &interleaved {
-        let Some(observed) = record_from_frame(frame, terminal) else {
-            continue;
-        };
-        let Some(observed) = observed else {
-            return Err(PromptError::OccupantChanged {
-                detail: "the phux.agent/v1 record was deleted".to_owned(),
-                operation_id: hex,
-                delivery,
-            });
-        };
-        if !observed.name.eq_ignore_ascii_case(&record.name) {
-            return Err(PromptError::OccupantChanged {
-                detail: format!("'{}' replaced '{}'", observed.name, record.name),
-                operation_id: hex,
-                delivery,
-            });
-        }
-        if observed.state == AgentMetaState::Unknown && record.state != AgentMetaState::Unknown {
-            return Err(PromptError::OccupantChanged {
-                detail: format!("'{}' withdrew its state to unknown", observed.name),
-                operation_id: hex,
-                delivery,
-            });
-        }
-        level = observed;
-    }
+    // 6. Who the bytes went to, read off the frames that arrived first.
+    let level = confirm_occupant(&submitted.interleaved, terminal, &record, &hex, delivery)?;
 
     let Some(wait) = wait else {
         return Ok(PromptOutcome {
@@ -958,8 +1030,8 @@ pub async fn deliver_acknowledged(
             operation_id: hex,
             agent: record,
             pre_submit_state,
-            attempts,
-            submit_ms,
+            attempts: submitted.attempts,
+            submit_ms: submitted.submit_ms,
             wait: None,
             degraded_to_polling: false,
         });
@@ -991,8 +1063,8 @@ pub async fn deliver_acknowledged(
         operation_id: hex,
         agent: record,
         pre_submit_state,
-        attempts,
-        submit_ms,
+        attempts: submitted.attempts,
+        submit_ms: submitted.submit_ms,
         wait: Some(result),
         degraded_to_polling: degraded,
     })

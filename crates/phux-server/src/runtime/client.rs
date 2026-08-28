@@ -1301,11 +1301,7 @@ async fn close_for_protocol_error(
 }
 
 /// SPEC §7.4: echo the nonce in PONG.
-async fn reply_pong(
-    out_tx: &tokio::sync::mpsc::Sender<Outbound>,
-    client_id: ClientId,
-    nonce: u64,
-) {
+async fn reply_pong(out_tx: &tokio::sync::mpsc::Sender<Outbound>, client_id: ClientId, nonce: u64) {
     debug!(nonce, "PING -> PONG");
     if out_tx
         .send(Outbound::Frame(FrameKind::Pong { nonce }))
@@ -1602,8 +1598,7 @@ async fn negotiate_hello(
         "HELLO",
     );
     if !protocol_is_compatible(protocol_major, protocol_minor) {
-        let message =
-            incompatible_protocol_message(protocol_major, protocol_minor, protocol_patch);
+        let message = incompatible_protocol_message(protocol_major, protocol_minor, protocol_patch);
         warn!(?client_id, %message, "HELLO protocol mismatch");
         return Err(ConnectionClose {
             attached_reason: None,
@@ -1661,10 +1656,7 @@ async fn negotiate_hello(
 /// Policy check: authorize HELLO only against the identity authenticated by
 /// the accepting transport. A missing registry entry is never equivalent to a
 /// local root peer.
-async fn authorize_hello(
-    state: &SharedState,
-    client_id: ClientId,
-) -> Result<(), ConnectionClose> {
+async fn authorize_hello(state: &SharedState, client_id: ClientId) -> Result<(), ConnectionClose> {
     let Some(peer) = state.with(|s| s.peer_identity(client_id).cloned()) else {
         warn!(
             ?client_id,
@@ -2047,8 +2039,13 @@ where
                 .await;
             }
             FrameKind::Detach => {
-                detach_on_request(&state, client_id, &plumbing.out_tx, &mut plumbing.output_pumps)
-                    .await;
+                detach_on_request(
+                    &state,
+                    client_id,
+                    &plumbing.out_tx,
+                    &mut plumbing.output_pumps,
+                )
+                .await;
             }
             FrameKind::ViewportResize { viewport } => {
                 debug!(
@@ -2166,8 +2163,15 @@ where
                 scope,
                 key,
             } => {
-                handle_get_metadata(&state, client_id, request_id, &scope, &key, &plumbing.out_tx)
-                    .await;
+                handle_get_metadata(
+                    &state,
+                    client_id,
+                    request_id,
+                    &scope,
+                    &key,
+                    &plumbing.out_tx,
+                )
+                .await;
             }
             FrameKind::SetMetadata {
                 request_id,
@@ -2661,13 +2665,12 @@ fn apply_session_rename(
         // is forwarded as-is so a subscriber can both find the
         // stale entry and learn its replacement; it is not
         // stored (see `metadata_broadcast`).
-        let delivered = if matches!(outcome, crate::state::RenameOutcome::Renamed)
-            && current != new_name
-        {
-            s.metadata_broadcast(scope, key, value)
-        } else {
-            Vec::new()
-        };
+        let delivered =
+            if matches!(outcome, crate::state::RenameOutcome::Renamed) && current != new_name {
+                s.metadata_broadcast(scope, key, value)
+            } else {
+                Vec::new()
+            };
         (outcome, delivered)
     });
     debug!(

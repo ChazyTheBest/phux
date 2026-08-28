@@ -229,7 +229,8 @@ fn verify_retained_overlap(
     if overlap_end <= chunk.offset {
         return Ok(());
     }
-    let overlap_len = usize::try_from(overlap_end - chunk.offset).map_err(|_| upload_too_large())?;
+    let overlap_len =
+        usize::try_from(overlap_end - chunk.offset).map_err(|_| upload_too_large())?;
     let mut existing = vec![0; overlap_len];
     file.seek(SeekFrom::Start(chunk.offset)).map_err(io_error)?;
     file.read_exact(&mut existing).map_err(io_error)?;

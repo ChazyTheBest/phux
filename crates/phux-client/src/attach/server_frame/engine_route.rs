@@ -109,28 +109,74 @@ pub(super) fn attach_participants(
         .collect()
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "cohesive translation of ordered wire-frame variants into session-kernel inputs and effects"
-)]
+/// Route one inbound wire frame through the session kernel and fold its
+/// declarative effects into a [`KernelRoute`] the handler's arm consumes.
 pub(super) fn route_engine_frame(
     frame: &FrameKind,
     kernel: &mut crate::attach::pane_state::AttachKernel,
     effects: &mut KernelEffectBuffer,
 ) -> KernelRoute {
-    let terminals;
-    let input = match frame {
-        FrameKind::Attached {
-            attach_id,
-            snapshot,
-            ..
-        } => {
-            terminals = attach_participants(snapshot);
-            Some(KernelInput::AttachStarted {
-                attach_id: *attach_id,
-                terminals: &terminals,
-            })
+    let terminals = frame_attach_participants(frame);
+    let input = match kernel_input_for(frame, &terminals) {
+        Ok(Some(input)) => input,
+        // A frame the session kernel does not model at all: the handler's own
+        // arm owns it end to end.
+        Ok(None) => return KernelRoute::default(),
+        Err(failed) => {
+            return KernelRoute {
+                failed: Some(failed.to_owned()),
+                ..KernelRoute::default()
+            };
         }
+    };
+
+    effects.clear();
+    let result = kernel.update(input, effects);
+    let mut route = classify_kernel_result(&result, frame, effects);
+    collect_route_effects(&mut route, effects);
+    route
+}
+
+/// The attach participants an `ATTACHED` frame declares; empty for every other
+/// frame.
+///
+/// Materialized before the input translation so `KernelInput::AttachStarted`
+/// has a slice to borrow that outlives the translation itself.
+fn frame_attach_participants(frame: &FrameKind) -> Vec<TerminalId> {
+    let FrameKind::Attached { snapshot, .. } = frame else {
+        return Vec::new();
+    };
+    attach_participants(snapshot)
+}
+
+/// Translate one wire frame into the session-kernel input it means.
+///
+/// `Ok(None)` ⇒ the kernel does not model this frame. `Err` ⇒ the frame names
+/// a history reason this build does not understand, which the caller turns
+/// into a rejected route.
+fn kernel_input_for<'a>(
+    frame: &'a FrameKind,
+    terminals: &'a [TerminalId],
+) -> Result<Option<KernelInput<'a>>, &'static str> {
+    if let Some(input) = attach_stream_input(frame, terminals) {
+        return Ok(Some(input));
+    }
+    if let Some(input) = content_stream_input(frame) {
+        return Ok(Some(input));
+    }
+    history_stream_input(frame)
+}
+
+/// The attach barrier and bootstrap-transcript frames.
+fn attach_stream_input<'a>(
+    frame: &'a FrameKind,
+    terminals: &'a [TerminalId],
+) -> Option<KernelInput<'a>> {
+    match frame {
+        FrameKind::Attached { attach_id, .. } => Some(KernelInput::AttachStarted {
+            attach_id: *attach_id,
+            terminals,
+        }),
         FrameKind::AttachReady { attach_id } => Some(KernelInput::AttachReady {
             attach_id: *attach_id,
         }),
@@ -177,84 +223,6 @@ pub(super) fn route_engine_frame(
             bootstrap_id: *bootstrap_id,
             history_cursor: history_cursor.as_deref(),
         }),
-        FrameKind::HistoryPage {
-            terminal_id,
-            stream_id,
-            bootstrap_id,
-            rows,
-            page_seq,
-            cursor,
-            next_cursor,
-            payload,
-        } => Some(KernelInput::HistoryPage {
-            terminal_id,
-            stream_id: *stream_id,
-            bootstrap_id: *bootstrap_id,
-            rows: *rows,
-            page_seq: *page_seq,
-            payload,
-            cursor,
-            next_cursor: next_cursor.as_deref(),
-        }),
-        FrameKind::HistoryTombstone {
-            terminal_id,
-            stream_id,
-            bootstrap_id,
-            cursor,
-            reason,
-        } => Some(KernelInput::HistoryTombstone {
-            terminal_id,
-            stream_id: *stream_id,
-            bootstrap_id: *bootstrap_id,
-            cursor,
-            reason: match history_unavailable_reason(*reason) {
-                Some(reason) => reason,
-                None => {
-                    return KernelRoute {
-                        failed: Some("unsupported history tombstone reason".to_owned()),
-                        ..KernelRoute::default()
-                    };
-                }
-            },
-        }),
-        FrameKind::HistoryRejected {
-            terminal_id,
-            stream_id,
-            bootstrap_id,
-            cursor,
-            reason,
-            required_bytes,
-            required_rows,
-        } => Some(KernelInput::HistoryRejected {
-            terminal_id,
-            stream_id: *stream_id,
-            bootstrap_id: *bootstrap_id,
-            cursor,
-            reason: match history_rejection_reason(*reason) {
-                Some(reason) => reason,
-                None => {
-                    return KernelRoute {
-                        failed: Some("unsupported history rejection reason".to_owned()),
-                        ..KernelRoute::default()
-                    };
-                }
-            },
-            required_bytes: *required_bytes,
-            required_rows: *required_rows,
-        }),
-        FrameKind::TerminalOutput {
-            terminal_id,
-            stream_id,
-            bootstrap_id,
-            seq,
-            bytes,
-        } => Some(KernelInput::TerminalOutput {
-            terminal_id,
-            stream_id: *stream_id,
-            bootstrap_id: *bootstrap_id,
-            seq: *seq,
-            payload: bytes,
-        }),
         FrameKind::BootstrapTombstone {
             terminal_id,
             stream_id,
@@ -268,51 +236,160 @@ pub(super) fn route_engine_frame(
             reason: *reason,
             last_valid_seq: *last_valid_seq,
         }),
+        _ => None,
+    }
+}
+
+/// The live-content frames: applied VT bytes and the pane's permanent close.
+fn content_stream_input(frame: &FrameKind) -> Option<KernelInput<'_>> {
+    match frame {
+        FrameKind::TerminalOutput {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            seq,
+            bytes,
+        } => Some(KernelInput::TerminalOutput {
+            terminal_id,
+            stream_id: *stream_id,
+            bootstrap_id: *bootstrap_id,
+            seq: *seq,
+            payload: bytes,
+        }),
         FrameKind::TerminalClosed { terminal_id, .. } => {
             Some(KernelInput::TerminalClosed { terminal_id })
         }
         _ => None,
-    };
-    let Some(input) = input else {
-        return KernelRoute::default();
-    };
+    }
+}
 
-    effects.clear();
-    let result = kernel.update(input, effects);
-    let resync_required = result.is_err()
-        && effects.as_slice().iter().any(|effect| {
-            matches!(
-                effect,
-                KernelEffect::Status(
-                    phux_client_core::session::KernelStatus::ResyncRequired { .. }
-                )
+/// The scrollback-page frames.
+///
+/// These are the fallible half of the translation: a tombstone or rejection
+/// reason this build does not recognise has no kernel input to map onto, so it
+/// is reported as a rejected route rather than guessed at.
+fn history_stream_input(frame: &FrameKind) -> Result<Option<KernelInput<'_>>, &'static str> {
+    let input = match frame {
+        FrameKind::HistoryPage {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            rows,
+            page_seq,
+            cursor,
+            next_cursor,
+            payload,
+        } => KernelInput::HistoryPage {
+            terminal_id,
+            stream_id: *stream_id,
+            bootstrap_id: *bootstrap_id,
+            rows: *rows,
+            page_seq: *page_seq,
+            payload,
+            cursor,
+            next_cursor: next_cursor.as_deref(),
+        },
+        FrameKind::HistoryTombstone {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            cursor,
+            reason,
+        } => KernelInput::HistoryTombstone {
+            terminal_id,
+            stream_id: *stream_id,
+            bootstrap_id: *bootstrap_id,
+            cursor,
+            reason: history_unavailable_reason(*reason)
+                .ok_or("unsupported history tombstone reason")?,
+        },
+        FrameKind::HistoryRejected {
+            terminal_id,
+            stream_id,
+            bootstrap_id,
+            cursor,
+            reason,
+            required_bytes,
+            required_rows,
+        } => KernelInput::HistoryRejected {
+            terminal_id,
+            stream_id: *stream_id,
+            bootstrap_id: *bootstrap_id,
+            cursor,
+            reason: history_rejection_reason(*reason)
+                .ok_or("unsupported history rejection reason")?,
+            required_bytes: *required_bytes,
+            required_rows: *required_rows,
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(input))
+}
+
+/// Did the kernel emit a typed resync-required status alongside its error?
+fn emitted_resync_required(effects: &KernelEffectBuffer) -> bool {
+    effects.as_slice().iter().any(|effect| {
+        matches!(
+            effect,
+            KernelEffect::Status(phux_client_core::session::KernelStatus::ResyncRequired { .. })
+        )
+    })
+}
+
+/// Did the kernel emit a per-pane history-unavailable status alongside its
+/// error? phux-ijuj: that degradation is recoverable — the live stream stays
+/// valid, only the pane's scrollback boundary is gone.
+fn emitted_history_unavailable(effects: &KernelEffectBuffer) -> bool {
+    effects.as_slice().iter().any(|effect| {
+        matches!(
+            effect,
+            KernelEffect::Status(
+                phux_client_core::session::KernelStatus::HistoryUnavailable { .. }
             )
-        });
+        )
+    })
+}
+
+/// Fold the kernel's `update` result, read together with the statuses it
+/// emitted, into the route's three terminal verdicts.
+///
+/// A resync status, a retired generation, and a recovered history failure are
+/// each non-fatal: they clear `failed` and leave the decision to the handler's
+/// arm. Anything else is a genuine rejection of the frame.
+fn classify_kernel_result<E>(
+    result: &Result<(), phux_client_core::session::KernelError<E>>,
+    frame: &FrameKind,
+    effects: &KernelEffectBuffer,
+) -> KernelRoute
+where
+    phux_client_core::session::KernelError<E>: std::fmt::Display,
+{
+    let resync_required = result.is_err() && emitted_resync_required(effects);
     let recovered_history_failure = result.is_err()
         && matches!(frame, FrameKind::HistoryPage { .. })
-        && effects.as_slice().iter().any(|effect| {
-            matches!(
-                effect,
-                KernelEffect::Status(
-                    phux_client_core::session::KernelStatus::HistoryUnavailable { .. }
-                )
-            )
-        });
+        && emitted_history_unavailable(effects);
     let ignored = matches!(
-        &result,
+        result,
         Err(phux_client_core::session::KernelError::RetiredGeneration { .. })
     );
+    let degraded = resync_required || ignored || recovered_history_failure;
     let failed = match result {
         Ok(()) => None,
-        Err(_) if resync_required || ignored || recovered_history_failure => None,
+        Err(_) if degraded => None,
         Err(error) => Some(error.to_string()),
     };
-    let mut route = KernelRoute {
+    KernelRoute {
         resync_required,
         ignored,
         failed,
         ..KernelRoute::default()
-    };
+    }
+}
+
+/// Fold the kernel's declarative effects into the route the handler reads:
+/// the sends it must forward, the panes it must repaint, and the notices it
+/// must raise.
+fn collect_route_effects(route: &mut KernelRoute, effects: &KernelEffectBuffer) {
     for effect in effects.as_slice() {
         match effect {
             KernelEffect::Send(KernelSend::FrameAck {
@@ -373,5 +450,4 @@ pub(super) fn route_engine_frame(
             }
         }
     }
-    route
 }

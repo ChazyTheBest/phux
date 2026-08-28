@@ -1855,9 +1855,9 @@ impl<E: EngineAdapter> SessionKernel<E> {
             None
         };
         self.engine_effects.clear();
-        let applied = self
-            .adapter
-            .apply_output(&mut replica.engine, payload, &mut self.engine_effects);
+        let applied =
+            self.adapter
+                .apply_output(&mut replica.engine, payload, &mut self.engine_effects);
         if let Err(error) = applied {
             let last_valid_seq = replica.last_seq;
             self.retire_after_codec_failure(terminal_id, generation, last_valid_seq, effects);
@@ -1948,10 +1948,7 @@ impl<E: EngineAdapter> SessionKernel<E> {
 
     /// Report the cache's current history status. This is the whole
     /// response to a byte-identical duplicate page.
-    fn report_history_status(
-        replica: &Replica<E::Replica>,
-        effects: &mut EffectBuffer,
-    ) {
+    fn report_history_status(replica: &Replica<E::Replica>, effects: &mut EffectBuffer) {
         effects.push(KernelEffect::Status(KernelStatus::History {
             key: replica.key.clone(),
             status: replica.history.status(),

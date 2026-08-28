@@ -396,63 +396,92 @@ struct Stats {
 /// half of the wait saw it.
 type Decision = (Verdict, Option<AgentRecord>, EdgeSource);
 
-/// Wait until `terminal`'s agent record transitions **into** one of
-/// `targets`, or `timeout` elapses.
+/// State the two halves of the wait share while both are running.
 ///
-/// The predicate, precisely. Let `O_0, O_1, …` be this call's observations of
-/// the pane's `phux.agent/v1` record, in arrival order, merged from the
-/// `METADATA_CHANGED` push stream and the `GET_METADATA` poll floor, starting
-/// with the pre-wait baseline read. The wait is **satisfied** at the first
-/// `i > 0` such that `O_i` is a record whose state differs from the state
-/// last held and is a member of `targets`. It **fails** with
-/// [`AgentWaitError::Departed`] at the first `O_i` that is a tombstone, or
-/// whose state differs from the last held and is `unknown`. No single
-/// observation, at any index — least of all `O_0` — satisfies the wait on its
-/// own. A pane resting at `idle` therefore never satisfies `--until idle`
-/// without first having been observed in some other state, which is exactly
-/// what stops a wait from succeeding on a pane whose agent crashed.
-///
-/// # Errors
-///
-/// [`AgentWaitError::NoRecord`] when the pane declares no record at subscribe
-/// time; [`AgentWaitError::Departed`] when the agent goes away mid-wait;
-/// [`AgentWaitError::Transport`] on connect/transport failure.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one function so the subscribe-then-read ordering, the two \
-              halves, and the deadline are readable as a single sequence"
-)]
-#[allow(
-    clippy::future_not_send,
-    reason = "the push and poll halves share one EdgeTracker through a \
-              RefCell because they are polled by one task; ADR-0003 binds \
-              the CLI to a current-thread runtime"
-)]
-pub async fn wait_for_agent_state(
-    socket: &Path,
-    terminal: &TerminalId,
-    targets: &[AgentMetaState],
-    timeout: Option<Duration>,
-    poll_interval: Duration,
-) -> Result<AgentWaitResult, AgentWaitError> {
-    // Subscribe FIRST, and read the baseline on the same connection, so the
-    // window between "what is it now" and "tell me when it changes" does not
-    // exist. See the module docs.
-    let mut conn = subscribe(socket, Some(terminal.clone())).await?;
-    let (answered, interleaved) = read_record(&mut conn, terminal, BASELINE_REQUEST_ID).await?;
+/// The halves are polled by one task (ADR-0003 binds the CLI to a
+/// current-thread runtime), so the interior mutability never overlaps a
+/// borrow.
+struct WaitShared {
+    tracker: RefCell<EdgeTracker>,
+    latest: RefCell<Option<AgentRecord>>,
+    stats: RefCell<Stats>,
+    push_ended: Cell<bool>,
+}
 
-    // Time order: anything the server published between the subscribe and the
-    // answer, then the answer itself. Folding the interleave in rather than
-    // dropping it is what keeps a `working -> idle -> working` flicker inside
-    // that window from being invisible.
+impl WaitShared {
+    /// Carry the replayed tracker and last-seen record into the live wait.
+    fn new(tracker: EdgeTracker, latest: Option<AgentRecord>) -> Self {
+        Self {
+            tracker: RefCell::new(tracker),
+            latest: RefCell::new(latest),
+            stats: RefCell::new(Stats::default()),
+            push_ended: Cell::new(false),
+        }
+    }
+
+    /// Count one observation from `via`, fold it into the tracker, and
+    /// remember the record unless it was a tombstone.
+    fn observe(&self, record: Option<&AgentRecord>, via: EdgeSource) -> Verdict {
+        {
+            let mut stats = self.stats.borrow_mut();
+            match via {
+                EdgeSource::Push => stats.pushes = stats.pushes.saturating_add(1),
+                EdgeSource::Poll => stats.polls = stats.polls.saturating_add(1),
+            }
+        }
+        let verdict = self.tracker.borrow_mut().observe(record);
+        if let Some(record) = record {
+            *self.latest.borrow_mut() = Some(record.clone());
+        }
+        verdict
+    }
+
+    /// Take the state apart once both halves are done with it.
+    fn into_parts(self) -> (EdgeTracker, Option<AgentRecord>, Stats) {
+        (
+            self.tracker.into_inner(),
+            self.latest.into_inner(),
+            self.stats.into_inner(),
+        )
+    }
+}
+
+/// What replaying the subscribe/read window left the wait in.
+enum Replay {
+    /// The window already decided the wait; neither live half ever runs.
+    Decided(AgentWaitResult),
+    /// Nothing decided: carry this state into the live wait.
+    Watching(WaitShared),
+}
+
+/// The observation sequence for the subscribe/read window, in time order:
+/// anything the server published between the subscribe and the answer, then
+/// the answer itself.
+///
+/// Folding the interleave in rather than dropping it is what keeps a
+/// `working -> idle -> working` flicker inside that window from being
+/// invisible.
+fn window_observations(
+    interleaved: &[FrameKind],
+    answered: Option<AgentRecord>,
+    terminal: &TerminalId,
+) -> Vec<Option<AgentRecord>> {
     let mut observations: Vec<Option<AgentRecord>> = interleaved
         .iter()
         .filter_map(|frame| record_from_frame(frame, terminal))
         .collect();
     observations.push(answered);
+    observations
+}
 
+/// Seed the tracker from the baseline observation, then replay everything
+/// that arrived inside the subscribe/read window through it.
+fn replay_window(
+    observations: Vec<Option<AgentRecord>>,
+    targets: &[AgentMetaState],
+) -> Result<Replay, AgentWaitError> {
     let mut sequence = observations.into_iter();
-    // `push` above guarantees at least one element.
+    // `window_observations` pushes the answer, so there is at least one.
     let baseline_record = sequence.next().flatten();
     let Some(baseline_record) = baseline_record else {
         return Err(AgentWaitError::NoRecord);
@@ -460,7 +489,6 @@ pub async fn wait_for_agent_state(
     let mut tracker = EdgeTracker::new(baseline_record.state, targets);
     let mut latest = Some(baseline_record);
 
-    // Replay anything that arrived inside the subscribe/read window.
     for observation in sequence {
         let verdict = tracker.observe(observation.as_ref());
         if observation.is_some() {
@@ -469,7 +497,7 @@ pub async fn wait_for_agent_state(
         match verdict {
             Verdict::Pending => {}
             Verdict::Satisfied { from, to } => {
-                return Ok(AgentWaitResult {
+                return Ok(Replay::Decided(AgentWaitResult {
                     edge: Some(ObservedEdge {
                         from,
                         to,
@@ -481,7 +509,7 @@ pub async fn wait_for_agent_state(
                     edges: tracker.edges(),
                     polls: 0,
                     pushes: 0,
-                });
+                }));
             }
             Verdict::Departed { from, reason } => {
                 return Err(AgentWaitError::Departed {
@@ -492,89 +520,95 @@ pub async fn wait_for_agent_state(
             }
         }
     }
+    Ok(Replay::Watching(WaitShared::new(tracker, latest)))
+}
 
-    let tracker = RefCell::new(tracker);
-    let stats = RefCell::new(Stats::default());
-    let latest = RefCell::new(latest);
-    let push_ended = Cell::new(false);
-
-    let push_half = async {
-        let mut decided: Option<Decision> = None;
-        let streamed = stream_items(&mut conn, |item| {
-            let WatchItem::AgentState(update) = item else {
-                return true;
-            };
-            {
-                let mut stats = stats.borrow_mut();
-                stats.pushes = stats.pushes.saturating_add(1);
-            }
-            let verdict = tracker.borrow_mut().observe(update.record.as_ref());
-            if update.record.is_some() {
-                latest.borrow_mut().clone_from(&update.record);
-            }
-            if matches!(verdict, Verdict::Pending) {
-                return true;
-            }
-            decided = Some((verdict, update.record, EdgeSource::Push));
-            false
-        })
-        .await;
-        push_ended.set(true);
-        // A stream that ends without deciding is not fatal: the poll floor is
-        // the floor precisely so a dropped subscription degrades to latency
-        // rather than to a wrong answer.
-        let _ = streamed;
-        match decided {
-            Some(decision) => Ok(decision),
-            None => std::future::pending::<Result<Decision, AgentWaitError>>().await,
+/// The low-latency half: fold `METADATA_CHANGED` pushes in until one decides
+/// the wait, then park forever if the stream ends without deciding.
+#[allow(
+    clippy::future_not_send,
+    reason = "the push and poll halves share one EdgeTracker through a \
+              RefCell because they are polled by one task; ADR-0003 binds \
+              the CLI to a current-thread runtime"
+)]
+async fn watch_pushes(
+    conn: &mut Connection,
+    shared: &WaitShared,
+) -> Result<Decision, AgentWaitError> {
+    let mut decided: Option<Decision> = None;
+    let streamed = stream_items(conn, |item| {
+        let WatchItem::AgentState(update) = item else {
+            return true;
+        };
+        let verdict = shared.observe(update.record.as_ref(), EdgeSource::Push);
+        if matches!(verdict, Verdict::Pending) {
+            return true;
         }
-    };
+        decided = Some((verdict, update.record, EdgeSource::Push));
+        false
+    })
+    .await;
+    shared.push_ended.set(true);
+    // A stream that ends without deciding is not fatal: the poll floor is
+    // the floor precisely so a dropped subscription degrades to latency
+    // rather than to a wrong answer.
+    let _ = streamed;
+    match decided {
+        Some(decision) => Ok(decision),
+        None => std::future::pending::<Result<Decision, AgentWaitError>>().await,
+    }
+}
 
-    let poll_half = async {
-        let mut failures: u32 = 0;
-        loop {
-            tokio::time::sleep(poll_interval).await;
-            match fetch_agent_record(socket, terminal).await {
-                Ok(record) => {
-                    failures = 0;
-                    {
-                        let mut stats = stats.borrow_mut();
-                        stats.polls = stats.polls.saturating_add(1);
-                    }
-                    let verdict = tracker.borrow_mut().observe(record.as_ref());
-                    if record.is_some() {
-                        latest.borrow_mut().clone_from(&record);
-                    }
-                    if !matches!(verdict, Verdict::Pending) {
-                        return Ok((verdict, record, EdgeSource::Poll));
-                    }
+/// The recovery half: re-read the record on the `wait` cadence and decide
+/// from any level that differs from the one last held.
+#[allow(
+    clippy::future_not_send,
+    reason = "the push and poll halves share one EdgeTracker through a \
+              RefCell because they are polled by one task; ADR-0003 binds \
+              the CLI to a current-thread runtime"
+)]
+async fn poll_floor(
+    socket: &Path,
+    terminal: &TerminalId,
+    poll_interval: Duration,
+    shared: &WaitShared,
+) -> Result<Decision, AgentWaitError> {
+    let mut failures: u32 = 0;
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        match fetch_agent_record(socket, terminal).await {
+            Ok(record) => {
+                failures = 0;
+                let verdict = shared.observe(record.as_ref(), EdgeSource::Poll);
+                if !matches!(verdict, Verdict::Pending) {
+                    return Ok((verdict, record, EdgeSource::Poll));
                 }
-                Err(err) => {
-                    failures = failures.saturating_add(1);
-                    if failures >= POLL_FAILURE_LIMIT && push_ended.get() {
-                        return Err(AgentWaitError::Transport(err));
-                    }
+            }
+            Err(err) => {
+                failures = failures.saturating_add(1);
+                if failures >= POLL_FAILURE_LIMIT && shared.push_ended.get() {
+                    return Err(AgentWaitError::Transport(err));
                 }
             }
         }
-    };
+    }
+}
 
-    let deadline = async {
-        match timeout {
-            Some(limit) => tokio::time::sleep(limit).await,
-            None => std::future::pending::<()>().await,
-        }
-    };
+/// Elapse after `timeout`, or never when the caller set none.
+async fn deadline(timeout: Option<Duration>) {
+    match timeout {
+        Some(limit) => tokio::time::sleep(limit).await,
+        None => std::future::pending::<()>().await,
+    }
+}
 
-    let decision: Option<Decision> = tokio::select! {
-        decided = push_half => Some(decided?),
-        decided = poll_half => Some(decided?),
-        () = deadline => None,
-    };
-
-    let stats = *stats.borrow();
-    let tracker = tracker.into_inner();
-    let latest = latest.into_inner();
+/// Fold the decided verdict — or the deadline's absence of one — into the
+/// call's result.
+fn finish(
+    decision: Option<Decision>,
+    shared: WaitShared,
+) -> Result<AgentWaitResult, AgentWaitError> {
+    let (tracker, latest, stats) = shared.into_parts();
     match decision {
         Some((Verdict::Satisfied { from, to }, record, via)) => Ok(AgentWaitResult {
             edge: Some(ObservedEdge { from, to, via }),
@@ -603,6 +637,61 @@ pub async fn wait_for_agent_state(
             pushes: stats.pushes,
         }),
     }
+}
+
+/// Wait until `terminal`'s agent record transitions **into** one of
+/// `targets`, or `timeout` elapses.
+///
+/// The predicate, precisely. Let `O_0, O_1, …` be this call's observations of
+/// the pane's `phux.agent/v1` record, in arrival order, merged from the
+/// `METADATA_CHANGED` push stream and the `GET_METADATA` poll floor, starting
+/// with the pre-wait baseline read. The wait is **satisfied** at the first
+/// `i > 0` such that `O_i` is a record whose state differs from the state
+/// last held and is a member of `targets`. It **fails** with
+/// [`AgentWaitError::Departed`] at the first `O_i` that is a tombstone, or
+/// whose state differs from the last held and is `unknown`. No single
+/// observation, at any index — least of all `O_0` — satisfies the wait on its
+/// own. A pane resting at `idle` therefore never satisfies `--until idle`
+/// without first having been observed in some other state, which is exactly
+/// what stops a wait from succeeding on a pane whose agent crashed.
+///
+/// # Errors
+///
+/// [`AgentWaitError::NoRecord`] when the pane declares no record at subscribe
+/// time; [`AgentWaitError::Departed`] when the agent goes away mid-wait;
+/// [`AgentWaitError::Transport`] on connect/transport failure.
+#[allow(
+    clippy::future_not_send,
+    reason = "the push and poll halves share one EdgeTracker through a \
+              RefCell because they are polled by one task; ADR-0003 binds \
+              the CLI to a current-thread runtime"
+)]
+pub async fn wait_for_agent_state(
+    socket: &Path,
+    terminal: &TerminalId,
+    targets: &[AgentMetaState],
+    timeout: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<AgentWaitResult, AgentWaitError> {
+    // Subscribe FIRST, and read the baseline on the same connection, so the
+    // window between "what is it now" and "tell me when it changes" does not
+    // exist. See the module docs.
+    let mut conn = subscribe(socket, Some(terminal.clone())).await?;
+    let (answered, interleaved) = read_record(&mut conn, terminal, BASELINE_REQUEST_ID).await?;
+
+    let observations = window_observations(&interleaved, answered, terminal);
+    let shared = match replay_window(observations, targets)? {
+        Replay::Decided(result) => return Ok(result),
+        Replay::Watching(shared) => shared,
+    };
+
+    let decision: Option<Decision> = tokio::select! {
+        decided = watch_pushes(&mut conn, &shared) => Some(decided?),
+        decided = poll_floor(socket, terminal, poll_interval, &shared) => Some(decided?),
+        () = deadline(timeout) => None,
+    };
+
+    finish(decision, shared)
 }
 
 #[cfg(test)]

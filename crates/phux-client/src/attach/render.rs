@@ -25,7 +25,7 @@ use std::io::{self, Write};
 
 use libghostty_vt::{
     Terminal as GhosttyTerminal,
-    render::{CursorVisualStyle, Dirty, Snapshot},
+    render::{CellIteration, CellIterator, CursorVisualStyle, Dirty, RowIteration, Snapshot},
     screen::CellWide,
     style::{RgbColor, Style, StyleColor, Underline},
 };
@@ -398,8 +398,6 @@ impl<'alloc> TerminalRenderer<'alloc> {
         origin: (u16, u16),
         clip: (u16, u16),
     ) -> Result<Option<CursorState>, RenderError> {
-        let (ox, oy) = origin;
-        let (clip_cols, clip_rows) = clip;
         let RenderWalk {
             snapshot,
             rows,
@@ -409,8 +407,8 @@ impl<'alloc> TerminalRenderer<'alloc> {
         // server-authoritative mirror may transiently exceed the client's
         // layout rect during a resize handshake; confine the walk so a wider
         // mirror never spills past the rect and a smaller one stays in-grid.
-        let rows_total = snapshot.rows()?.min(clip_rows);
-        let cols_total = snapshot.cols()?.min(clip_cols);
+        let extent = clipped_extent(&snapshot, clip)?;
+        let (cols_total, rows_total) = extent;
 
         let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
@@ -418,46 +416,11 @@ impl<'alloc> TerminalRenderer<'alloc> {
             if row_index >= rows_total {
                 break;
             }
-            let mut col: u16 = 0;
-            let mut cell_iter = cells.update(row)?;
-            while let Some(cell) = cell_iter.next() {
-                if col >= cols_total {
-                    break;
-                }
-                let wide = cell.raw_cell()?.wide()?;
-                let graphemes = cell.graphemes()?;
-                let grapheme = if matches!(wide, CellWide::SpacerTail) {
-                    // Right half of a wide glyph: the base cell already
-                    // carries the cluster; emit no glyph so widths stay exact.
-                    String::new()
-                } else if graphemes.is_empty() {
-                    " ".to_owned()
-                } else {
-                    graphemes.iter().collect()
-                };
-                let style = to_cell_style(&cell.style()?, cell.fg_color()?, cell.bg_color()?);
-                if let Some(dst) =
-                    frame.cell_mut(row_index.saturating_add(oy), col.saturating_add(ox))
-                {
-                    dst.grapheme = grapheme;
-                    dst.style = style;
-                }
-                col = col.saturating_add(1);
-            }
+            project_row_into_frame(frame, cells, row, row_index, origin, cols_total)?;
             row_index = row_index.saturating_add(1);
         }
 
-        // Cursor, shifted into frame-absolute coords, dropped when it sits
-        // outside the painted (clipped) region.
-        let cursor = match snapshot.cursor_viewport()? {
-            Some(v) if v.y < rows_total && v.x < cols_total => Some(CursorState {
-                x: v.x.saturating_add(ox),
-                y: v.y.saturating_add(oy),
-                visible: snapshot.cursor_visible()?,
-            }),
-            _ => None,
-        };
-        Ok(cursor)
+        clipped_frame_cursor(&snapshot, origin, extent)
     }
 
     /// Render `terminal` into the outer-viewport rect at `rect_origin =
@@ -510,8 +473,6 @@ impl<'alloc> TerminalRenderer<'alloc> {
         clip: (u16, u16),
         force_full: bool,
     ) -> Result<Dirty, RenderError> {
-        let (ox, oy) = origin;
-        let (clip_cols, clip_rows) = clip;
         // Record where this pane is anchored before any early-return: the
         // predictive-echo overlay reads `last_origin` to place pane-local
         // echoes, and the pane stays at this origin even on a clean (no-op)
@@ -522,22 +483,16 @@ impl<'alloc> TerminalRenderer<'alloc> {
             rows,
             cells,
         } = self.pool.begin(walk.terminal, walk.generation)?;
-        let dirty = if force_full {
-            Dirty::Full
-        } else {
-            snapshot.dirty()?
-        };
+        let dirty = frame_dirty(&snapshot, force_full)?;
 
-        let emitted_kitty = matches!(dirty, Dirty::Clean)
-            && kitty_replay::emit_kitty_graphics_replay(
+        if matches!(dirty, Dirty::Clean) {
+            let emitted_kitty = kitty_replay::emit_kitty_graphics_replay(
                 walk.terminal,
                 &mut self.kitty_placements,
                 out,
                 origin,
                 clip,
             )?;
-
-        if matches!(dirty, Dirty::Clean) {
             render_clean_frame_cursor(
                 &snapshot,
                 out,
@@ -550,72 +505,17 @@ impl<'alloc> TerminalRenderer<'alloc> {
         }
         out.write_all(b"\x1b[?25l")?;
 
-        // Walk rows. Under `Dirty::Full` paint every row; under
-        // `Dirty::Partial` skip rows whose per-row dirty bit is clear.
+        let extent = clipped_extent(&snapshot, clip)?;
         let mut row_iter = rows.update(&snapshot)?;
-        let mut row_index: u16 = 0;
-        // Clip to the render rect: a server-authoritative mirror may be
-        // larger than the client's layout rect during a resize handshake;
-        // painting past the rect would spill into a divider or neighbour
-        // pane. `min` also keeps a smaller mirror within its own grid.
-        let rows_total = snapshot.rows()?.min(clip_rows);
-        let cols_total = snapshot.cols()?.min(clip_cols);
-        while let Some(row) = row_iter.next() {
-            if row_index >= rows_total {
-                break;
-            }
-            let must_draw = matches!(dirty, Dirty::Full) || row.dirty()?;
-            if must_draw {
-                write_cup(out, row_index.saturating_add(oy), ox)?;
-                // Force a reset at row start so the previous row's tail
-                // style can't leak into the current row. After this the
-                // active outer-terminal SGR state is the default style,
-                // which `emitted = None` represents.
-                out.write_all(b"\x1b[0m")?;
-                let mut emitted: Option<EmittedStyle> = None;
-
-                let selection = self.selection;
-                let mut col: u16 = 0;
-                let mut cell_iter = cells.update(row)?;
-                while let Some(cell) = cell_iter.next() {
-                    if col >= cols_total {
-                        break;
-                    }
-                    let (graphemes, mut style) = (cell.graphemes()?, cell.style()?);
-                    let (fg, bg) = (cell.fg_color()?, cell.bg_color()?);
-                    let wide = cell.raw_cell()?.wide()?;
-                    // Toggle inverse so selected cells differ from their normal state.
-                    if selection_covers_cell(selection, row_index, col, wide) {
-                        style.inverse = !style.inverse;
-                    }
-                    col = col.saturating_add(1);
-                    if matches!(wide, CellWide::SpacerTail) {
-                        // Account for the tail column, but emit no overwrite.
-                        continue;
-                    }
-                    // Coalesce: emit an SGR sequence only when the cell's
-                    // effective style differs from the one currently active
-                    // on the outer terminal. A run of same-style cells then
-                    // costs one SGR sequence plus the glyphs, not one SGR per
-                    // cell. `emitted` tracks the active state for this row
-                    // (reset to default = `None` at row start).
-                    emit_sgr_if_changed(out, &mut emitted, style, fg, bg)?;
-                    if graphemes.is_empty() {
-                        // A regular blank advances one column with a space.
-                        out.write_all(b" ")?;
-                        continue;
-                    }
-                    let mut buf = [0u8; 4];
-                    for ch in &graphemes {
-                        out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
-                    }
-                }
-                // Reset per-row dirty bit after drawing, per the libghostty
-                // contract.
-                row.set_dirty(false)?;
-            }
-            row_index += 1;
-        }
+        paint_dirty_rows(
+            out,
+            &mut row_iter,
+            cells,
+            dirty,
+            origin,
+            extent,
+            self.selection,
+        )?;
 
         let _ = kitty_replay::emit_kitty_graphics_replay(
             walk.terminal,
@@ -625,29 +525,276 @@ impl<'alloc> TerminalRenderer<'alloc> {
             clip,
         )?;
 
-        // Reset SGR before the final cursor placement so the visual
-        // cursor isn't tainted by the last cell's attributes.
-        out.write_all(b"\x1b[0m")?;
-        cache_and_render_cursor(
+        emit_frame_epilogue(
             &snapshot,
             out,
             origin,
             &mut self.last_cursor,
             &mut self.last_cursor_local,
         )?;
-        // Optional cursor style — best-effort.
-        emit_cursor_style(
-            out,
-            snapshot.cursor_visual_style()?,
-            snapshot.cursor_blinking()?,
-        )?;
-
-        // Clear the global dirty bit. Per-row bits were cleared inline.
-        snapshot.set_dirty(Dirty::Clean)?;
-
-        out.flush()?;
         Ok(dirty)
     }
+}
+
+/// The frame-level dirty verdict this paint acts on.
+///
+/// `force_full` — the full-frame path's forced redraw after its `ED2` — wins
+/// over the snapshot's own incremental tracking.
+fn frame_dirty(snapshot: &Snapshot<'_, '_>, force_full: bool) -> Result<Dirty, RenderError> {
+    if force_full {
+        return Ok(Dirty::Full);
+    }
+    Ok(snapshot.dirty()?)
+}
+
+/// The painted extent as `(cols, rows)`.
+///
+/// Clip to the render rect: a server-authoritative mirror may be larger than
+/// the client's layout rect during a resize handshake; painting past the rect
+/// would spill into a divider or neighbour pane. `min` also keeps a smaller
+/// mirror within its own grid.
+fn clipped_extent(
+    snapshot: &Snapshot<'_, '_>,
+    clip: (u16, u16),
+) -> Result<(u16, u16), RenderError> {
+    let (clip_cols, clip_rows) = clip;
+    let rows_total = snapshot.rows()?.min(clip_rows);
+    let cols_total = snapshot.cols()?.min(clip_cols);
+    Ok((cols_total, rows_total))
+}
+
+/// Walk rows, painting each one that needs redrawing.
+///
+/// Under `Dirty::Full` paint every row; under `Dirty::Partial` skip rows whose
+/// per-row dirty bit is clear.
+fn paint_dirty_rows<'alloc>(
+    out: &mut impl Write,
+    row_iter: &mut RowIteration<'alloc, '_>,
+    cells: &mut CellIterator<'alloc>,
+    dirty: Dirty,
+    origin: (u16, u16),
+    extent: (u16, u16),
+    selection: Option<SelectionRect>,
+) -> Result<(), RenderError> {
+    let (cols_total, rows_total) = extent;
+    let mut row_index: u16 = 0;
+    while let Some(row) = row_iter.next() {
+        if row_index >= rows_total {
+            break;
+        }
+        if matches!(dirty, Dirty::Full) || row.dirty()? {
+            paint_row(out, row, cells, row_index, origin, cols_total, selection)?;
+        }
+        row_index += 1;
+    }
+    Ok(())
+}
+
+/// Paint one row: position the cursor at its start, emit every cell up to
+/// `cols_total`, then clear the row's dirty bit.
+fn paint_row<'alloc>(
+    out: &mut impl Write,
+    row: &RowIteration<'alloc, '_>,
+    cells: &mut CellIterator<'alloc>,
+    row_index: u16,
+    origin: (u16, u16),
+    cols_total: u16,
+    selection: Option<SelectionRect>,
+) -> Result<(), RenderError> {
+    let (ox, oy) = origin;
+    write_cup(out, row_index.saturating_add(oy), ox)?;
+    // Force a reset at row start so the previous row's tail
+    // style can't leak into the current row. After this the
+    // active outer-terminal SGR state is the default style,
+    // which `emitted = None` represents.
+    out.write_all(b"\x1b[0m")?;
+    let mut emitted: Option<EmittedStyle> = None;
+
+    let mut col: u16 = 0;
+    let mut cell_iter = cells.update(row)?;
+    while let Some(cell) = cell_iter.next() {
+        if col >= cols_total {
+            break;
+        }
+        emit_cell(out, cell, &mut emitted, selection, (row_index, col))?;
+        // Every cell consumes one column, including a wide glyph's spacer
+        // tail (which emits nothing).
+        col = col.saturating_add(1);
+    }
+    // Reset per-row dirty bit after drawing, per the libghostty
+    // contract.
+    row.set_dirty(false)?;
+    Ok(())
+}
+
+/// Emit one cell at `at = (row, col)`: apply the copy-mode inversion, then
+/// hand the coalesced style and graphemes to [`emit_cell_glyphs`].
+///
+/// A wide glyph's `SpacerTail` column writes nothing at all.
+fn emit_cell(
+    out: &mut impl Write,
+    cell: &CellIteration<'_, '_>,
+    emitted: &mut Option<EmittedStyle>,
+    selection: Option<SelectionRect>,
+    at: (u16, u16),
+) -> Result<(), RenderError> {
+    let (row, col) = at;
+    let (graphemes, mut style) = (cell.graphemes()?, cell.style()?);
+    let (fg, bg) = (cell.fg_color()?, cell.bg_color()?);
+    let wide = cell.raw_cell()?.wide()?;
+    // Toggle inverse so selected cells differ from their normal state.
+    if selection_covers_cell(selection, row, col, wide) {
+        style.inverse = !style.inverse;
+    }
+    if matches!(wide, CellWide::SpacerTail) {
+        // Account for the tail column, but emit no overwrite.
+        return Ok(());
+    }
+    emit_cell_glyphs(out, emitted, style, fg, bg, &graphemes)?;
+    Ok(())
+}
+
+/// Write one cell's style change (if any) followed by its glyphs.
+///
+/// Coalesce: emit an SGR sequence only when the cell's effective style differs
+/// from the one currently active on the outer terminal. A run of same-style
+/// cells then costs one SGR sequence plus the glyphs, not one SGR per cell.
+/// `emitted` tracks the active state for this row (reset to default = `None`
+/// at row start).
+fn emit_cell_glyphs(
+    out: &mut impl Write,
+    emitted: &mut Option<EmittedStyle>,
+    style: Style,
+    fg: Option<RgbColor>,
+    bg: Option<RgbColor>,
+    graphemes: &[char],
+) -> io::Result<()> {
+    emit_sgr_if_changed(out, emitted, style, fg, bg)?;
+    if graphemes.is_empty() {
+        // A regular blank advances one column with a space.
+        return out.write_all(b" ");
+    }
+    write_graphemes(out, graphemes)
+}
+
+/// Write a cell's grapheme cluster as UTF-8.
+///
+/// The scratch buffer is on the stack, so this per-cell path allocates nothing.
+fn write_graphemes(out: &mut impl Write, graphemes: &[char]) -> io::Result<()> {
+    let mut buf = [0u8; 4];
+    for ch in graphemes {
+        out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Close out a painted frame: reset SGR, place and cache the cursor, apply the
+/// cursor style, clear the global dirty bit, and flush.
+fn emit_frame_epilogue(
+    snapshot: &Snapshot<'_, '_>,
+    out: &mut impl Write,
+    origin: (u16, u16),
+    last_cursor: &mut Option<(u16, u16)>,
+    last_cursor_local: &mut Option<(u16, u16)>,
+) -> Result<(), RenderError> {
+    // Reset SGR before the final cursor placement so the visual
+    // cursor isn't tainted by the last cell's attributes.
+    out.write_all(b"\x1b[0m")?;
+    cache_and_render_cursor(snapshot, out, origin, last_cursor, last_cursor_local)?;
+    // Optional cursor style — best-effort.
+    emit_cursor_style(
+        out,
+        snapshot.cursor_visual_style()?,
+        snapshot.cursor_blinking()?,
+    )?;
+
+    // Clear the global dirty bit. Per-row bits were cleared inline.
+    snapshot.set_dirty(Dirty::Clean)?;
+
+    out.flush()?;
+    Ok(())
+}
+
+/// Project one row's cells into `frame`, clipped to `cols_total` columns.
+fn project_row_into_frame<'alloc>(
+    frame: &mut RenderedFrame,
+    cells: &mut CellIterator<'alloc>,
+    row: &RowIteration<'alloc, '_>,
+    row_index: u16,
+    origin: (u16, u16),
+    cols_total: u16,
+) -> Result<(), RenderError> {
+    let (ox, oy) = origin;
+    let mut col: u16 = 0;
+    let mut cell_iter = cells.update(row)?;
+    while let Some(cell) = cell_iter.next() {
+        if col >= cols_total {
+            break;
+        }
+        project_cell_into_frame(
+            frame,
+            cell,
+            row_index.saturating_add(oy),
+            col.saturating_add(ox),
+        )?;
+        col = col.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Write one cell's grapheme + resolved style into `frame` at `(row, col)`,
+/// leaving the frame untouched when that coordinate is out of range.
+fn project_cell_into_frame(
+    frame: &mut RenderedFrame,
+    cell: &CellIteration<'_, '_>,
+    row: u16,
+    col: u16,
+) -> Result<(), RenderError> {
+    let grapheme = frame_grapheme(cell)?;
+    let style = to_cell_style(&cell.style()?, cell.fg_color()?, cell.bg_color()?);
+    if let Some(dst) = frame.cell_mut(row, col) {
+        dst.grapheme = grapheme;
+        dst.style = style;
+    }
+    Ok(())
+}
+
+/// The grapheme a cell contributes to a [`RenderedFrame`].
+///
+/// A blank cell becomes a single space; everything else is the cell's own
+/// cluster.
+fn frame_grapheme(cell: &CellIteration<'_, '_>) -> Result<String, RenderError> {
+    let wide = cell.raw_cell()?.wide()?;
+    let graphemes = cell.graphemes()?;
+    if matches!(wide, CellWide::SpacerTail) {
+        // Right half of a wide glyph: the base cell already
+        // carries the cluster; emit no glyph so widths stay exact.
+        return Ok(String::new());
+    }
+    if graphemes.is_empty() {
+        return Ok(" ".to_owned());
+    }
+    Ok(graphemes.iter().collect())
+}
+
+/// The pane's cursor, shifted into frame-absolute coords, dropped when it sits
+/// outside the painted (clipped) region.
+fn clipped_frame_cursor(
+    snapshot: &Snapshot<'_, '_>,
+    origin: (u16, u16),
+    extent: (u16, u16),
+) -> Result<Option<CursorState>, RenderError> {
+    let (ox, oy) = origin;
+    let (cols_total, rows_total) = extent;
+    let cursor = match snapshot.cursor_viewport()? {
+        Some(v) if v.y < rows_total && v.x < cols_total => Some(CursorState {
+            x: v.x.saturating_add(ox),
+            y: v.y.saturating_add(oy),
+            visible: snapshot.cursor_visible()?,
+        }),
+        _ => None,
+    };
+    Ok(cursor)
 }
 
 fn cache_and_render_cursor(
@@ -817,6 +964,20 @@ struct Letterbox {
     rect_clip: (u16, u16),
 }
 
+impl Letterbox {
+    /// Whether any margin bar exists at all.
+    ///
+    /// `false` is the mirror-fills-or-exceeds-the-rect clamp case, where
+    /// [`emit_letterbox_margins`] emits nothing and the paint stays
+    /// byte-identical to [`TerminalRenderer::render_at`].
+    const fn has_pad(self) -> bool {
+        self.margin_left > 0
+            || self.margin_right > 0
+            || self.margin_top > 0
+            || self.margin_bottom > 0
+    }
+}
+
 /// Centre a mirror of `mirror = (cols, rows)` within the render rect at
 /// `rect_origin = (x, y)` spanning `rect_clip = (cols, rows)`, returning the
 /// centred [`Letterbox`].
@@ -870,36 +1031,61 @@ fn letterbox_rect(rect_origin: (u16, u16), rect_clip: (u16, u16), mirror: (u16, 
 /// exceeds the rect) emits nothing, keeping the clamp path byte-identical to
 /// [`TerminalRenderer::render_at`].
 fn emit_letterbox_margins(out: &mut impl Write, lb: Letterbox) -> io::Result<()> {
-    let (rx, ry) = lb.rect_origin;
-    let (rect_cols, rect_rows) = lb.rect_clip;
-    if lb.margin_left == 0 && lb.margin_right == 0 && lb.margin_top == 0 && lb.margin_bottom == 0 {
+    if !lb.has_pad() {
         return Ok(());
     }
     // Reset SGR so the blanks paint in the default (background) style and no
     // prior run's attributes leak into the bars.
     out.write_all(b"\x1b[0m")?;
 
+    let (rx, ry) = lb.rect_origin;
+    let (rect_cols, rect_rows) = lb.rect_clip;
+    let content_top = ry.saturating_add(lb.margin_top);
+    let content_bottom = content_top.saturating_add(lb.inner_clip.1);
+
     // Top bar: full-width rows above the centred content.
-    for row in ry..ry.saturating_add(lb.margin_top) {
-        write_cup(out, row, rx)?;
-        write_blank_run(out, rect_cols)?;
-    }
+    emit_blank_rows(out, ry, content_top, rx, rect_cols)?;
     // Bottom bar: full-width rows below the centred content.
-    let content_bottom = ry
-        .saturating_add(lb.margin_top)
-        .saturating_add(lb.inner_clip.1);
-    for row in content_bottom..ry.saturating_add(rect_rows) {
-        write_cup(out, row, rx)?;
-        write_blank_run(out, rect_cols)?;
-    }
+    emit_blank_rows(
+        out,
+        content_bottom,
+        ry.saturating_add(rect_rows),
+        rx,
+        rect_cols,
+    )?;
     // Left/right bars: only the interior rows (the top/bottom bars already
     // cleared the corners).
-    let interior_top = ry.saturating_add(lb.margin_top);
-    let interior_bottom = content_bottom;
+    emit_side_margin_bars(out, lb, content_top, content_bottom)
+}
+
+/// Blank `cols` cells starting at column `col` on every row in `[first, end)`.
+fn emit_blank_rows(
+    out: &mut impl Write,
+    first: u16,
+    end: u16,
+    col: u16,
+    cols: u16,
+) -> io::Result<()> {
+    for row in first..end {
+        write_cup(out, row, col)?;
+        write_blank_run(out, cols)?;
+    }
+    Ok(())
+}
+
+/// Blank the left and right margin bars across the interior rows
+/// `[top, bottom)` — the rows the centred content occupies.
+fn emit_side_margin_bars(
+    out: &mut impl Write,
+    lb: Letterbox,
+    top: u16,
+    bottom: u16,
+) -> io::Result<()> {
+    let (rx, _) = lb.rect_origin;
     let right_col = rx
         .saturating_add(lb.margin_left)
         .saturating_add(lb.inner_clip.0);
-    for row in interior_top..interior_bottom {
+    for row in top..bottom {
         if lb.margin_left > 0 {
             write_cup(out, row, rx)?;
             write_blank_run(out, lb.margin_left)?;

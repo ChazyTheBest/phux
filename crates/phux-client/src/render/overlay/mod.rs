@@ -622,51 +622,90 @@ fn emit_buffer_clipped(
     if clip.width == 0 || clip.height == 0 {
         return Ok(());
     }
+    let bands = paint_shadow_bands(buf, clip, shadow);
+    out.write_all(b"\x1b[?25l")?;
+    emit_clipped_rows(out, buf, clip, bands)?;
+    // Park the (hidden) cursor at the modal origin; the next pane repaint on
+    // dismiss emits its own DECTCEM.
+    write!(out, "\x1b[{};{}H", clip.y + 1, clip.x + 1)?;
+    out.flush()
+}
+
+/// Which of the drop shadow's two bands the viewport has room for.
+#[derive(Clone, Copy)]
+struct ShadowBands {
+    /// The column just right of the box (`clip.x + clip.width`).
+    col: bool,
+    /// The row just below the box (`clip.y + clip.height`).
+    row: bool,
+}
+
+impl ShadowBands {
+    /// The shadow bands exist only where there's a pane cell to cast onto.
+    const fn for_clip(area: Rect, clip: Rect, shadow: Color) -> Self {
+        Self {
+            col: !matches!(shadow, Color::Reset) && clip.x + clip.width < area.width,
+            row: !matches!(shadow, Color::Reset) && clip.y + clip.height < area.height,
+        }
+    }
+}
+
+/// Paint the drop shadow's bands into `buf` as `shadow`-bg spaces, and report
+/// which of them landed.
+fn paint_shadow_bands(buf: &mut Buffer, clip: Rect, shadow: Color) -> ShadowBands {
     let vp_w = buf.area.width;
     let vp_h = buf.area.height;
-    let bx = clip.x;
-    let by = clip.y;
+    let bands = ShadowBands::for_clip(buf.area, clip, shadow);
     let rx = clip.x + clip.width; // box right edge (exclusive) = shadow column
     let ry = clip.y + clip.height; // box bottom edge (exclusive) = shadow row
-    // The shadow bands exist only where there's a pane cell to cast onto.
-    let shadow_col = !matches!(shadow, Color::Reset) && rx < vp_w;
-    let shadow_row = !matches!(shadow, Color::Reset) && ry < vp_h;
-    let shadow_style = ratatui::style::Style::default().bg(shadow);
-    if shadow_col {
+    let style = ratatui::style::Style::default().bg(shadow);
+    if bands.col {
         // Right band: beside the box's lower rows + the bottom-right corner.
-        for y in (by + 1)..=ry.min(vp_h - 1) {
-            if let Some(cell) = buf.cell_mut((rx, y)) {
-                cell.set_symbol(" ");
-                cell.set_style(shadow_style);
-            }
+        for y in (clip.y + 1)..=ry.min(vp_h - 1) {
+            fill_shadow_cell(buf, rx, y, style);
         }
     }
-    if shadow_row {
+    if bands.row {
         // Bottom band: beneath the box, starting one cell in (skip the corner).
-        for x in (bx + 1)..=rx.min(vp_w - 1) {
-            if let Some(cell) = buf.cell_mut((x, ry)) {
-                cell.set_symbol(" ");
-                cell.set_style(shadow_style);
-            }
+        for x in (clip.x + 1)..=rx.min(vp_w - 1) {
+            fill_shadow_cell(buf, x, ry, style);
         }
     }
+    bands
+}
 
-    out.write_all(b"\x1b[?25l")?;
+/// Overwrite one in-bounds cell with a blank carrying the shadow style.
+fn fill_shadow_cell(buf: &mut Buffer, x: u16, y: u16, style: ratatui::style::Style) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(" ");
+        cell.set_style(style);
+    }
+}
+
+/// Emit the box's rows plus the bottom shadow band, each with a leading CUP
+/// to its own left edge so only the box (and shadow band) cells are written.
+fn emit_clipped_rows(
+    out: &mut impl Write,
+    buf: &Buffer,
+    clip: Rect,
+    bands: ShadowBands,
+) -> io::Result<()> {
+    let bx = clip.x;
+    let by = clip.y;
+    let rx = clip.x + clip.width;
+    let ry = clip.y + clip.height;
     // Box rows. The top row omits the right shadow cell (no shadow above the
     // box); lower rows extend one cell right to include the shadow column.
     for row in by..ry {
-        let end = if shadow_col && row > by { rx + 1 } else { rx };
+        let end = if bands.col && row > by { rx + 1 } else { rx };
         emit_row_span(out, buf, row, bx, end)?;
     }
     // Bottom shadow row, skipping the bottom-left corner (start at bx + 1).
-    if shadow_row {
-        let end = if shadow_col { rx + 1 } else { rx };
+    if bands.row {
+        let end = if bands.col { rx + 1 } else { rx };
         emit_row_span(out, buf, ry, bx + 1, end)?;
     }
-    // Park the (hidden) cursor at the modal origin; the next pane repaint on
-    // dismiss emits its own DECTCEM.
-    write!(out, "\x1b[{};{}H", by + 1, bx + 1)?;
-    out.flush()
+    Ok(())
 }
 
 /// Emit cells `[start_col, end_col)` of `row` from `buf` with a leading CUP to

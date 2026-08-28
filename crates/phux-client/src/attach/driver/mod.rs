@@ -24,6 +24,7 @@ mod chrome;
 mod config_ui;
 mod entry;
 mod headless;
+mod loop_state;
 mod main_loop;
 mod overlay_paint;
 mod session_io;

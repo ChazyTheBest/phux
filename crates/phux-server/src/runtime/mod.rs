@@ -681,9 +681,11 @@ impl ServerRuntime {
         let connector_consumer_tokens = load_connector_consumer_tokens(&connector_specs)?;
 
         let resume_blob = read_resume_blob(self.resume_fd)?;
-        let listener =
-            adopt_or_bind_listener(&socket_path, resume_blob.as_ref().map(|blob| blob.listener_fd))
-                .await?;
+        let listener = adopt_or_bind_listener(
+            &socket_path,
+            resume_blob.as_ref().map(|blob| blob.listener_fd),
+        )
+        .await?;
 
         // phux-zomb.3: remember which inode we bound, so the unlink on the way
         // out can prove the entry at `socket_path` is still ours. See

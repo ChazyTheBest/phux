@@ -432,42 +432,56 @@ pub fn row_model(counts: SidebarCounts, h: u16) -> Vec<SidebarRow> {
     let body = h - footer;
     let mut rows = Vec::with_capacity(h);
 
-    // Zone 1. Reserved FIRST (inverting the old window-greedy order) but
-    // clamped so zone 2 keeps its floor: the queue outranks the local window
-    // list for attention, never for existence.
-    if counts.needs_you > 0 && body > 0 {
-        let shown = counts.needs_you.min(NEEDS_YOU_CAP);
-        let overflow = usize::from(counts.needs_you > shown);
-        // header + rows + overflow, held back from zone 2's floor.
-        let want = 1 + shown + overflow;
-        let allowed = body.saturating_sub(HERE_FLOOR);
-        let budget = want.min(allowed);
-        // A header with no row under it is noise; skip the zone entirely.
-        // At least one REAL row is guaranteed whenever the header renders —
-        // a header over nothing but `+N more` tells the user less than the
-        // single most-urgent row would.
-        if budget >= 2 {
-            rows.push(SidebarRow::NeedsYouHeader);
-            let room = budget - 1;
-            let listed = room.saturating_sub(overflow).max(1).min(shown).min(room);
-            for j in 0..listed {
-                rows.push(SidebarRow::NeedsYou(j));
-            }
-            if counts.needs_you > listed && rows.len() < budget {
-                rows.push(SidebarRow::NeedsYouOverflow);
-            }
-        }
-    }
+    push_needs_you_zone(&mut rows, counts, body);
+    push_here_zone(&mut rows, counts, body);
+    push_spaces_zone(&mut rows, counts, body);
 
-    // Zone 2.
-    if rows.len() < body {
-        if !rows.is_empty() && rows.len() + 1 < body {
-            rows.push(SidebarRow::Blank);
-        }
-        if rows.len() < body {
-            rows.push(SidebarRow::HereHeader);
-        }
+    while rows.len() < body {
+        rows.push(SidebarRow::Blank);
     }
+    if footer == 2 {
+        rows.push(SidebarRow::NewWindow);
+        rows.push(SidebarRow::Menu);
+    }
+    rows
+}
+
+/// Append zone 1, the `needs you` queue, to `rows`.
+///
+/// Reserved FIRST (inverting the old window-greedy order) but clamped so
+/// zone 2 keeps its floor: the queue outranks the local window list for
+/// attention, never for existence.
+fn push_needs_you_zone(rows: &mut Vec<SidebarRow>, counts: SidebarCounts, body: usize) {
+    if counts.needs_you == 0 || body == 0 {
+        return;
+    }
+    let shown = counts.needs_you.min(NEEDS_YOU_CAP);
+    let overflow = usize::from(counts.needs_you > shown);
+    // header + rows + overflow, held back from zone 2's floor.
+    let want = 1 + shown + overflow;
+    let allowed = body.saturating_sub(HERE_FLOOR);
+    let budget = want.min(allowed);
+    // A header with no row under it is noise; skip the zone entirely.
+    // At least one REAL row is guaranteed whenever the header renders —
+    // a header over nothing but `+N more` tells the user less than the
+    // single most-urgent row would.
+    if budget < 2 {
+        return;
+    }
+    rows.push(SidebarRow::NeedsYouHeader);
+    let room = budget - 1;
+    let listed = room.saturating_sub(overflow).max(1).min(shown).min(room);
+    for j in 0..listed {
+        rows.push(SidebarRow::NeedsYou(j));
+    }
+    if counts.needs_you > listed && rows.len() < budget {
+        rows.push(SidebarRow::NeedsYouOverflow);
+    }
+}
+
+/// Append zone 2, the focused session's windows, to `rows`.
+fn push_here_zone(rows: &mut Vec<SidebarRow>, counts: SidebarCounts, body: usize) {
+    push_here_header(rows, body);
     if counts.windows == 0 && rows.len() < body {
         rows.push(SidebarRow::HereEmpty);
     }
@@ -481,39 +495,59 @@ pub fn row_model(counts: SidebarCounts, h: u16) -> Vec<SidebarRow> {
             rows.push(row);
         }
     }
+}
 
-    // Zone 3, only when its gap + header + at least one row all fit.
-    if counts.roster > 0 && rows.len() + 3 <= body {
-        rows.push(SidebarRow::Blank);
-        rows.push(SidebarRow::SpacesHeader);
-        let mut listed = 0;
-        for j in 0..counts.roster {
-            if rows.len() >= body {
-                break;
-            }
-            // Keep the last row for the overflow marker when more remain —
-            // but never at the cost of listing no session at all, which
-            // would leave a header over a bare `+N more`.
-            let remaining = counts.roster - j;
-            if remaining > 1 && listed > 0 && rows.len() + 1 >= body {
-                break;
-            }
-            rows.push(SidebarRow::RosterEntry(j));
-            listed += 1;
-        }
-        if counts.roster > listed && rows.len() < body {
-            rows.push(SidebarRow::RosterOverflow);
-        }
+/// Append zone 2's separating gap (only when a zone precedes it, and only
+/// when a header would still fit under it) and its `here` header.
+fn push_here_header(rows: &mut Vec<SidebarRow>, body: usize) {
+    if rows.len() >= body {
+        return;
     }
-
-    while rows.len() < body {
+    if !rows.is_empty() && rows.len() + 1 < body {
         rows.push(SidebarRow::Blank);
     }
-    if footer == 2 {
-        rows.push(SidebarRow::NewWindow);
-        rows.push(SidebarRow::Menu);
+    if rows.len() < body {
+        rows.push(SidebarRow::HereHeader);
     }
-    rows
+}
+
+/// Append zone 3, the other-sessions roster, to `rows` — only when its gap +
+/// header + at least one row all fit.
+fn push_spaces_zone(rows: &mut Vec<SidebarRow>, counts: SidebarCounts, body: usize) {
+    if counts.roster == 0 || rows.len() + 3 > body {
+        return;
+    }
+    rows.push(SidebarRow::Blank);
+    rows.push(SidebarRow::SpacesHeader);
+    let mut listed = 0;
+    for j in 0..counts.roster {
+        if rows.len() >= body {
+            break;
+        }
+        if roster_entry_would_crowd_overflow(counts.roster - j, listed, rows.len(), body) {
+            break;
+        }
+        rows.push(SidebarRow::RosterEntry(j));
+        listed += 1;
+    }
+    if counts.roster > listed && rows.len() < body {
+        rows.push(SidebarRow::RosterOverflow);
+    }
+}
+
+/// Whether listing one more roster entry would leave no room for the overflow
+/// marker.
+///
+/// Keep the last row for the overflow marker when more remain — but never at
+/// the cost of listing no session at all, which would leave a header over a
+/// bare `+N more`.
+const fn roster_entry_would_crowd_overflow(
+    remaining: usize,
+    listed: usize,
+    len: usize,
+    body: usize,
+) -> bool {
+    remaining > 1 && listed > 0 && len + 1 >= body
 }
 
 /// Resolve an outer-viewport mouse cell to a sidebar target.

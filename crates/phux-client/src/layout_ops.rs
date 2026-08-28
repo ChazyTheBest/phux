@@ -319,68 +319,97 @@ pub fn apply_mutation(
             new_pane,
             dir,
             ratio,
-        }
-        | LayoutMutation::SplitPreservingFocus {
+        } => apply_split(workspace, target, new_pane, *dir, *ratio, true),
+        LayoutMutation::SplitPreservingFocus {
             target,
             new_pane,
             dir,
             ratio,
-        } => {
-            if find_window(workspace, new_pane).is_some() {
-                return Err(LayoutOpsError::DuplicatePane(new_pane.clone()));
-            }
-            let index = find_window(workspace, target)
-                .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
-            let tree = workspace.windows[index]
-                .state
-                .tree
-                .as_ref()
-                .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
-            workspace.windows[index].state.tree =
-                Some(split_at(tree, target, new_pane, *dir, *ratio)?);
-            if matches!(mutation, LayoutMutation::Split { .. }) {
-                workspace.windows[index].state.focus = Some(new_pane.clone());
-                workspace.active = index;
-            }
-        }
+        } => apply_split(workspace, target, new_pane, *dir, *ratio, false),
         LayoutMutation::Move {
             source,
             target,
             dir,
             ratio,
-        } => apply_move(workspace, source, target, *dir, *ratio)?,
-        LayoutMutation::Swap { first, second } => {
-            if first == second {
-                return Err(LayoutOpsError::SamePane);
-            }
-            find_window(workspace, first)
-                .ok_or_else(|| LayoutOpsError::ForeignTarget(first.clone()))?;
-            find_window(workspace, second)
-                .ok_or_else(|| LayoutOpsError::ForeignTarget(second.clone()))?;
-            for window in &mut workspace.windows {
-                if let Some(tree) = window.state.tree.as_ref() {
-                    window.state.tree = Some(swap_leaves(tree, first, second)?);
-                }
-            }
-            // Focus follows Terminal identity, not physical leaf position.
-        }
-        LayoutMutation::Close { target } => {
-            if pane_count(workspace) == 1 {
-                return Err(LayoutOpsError::LastPane);
-            }
-            let index = find_window(workspace, target)
-                .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
-            let tree = workspace.windows[index]
-                .state
-                .tree
-                .as_ref()
-                .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
-            workspace.windows[index].state.tree = kill_pane(tree, target)?;
-            repair_focus(&mut workspace.windows[index].state);
-            workspace.active = index;
-            workspace.prune_empty_windows();
+        } => apply_move(workspace, source, target, *dir, *ratio),
+        LayoutMutation::Swap { first, second } => apply_swap(workspace, first, second),
+        LayoutMutation::Close { target } => apply_close(workspace, target),
+    }
+}
+
+/// The tree of `workspace.windows[index]`, blaming `blame` when the window
+/// carries no tree at all.
+fn window_tree<'a>(
+    workspace: &'a Workspace,
+    index: usize,
+    blame: &TerminalId,
+) -> Result<&'a LayoutNode, LayoutOpsError> {
+    workspace.windows[index]
+        .state
+        .tree
+        .as_ref()
+        .ok_or_else(|| LayoutOpsError::ForeignTarget(blame.clone()))
+}
+
+/// The index of the window holding `target`, or [`LayoutOpsError::ForeignTarget`].
+fn require_window(workspace: &Workspace, target: &TerminalId) -> Result<usize, LayoutOpsError> {
+    find_window(workspace, target).ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))
+}
+
+/// Split `target` to make room for `new_pane`, moving focus to the new pane
+/// only when `focus_new_pane` is set.
+fn apply_split(
+    workspace: &mut Workspace,
+    target: &TerminalId,
+    new_pane: &TerminalId,
+    dir: SplitDir,
+    ratio: f32,
+    focus_new_pane: bool,
+) -> Result<(), LayoutOpsError> {
+    if find_window(workspace, new_pane).is_some() {
+        return Err(LayoutOpsError::DuplicatePane(new_pane.clone()));
+    }
+    let index = require_window(workspace, target)?;
+    let tree = window_tree(workspace, index, target)?;
+    workspace.windows[index].state.tree = Some(split_at(tree, target, new_pane, dir, ratio)?);
+    if focus_new_pane {
+        workspace.windows[index].state.focus = Some(new_pane.clone());
+        workspace.active = index;
+    }
+    Ok(())
+}
+
+/// Exchange the leaf positions of `first` and `second` across every window.
+fn apply_swap(
+    workspace: &mut Workspace,
+    first: &TerminalId,
+    second: &TerminalId,
+) -> Result<(), LayoutOpsError> {
+    if first == second {
+        return Err(LayoutOpsError::SamePane);
+    }
+    require_window(workspace, first)?;
+    require_window(workspace, second)?;
+    for window in &mut workspace.windows {
+        if let Some(tree) = window.state.tree.as_ref() {
+            window.state.tree = Some(swap_leaves(tree, first, second)?);
         }
     }
+    // Focus follows Terminal identity, not physical leaf position.
+    Ok(())
+}
+
+/// Remove `target`, refusing to close the workspace's final pane.
+fn apply_close(workspace: &mut Workspace, target: &TerminalId) -> Result<(), LayoutOpsError> {
+    if pane_count(workspace) == 1 {
+        return Err(LayoutOpsError::LastPane);
+    }
+    let index = require_window(workspace, target)?;
+    let tree = window_tree(workspace, index, target)?;
+    workspace.windows[index].state.tree = kill_pane(tree, target)?;
+    repair_focus(&mut workspace.windows[index].state);
+    workspace.active = index;
+    workspace.prune_empty_windows();
     Ok(())
 }
 
@@ -394,50 +423,80 @@ fn apply_move(
     if source == target {
         return Err(LayoutOpsError::SamePane);
     }
-    let source_index = find_window(workspace, source)
-        .ok_or_else(|| LayoutOpsError::ForeignTarget(source.clone()))?;
-    let target_index = find_window(workspace, target)
-        .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
+    let source_index = require_window(workspace, source)?;
+    let target_index = require_window(workspace, target)?;
     // Validate the destination and ratio before collapsing the source so the
     // public pure helper is transactional on ordinary validation errors.
-    let target_tree = workspace.windows[target_index]
-        .state
-        .tree
-        .as_ref()
-        .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
+    let target_tree = window_tree(workspace, target_index, target)?;
     let _ = split_at(target_tree, target, source, dir, ratio)?;
 
     if source_index == target_index {
-        let tree = workspace.windows[source_index]
-            .state
-            .tree
-            .as_ref()
-            .ok_or_else(|| LayoutOpsError::ForeignTarget(source.clone()))?;
-        let collapsed = kill_pane(tree, source)?.ok_or(LayoutOpsError::LastPane)?;
-        let moved = split_at(&collapsed, target, source, dir, ratio)?;
-        workspace.windows[source_index].state.tree = Some(moved);
-        workspace.windows[source_index].state.focus = Some(source.clone());
-        workspace.active = source_index;
+        move_within_window(workspace, source_index, source, target, dir, ratio)
     } else {
-        let source_tree = workspace.windows[source_index]
-            .state
-            .tree
-            .as_ref()
-            .ok_or_else(|| LayoutOpsError::ForeignTarget(source.clone()))?;
-        workspace.windows[source_index].state.tree = kill_pane(source_tree, source)?;
-        repair_focus(&mut workspace.windows[source_index].state);
-
-        let target_tree = workspace.windows[target_index]
-            .state
-            .tree
-            .as_ref()
-            .ok_or_else(|| LayoutOpsError::ForeignTarget(target.clone()))?;
-        workspace.windows[target_index].state.tree =
-            Some(split_at(target_tree, target, source, dir, ratio)?);
-        workspace.windows[target_index].state.focus = Some(source.clone());
-        workspace.active = target_index;
-        workspace.prune_empty_windows();
+        move_across_windows(
+            workspace,
+            MoveWindows {
+                source_index,
+                target_index,
+            },
+            source,
+            target,
+            dir,
+            ratio,
+        )
     }
+}
+
+/// The pair of window indices a cross-window move connects.
+#[derive(Debug, Clone, Copy)]
+struct MoveWindows {
+    source_index: usize,
+    target_index: usize,
+}
+
+/// Re-place `source` next to `target` inside the single window holding both:
+/// collapse the source leaf first, then split the collapsed tree.
+fn move_within_window(
+    workspace: &mut Workspace,
+    index: usize,
+    source: &TerminalId,
+    target: &TerminalId,
+    dir: SplitDir,
+    ratio: f32,
+) -> Result<(), LayoutOpsError> {
+    let tree = window_tree(workspace, index, source)?;
+    let collapsed = kill_pane(tree, source)?.ok_or(LayoutOpsError::LastPane)?;
+    let moved = split_at(&collapsed, target, source, dir, ratio)?;
+    workspace.windows[index].state.tree = Some(moved);
+    workspace.windows[index].state.focus = Some(source.clone());
+    workspace.active = index;
+    Ok(())
+}
+
+/// Move `source` out of its window and into `target`'s, repairing the vacated
+/// window's focus and pruning it if it emptied.
+fn move_across_windows(
+    workspace: &mut Workspace,
+    windows: MoveWindows,
+    source: &TerminalId,
+    target: &TerminalId,
+    dir: SplitDir,
+    ratio: f32,
+) -> Result<(), LayoutOpsError> {
+    let MoveWindows {
+        source_index,
+        target_index,
+    } = windows;
+    let source_tree = window_tree(workspace, source_index, source)?;
+    workspace.windows[source_index].state.tree = kill_pane(source_tree, source)?;
+    repair_focus(&mut workspace.windows[source_index].state);
+
+    let target_tree = window_tree(workspace, target_index, target)?;
+    workspace.windows[target_index].state.tree =
+        Some(split_at(target_tree, target, source, dir, ratio)?);
+    workspace.windows[target_index].state.focus = Some(source.clone());
+    workspace.active = target_index;
+    workspace.prune_empty_windows();
     Ok(())
 }
 
