@@ -121,6 +121,14 @@ impl Slot {
         // A widget is free to under-spend but never to overrun; clamp
         // anyway so a third-party widget cannot corrupt the row geometry.
         out.truncate(budget);
+        // The clamp cuts between cells, and a double-width character
+        // spans two of them: a cut landing between a base and the cell
+        // it claimed leaves a cell the composer counts as one column and
+        // the terminal advances two for. In the right slot that orphan
+        // lands on the last column, the terminal advances past the end of
+        // the row, and the bar wraps into the pane grid below —
+        // libghostty's cells (ADR-0020).
+        crate::widget::drop_orphan_base(&mut out);
         out
     }
 }

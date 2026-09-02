@@ -238,13 +238,41 @@ fn full_row_buffer(message: &str, style: Style, cols: u16) -> Buffer {
     let mut tmp = [0u8; 4];
     let mut col: u16 = 0;
     for ch in message.chars() {
-        if col >= cols {
+        // Refuses control characters and explicit bidi overrides: a
+        // notice carries a config-reload error, which quotes the user's
+        // own file, and the strip is emitted as one uninterrupted run.
+        let Some(width) = crate::render::cell_width(ch) else {
+            continue;
+        };
+        let width = u16::try_from(width).unwrap_or(1);
+        if width == 0 {
+            // A combining mark belongs to the cell before it.
+            if col > 0 {
+                let cell = &mut buffer[(col - 1, 0)];
+                let joined = format!("{}{}", cell.symbol(), ch);
+                cell.set_symbol(&joined);
+            }
+            continue;
+        }
+        // A character that would STRADDLE the last column is dropped
+        // whole. `write_buffer` advances by each symbol's display width,
+        // so a double-width glyph parked on the final column would make
+        // the row emit `cols + 1` columns and wrap into the pane grid
+        // below — libghostty's cells (ADR-0020).
+        if col.saturating_add(width) > cols {
             break;
         }
         let cell = &mut buffer[(col, 0)];
         cell.set_symbol(ch.encode_utf8(&mut tmp));
         cell.set_style(style);
-        col = col.saturating_add(1);
+        // The columns a wide glyph claims are styled but never emitted:
+        // `write_buffer` skips them, having already advanced past them.
+        for claimed in 1..width {
+            let cell = &mut buffer[(col + claimed, 0)];
+            cell.set_symbol(" ");
+            cell.set_style(style);
+        }
+        col = col.saturating_add(width);
     }
     while col < cols {
         let cell = &mut buffer[(col, 0)];
@@ -1305,6 +1333,83 @@ mod tests {
 
     fn ctx_default(session: &str) -> StatusBarContext<'_> {
         make_context(session, UNIX_EPOCH)
+    }
+
+    /// Walk an emitted row the way `write_buffer` does — advancing by
+    /// each symbol's display width — and report the columns it moves the
+    /// terminal. The strip is one uninterrupted run from a single `CUP`,
+    /// so this number must be exactly the strip's width.
+    fn emitted_columns(buffer: &Buffer, cols: u16) -> u16 {
+        let mut x = 0u16;
+        let mut columns = 0u16;
+        while x < cols {
+            let sym = buffer[(x, 0)].symbol();
+            let w = u16::try_from(crate::render::display_width(sym))
+                .unwrap_or(1)
+                .max(1);
+            columns = columns.saturating_add(w);
+            x = x.saturating_add(w);
+        }
+        columns
+    }
+
+    /// phux-l96p.8 fix pass II: the notice / error strip laid one CHAR
+    /// per cell while `write_buffer` advances by each symbol's display
+    /// width. A double-width character landing on the last column made
+    /// the row emit `cols + 1` columns, and the bar wrapped into the
+    /// pane grid below — libghostty's cells (ADR-0020).
+    ///
+    /// Swept across widths so the straddling case is hit exactly.
+    #[test]
+    fn a_notice_strip_advances_exactly_its_own_width() {
+        let style = Style::default();
+        for message in [
+            "\u{65e5}\u{672c}\u{8a9e}のエラー",
+            "config error: \u{65e5}",
+            "a\u{65e5}b\u{672c}c",
+            "plain ascii notice",
+        ] {
+            for cols in 1u16..24 {
+                let buffer = full_row_buffer(message, style, cols);
+                assert_eq!(
+                    emitted_columns(&buffer, cols),
+                    cols,
+                    "message {message:?} at {cols} columns"
+                );
+            }
+        }
+    }
+
+    /// A character that would straddle the last column is dropped whole:
+    /// half a glyph is not a narrower glyph, and the half that spills is
+    /// the half that wraps.
+    #[test]
+    fn a_straddling_character_is_dropped_from_the_notice_strip() {
+        // "a" then a double-width character, in a two-column strip: the
+        // wide character needs columns 1 and 2, and only column 1 is
+        // left, so it is left out and the column is padded.
+        let buffer = full_row_buffer("a\u{65e5}", Style::default(), 2);
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        // With room for both, it is placed and claims its second column.
+        let buffer = full_row_buffer("a\u{65e5}", Style::default(), 3);
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), "\u{65e5}");
+    }
+
+    /// A notice quotes the user's own config on a reload error, and the
+    /// strip is emitted as raw VT. Neither a control character nor an
+    /// explicit bidi override may become a cell.
+    #[test]
+    fn a_notice_cannot_carry_controls_or_bidi_overrides() {
+        let buffer = full_row_buffer("a\u{1b}[31m\u{202e}b", Style::default(), 10);
+        let row: String = (0..10).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(!row.contains('\u{1b}'), "an ESC reached the strip: {row:?}");
+        assert!(
+            !row.contains('\u{202e}'),
+            "a bidi override reached the strip: {row:?}"
+        );
+        assert!(row.starts_with("a[31mb"), "inert payload survives: {row:?}");
     }
 
     fn spec(kind: &str, opts: &[(&str, toml::Value)]) -> Widget {

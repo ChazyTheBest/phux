@@ -73,15 +73,14 @@ use phux_protocol::TerminalId;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect as RataRect;
 use ratatui::style::{Color, Modifier, Style};
-use unicode_width::UnicodeWidthChar;
 
 use crate::agent_meta::AgentMetaState;
 use crate::attach::multi_pane::PaneLayout;
 use crate::layout::Rect;
-use crate::render::ELLIPSIS;
 use crate::render::chrome::{AgentBadge, agent_badge, attention_badge};
 use crate::render::overlay::HardcodedBinding;
 use crate::render::theme::Theme;
+use crate::render::{ELLIPSIS, cell_width};
 
 /// The divider drag-resize table for handler-adjacency tests
 /// section (phux-i0e8.10.3).
@@ -564,7 +563,11 @@ fn draw_one_title(
     // Budget: the pane's width, less the lead-in rule cell, the two
     // padding spaces, and one closing rule cell.
     let mut budget = usize::from(rect.w - TITLE_CHROME_CELLS);
-    let badge_cells = usize::from(u8::from(badge.is_some())) * 2;
+    // MEASURE the badge rather than assuming it is one column wide.
+    // `put_measured` writes it by its real width, so a two-column glyph
+    // reserved as one would spend a column the title budget still
+    // believed it had. The two must be the same arithmetic.
+    let badge_cells = badge.map_or(0, |b| text_columns(b.glyph) + 1);
     if budget <= badge_cells {
         return;
     }
@@ -597,27 +600,18 @@ fn draw_one_title(
     put_measured(cells, x, y, " ", pad);
 }
 
-/// The advance width of `ch` in terminal cells, or `None` for something
-/// that must never reach the wire.
+/// The columns `text` advances, counting only what may reach the wire.
 ///
-/// Control characters are refused EXPLICITLY rather than left to
-/// `unicode-width` returning `None` for them. A pane title is an
-/// arbitrary OSC-2 string chosen by whatever runs in the pane, so it is
-/// untrusted input on a path that writes escape sequences: an `\x1b`
-/// reaching the emitter would let a pane's own title inject VT into the
-/// chrome. The check is stated here so a future rewrite of the width
-/// logic cannot quietly reopen it.
-fn cell_width(ch: char) -> Option<usize> {
-    if ch.is_control() {
-        return None;
-    }
-    UnicodeWidthChar::width(ch)
+/// One function, so a reservation and the write it reserves for can
+/// never disagree about how wide a glyph is.
+fn text_columns(text: &str) -> usize {
+    text.chars().filter_map(cell_width).sum()
 }
 
 /// Write a symbol that is expected to advance one cell, blanking any
 /// trailing cells it actually claims. Returns the next column.
 fn put_measured(cells: &mut ChromeCells, x: u16, y: u16, symbol: &str, style: Style) -> u16 {
-    let width = symbol.chars().filter_map(cell_width).sum::<usize>().max(1);
+    let width = text_columns(symbol).max(1);
     cells.put_str(x, y, symbol, style);
     blank_continuations(cells, x, y, width, style)
 }
@@ -650,12 +644,18 @@ fn blank_continuations(cells: &mut ChromeCells, x: u16, y: u16, width: usize, st
 /// so a CJK or emoji title measured by `chars().count()` overflows its
 /// budget and writes over the rule that was supposed to close it.
 ///
-/// Zero-width characters — combining marks, variation selectors, ZWJ,
-/// bidi controls — are appended to the cell they belong to rather than
-/// ending the string. Stopping at the first one truncated `"cafe\u{301}/src"`
-/// to `"cafe"` and `"\u{2705}\u{fe0f} build"` to the emoji alone, silently: they
-/// carry no width, so the budget check that produces the ellipsis never
-/// fired either.
+/// Zero-width characters — combining marks, variation selectors, ZWJ —
+/// are appended to the cell they belong to rather than ending the
+/// string. Stopping at the first one truncated `"cafe\u{301}/src"` to
+/// `"cafe"` and `"\u{2705}\u{fe0f} build"` to the emoji alone, silently: they carry
+/// no width, so the budget check that produces the ellipsis never fired
+/// either.
+///
+/// Explicit bidi controls are the exception: [`cell_width`] refuses
+/// them, so they never reach a cell. They are zero-width and would
+/// otherwise ride an untrusted OSC-2 title straight onto the rail, where
+/// they reorder every label after them — a pane could make its own title
+/// read as its neighbour's.
 ///
 /// Allocation-free by construction: cells carry their grapheme inline,
 /// so a per-frame `String` per pane never exists.
@@ -1490,6 +1490,97 @@ mod tests {
             .filter(|(_, y, sym)| *y == rail_y && sym == "P")
             .count();
         assert_eq!(titles, 1, "expected exactly one label on the rail");
+    }
+
+    /// phux-l96p.8 fix pass II: a pane title is an untrusted OSC-2
+    /// string, and explicit bidi overrides are zero-width — they cost no
+    /// budget, so no width check notices them, and they reorder
+    /// everything drawn after them. A pane could title itself so its own
+    /// rail label reads as its neighbour's.
+    #[test]
+    fn a_title_can_never_carry_a_bidi_override() {
+        let content = railed(60, 10);
+        let layout = split_layout(content);
+        // U+202E RIGHT-TO-LEFT OVERRIDE around a payload, plus an
+        // isolate and a standalone mark.
+        let s = render(
+            &layout,
+            content,
+            Some("run\u{202e}gpj.exe\u{202c} \u{2066}x\u{2069}\u{200f}"),
+        );
+        for bad in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}',
+        ] {
+            assert!(
+                !s.contains(bad),
+                "bidi control U+{:04X} reached the rail: {s:?}",
+                bad as u32
+            );
+        }
+        // The inert payload still shows, so the label is not silently
+        // emptied either.
+        assert!(s.contains("gpj.exe"), "the payload should survive: {s:?}");
+    }
+
+    /// A bidi override costs no columns, so it must not consume title
+    /// budget or shift where the closing rule lands.
+    #[test]
+    fn a_bidi_override_costs_no_title_budget() {
+        let content = railed(60, 10);
+        let layout = split_layout(content);
+        let plain = render(&layout, content, Some("abcdef"));
+        let spiked = render(&layout, content, Some("abc\u{202e}def"));
+        assert_eq!(
+            plain, spiked,
+            "a zero-width override must compose byte-identically"
+        );
+    }
+
+    /// The badge's reserved width and the width it is actually written
+    /// at come from one measurement. Reserving a flat two columns while
+    /// `put_measured` wrote the glyph at its real width would spend a
+    /// column the title budget still believed it had.
+    #[test]
+    fn the_badge_reservation_matches_what_is_written() {
+        let content = railed(40, 10);
+        let layout = split_layout(content);
+        let mut bytes: Vec<u8> = Vec::new();
+        render_dividers(
+            &mut bytes,
+            &layout,
+            content,
+            rail_row(content),
+            Some(&t(1)),
+            &theme(),
+            |_| {
+                Some(PaneLabel {
+                    text: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    agent: Some(AgentMetaState::Working),
+                    attention: false,
+                    seen: true,
+                })
+            },
+        )
+        .unwrap();
+        let s = String::from_utf8(bytes).unwrap();
+        let right_edge = content.x.saturating_add(content.w);
+        for (x, y, sym) in painted_cells(&s) {
+            assert!(
+                x < right_edge,
+                "badge + title cell {sym:?} landed at column {x}, past {right_edge}"
+            );
+            for r in layout.rects.values() {
+                assert!(
+                    !rect_contains(*r, x, y),
+                    "painted {sym:?} at ({x}, {y}) inside pane rect {r:?}"
+                );
+            }
+        }
+        // The badge's own reservation is `text_columns(glyph) + 1`, the
+        // same arithmetic `put_measured` writes it with.
+        assert_eq!(text_columns("\u{25d0}") + 1, 2);
+        assert_eq!(text_columns("\u{65e5}") + 1, 3);
     }
 
     /// Buffer-level introspection: every cell inside a pane Rect has

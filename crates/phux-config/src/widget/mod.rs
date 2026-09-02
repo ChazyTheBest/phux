@@ -225,12 +225,60 @@ pub struct WidgetCells {
 /// `unicode-width` happening to return `None`: a status-bar string can
 /// come from a window name, a `cwd`, or an `exec` widget's stdout, so it
 /// is untrusted input on a path that writes escape sequences.
+///
+/// Explicit BIDI FORMATTING characters are refused for the same reason.
+/// They are zero-width, so they cost no budget and no width check ever
+/// notices them, but they reorder everything drawn after them: a pane
+/// that names itself `"\u{202e}..."` can make the tab bar read as a
+/// different window. Real right-to-left text does not need them — the
+/// terminal's bidi algorithm derives direction from the letters
+/// themselves — so dropping the overrides costs nothing legitimate.
 #[must_use]
 pub fn cell_width(ch: char) -> Option<usize> {
-    if ch.is_control() {
+    if ch.is_control() || is_bidi_control(ch) {
         return None;
     }
     unicode_width::UnicodeWidthChar::width(ch)
+}
+
+/// The explicit bidi formatting characters: the embedding/override set
+/// (`U+202A`-`U+202E`), the isolates (`U+2066`-`U+2069`), and the
+/// standalone marks (`U+061C`, `U+200E`, `U+200F`).
+#[must_use]
+pub const fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// The columns one composed [`Cell`] advances the terminal.
+///
+/// A cell claiming two columns is followed by a cell that paints
+/// nothing (see [`WidgetCells::from_styled`]); the claimed cell reports
+/// `0`, because it advances nothing of its own.
+#[must_use]
+pub fn cell_columns(cell: &Cell) -> usize {
+    cell.text.iter().copied().filter_map(cell_width).sum()
+}
+
+/// Drop a trailing cell whose claimed continuation was cut away.
+///
+/// A cut lands between cells, and a double-width character occupies two
+/// of them. Truncating between a base and the cell it claimed leaves an
+/// ORPHAN BASE: a cell the composer counts as one column that the
+/// terminal advances two for. In the bar's right slot that orphan sits
+/// at the last column, so the terminal advances past the end of the row
+/// and the bar wraps into the pane grid below — libghostty's cells
+/// (ADR-0020).
+///
+/// The strip comes back one cell shorter than the budget. That is the
+/// only honest answer: half a character is not a narrower character, and
+/// a strip may always under-spend, never overrun.
+pub fn drop_orphan_base(cells: &mut Vec<Cell>) {
+    while cells.last().is_some_and(|c| cell_columns(c) > 1) {
+        cells.pop();
+    }
 }
 
 /// The width of `s` in terminal cells, ignoring anything unprintable.
@@ -313,10 +361,21 @@ impl WidgetCells {
     /// one.
     ///
     /// The ellipsis replaces the *last surviving* cell rather than being
-    /// appended, so the result is exactly `min(len, budget)` cells wide —
-    /// the composer can rely on the arithmetic. Style and hit target are
-    /// inherited from the cell it replaces, which keeps a truncated
-    /// window tab clickable and correctly colored right up to its edge.
+    /// appended, so the result is at most `budget` cells wide — the
+    /// composer can rely on never being handed more than it asked for.
+    /// Style and hit target are inherited from the cell it replaces,
+    /// which keeps a truncated window tab clickable and correctly
+    /// colored right up to its edge.
+    ///
+    /// A cut that would land inside a double-width character takes the
+    /// whole character, so the strip can come back ONE CELL SHORT of the
+    /// budget. Under-spending is always safe; overrunning is not.
+    ///
+    /// The ellipsis is stamped on a BASE cell, never on a claimed one.
+    /// A claimed cell is skipped at emit — the terminal already advanced
+    /// past it when it drew the base — so an ellipsis parked there is
+    /// never drawn at all, and a clipped strip silently loses the mark
+    /// that says it was clipped.
     ///
     /// A `budget` of 0 empties the strip. Strips that already fit are
     /// untouched, ellipsis included: this is a no-op on the common path.
@@ -324,9 +383,36 @@ impl WidgetCells {
         if self.cells.len() <= budget {
             return;
         }
+        // Kept before the cut so the mark can inherit them even when the
+        // cut leaves nothing behind to inherit from.
+        let carried = self.cells.first().map(|c| (c.style.clone(), c.hit));
         self.cells.truncate(budget);
+        // A cut can land between a wide character's base and the cell it
+        // claimed. Take the whole character rather than half of it.
+        drop_orphan_base(&mut self.cells);
+        // If the survivor is a CLAIMED cell, its base is the cell before
+        // it; drop the claimed half so the ellipsis lands on the base,
+        // which is a column the terminal actually draws.
+        if self.cells.last().is_some_and(|c| cell_columns(c) == 0) {
+            self.cells.pop();
+        }
         if let Some(last) = self.cells.last_mut() {
             last.text = smallvec::smallvec![ELLIPSIS];
+            return;
+        }
+        // Everything went: a budget of one column against a strip whose
+        // first character needs two. The mark still has to be there —
+        // a blank one-column strip is indistinguishable from a widget
+        // that had nothing to say, which is exactly the lie the ellipsis
+        // exists to prevent.
+        if budget > 0
+            && let Some((style, hit)) = carried
+        {
+            self.cells.push(Cell {
+                text: smallvec::smallvec![ELLIPSIS],
+                style,
+                hit,
+            });
         }
     }
 

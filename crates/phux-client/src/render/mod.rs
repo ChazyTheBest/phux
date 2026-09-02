@@ -69,7 +69,12 @@ pub fn clip_text(s: &str, max: usize) -> String {
         return String::new();
     }
     if display_width(s) <= max {
-        return s.chars().filter(|c| !c.is_control()).collect();
+        // One filter for both paths: a character that cannot reach the
+        // wire cannot survive a clip either, whether or not the clip
+        // shortened anything. `cell_width` is that filter — controls and
+        // explicit bidi overrides return `None`, and a zero-width mark
+        // returns `Some(0)`, so marks ride along and formatting does not.
+        return s.chars().filter(|c| cell_width(*c).is_some()).collect();
     }
     // The cut costs one cell for the ellipsis.
     let budget = max - 1;
@@ -105,12 +110,32 @@ pub fn clip_text(s: &str, max: usize) -> String {
 /// untrusted (a pane names itself via OSC 2), and an `\x1b` reaching the
 /// emitter would let that pane inject escape sequences into phux's own
 /// chrome.
+///
+/// Explicit BIDI FORMATTING characters are refused for the same reason.
+/// They are zero-width, so they cost no budget and no width check ever
+/// notices them, but they reorder everything drawn after them: a pane
+/// that titles itself `"\u{202e}..."` can make its own rail label — or its
+/// tab, or its sidebar row — read as another pane's. Real
+/// right-to-left text does not need them; the terminal derives direction
+/// from the letters themselves, so dropping the overrides costs nothing
+/// legitimate.
 #[must_use]
 pub fn cell_width(ch: char) -> Option<usize> {
-    if ch.is_control() {
+    if ch.is_control() || is_bidi_control(ch) {
         return None;
     }
     unicode_width::UnicodeWidthChar::width(ch)
+}
+
+/// The explicit bidi formatting characters: the embedding/override set
+/// (`U+202A`-`U+202E`), the isolates (`U+2066`-`U+2069`), and the
+/// standalone marks (`U+061C`, `U+200E`, `U+200F`).
+#[must_use]
+pub const fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// The width of `s` in terminal cells, ignoring anything unprintable.
@@ -189,6 +214,26 @@ mod clip_text_tests {
             clip_text("\u{2705}\u{fe0f} build", 20),
             "\u{2705}\u{fe0f} build"
         );
+    }
+
+    /// Explicit bidi overrides never survive either. They are
+    /// zero-width, so they cost no budget and no width check notices
+    /// them, but they reorder everything drawn after them: a pane that
+    /// names itself with an override can make its sidebar row or its tab
+    /// read as another pane's. Real right-to-left text keeps working —
+    /// the terminal derives direction from the letters themselves.
+    #[test]
+    fn bidi_overrides_are_dropped_but_rtl_letters_are_not() {
+        assert_eq!(clip_text("run\u{202e}gpj.exe", 40), "rungpj.exe");
+        assert_eq!(clip_text("\u{2066}a\u{2069}", 40), "a");
+        assert_eq!(clip_text("x\u{200f}y", 40), "xy");
+        // Hebrew letters are content, not formatting: untouched.
+        assert_eq!(
+            clip_text("\u{5e9}\u{5dc}\u{5d5}\u{5dd}", 40),
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd}"
+        );
+        // And they cost no budget, so they cannot shift a cut.
+        assert_eq!(clip_text("abcdef", 4), clip_text("abc\u{202e}def", 4));
     }
 
     /// Control characters never survive: chrome text reaches an emitter

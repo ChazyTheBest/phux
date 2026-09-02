@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::widget::{
     Cell, CellHit, CellStyle, StatusWidget, WidgetCells, WidgetContext, WidgetError,
-    WidgetKindSpec, WidgetOptSpec, WindowInfo, reject_unknown_opts, style_opt,
+    WidgetKindSpec, WidgetOptSpec, WindowInfo, display_width, reject_unknown_opts, style_opt,
 };
 
 /// Widget kind, used in error messages.
@@ -153,7 +153,15 @@ impl WindowsWidget {
     /// including separators and whichever overflow marks that range
     /// implies.
     fn windowed_width(&self, seg_widths: &[usize], lo: usize, hi: usize) -> usize {
-        let sep = self.separator.chars().count();
+        // CELLS, not chars, and for the same reason `separator_cells`
+        // goes through `WidgetCells::from_styled`: the separator is
+        // user-configurable text. `separator = "\u{ff5c}"` is one char and
+        // two columns, so counting chars under-reported every gap by a
+        // column, `render_within` handed back more cells than its budget,
+        // and the `debug_assert` below fired in debug and test builds.
+        // The two measurements have to be the same function or they will
+        // drift again.
+        let sep = display_width(&self.separator);
         let tabs: usize = seg_widths[lo..=hi].iter().sum();
         let seps = sep.saturating_mul(hi - lo);
         let marks = usize::from(lo > 0) + usize::from(hi + 1 < seg_widths.len());

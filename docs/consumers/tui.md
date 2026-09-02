@@ -1815,6 +1815,16 @@ so a CJK or emoji title cannot overrun the rule that closes it. A pane
 whose program never set a title gets no label: phux does not invent a name
 for a pane it did not name.
 
+A title is whatever the pane says it is, so it is untrusted text on a path
+that writes escape sequences. Control characters and explicit bidi
+formatting overrides (`U+202A`-`U+202E`, `U+2066`-`U+2069`, `U+061C`,
+`U+200E`, `U+200F`) are dropped from every chrome label — pane titles,
+window tabs, sidebar rows, status-bar text. The overrides are zero-width,
+so they cost no budget and no width check notices them, but they reorder
+everything drawn after them: a pane could make its own label read as its
+neighbour's. Right-to-left text is unaffected, because a terminal derives
+direction from the letters themselves rather than from the overrides.
+
 A pane that has asked for a human ([ADR-0035](../../ADR/0035-agent-asked-event.md))
 badges with a filled `●` in the `attention` tone ahead of its title — the
 same glyph and tone the sidebar's row for that pane uses, because a pane's
