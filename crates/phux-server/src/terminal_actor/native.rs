@@ -12,6 +12,44 @@ use super::{
 };
 use super::{NativeActorRequest, TerminalActor};
 
+/// Starting width of the per-pane native checkpoint scratch buffer.
+///
+/// One standard libghostty page is the unit a prefix record is built from, so
+/// a real active-area record is hundreds of kilobytes at most. The buffer
+/// grows to the exact `required_bytes` the engine reports when a record does
+/// not fit, so this is a starting point, never a cap.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+pub(super) const INITIAL_NATIVE_SCRATCH_BYTES: usize = 64 * 1024;
+
+/// Width of the scratch buffer a fresh bootstrap starts with.
+///
+/// The negotiated `ceiling` is the whole connection staging budget (64 MiB by
+/// default) and the engine advertises `u32::MAX` for its own record bound, so
+/// sizing the buffer from either committed two orders of magnitude more memory
+/// than any real record uses. Seed one page-sized window instead and let the
+/// engine's exact `OutOfSpace { required_bytes }` widen it.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+pub(super) const fn initial_native_scratch_bytes(ceiling: usize) -> usize {
+    if ceiling < INITIAL_NATIVE_SCRATCH_BYTES {
+        ceiling
+    } else {
+        INITIAL_NATIVE_SCRATCH_BYTES
+    }
+}
+
+/// Widen `scratch` to exactly `required_bytes` without ever aborting on a
+/// failed allocation.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+fn grow_native_scratch(
+    scratch: &mut Vec<u8>,
+    required_bytes: usize,
+) -> Result<(), crate::native_state::NativeStateError> {
+    let mut grown = reserve_native_bytes(required_bytes)?;
+    grown.resize(required_bytes, 0);
+    *scratch = grown;
+    Ok(())
+}
+
 impl TerminalActor {
     #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
     pub(super) fn handle_native_bootstrap(&mut self, req: NativeBootstrapRequest) {
@@ -86,7 +124,16 @@ impl TerminalActor {
                 }
             }
         };
-        let scratch_bytes = match native_step_bytes(capture_bytes, 0, capture.max_record_bytes()) {
+        // The scratch buffer holds ONE opaque prefix record at a time, not the
+        // whole connection staging budget. The engine advertises `u32::MAX`
+        // for `max_record_bytes`, so sizing it from the negotiated ceiling
+        // committed (and zeroed) 64 MiB per pane per attach — two orders of
+        // magnitude above the ~760 KiB a real active-area record needs. Start
+        // at one page-sized window and let `step_native_bootstrap` grow it to
+        // the exact `required_bytes` libghostty reports; the ceiling still
+        // bounds it.
+        let scratch_ceiling = match native_step_bytes(capture_bytes, 0, capture.max_record_bytes())
+        {
             Ok(bytes) => bytes,
             Err(error) => {
                 if let CanonicalTerminal::Native(manager) = &mut *self.terminal.borrow_mut() {
@@ -96,6 +143,7 @@ impl TerminalActor {
                 return;
             }
         };
+        let scratch_bytes = initial_native_scratch_bytes(scratch_ceiling);
         let mut scratch = match reserve_native_bytes(scratch_bytes) {
             Ok(scratch) => scratch,
             Err(error) => {
@@ -133,7 +181,7 @@ impl TerminalActor {
         let Some(mut pending) = self.pending_native_bootstrap.take() else {
             return;
         };
-        let step_bytes = match native_step_bytes(
+        let step_ceiling = match native_step_bytes(
             pending.capture_bytes,
             pending.retained_bytes,
             pending.capture.as_ref().map_or(
@@ -141,12 +189,14 @@ impl TerminalActor {
                 crate::native_state::NativeManagedCapture::max_record_bytes,
             ),
         ) {
-            Ok(bytes) => bytes.min(pending.scratch.len()),
+            Ok(bytes) => bytes,
             Err(error) => {
                 self.fail_native_bootstrap(pending, error);
                 return;
             }
         };
+        let scratch_len = pending.scratch.len();
+        let step_bytes = step_ceiling.min(scratch_len);
         let (ready, record_len) = match pending
             .capture
             .as_mut()
@@ -160,6 +210,20 @@ impl TerminalActor {
                 ),
                 event.bytes.len(),
             ),
+            // The engine reports the exact width of the record it could not
+            // write. Grow the scratch to it, still under the negotiated
+            // ceiling, and retry on the next cooperative turn: `next` does not
+            // consume the record when it returns `OutOfSpace`.
+            Err(crate::native_state::NativeStateError::OutOfSpace {
+                required_bytes,
+                required_rows: 0,
+            }) if required_bytes > scratch_len && required_bytes <= step_ceiling => {
+                match grow_native_scratch(&mut pending.scratch, required_bytes) {
+                    Ok(()) => self.pending_native_bootstrap = Some(pending),
+                    Err(error) => self.fail_native_bootstrap(pending, error),
+                }
+                return;
+            }
             Err(error) => {
                 self.fail_native_bootstrap(pending, error);
                 return;

@@ -98,7 +98,10 @@ bytes.workspace = true
 # (which would require relaxing the unsafe lint) and over `crossterm` (which
 # pulls its own event loop we don't use). `fs` supplies the profile-scoped
 # onboarding `flock`; rustix's default crate-feature set is opt-in beyond that.
-rustix = { version = "0.38", default-features = false, features = ["std", "termios", "fs"] }
+# `event` adds only `poll(2)` (no new crate): the OSC 10/11 palette probe waits
+# on its own deadline instead of the terminal's 100 ms `VTIME` timer, which sat
+# on the attach critical path.
+rustix = { version = "0.38", default-features = false, features = ["std", "termios", "fs", "event"] }
 # `phux run` / `phux snapshot` deserialize the server's JSON contracts
 # (run result, `GET_SCREEN` screen state) via serde derives. The layout
 # CBOR envelope and the predict layer (which also needed serde, ciborium,

@@ -782,6 +782,91 @@ fn native_step_allocation_never_exceeds_remaining_capture_budget() {
     ));
 }
 
+/// The bootstrap scratch is sized for one record, not for the connection's
+/// whole staging budget: the engine advertises `u32::MAX` as its record bound,
+/// so deriving the buffer from the negotiated ceiling committed and zeroed
+/// 64 MiB per pane per attach.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+#[test]
+fn initial_native_scratch_is_one_record_window_not_the_staging_budget() {
+    use super::native::{INITIAL_NATIVE_SCRATCH_BYTES, initial_native_scratch_bytes};
+
+    assert_eq!(
+        initial_native_scratch_bytes(crate::native_state::MAX_NATIVE_PREFIX_BYTES),
+        INITIAL_NATIVE_SCRATCH_BYTES,
+    );
+    assert_eq!(initial_native_scratch_bytes(4_096), 4_096);
+    assert_eq!(
+        initial_native_scratch_bytes(INITIAL_NATIVE_SCRATCH_BYTES),
+        INITIAL_NATIVE_SCRATCH_BYTES,
+    );
+}
+
+/// A real active-area checkpoint record is hundreds of kilobytes, far past the
+/// seed window, so this only reaches `READY` if the `OutOfSpace` retry widens
+/// the scratch to the exact `required_bytes` libghostty reported.
+#[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+#[tokio::test(flavor = "current_thread")]
+async fn native_bootstrap_grows_its_scratch_past_the_seed_window() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let bundle = TerminalActor::new(200, 50).expect("new actor");
+            let handle = bundle.handle.clone();
+            let token = bundle.token.clone();
+            let actor = bundle.actor;
+            let (reply, replied) = oneshot::channel();
+            handle
+                .native_bootstrap
+                .send(NativeBootstrapRequest {
+                    owner: 3,
+                    terminal_id: phux_protocol::ids::TerminalId::local(1),
+                    stream_id: phux_protocol::ids::StreamId::new(1).expect("stream id"),
+                    bootstrap_id: phux_protocol::ids::BootstrapId::new(1).expect("bootstrap id"),
+                    limits: phux_protocol::caps::BootstrapLimits::new(
+                        phux_protocol::MAX_BOOTSTRAP_CHUNK_BYTES,
+                        phux_protocol::DEFAULT_HISTORY_PAGE_BYTES,
+                    )
+                    .expect("wide negotiated bootstrap bound"),
+                    max_bytes: crate::native_state::MAX_NATIVE_PREFIX_BYTES,
+                    max_frames: crate::native_state::MAX_NATIVE_PREFIX_CHUNKS + 2,
+                    reply,
+                })
+                .await
+                .expect("send native request");
+            let run = tokio::task::spawn_local(actor.run());
+            let capture = tokio::time::timeout(ACTOR_EXIT_DEADLINE, replied)
+                .await
+                .expect("native bootstrap stalled")
+                .expect("native reply dropped")
+                .expect("native capture");
+            let widest = capture
+                .frames
+                .iter()
+                .filter_map(|frame| match frame {
+                    FrameKind::BootstrapChunk { payload, .. } => Some(payload.len()),
+                    _ => None,
+                })
+                .max()
+                .expect("at least one bootstrap chunk");
+            assert!(
+                widest > super::native::INITIAL_NATIVE_SCRATCH_BYTES,
+                "expected a record wider than the {} byte seed window, saw {widest}",
+                super::native::INITIAL_NATIVE_SCRATCH_BYTES,
+            );
+            assert!(
+                capture
+                    .frames
+                    .iter()
+                    .any(|frame| matches!(frame, FrameKind::BootstrapReady { .. })),
+                "bootstrap must reach READY after the scratch grows",
+            );
+            token.cancel();
+            run.await.expect("actor run");
+        })
+        .await;
+}
+
 #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
 #[tokio::test(flavor = "current_thread")]
 async fn native_request_runs_after_one_bounded_pty_turn_and_preserves_raw_bytes() {

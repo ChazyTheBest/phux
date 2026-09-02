@@ -137,6 +137,15 @@ pub struct DefaultsCfg {
     /// `phux-config` first shipped. `scrollback-lines` was proposed in
     /// phux-4li.1 but consciously folded into this field rather than
     /// duplicated: they describe the same per-Terminal scrollback cap.
+    ///
+    /// This is an upper bound, not a reservation, and it is not the only
+    /// one: libghostty enforces a byte limit beside the line limit and
+    /// prunes on whichever is reached first. `phux-server` installs that
+    /// byte limit explicitly (`MAX_SCROLLBACK_BYTES`, ADR-0094) so one
+    /// pane's retained history has a hard memory ceiling whatever this
+    /// value says. On a wide grid the byte limit is what binds, so a large
+    /// `history-limit` buys depth only until a pane's history reaches that
+    /// ceiling.
     #[serde(default = "default_history_limit", rename = "history-limit")]
     pub history_limit: u32,
 

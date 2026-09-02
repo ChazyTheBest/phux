@@ -7,13 +7,13 @@ use super::{
     CancellationToken, CanonicalTerminal, Cell, ColorQueryScanner, CommandBuilder,
     ConsumerAckRequest, ConsumerAttachRequest, ConsumerDetachRequest, ControlRequest,
     DEFAULT_CELL_PX, DEFAULT_INPUT_MAILBOX, DEFAULT_MAX_SCROLLBACK, DEFAULT_OUTPUT_BROADCAST,
-    EncodedInputRequest, GhosttyTerminal, HashMap, InputEncoderSnapshot, NativeRequestReceivers,
-    PerTerminalFocusEncoder, PerTerminalKeyEncoder, PerTerminalMouseEncoder,
-    PerTerminalPasteEncoder, PtySource, Rc, RefCell, SizeReportSize, SnapshotSynthesizer,
-    SubscribeToEventsRequest, TerminalActor, TerminalActorBundle, TerminalActorError,
-    TerminalHandle, TerminalLifecycle, TerminalOptions, UnsubscribeFromEventsRequest, VecDeque,
-    adopt_pty, broadcast, color_query_reply, default_shell_command, mpsc, oneshot, osc133,
-    resolve_shell, spawn_pty, watch,
+    EncodedInputRequest, GhosttyTerminal, HashMap, InputEncoderSnapshot, MAX_SCROLLBACK_BYTES,
+    NativeRequestReceivers, PerTerminalFocusEncoder, PerTerminalKeyEncoder,
+    PerTerminalMouseEncoder, PerTerminalPasteEncoder, PtySource, Rc, RefCell, SizeReportSize,
+    SnapshotSynthesizer, SubscribeToEventsRequest, TerminalActor, TerminalActorBundle,
+    TerminalActorError, TerminalHandle, TerminalLifecycle, TerminalOptions,
+    UnsubscribeFromEventsRequest, VecDeque, adopt_pty, broadcast, color_query_reply,
+    default_shell_command, mpsc, oneshot, osc133, resolve_shell, spawn_pty, watch,
 };
 
 impl TerminalActor {
@@ -169,6 +169,17 @@ impl TerminalActor {
             // supported targets.
             max_scrollback: max_scrollback as usize,
         })?;
+        // `TerminalOptions::max_scrollback` is only libghostty's *line* limit.
+        // The engine enforces a byte limit alongside it and applies whichever
+        // is reached first, and a terminal built through the C API keeps
+        // Ghostty's 10_000-byte constructor default — floored at two standard
+        // pages. That byte floor, not `history-limit`, decided how much
+        // history a phux pane kept: 810 rows at 80 columns and 295 rows at
+        // 200 columns, whatever `history-limit` said. Install an explicit
+        // per-pane ceiling so the configured line limit is the one that binds
+        // until retained history actually costs
+        // `MAX_SCROLLBACK_BYTES` (ADR-0094).
+        terminal.set_scrollback_max_bytes(Some(MAX_SCROLLBACK_BYTES))?;
         phux_protocol::kitty_replay::configure_terminal_for_kitty_graphics(&mut terminal)?;
         if let Some(colors) = default_colors {
             Self::install_default_colors(&mut terminal, colors)?;

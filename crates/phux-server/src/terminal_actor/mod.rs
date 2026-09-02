@@ -87,6 +87,39 @@ pub use tick::*;
 /// `defaults.history-limit` via [`TerminalActor::build_with_token`].
 const DEFAULT_MAX_SCROLLBACK: u32 = 10_000;
 
+/// Hard per-pane ceiling on retained scrollback memory (ADR-0094).
+///
+/// libghostty enforces a byte limit and a line limit together and prunes on
+/// whichever is reached first. `defaults.history-limit` sets the line limit;
+/// this is the byte limit phux installs beside it, so one pane's retained
+/// history can never cost more than this no matter how wide the grid is or
+/// how many styles, graphemes, and hyperlinks its rows carry.
+///
+/// The value is chosen against the engine's history lease, not against memory
+/// alone. `detach_ready` encodes every retained history page eagerly, in one
+/// actor turn, on the attach critical path, at roughly 6.5 ms and 1.7 MiB of
+/// transient host memory per retained MiB, per pane (measured at 200x50 on
+/// an M-series host; a page compressed while idle costs several times that to
+/// recommit). Retention and attach latency therefore trade directly:
+///
+/// | ceiling | rows kept @200 cols | `detach_ready` |
+/// |---------|--------------------|----------------|
+/// | engine default | 229 | 2 us |
+/// | 2 MiB | 943 | 8 ms |
+/// | 4 MiB | 2133 | 22 ms |
+/// | 10 MiB | 5703 | 65 ms |
+/// | 32 MiB | 19031 | 222 ms |
+///
+/// 2 MiB is the smallest value that is a real bound at every grid width (the
+/// engine floors its own byte limit at two standard pages) while keeping a
+/// four-pane attach inside a couple of hundred milliseconds. Raising it is a
+/// one-line change once the engine can lease history lazily instead of
+/// materialising it at READY.
+///
+/// Pruning is page-granular, so real usage lands within one standard
+/// libghostty page (a few hundred KiB) of this number.
+pub(crate) const MAX_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
+
 /// Fallback per-cell pixel size `(width, height)` used to derive the PTY
 /// `winsize` pixel fields and XTWINOPS size reports until a client announces
 /// a viewport with usable pixel metrics. A program inside the pane that calls
