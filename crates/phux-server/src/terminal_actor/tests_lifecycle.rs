@@ -590,7 +590,10 @@ async fn pane_kill_lets_foreground_process_flush_before_death() {
             // process group, matching an interactive shell running Claude.
             let mut cmd = CommandBuilder::new("/bin/sh");
             cmd.arg("-c");
-            cmd.arg(format!("set -m; /bin/sh {}", script.display()));
+            cmd.arg(format!(
+                "set -m; trap ':' HUP; /bin/sh {}",
+                script.display()
+            ));
             cmd.env("PHUX_TEST_MARKER", &marker);
             cmd.env("PHUX_TEST_ARMED", &armed);
 
@@ -668,6 +671,255 @@ async fn pane_kill_lets_foreground_process_flush_before_death() {
                 body.contains("flushed"),
                 "foreground process must run its SIGHUP flush handler before \
                      the pane is killed; marker={body:?}",
+            );
+        })
+        .await;
+}
+
+/// phux-l96p.12: the hangup grace must let a foreground job finish flushing
+/// **to the terminal**, not merely to somewhere.
+///
+/// The sibling test above proves the trap RUNS. This one proves it can
+/// COMPLETE, which is a different claim with a different failure mode. The
+/// PTY reader hands bytes to the actor over a bounded channel, and teardown
+/// is the one stretch where the actor is parked in `shutdown_pty` rather than
+/// draining that channel in its `select!` loop. Let the queue fill and the
+/// reader stops calling `read(2)`; an unread PTY master accepts very little
+/// before `write(2)` blocks (measured: 1024 bytes on macOS), so the child
+/// wedges mid-flush, burns the whole grace, and is hard-killed. The marker
+/// never appears — even though the trap fired immediately.
+///
+/// Three things the fixture has to get right, each learned by watching this
+/// test pass for the wrong reason:
+///
+/// * The outer shell installs a `SIGHUP` handler and survives. It is the
+///   session leader, and when a session leader exits the kernel revokes the
+///   controlling terminal for the whole session — every subsequent write from
+///   the foreground job fails `EIO` immediately. That is a real effect, but it
+///   is not this one, and it masks this one completely.
+/// * The trap masks further hangups before flushing. `cat` is a separate
+///   process in the foreground group and an ignored disposition is what
+///   survives `exec`; without the mask it takes the kernel's second `SIGHUP`
+///   (sent when the session leader's terminal is released) and dies at ~20ms.
+///   A real process flushing on hangup masks further hangups the same way.
+/// * `&&`, not `;`. The marker has to mean "every byte reached the terminal".
+///   With `;` it lands even when `cat` died after one buffer, which makes this
+///   test pass against the exact bug it exists to catch.
+///
+/// Load-sensitive for the same structural reason as the sibling test, and
+/// mitigated the same way — see the `threads-required` override in
+/// `.config/nextest.toml`.
+#[tokio::test(flavor = "current_thread")]
+async fn pane_kill_lets_a_terminal_flush_finish_inside_the_grace() {
+    use portable_pty::CommandBuilder;
+
+    // Larger than everything that could absorb the flush without the child
+    // ever blocking: the whole reader->actor channel, plus slack for the
+    // kernel PTY buffer. Derived from the constants rather than written out,
+    // so retuning the channel cannot silently defang this test. This is
+    // deliberately above the 512 KiB the ticket names — 512 KiB is under the
+    // bound on any platform whose line discipline fills a whole
+    // `PTY_READ_CHUNK` per read, and would gate nothing there.
+    const FLUSH_BYTES: usize =
+        super::spawn::PTY_CHANNEL_DEPTH * super::spawn::PTY_READ_CHUNK + 512 * 1024;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let marker = dir.path().join("flushed");
+            let armed = dir.path().join("armed");
+            let payload = dir.path().join("payload");
+            let status = dir.path().join("status");
+            let stderr = dir.path().join("err");
+            std::fs::write(&payload, vec![b'.'; FLUSH_BYTES]).expect("write flush payload");
+
+            // `cat`, not a shell loop: this has to move megabytes inside a
+            // 500ms product budget, and a `printf` loop cannot.
+            let script = dir.path().join("foreground.sh");
+            std::fs::write(
+                &script,
+                "trap 'trap \"\" HUP; cat \"$PHUX_TEST_PAYLOAD\" 2>\"$PHUX_TEST_ERR\"; s=$?; \
+                     printf %s \"$s\" > \"$PHUX_TEST_STATUS\"; \
+                     [ \"$s\" -eq 0 ] && printf flushed > \"$PHUX_TEST_MARKER\"; exit 0' HUP\n\
+                     printf armed > \"$PHUX_TEST_ARMED\"\n\
+                     while :; do sleep 30; done\n",
+            )
+            .expect("write foreground script");
+
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.arg("-c");
+            // `trap ':' HUP` on the session leader: a CAUGHT disposition is
+            // reset (not inherited) across `exec`, so the inner shell can
+            // still install its own trap, while this shell stays alive and
+            // keeps the controlling terminal from being revoked.
+            cmd.arg(format!(
+                "set -m; trap ':' HUP; /bin/sh {}",
+                script.display()
+            ));
+            cmd.env("PHUX_TEST_MARKER", &marker);
+            cmd.env("PHUX_TEST_ARMED", &armed);
+            cmd.env("PHUX_TEST_PAYLOAD", &payload);
+            cmd.env("PHUX_TEST_STATUS", &status);
+            cmd.env("PHUX_TEST_ERR", &stderr);
+
+            let token = CancellationToken::new();
+            let bundle = TerminalActor::build_with_token(
+                80,
+                24,
+                Some(cmd),
+                test_scrollback(1000),
+                token.clone(),
+            )
+            .expect("build actor");
+            let actor = bundle.actor;
+            let pty = actor.pty.as_ref().expect("test actor has PTY");
+            let shell_group = i32::try_from(pty.child.process_id().expect("shell pid"))
+                .expect("shell pid fits i32");
+            let master = std::sync::Arc::clone(&pty.master);
+            let run = tokio::task::spawn_local(actor.run());
+
+            // Same single barrier as the sibling test, generous for the same
+            // reason: forking and scheduling two shells is ambient work whose
+            // cost is unbounded in machine load. Nothing after it depends on
+            // this budget.
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !armed.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "foreground job never installed its SIGHUP trap: the fixture shells did not \
+                     get scheduled, which is an environment problem (machine load), not a \
+                     failure of the flush-before-death path this test covers",
+            );
+
+            let foreground_group = master
+                .lock()
+                .expect("master lock")
+                .process_group_leader()
+                .expect("an armed foreground job has a process group");
+            assert_ne!(
+                foreground_group, shell_group,
+                "the fixture must reproduce interactive job-control topology: a foreground \
+                     job in a group distinct from the shell's",
+            );
+
+            let killed_at = std::time::Instant::now();
+            token.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(10), run)
+                .await
+                .expect("actor shutdown stalled: the pane-kill path did not complete")
+                .expect("actor task failed");
+            let shutdown_took = killed_at.elapsed();
+
+            let body = std::fs::read_to_string(&marker).unwrap_or_default();
+            let cat_status = std::fs::read_to_string(&status).unwrap_or_default();
+            let cat_err = std::fs::read_to_string(&stderr).unwrap_or_default();
+            assert!(
+                body.contains("flushed"),
+                "a foreground job flushing {FLUSH_BYTES} bytes to the TERMINAL must finish \
+                     inside the hangup grace. An empty marker with a non-zero cat status means \
+                     it could not write: either it blocked against an undrained PTY and was \
+                     hard-killed mid-flush, or the terminal was revoked out from under it. \
+                     marker={body:?} cat_status={cat_status:?} cat_err={cat_err:?} \
+                     shutdown_took={shutdown_took:?}",
+            );
+        })
+        .await;
+}
+
+/// phux-l96p.12: a child that refuses to die must not be able to hang the
+/// server.
+///
+/// The companion hazard to the test above, and the more dangerous one. Every
+/// pane actor shares a single current-thread runtime (ADR-0003), so a
+/// teardown that blocks does not stall one pane, it freezes all of them. Two
+/// ways that used to be reachable: `shutdown_pty` reaped with a blocking
+/// `waitpid`, and its `try_wait` error branch fell through to that reap
+/// having sent no signal at all — so a child nobody had asked to exit was
+/// waited on forever.
+///
+/// The fixture is the adversary those paths assume cannot exist: a shell that
+/// ignores `SIGHUP` outright and writes to the terminal without pause, so it
+/// can only be stopped by `SIGKILL` at the grace deadline. What is asserted
+/// is not a latency number but a bound — that teardown finishes at all, and
+/// on roughly the schedule the grace defines.
+#[tokio::test(flavor = "current_thread")]
+async fn pane_kill_hard_kills_a_child_that_ignores_the_hangup() {
+    use portable_pty::CommandBuilder;
+
+    // Loose on purpose. The bug this guards against is an UNBOUNDED hang, so
+    // any finite bound catches it, and a tight one would just re-import the
+    // sibling test's load sensitivity for no extra detection. Six times the
+    // grace is comfortably beyond scheduling noise and still nowhere near
+    // "hung".
+    let ceiling = PANE_KILL_GRACE * 6;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let armed = dir.path().join("armed");
+            let payload = dir.path().join("payload");
+            std::fs::write(&payload, vec![b'.'; 256 * 1024]).expect("write payload");
+
+            // `trap '' HUP` sets SIG_IGN, which every `cat` below inherits
+            // across `exec`. Nothing short of SIGKILL stops this pane.
+            let script = dir.path().join("foreground.sh");
+            std::fs::write(
+                &script,
+                "trap '' HUP\n\
+                     printf armed > \"$PHUX_TEST_ARMED\"\n\
+                     while :; do cat \"$PHUX_TEST_PAYLOAD\"; done\n",
+            )
+            .expect("write foreground script");
+
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.arg("-c");
+            cmd.arg(format!("set -m; trap '' HUP; /bin/sh {}", script.display()));
+            cmd.env("PHUX_TEST_ARMED", &armed);
+            cmd.env("PHUX_TEST_PAYLOAD", &payload);
+
+            let token = CancellationToken::new();
+            let bundle = TerminalActor::build_with_token(
+                80,
+                24,
+                Some(cmd),
+                test_scrollback(1000),
+                token.clone(),
+            )
+            .expect("build actor");
+            let actor = bundle.actor;
+            let run = tokio::task::spawn_local(actor.run());
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !armed.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "the fixture shell never started: an environment problem (machine load), \
+                     not a failure of the path this test covers",
+            );
+
+            let killed_at = std::time::Instant::now();
+            token.cancel();
+            tokio::time::timeout(ceiling, run)
+                .await
+                .expect(
+                    "pane teardown never completed for a child that ignores SIGHUP and keeps \
+                     writing: the actor is blocked, and on a shared current-thread runtime \
+                     that means every pane on the server is blocked with it",
+                )
+                .expect("actor task failed");
+            let shutdown_took = killed_at.elapsed();
+            assert!(
+                shutdown_took < ceiling,
+                "teardown must be bounded by the hangup grace plus the reap budget, not by \
+                     the child's willingness to exit; took {shutdown_took:?}",
             );
         })
         .await;

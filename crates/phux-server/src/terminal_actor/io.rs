@@ -2,9 +2,10 @@
 //! lifecycle plumbing for [`TerminalActor`].
 
 use super::{
-    Bytes, EncodedInputRequest, InputEncoderSnapshot, PANE_KILL_GRACE, PANE_KILL_POLL, PaneOutput,
-    PasteOutcome, PtyOwned, PtySize, ResyncReason, SizeReportSize, SnapshotBytes, TerminalActor,
-    TerminalInput, WriteCompletion, debug, error, exit_status_to_wire, mpsc, trace, warn,
+    Bytes, EncodedInputRequest, InputEncoderSnapshot, PANE_KILL_GRACE, PANE_KILL_POLL,
+    PANE_KILL_REAP_BUDGET, PaneOutput, PasteOutcome, PtyOwned, PtySize, ResyncReason,
+    SizeReportSize, SnapshotBytes, TerminalActor, TerminalInput, WriteCompletion, debug, error,
+    exit_status_to_wire, mpsc, trace, warn,
 };
 
 impl TerminalActor {
@@ -437,10 +438,37 @@ impl TerminalActor {
         let Some(mut pty) = self.pty.take() else {
             return;
         };
+        // Close the PTY receiver FIRST, before anything below that waits.
+        //
+        // The reader-to-actor channel is bounded (`spawn::PTY_CHANNEL_DEPTH`),
+        // and from here to the end of this function the actor never drains it
+        // again — it is parked in the code below, not in its `select!` loop.
+        // Leaving the receiver open therefore lets the queue fill and parks
+        // the reader thread in `blocking_send`, which stops it calling
+        // `read(2)` on the master. An unread PTY master accepts very little
+        // before `write(2)` blocks (measured: 1024 bytes on macOS), so a
+        // foreground job flushing a transcript wedges mid-flush — defeating
+        // the grace window immediately below, whose entire purpose is to let
+        // that flush finish.
+        //
+        // Dropping the receiver is what keeps the reader running rather than
+        // stopping it: it switches to `spawn::drain_master_to_eof`, which
+        // keeps reading and discarding so the far side of the PTY never
+        // blocks. Discarding is not a behaviour change — nothing rendered
+        // these bytes before either, since the actor is on its way out.
+        self.pty_rx = None;
         // If the child is still alive, tear it down *gracefully* so a
         // foreground process (e.g. `claude`) gets a chance to flush before
         // we pull the rug — see `terminate_child_group`. If it already
-        // exited this is a no-op; `wait` below reaps the zombie.
+        // exited this is a no-op; the reap below collects the zombie.
+        //
+        // A failed `try_wait` is treated as "still running", deliberately.
+        // This branch used to log and fall through having sent no signal at
+        // all: a child that was in fact alive was never asked to exit, never
+        // killed, and the blocking reap then waited on it forever — freezing
+        // every pane on this current-thread runtime (ADR-0003), not just this
+        // one. Signalling a child that turns out to be dead is harmless
+        // (`ESRCH`); failing to signal one that is alive is unbounded.
         match pty.child.try_wait() {
             Ok(Some(_status)) => {
                 trace!("pty child already exited");
@@ -449,7 +477,11 @@ impl TerminalActor {
                 Self::terminate_child_group(&mut pty).await;
             }
             Err(err) => {
-                debug!(?err, "pty child try_wait failed");
+                debug!(
+                    ?err,
+                    "pty child try_wait failed; assuming alive and terminating"
+                );
+                Self::terminate_child_group(&mut pty).await;
             }
         }
         // Drop the master so the reader thread sees EOF and exits.
@@ -458,32 +490,17 @@ impl TerminalActor {
         // `self.pty_tx` are dropped at the end of `run`, but doing it
         // here makes the thread joins below predictable.
         drop(self.pty_tx.take());
-        // Reap the child so the OS releases its slot.
-        match pty.child.wait() {
-            Ok(status) => debug!(?status, "pty child reaped"),
-            Err(err) => debug!(?err, "pty child wait failed"),
-        }
-        // Close the PTY receiver before joining the reader. The channel is
-        // bounded (`spawn::PTY_CHANNEL_DEPTH`), so a reader parked in
-        // `blocking_send` behind a full queue only wakes when the receive
-        // half goes away; joining first would deadlock teardown. Nothing
-        // reads `pty_rx` after this point — both `shutdown_pty` callers
-        // return from `run` immediately afterwards.
-        self.pty_rx = None;
+        // Reap the child so the OS releases its slot — without ever blocking
+        // this task. See `reap_child_bounded`.
+        reap_child_bounded(&mut pty).await;
         // We can't drop `pty.master` separately because it's behind an
         // Arc<Mutex<_>> — the Arc strong count drops when `pty` falls
         // out of scope at the end of this function.
         if let Some(handle) = pty.reader_thread.take() {
-            // Bounded wait: if the reader hasn't exited inside a small
-            // budget we move on. Joining unconditionally would hang
-            // the shutdown path if the reader is wedged in a blocking
-            // read on a pty fd that won't EOF (rare but possible).
-            //
-            // In practice EOF arrives immediately after `master` drops
-            // at the end of this function; we accept the join-on-drop
-            // ordering risk because the reader thread is owned and
-            // bounded by us. The unwrap below is safe because the
-            // thread itself can't panic — it's a tight loop on Read.
+            // Safe to join unconditionally: the receiver was dropped at the
+            // top of this function, so the reader can never be parked in
+            // `blocking_send` waiting for a permit that will never come, and
+            // its post-actor drain is bounded by `spawn::ORPHAN_DRAIN_BUDGET`.
             let _ = handle.join();
         }
         if let Some(handle) = pty.writer_thread.take() {
@@ -606,6 +623,48 @@ async fn await_pane_group_exit(pty: &mut PtyOwned, groups: &[nix::unistd::Pid]) 
         tokio::time::sleep(PANE_KILL_POLL).await;
     }
     false
+}
+
+/// Reap the pane's child without ever blocking the actor task.
+///
+/// `Child::wait` is a blocking `waitpid`. Calling it from the actor is only
+/// sound if the child is guaranteed dead, and it is not: every path into this
+/// function has *asked* the child to exit, but a child can ignore `SIGHUP`,
+/// and `hard_kill_pane_groups` only reaches the process groups snapshotted
+/// before signalling. One that slips through blocks `waitpid` forever — and
+/// because every pane actor shares one current-thread runtime (ADR-0003),
+/// that is not one stuck pane, it is a frozen server.
+///
+/// So poll `try_wait` on the same cadence the grace window uses and give up
+/// after a bounded budget. Giving up leaks a zombie until the server exits,
+/// which is a strictly better failure than deadlocking every pane.
+#[allow(
+    clippy::future_not_send,
+    reason = "ADR-0014: TerminalActor owns !Send Terminal; lives on LocalSet"
+)]
+async fn reap_child_bounded(pty: &mut PtyOwned) {
+    let deadline = tokio::time::Instant::now() + PANE_KILL_REAP_BUDGET;
+    loop {
+        match pty.child.try_wait() {
+            Ok(Some(status)) => {
+                debug!(?status, "pty child reaped");
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!(?err, "pty child wait failed");
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                "pty child did not exit within the reap budget; abandoning it \
+                 rather than blocking the runtime"
+            );
+            return;
+        }
+        tokio::time::sleep(PANE_KILL_POLL).await;
+    }
 }
 
 /// Backstop: a group ignored the hangup (or is mid-flush past the

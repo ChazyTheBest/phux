@@ -456,6 +456,17 @@ impl TerminalActor {
     /// second for every pane on the server whether or not anyone was
     /// attached. Naming the precondition lets the `select!` skip arming the
     /// timer entirely.
+    ///
+    /// **This is only safe because [`armed_interval`] sets
+    /// `MissedTickBehavior::Delay`.** A disarmed arm is not polled, so its
+    /// `Interval` accumulates missed periods for as long as the pane stays
+    /// quiet. Under tokio's default `Burst` those would all be owed on
+    /// re-arm: an hour of silence at the 30 ms cold-start cadence is ~120,000
+    /// back-to-back `service_state_tick` calls, on the shared current-thread
+    /// runtime, the instant someone attaches. `Delay` discards them and
+    /// yields exactly one catch-up tick, which is what makes disarming a
+    /// saving rather than a deferred stampede. `disarming_the_tick_does_not_\
+    /// bank_a_stampede_of_catch_up_ticks` pins that.
     pub(super) fn state_tick_armed(&self) -> bool {
         if self.in_output_burst {
             return true;
@@ -1264,4 +1275,47 @@ async fn armed_interval(period: std::time::Duration) -> tokio::time::Interval {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = interval.tick().await;
     interval
+}
+
+#[cfg(test)]
+mod tick_rearm_tests {
+    use super::{DEFAULT_TICK_INTERVAL, armed_interval};
+
+    /// The state-sync tick arm is disarmed while a pane has nothing to emit
+    /// (see [`TerminalActor::state_tick_armed`]), which means its `Interval`
+    /// can sit unpolled across thousands of missed periods. Re-arming must
+    /// cost exactly one tick.
+    ///
+    /// This is a guard on [`armed_interval`]'s `MissedTickBehavior`, not on
+    /// the `select!`: switch it to tokio's default `Burst` and this test
+    /// reports ~120,000 immediately-ready ticks instead of one, which on a
+    /// shared current-thread runtime is a stall for every pane on the server.
+    #[tokio::test(start_paused = true)]
+    async fn disarming_the_tick_does_not_bank_a_stampede_of_catch_up_ticks() {
+        let mut tick = armed_interval(DEFAULT_TICK_INTERVAL).await;
+
+        // An hour with the arm's precondition false: nothing polls the timer.
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+
+        // Re-armed. Count the ticks that are ready with no further time
+        // passing; a zero-length timeout resolves against the paused clock
+        // without letting it advance to the next deadline.
+        let mut immediate = 0_u32;
+        while tokio::time::timeout(std::time::Duration::ZERO, tick.tick())
+            .await
+            .is_ok()
+        {
+            immediate += 1;
+            // Bail out rather than counting to 120,000 on a regression.
+            if immediate > 8 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            immediate, 1,
+            "re-arming a long-disarmed tick must yield one catch-up tick, not one per \
+             missed period",
+        );
+    }
 }

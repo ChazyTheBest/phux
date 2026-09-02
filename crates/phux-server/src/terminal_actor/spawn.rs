@@ -25,7 +25,7 @@ use tracing::{debug, error, warn};
 /// staying small enough that `PTY_READ_CHUNK * PTY_CHANNEL_DEPTH` is a
 /// defensible per-pane memory bound; a 64 KiB buffer bought nothing
 /// measurable and multiplied that bound by four.
-const PTY_READ_CHUNK: usize = 16 * 1024;
+pub(super) const PTY_READ_CHUNK: usize = 16 * 1024;
 
 /// Depth of the reader-thread -> actor PTY channel.
 ///
@@ -848,6 +848,60 @@ pub(crate) fn adopt_pty(
     start_pty_bridge(master, child)
 }
 
+/// Budget for the reader's post-actor drain (see [`drain_master_to_eof`]).
+///
+/// Must cover the whole of the teardown that follows the receiver being
+/// dropped, because that is exactly the window in which the child may still
+/// be writing: the hangup grace plus the bounded reap. Sized as their sum so
+/// retuning either cannot silently leave the tail of a flush unread.
+///
+/// In the ordinary teardown it is never approached — the child dies inside
+/// the grace, the master returns EOF, and the drain ends there. It bounds the
+/// case that has no other bound: a child that outlives the actor and keeps
+/// writing forever (`yes`), which must not pin a thread for the life of the
+/// process.
+const ORPHAN_DRAIN_BUDGET: std::time::Duration =
+    super::PANE_KILL_GRACE.saturating_add(super::PANE_KILL_REAP_BUDGET);
+
+/// Keep draining the PTY master after the actor is gone, discarding what
+/// arrives, until EOF or the [`ORPHAN_DRAIN_BUDGET`] expires.
+///
+/// The reader used to exit the instant its channel closed. That leaves the
+/// kernel PTY buffer unread, and an unread PTY master accepts very little
+/// before `write(2)` blocks — measured at 1024 bytes on macOS. A foreground
+/// job that is mid-flush in its `SIGHUP` handler then wedges in `write(2)`:
+/// it can still *take* the signal, but it cannot finish writing, so the
+/// graceful-hangup contract (`TerminalActor::terminate_child_group`) silently
+/// degrades into a hard kill. Reading and discarding costs nothing and lets
+/// the child finish dying.
+///
+/// This is a backstop, not the primary fix. In the normal kill path the
+/// receiver stays alive and drained for the whole grace window
+/// (`await_pane_group_exit`), so the reader never reaches this function with
+/// a child still running. It matters if that ordering is ever changed, and on
+/// the paths where the actor drops without going through `shutdown_pty`.
+///
+/// The budget can only be observed between reads; a reader already blocked in
+/// `read(2)` on a silent child stays blocked, exactly as it did before this
+/// function existed.
+fn drain_master_to_eof<R: Read>(reader: &mut R, buf: &mut [u8]) {
+    let deadline = std::time::Instant::now() + ORPHAN_DRAIN_BUDGET;
+    loop {
+        match reader.read(buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(err) => {
+                debug!(?err, "pty reader thread: read error while draining orphan");
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            debug!("pty reader thread: orphan drain budget expired; leaving the master unread");
+            return;
+        }
+    }
+}
+
 /// Hand one PTY chunk to the actor, blocking the reader thread only when the
 /// queue is genuinely full.
 ///
@@ -919,7 +973,9 @@ fn start_pty_bridge(
                         // path wants.
                         let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
                         if send_pty_chunk(&pty_tx_to_actor, chunk).is_break() {
-                            // Actor went away.
+                            // The actor is gone. Keep reading anyway — see
+                            // `drain_master_to_eof`.
+                            drain_master_to_eof(&mut reader, &mut buf);
                             break;
                         }
                     }

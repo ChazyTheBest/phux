@@ -340,6 +340,17 @@ const MAX_INPUT_COALESCE: usize = 16;
 // slow-flushing agent actually needs longer.
 const PANE_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 const PANE_KILL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Ceiling on how long the pane-kill path will wait to reap the child after
+/// it has been signalled (phux-l96p.12).
+///
+/// Reached only when something has already gone wrong: by this point the
+/// child has been sent `SIGHUP` and then `SIGKILL`, so it should be a zombie
+/// within a poll or two. The budget exists because the alternative — a
+/// blocking `waitpid` — turns "one child we failed to kill" into "every pane
+/// on the runtime is frozen" (ADR-0003). Generous relative to
+/// [`PANE_KILL_POLL`] so ordinary scheduling delay never trips it.
+const PANE_KILL_REAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
 const NATIVE_HISTORY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
