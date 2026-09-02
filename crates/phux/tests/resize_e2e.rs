@@ -246,9 +246,12 @@ fn attach_sizes_the_pane_to_the_viewport_minus_the_status_bar() {
     // Read from the shipped default rather than hardcoded, so changing the
     // width in one place does not silently leave this asserting the old one.
     let sidebar = phux_config::SidebarCfg::default();
+    // Two rows come off the top and bottom of the viewport: the status bar
+    // and the pane-title rail the chrome draws above every pane grid
+    // (phux-l96p.8).
     let want = (
         u64::from(cols) - u64::from(sidebar.width),
-        u64::from(rows) - 1,
+        u64::from(rows) - 2,
     );
     let deadline = Instant::now() + ATTACH_DEADLINE;
     let mut seen = server.pane_size();
@@ -260,7 +263,8 @@ fn attach_sizes_the_pane_to_the_viewport_minus_the_status_bar() {
         seen,
         want,
         "an attached client on a {cols}x{rows} PTY reserves one row for the \
-         status bar and {sidebar_width} columns for the window sidebar, so \
+         status bar, one row for the pane-title rail, and {sidebar_width} \
+         columns for the window sidebar, so \
          the pane's real grid must settle at {want:?}. Seeing the full {rows} \
          rows or {cols} columns means the client never sent the post-attach \
          TERMINAL_RESIZE: the PTY is larger than the rect the client paints \
