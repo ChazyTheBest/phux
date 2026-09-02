@@ -190,21 +190,54 @@ fn write_profile_fixture() -> TempDir {
     home
 }
 
-/// Poll `path` until it exists and is non-empty, or panic at `deadline`.
-/// The seed shell writes its result in one shot (`>file 2>&1`), so a
-/// non-empty read is never a torn write.
+/// Last line the seed shell writes, and the only safe signal that the record
+/// is complete. See [`read_result_file`].
+const RESULT_TERMINATOR: &str = "PHUX_RESULT_END";
+
+/// The seed command every case in this file runs: report `PATH`, try the
+/// `~/.profile`-provided command, then mark the record finished.
+///
+/// The terminator is a separate `printf` rather than part of the marker's own
+/// output because the marker is exactly the thing that may not resolve — when
+/// it does not, the shell's "not found" goes to the same file via `2>&1` and
+/// execution continues, so the terminator still lands. That is what makes it a
+/// completeness signal rather than a second thing to race on.
+fn seed_command(result_path: &Path) -> String {
+    format!(
+        "{{ printf '%s\\n' \"$PATH\"; phux-profile-marker; printf '%s\\n' \
+         '{RESULT_TERMINATOR}'; }} >'{}' 2>&1",
+        result_path.display()
+    )
+}
+
+/// Poll `path` until the seed shell's record is **complete**, or panic at
+/// `deadline`.
+///
+/// Completeness is the terminator line, not a non-empty file. The seed writes
+/// its record with several sequential commands sharing one redirection
+/// (`{ printf; marker; printf; } >file`); the redirection truncates once, but
+/// the writes land at different times, so a read taken between them returns a
+/// prefix. The earlier version of this returned on the first non-empty read
+/// and therefore raced: it usually caught the whole record, and occasionally
+/// caught only the `PATH` line, which then failed the marker assertion and
+/// looked exactly like a real login-shell regression. It was a flake on every
+/// lane that ran this suite before anyone read the seed closely enough to
+/// notice that "one shot" described the truncation, not the writes.
 fn read_result_file(path: &Path, deadline: Duration) -> String {
     let end = Instant::now() + deadline;
+    let mut last = String::new();
     while Instant::now() < end {
-        if let Ok(contents) = std::fs::read_to_string(path)
-            && !contents.is_empty()
-        {
-            return contents;
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if contents.contains(RESULT_TERMINATOR) {
+                return contents;
+            }
+            last = contents;
         }
         std::thread::sleep(POLL);
     }
     panic!(
-        "seed pane never wrote a result to {} within {deadline:?}",
+        "seed pane never wrote a complete result to {} within {deadline:?} \
+         (waiting for the {RESULT_TERMINATOR} line); got so far: {last:?}",
         path.display()
     );
 }
@@ -237,10 +270,7 @@ fn read_result_file(path: &Path, deadline: Duration) -> String {
 fn service_managed_pane_resolves_a_profile_provided_command() {
     let home = write_profile_fixture();
     let result_path = home.path().join("result");
-    let seed = format!(
-        "{{ printf '%s\\n' \"$PATH\"; phux-profile-marker; }} >'{}' 2>&1",
-        result_path.display()
-    );
+    let seed = seed_command(&result_path);
 
     let _server = ServerGuard::start(home.path(), &seed, true);
 
@@ -370,10 +400,7 @@ fn probe_system_profile() -> String {
 fn ordinary_pane_does_not_source_the_profile_twice() {
     let home = write_profile_fixture();
     let result_path = home.path().join("result");
-    let seed = format!(
-        "{{ printf '%s\\n' \"$PATH\"; phux-profile-marker; }} >'{}' 2>&1",
-        result_path.display()
-    );
+    let seed = seed_command(&result_path);
 
     let _server = ServerGuard::start(home.path(), &seed, false);
 
