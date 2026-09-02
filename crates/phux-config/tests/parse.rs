@@ -115,10 +115,10 @@ shell = "/bin/bash"
 /// values themselves are pinned per field so a change to any schema
 /// default cannot slip through the two-way equality:
 /// - which-key on with a 400 ms hesitation delay (phux-foz.2);
-/// - predictive-echo OFF (phux-pxaj, re-evaluated phux-51n6.1: readline
-///   vi command-mode and no-echo prompts remain un-gatable client-side,
-///   and mosh's RTT-adaptive gating is not yet ported — opt in with
-///   `predictive-echo = true`);
+/// - predictive-echo UNSET, i.e. the dial decides (ADR-0090's RTT-adaptive
+///   gate in its coarse form: on for a remote attach, off over UDS, where
+///   the round trip is not worth hiding). An explicit `predictive-echo`
+///   still wins in either direction;
 /// - sidebar ENABLED, width 28, on the left (phux-4h5a, on by default
 ///   per phux-k0cw);
 /// - status bar at the bottom (phux-foz.8);
@@ -133,7 +133,15 @@ fn empty_input_is_full_defaults() {
 
     assert!(cfg.keybindings.which_key);
     assert_eq!(cfg.keybindings.which_key_delay_ms, 400);
-    assert!(!cfg.experimental.predictive_echo);
+    assert_eq!(cfg.experimental.predictive_echo, None);
+    assert!(
+        !cfg.experimental.predictive_echo_for(false),
+        "an unset key means no prediction over the local socket"
+    );
+    assert!(
+        cfg.experimental.predictive_echo_for(true),
+        "an unset key means prediction over a remote dial"
+    );
     assert!(
         cfg.sidebar.enabled,
         "the sidebar ships ON: it is the answer to 'which agent needs me?', \
@@ -152,7 +160,7 @@ fn empty_input_is_full_defaults() {
     // An empty [experimental] table is also valid and yields the same
     // default.
     let cfg2 = parse_str("[experimental]\n", &path()).expect("empty section parses");
-    assert!(!cfg2.experimental.predictive_echo);
+    assert_eq!(cfg2.experimental.predictive_echo, None);
 }
 
 #[test]
@@ -288,17 +296,27 @@ fn spanless_schema_error_renders_no_fabricated_position() {
 fn experimental_predictive_echo_parses_both_values() {
     let cfg = parse_str("[experimental]\npredictive-echo = true\n", &path())
         .expect("[experimental] section parses");
-    assert!(
+    assert_eq!(
         cfg.experimental.predictive_echo,
-        "predictive-echo = true should land as true in the typed view"
+        Some(true),
+        "predictive-echo = true should land as an explicit true in the typed view"
+    );
+    assert!(
+        cfg.experimental.predictive_echo_for(false),
+        "an explicit true beats the UDS default"
     );
 
     // The opt-out must stick: an explicit `false` parses as false.
     let cfg = parse_str("[experimental]\npredictive-echo = false\n", &path())
         .expect("[experimental] section parses");
+    assert_eq!(
+        cfg.experimental.predictive_echo,
+        Some(false),
+        "predictive-echo = false should land as an explicit false in the typed view"
+    );
     assert!(
-        !cfg.experimental.predictive_echo,
-        "predictive-echo = false should land as false in the typed view"
+        !cfg.experimental.predictive_echo_for(true),
+        "an explicit false beats the remote default: the opt-out must stick"
     );
 }
 

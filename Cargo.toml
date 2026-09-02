@@ -105,6 +105,20 @@ unicode-width = "0.2"
 # is pure-safe Rust with no C deps, and is already present in Cargo.lock
 # transitively — adding it as a direct dep compiles no new crate.
 unicode-segmentation = "1"
+# DEFLATE for the negotiated `FRAME_COMPRESSED` wire envelope
+# (docs/spec/proto.md §6.4). A remote attach's first paint is dominated by the
+# native bootstrap prefix, which libghostty emits as whole 16-bytes-per-cell
+# pages: a dense scrolled 200x50 pane measures 522 KiB, and four panes put
+# 2 MiB on the wire before the user sees anything. That payload is mostly
+# structural repetition and deflates 14x at level 1, which is the difference
+# between a second and a blink on a 20 Mbit uplink. `flate2` is the canonical
+# Rust DEFLATE crate; with `default-features` (the pure-Rust `miniz_oxide`
+# backend, no `zlib`/C toolchain, wasm-safe) it is ALREADY in Cargo.lock as a
+# transitive dependency of `png`, so taking it as a direct dependency compiles
+# no crate that was not being compiled anyway. `zstd` would reach a better
+# ratio but pulls a C backend for a payload that is already 14x smaller and no
+# longer what makes a remote attach slow.
+flate2 = "1.1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 dhat = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "sync", "signal", "time", "process"] }

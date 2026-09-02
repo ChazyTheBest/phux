@@ -5,7 +5,7 @@ use bytes::BytesMut;
 
 use crate::caps::{
     BootstrapCodec, BootstrapLimits, BootstrapProfile, BootstrapStreamProfile, ClientCapabilities,
-    OutputMode, ServerCapabilities,
+    Compression, OutputMode, ServerCapabilities,
 };
 use crate::ids::{BootstrapId, ClientId, GroupId, SatelliteHost, StreamId, TerminalId};
 use crate::input::InputEvent;
@@ -17,6 +17,7 @@ use crate::wire::decode::Decoder;
 use crate::wire::encode::Encoder;
 use crate::wire::error::DecodeError;
 use crate::wire::field;
+use crate::wire::framing::LENGTH_PREFIX_LEN;
 use crate::wire::info::{SessionSnapshot, encode_client_id, encode_session_snapshot};
 
 use super::{
@@ -25,14 +26,14 @@ use super::{
     TYPE_ATTACH, TYPE_ATTACH_READY, TYPE_ATTACHED, TYPE_BELL, TYPE_BOOTSTRAP_BEGIN,
     TYPE_BOOTSTRAP_CHUNK, TYPE_BOOTSTRAP_READY, TYPE_BOOTSTRAP_TOMBSTONE, TYPE_COMMAND,
     TYPE_COMMAND_RESULT, TYPE_DELETE_METADATA, TYPE_DETACH, TYPE_DETACHED, TYPE_ERROR, TYPE_EVENT,
-    TYPE_FRAME_ACK, TYPE_GET_METADATA, TYPE_HELLO, TYPE_HELLO_OK, TYPE_HISTORY_PAGE,
-    TYPE_HISTORY_REJECTED, TYPE_HISTORY_REQUEST, TYPE_HISTORY_TOMBSTONE, TYPE_INPUT_FOCUS,
-    TYPE_INPUT_KEY, TYPE_INPUT_MOUSE, TYPE_INPUT_PASTE, TYPE_INPUT_TERMINAL_REPLY,
-    TYPE_LIST_METADATA, TYPE_METADATA_CHANGED, TYPE_METADATA_KEYS, TYPE_METADATA_VALUE,
-    TYPE_MOVE_TERMINAL, TYPE_PING, TYPE_PONG, TYPE_SET_METADATA, TYPE_SPAWN_TERMINAL,
-    TYPE_SUBSCRIBE_EVENTS, TYPE_SUBSCRIBE_METADATA, TYPE_TERMINAL_CLOSED, TYPE_TERMINAL_MOVED,
-    TYPE_TERMINAL_OUTPUT, TYPE_TERMINAL_RESIZE, TYPE_TERMINAL_SPAWNED, TYPE_VIEWPORT_RESIZE,
-    TombstoneReason, ViewportInfo, encode_agent_event, encode_attach_target,
+    TYPE_FRAME_ACK, TYPE_FRAME_COMPRESSED, TYPE_GET_METADATA, TYPE_HELLO, TYPE_HELLO_OK,
+    TYPE_HISTORY_PAGE, TYPE_HISTORY_REJECTED, TYPE_HISTORY_REQUEST, TYPE_HISTORY_TOMBSTONE,
+    TYPE_INPUT_FOCUS, TYPE_INPUT_KEY, TYPE_INPUT_MOUSE, TYPE_INPUT_PASTE,
+    TYPE_INPUT_TERMINAL_REPLY, TYPE_LIST_METADATA, TYPE_METADATA_CHANGED, TYPE_METADATA_KEYS,
+    TYPE_METADATA_VALUE, TYPE_MOVE_TERMINAL, TYPE_PING, TYPE_PONG, TYPE_SET_METADATA,
+    TYPE_SPAWN_TERMINAL, TYPE_SUBSCRIBE_EVENTS, TYPE_SUBSCRIBE_METADATA, TYPE_TERMINAL_CLOSED,
+    TYPE_TERMINAL_MOVED, TYPE_TERMINAL_OUTPUT, TYPE_TERMINAL_RESIZE, TYPE_TERMINAL_SPAWNED,
+    TYPE_VIEWPORT_RESIZE, TombstoneReason, ViewportInfo, encode_agent_event, encode_attach_target,
     encode_bootstrap_codec, encode_bootstrap_profile, encode_command, encode_command_result,
     encode_env, encode_focus_event, encode_key_event, encode_mouse_event, encode_move_result,
     encode_paste_event, encode_scope, encode_spawn_result, encode_string_list, encode_terminal_id,
@@ -892,6 +893,62 @@ impl FrameKind {
         }
     }
 
+    /// Encode `self`, wrapping it in a `FRAME_COMPRESSED` envelope when the
+    /// connection negotiated a compression and the transform actually pays.
+    ///
+    /// Falls back to a plain [`Self::encode`] whenever it does not — nothing
+    /// was negotiated, the body is small, or it did not shrink. That fallback
+    /// is not a degraded mode: compression is per frame, so a receiver sees an
+    /// ordinary frame and a wrapped one interchangeably on the same
+    /// connection, and a keystroke echo never pays a compressor.
+    ///
+    /// `scratch` is a caller-owned buffer for the uncompressed image, reused
+    /// across calls so a per-frame allocation does not replace the syscall
+    /// this is meant to make cheaper.
+    pub fn encode_compressed(
+        &self,
+        compression: Compression,
+        scratch: &mut BytesMut,
+        out: &mut BytesMut,
+    ) {
+        if compression == Compression::None {
+            self.encode(out);
+            return;
+        }
+        scratch.clear();
+        self.encode(scratch);
+        // The envelope carries the inner frame's body: its type byte and
+        // payload, i.e. everything past the four-byte length prefix. Carrying
+        // the prefix too would duplicate a length the envelope already knows.
+        let Some(body) = scratch.get(LENGTH_PREFIX_LEN..) else {
+            self.encode(out);
+            return;
+        };
+        let Some(deflated) = crate::wire::compress::deflate(body) else {
+            out.extend_from_slice(scratch);
+            return;
+        };
+        let Ok(uncompressed_len) = u32::try_from(body.len()) else {
+            out.extend_from_slice(scratch);
+            return;
+        };
+        let header_pos = out.len();
+        out.extend_from_slice(&[0u8; LENGTH_PREFIX_LEN]);
+        let body_start = out.len();
+        let mut enc = Encoder::new(out);
+        enc.write_u8(TYPE_FRAME_COMPRESSED);
+        enc.write_field_with(field::frame_compressed::ALGORITHM, |e| {
+            e.write_u8(compression.as_u8());
+        });
+        enc.write_field_with(field::frame_compressed::UNCOMPRESSED_LEN, |e| {
+            e.write_u32_be(uncompressed_len);
+        });
+        enc.write_field(field::frame_compressed::PAYLOAD, &deflated);
+        let body_len = out.len() - body_start;
+        let len_u32 = u32::try_from(body_len).unwrap_or(u32::MAX);
+        out[header_pos..header_pos + LENGTH_PREFIX_LEN].copy_from_slice(&len_u32.to_be_bytes());
+    }
+
     /// Encode `self` as a complete length-prefixed frame.
     ///
     /// Writes the four-byte big-endian length header, the type byte, and the
@@ -1303,6 +1360,14 @@ impl FrameKind {
             e.write_u32_be(client_caps.bootstrap.limits.max_chunk_bytes());
             e.write_u32_be(client_caps.bootstrap.limits.max_history_page_bytes());
         });
+        // Additive top-level field, omitted when the client accepts nothing
+        // compressed — which is every local consumer, so a UDS HELLO stays
+        // byte-identical to what protocol 0.8 has always emitted.
+        if !client_caps.compression.is_empty() {
+            enc.write_field_with(field::hello::COMPRESSION, |e| {
+                e.write_u8(client_caps.compression.bits());
+            });
+        }
     }
 
     /// Write the exact protocol version `HELLO_OK` admits the peer at.
@@ -1349,6 +1414,13 @@ impl FrameKind {
         enc.write_field_with(field::hello_ok::MAX_HISTORY_PAGE_BYTES, |e| {
             e.write_u32_be(bootstrap_limits.max_history_page_bytes());
         });
+        // Same discipline as HELLO's offer field: omitted when nothing was
+        // selected, so an uncompressed connection's HELLO_OK is unchanged.
+        if server_caps.compression != Compression::None {
+            enc.write_field_with(field::hello_ok::COMPRESSION, |e| {
+                e.write_u8(server_caps.compression.as_u8());
+            });
+        }
     }
 
     /// Write the single nonce field shared by `PING` and `PONG`.

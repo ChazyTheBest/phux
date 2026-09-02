@@ -26,6 +26,16 @@ pub enum DecodeError {
     #[error("invalid UTF-8 in string field")]
     InvalidUtf8,
 
+    /// A `FRAME_COMPRESSED` envelope did not carry a valid DEFLATE stream, or
+    /// the stream did not inflate to exactly the length it declared.
+    ///
+    /// Both halves matter. An invalid stream is ordinary corruption; a length
+    /// mismatch is the case worth naming, because accepting it would let a
+    /// sender declare a small buffer and then either overrun it or hand the
+    /// dispatcher a truncated frame body that decodes as a different message.
+    #[error("compressed frame did not inflate to its declared length")]
+    CompressedFrameInvalid,
+
     /// The frame's type byte did not match any known `FrameKind` discriminant.
     #[error("unknown frame kind: 0x{tag:04x}")]
     UnknownFrameKind {

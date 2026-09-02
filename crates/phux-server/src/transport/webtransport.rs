@@ -230,6 +230,15 @@ impl FrameWriter for WtWriter {
         self.send.write_all(frame).await.map_err(io::Error::other)
     }
 
+    /// One `write_all` for the whole batch — the same reasoning as
+    /// `QuicWriter::write_frames`. A WebTransport bidi stream is a reliable
+    /// ordered byte stream and `WtReader` reassembles it by length prefix, so
+    /// merging a coalesced burst into one write changes the poll count, not
+    /// the bytes.
+    async fn write_frames(&mut self, batch: &[u8], _ends: &[usize]) -> io::Result<()> {
+        self.send.write_all(batch).await.map_err(io::Error::other)
+    }
+
     async fn close(&mut self) -> io::Result<()> {
         self.send.finish().await.map_err(io::Error::other)
     }

@@ -29,6 +29,12 @@ use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::PredictiveConfig;
 use crate::render::chrome::sidebar::SidebarPainter;
+
+/// These tests drive a `UnixStream::pair`, so the local dial is the honest
+/// one: it also pins that the UDS lane offers no frame compression.
+fn test_dial() -> Dial {
+    Dial::uds(Path::new("/tmp/phux-driver-test.sock"))
+}
 use crate::render::chrome::status_bar::{Notice, StatusBarPainter};
 use crate::render::overlay::OverlayState;
 
@@ -1122,7 +1128,7 @@ async fn attach_negotiation_waits_for_hello_ok_and_sends_one_hello() {
     let server = tokio::spawn(ScriptedServer::on_stream(server_stream, ScriptSpec::new()).run());
 
     let res = client
-        .negotiate(attach_client_name(), attach_client_caps(None))
+        .negotiate(attach_client_name(), attach_client_caps(None, &test_dial()))
         .await;
     assert!(
         res.is_ok(),
@@ -1133,7 +1139,7 @@ async fn attach_negotiation_waits_for_hello_ok_and_sends_one_hello() {
         .expect("successful negotiation installs immutable profile state");
     assert_eq!(selected.limits, phux_protocol::BootstrapLimits::default());
     let duplicate = client
-        .negotiate(attach_client_name(), attach_client_caps(None))
+        .negotiate(attach_client_name(), attach_client_caps(None, &test_dial()))
         .await;
     assert!(
         matches!(duplicate, Err(AttachError::Protocol(_))),
@@ -1159,7 +1165,10 @@ async fn attach_negotiation_preserves_custom_caps_then_sends_attach() {
 
     let client_side = async {
         client
-            .negotiate(attach_client_name(), attach_client_caps(Some(colors)))
+            .negotiate(
+                attach_client_name(),
+                attach_client_caps(Some(colors), &test_dial()),
+            )
             .await
             .expect("HELLO_OK");
         client
@@ -1230,7 +1239,8 @@ async fn attach_negotiation_rejects_non_hello_ok_reply() {
             .expect("server send detached");
     };
 
-    let negotiation = client.negotiate(attach_client_name(), attach_client_caps(None));
+    let negotiation =
+        client.negotiate(attach_client_name(), attach_client_caps(None, &test_dial()));
     let (res, ()) = tokio::join!(negotiation, server_side);
     match res {
         Err(AttachError::Protocol(msg)) => {

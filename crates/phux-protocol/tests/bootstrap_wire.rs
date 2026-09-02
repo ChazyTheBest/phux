@@ -1143,3 +1143,119 @@ fn native_live_bytes_are_codec_opaque_and_round_trip_exactly() {
     };
     assert_eq!(bytes, raw);
 }
+
+// ---------------------------------------------------------------------------
+// FRAME_COMPRESSED (docs/spec/proto.md §6.4)
+// ---------------------------------------------------------------------------
+
+/// The envelope is decode-invisible: a wrapped frame decodes to exactly the
+/// frame that was wrapped, with a byte-identical opaque payload — the property
+/// §6.2 requires of native records across server, transport, and relay.
+#[test]
+fn compressed_bootstrap_chunk_round_trips_byte_identically() {
+    use phux_protocol::caps::Compression;
+
+    // A native page's shape: long structural runs, which is what makes the
+    // real bootstrap prefix compressible in the first place.
+    let payload: Vec<u8> = (0..8_u32 * 1024)
+        .flat_map(|cell| [1, 0, 0, 0, 0, 0, 0, 0, b'a' + (cell % 26) as u8, 0, 0, 0])
+        .collect();
+    let frame = FrameKind::BootstrapChunk {
+        terminal_id: TerminalId::local(7),
+        stream_id: StreamId::new(3).expect("stream id"),
+        bootstrap_id: BootstrapId::new(11).expect("bootstrap id"),
+        chunk_seq: 2,
+        payload: bytes::Bytes::from(payload.clone()),
+    };
+
+    let mut plain = bytes::BytesMut::new();
+    frame.encode(&mut plain);
+    let mut scratch = bytes::BytesMut::new();
+    let mut wrapped = bytes::BytesMut::new();
+    frame.encode_compressed(Compression::Deflate, &mut scratch, &mut wrapped);
+
+    assert!(
+        wrapped.len() * 4 < plain.len(),
+        "a structural payload must actually shrink: {} vs {}",
+        wrapped.len(),
+        plain.len()
+    );
+    assert_eq!(
+        wrapped[4],
+        phux_protocol::wire::frame::TYPE_FRAME_COMPRESSED,
+        "the outer frame is the envelope"
+    );
+
+    let (decoded, rest) = FrameKind::decode(&wrapped).expect("decodes");
+    assert!(rest.is_empty(), "one frame in, one frame out");
+    match decoded {
+        FrameKind::BootstrapChunk {
+            chunk_seq,
+            payload: got,
+            ..
+        } => {
+            assert_eq!(chunk_seq, 2);
+            assert_eq!(got.as_ref(), payload.as_slice(), "opaque bytes are exact");
+        }
+        other => panic!("expected a BootstrapChunk, got {other:?}"),
+    }
+}
+
+/// A body that cannot pay for the transform is written plain, so the two
+/// encoders agree byte-for-byte on everything interactive.
+#[test]
+fn small_frames_are_never_wrapped() {
+    use phux_protocol::caps::Compression;
+
+    let frame = FrameKind::BootstrapChunk {
+        terminal_id: TerminalId::local(1),
+        stream_id: StreamId::new(1).expect("stream id"),
+        bootstrap_id: BootstrapId::new(1).expect("bootstrap id"),
+        chunk_seq: 0,
+        payload: bytes::Bytes::from_static(b"tiny"),
+    };
+    let mut plain = bytes::BytesMut::new();
+    frame.encode(&mut plain);
+    let mut scratch = bytes::BytesMut::new();
+    let mut wrapped = bytes::BytesMut::new();
+    frame.encode_compressed(Compression::Deflate, &mut scratch, &mut wrapped);
+    assert_eq!(plain, wrapped, "a small frame takes the plain path");
+}
+
+/// An envelope may not wrap another envelope: unbounded nesting is an
+/// amplification vector (each layer multiplies the work a single received
+/// frame costs), and there is no legitimate reason to compress twice.
+///
+/// The encoder never produces one, so the envelope is hand-built here around
+/// an inner body whose type byte is `FRAME_COMPRESSED`.
+#[test]
+fn nested_envelopes_are_rejected() {
+    use phux_protocol::wire::encode::Encoder;
+    use phux_protocol::wire::field;
+    use phux_protocol::wire::frame::TYPE_FRAME_COMPRESSED;
+
+    let mut inner_body = vec![TYPE_FRAME_COMPRESSED];
+    inner_body.extend(std::iter::repeat_n(0_u8, 64 * 1024));
+    let deflated =
+        phux_protocol::wire::compress::deflate(&inner_body).expect("a run of zeros compresses");
+
+    let mut out = BytesMut::new();
+    out.extend_from_slice(&[0_u8; 4]);
+    let body_start = out.len();
+    {
+        let mut enc = Encoder::new(&mut out);
+        enc.write_u8(TYPE_FRAME_COMPRESSED);
+        enc.write_field_with(field::frame_compressed::ALGORITHM, |e| e.write_u8(1));
+        enc.write_field_with(field::frame_compressed::UNCOMPRESSED_LEN, |e| {
+            e.write_u32_be(u32::try_from(inner_body.len()).unwrap());
+        });
+        enc.write_field(field::frame_compressed::PAYLOAD, &deflated);
+    }
+    let body_len = u32::try_from(out.len() - body_start).unwrap();
+    out[0..4].copy_from_slice(&body_len.to_be_bytes());
+
+    assert_eq!(
+        FrameKind::decode(&out).expect_err("nesting refused"),
+        DecodeError::CompressedFrameInvalid,
+    );
+}

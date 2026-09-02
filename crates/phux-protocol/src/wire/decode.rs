@@ -13,19 +13,19 @@ use super::frame::{
     TYPE_ATTACH, TYPE_ATTACH_READY, TYPE_ATTACHED, TYPE_BELL, TYPE_BOOTSTRAP_BEGIN,
     TYPE_BOOTSTRAP_CHUNK, TYPE_BOOTSTRAP_READY, TYPE_BOOTSTRAP_TOMBSTONE, TYPE_COMMAND,
     TYPE_COMMAND_RESULT, TYPE_DELETE_METADATA, TYPE_DETACH, TYPE_DETACHED, TYPE_ERROR, TYPE_EVENT,
-    TYPE_FRAME_ACK, TYPE_GET_METADATA, TYPE_HELLO, TYPE_HELLO_OK, TYPE_HISTORY_PAGE,
-    TYPE_HISTORY_REJECTED, TYPE_HISTORY_REQUEST, TYPE_HISTORY_TOMBSTONE, TYPE_INPUT_FOCUS,
-    TYPE_INPUT_KEY, TYPE_INPUT_MOUSE, TYPE_INPUT_PASTE, TYPE_INPUT_TERMINAL_REPLY,
-    TYPE_LIST_METADATA, TYPE_METADATA_CHANGED, TYPE_METADATA_KEYS, TYPE_METADATA_VALUE,
-    TYPE_MOVE_TERMINAL, TYPE_PING, TYPE_PONG, TYPE_SET_METADATA, TYPE_SPAWN_TERMINAL,
-    TYPE_SUBSCRIBE_EVENTS, TYPE_SUBSCRIBE_METADATA, TYPE_TERMINAL_CLOSED, TYPE_TERMINAL_MOVED,
-    TYPE_TERMINAL_OUTPUT, TYPE_TERMINAL_RESIZE, TYPE_TERMINAL_SPAWNED, TYPE_VIEWPORT_RESIZE,
-    TombstoneReason, decode_agent_event, decode_attach_target, decode_bootstrap_codec,
-    decode_bootstrap_id, decode_bootstrap_profile, decode_bootstrap_stream_profile, decode_command,
-    decode_command_result, decode_env, decode_focus_event, decode_key_event,
-    decode_metadata_scope_key, decode_mouse_event, decode_move_result, decode_paste_event,
-    decode_scope, decode_spawn_result, decode_stream_id, decode_string_list, decode_terminal_id,
-    decode_viewport_info,
+    TYPE_FRAME_ACK, TYPE_FRAME_COMPRESSED, TYPE_GET_METADATA, TYPE_HELLO, TYPE_HELLO_OK,
+    TYPE_HISTORY_PAGE, TYPE_HISTORY_REJECTED, TYPE_HISTORY_REQUEST, TYPE_HISTORY_TOMBSTONE,
+    TYPE_INPUT_FOCUS, TYPE_INPUT_KEY, TYPE_INPUT_MOUSE, TYPE_INPUT_PASTE,
+    TYPE_INPUT_TERMINAL_REPLY, TYPE_LIST_METADATA, TYPE_METADATA_CHANGED, TYPE_METADATA_KEYS,
+    TYPE_METADATA_VALUE, TYPE_MOVE_TERMINAL, TYPE_PING, TYPE_PONG, TYPE_SET_METADATA,
+    TYPE_SPAWN_TERMINAL, TYPE_SUBSCRIBE_EVENTS, TYPE_SUBSCRIBE_METADATA, TYPE_TERMINAL_CLOSED,
+    TYPE_TERMINAL_MOVED, TYPE_TERMINAL_OUTPUT, TYPE_TERMINAL_RESIZE, TYPE_TERMINAL_SPAWNED,
+    TYPE_VIEWPORT_RESIZE, TombstoneReason, decode_agent_event, decode_attach_target,
+    decode_bootstrap_codec, decode_bootstrap_id, decode_bootstrap_profile,
+    decode_bootstrap_stream_profile, decode_command, decode_command_result, decode_env,
+    decode_focus_event, decode_key_event, decode_metadata_scope_key, decode_mouse_event,
+    decode_move_result, decode_paste_event, decode_scope, decode_spawn_result, decode_stream_id,
+    decode_string_list, decode_terminal_id, decode_viewport_info,
 };
 use super::info::{decode_client_id, decode_session_snapshot};
 use crate::caps::{
@@ -381,6 +381,7 @@ impl<'a> Decoder<'a> {
             TYPE_BOOTSTRAP_TOMBSTONE => self.decode_bootstrap_tombstone(),
             TYPE_HISTORY_TOMBSTONE => self.decode_history_tombstone(),
             TYPE_HISTORY_REJECTED => self.decode_history_rejected(),
+            TYPE_FRAME_COMPRESSED => self.decode_frame_compressed(),
             TYPE_DETACHED => self.decode_detached(),
             TYPE_BELL => self.decode_bell(),
             TYPE_ERROR => self.decode_error(),
@@ -415,6 +416,7 @@ impl<'a> Decoder<'a> {
         let mut protocol_minor = None;
         let mut protocol_patch = None;
         let mut client_caps: Option<crate::caps::ClientCapabilities> = None;
+        let mut compression: Option<crate::caps::CompressionSet> = None;
         while let Some((id, value)) = self.read_field()? {
             match id {
                 field::hello::CLIENT_NAME => {
@@ -436,15 +438,30 @@ impl<'a> Decoder<'a> {
                 field::hello::CLIENT_CAPS => {
                     client_caps = Some(sub!(value, decode_client_capabilities));
                 }
+                field::hello::COMPRESSION => {
+                    compression = Some(crate::caps::CompressionSet::from_bits(sub!(
+                        value,
+                        |d: &mut Decoder<'_>| d.read_u8()
+                    )));
+                }
                 _ => {}
             }
+        }
+        let mut client_caps = client_caps.ok_or(DecodeError::UnexpectedEof)?;
+        // The offer rides beside the frozen `CLIENT_CAPS` sub-record on the
+        // wire (§6.2 fixes that record's byte order) but belongs with the
+        // rest of the client's capabilities in the typed view, so fold it in.
+        // Absent means the empty set, which `ClientCapabilities::new` already
+        // installed.
+        if let Some(compression) = compression {
+            client_caps = client_caps.with_compression(compression);
         }
         Ok(FrameKind::Hello {
             client_name: client_name.ok_or(DecodeError::UnexpectedEof)?,
             protocol_major: protocol_major.ok_or(DecodeError::UnexpectedEof)?,
             protocol_minor: protocol_minor.ok_or(DecodeError::UnexpectedEof)?,
             protocol_patch: protocol_patch.ok_or(DecodeError::UnexpectedEof)?,
-            client_caps: client_caps.ok_or(DecodeError::UnexpectedEof)?,
+            client_caps,
         })
     }
 
@@ -458,6 +475,7 @@ impl<'a> Decoder<'a> {
         let mut selected_profile = None;
         let mut max_chunk_bytes = None;
         let mut max_history_page_bytes = None;
+        let mut compression: Option<crate::caps::Compression> = None;
         while let Some((id, value)) = self.read_field()? {
             match id {
                 field::hello_ok::PROTOCOL_MAJOR => {
@@ -483,20 +501,92 @@ impl<'a> Decoder<'a> {
                     max_history_page_bytes =
                         Some(sub!(value, |d: &mut Decoder<'_>| d.read_u32_be()));
                 }
+                field::hello_ok::COMPRESSION => {
+                    compression = Some(crate::caps::Compression::from_u8(sub!(
+                        value,
+                        |d: &mut Decoder<'_>| d.read_u8()
+                    )));
+                }
                 _ => {}
             }
         }
         let bootstrap_limits =
             negotiated_bootstrap_limits(max_chunk_bytes, max_history_page_bytes)?;
+        let mut server_caps = server_caps.ok_or(DecodeError::UnexpectedEof)?;
+        // Same fold as HELLO's offer: additive top-level field on the wire,
+        // one capability struct in the typed view.
+        if let Some(compression) = compression {
+            server_caps = server_caps.with_compression(compression);
+        }
         Ok(FrameKind::HelloOk {
             protocol_major: protocol_major.ok_or(DecodeError::UnexpectedEof)?,
             protocol_minor: protocol_minor.ok_or(DecodeError::UnexpectedEof)?,
             protocol_patch: protocol_patch.ok_or(DecodeError::UnexpectedEof)?,
-            server_caps: server_caps.ok_or(DecodeError::UnexpectedEof)?,
+            server_caps,
             server_id: server_id.ok_or(DecodeError::UnexpectedEof)?,
             selected_profile: selected_profile.ok_or(DecodeError::UnexpectedEof)?,
             bootstrap_limits,
         })
+    }
+
+    /// Inflate a `FRAME_COMPRESSED` envelope and dispatch the frame inside it.
+    ///
+    /// The envelope is decode-invisible: the inner frame is reconstructed
+    /// byte-for-byte and then run through the same [`Self::decode_body`]
+    /// dispatch it would have taken uncompressed, carrying this decoder's
+    /// negotiated bootstrap bounds with it so a wrapped `BOOTSTRAP_CHUNK` is
+    /// still rejected above its limit. Callers therefore never learn whether a
+    /// frame arrived compressed, which is the point.
+    ///
+    /// Two things are refused outright. A declared inflated length above
+    /// [`MAX_FRAME_LEN`] is rejected **before** allocating, so an envelope
+    /// cannot ask the receiver for more memory than a legal frame; and a
+    /// nested envelope is rejected, so a hostile sender cannot drive
+    /// unbounded recursion or amplification through repeated wrapping.
+    fn decode_frame_compressed(&mut self) -> Result<FrameKind, DecodeError> {
+        let mut algorithm = None;
+        let mut uncompressed_len = None;
+        let mut payload: Option<&[u8]> = None;
+        while let Some((id, value)) = self.read_field()? {
+            match id {
+                field::frame_compressed::ALGORITHM => {
+                    algorithm = Some(crate::caps::Compression::from_u8(sub!(
+                        value,
+                        |d: &mut Decoder<'_>| d.read_u8()
+                    )));
+                }
+                field::frame_compressed::UNCOMPRESSED_LEN => {
+                    uncompressed_len = Some(sub!(value, |d: &mut Decoder<'_>| d.read_u32_be()));
+                }
+                field::frame_compressed::PAYLOAD => payload = Some(value),
+                _ => {}
+            }
+        }
+        if algorithm.ok_or(DecodeError::UnexpectedEof)? != crate::caps::Compression::Deflate {
+            return Err(DecodeError::CompressedFrameInvalid);
+        }
+        let declared = uncompressed_len.ok_or(DecodeError::UnexpectedEof)?;
+        if declared == 0 || declared > MAX_FRAME_LEN {
+            return Err(DecodeError::LengthOverflow);
+        }
+        let declared = usize::try_from(declared).map_err(|_| DecodeError::LengthOverflow)?;
+        let payload = payload.ok_or(DecodeError::UnexpectedEof)?;
+        let body = crate::wire::compress::inflate(payload, declared)?;
+
+        let mut inner = Decoder::with_bootstrap_limits(
+            &body,
+            BootstrapLimits::new(self.max_bootstrap_chunk_bytes, self.max_history_page_bytes)
+                .unwrap_or_default(),
+        );
+        // The inner buffer is exactly one frame body, so its end is the end of
+        // the buffer. Setting it is what lets the inner variant decoders tell
+        // an absent additive trailing field from the start of another frame.
+        inner.body_end = Some(body.len());
+        let type_byte = inner.read_u8()?;
+        if type_byte == TYPE_FRAME_COMPRESSED {
+            return Err(DecodeError::CompressedFrameInvalid);
+        }
+        inner.decode_body(type_byte)
     }
 
     /// Decode a `PING` message body into [`FrameKind::Ping`].

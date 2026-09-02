@@ -2315,6 +2315,7 @@ dependencies = [
  "bitflags 2.13.0",
  "bytes",
  "chrono",
+ "flate2",
  "insta",
  "int-enum",
  "libghostty-vt",

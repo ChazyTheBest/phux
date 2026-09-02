@@ -26,7 +26,9 @@ For implementers extending the protocol:
   `0x91` is permanently retired.
   `BOOTSTRAP_BEGIN..BOOTSTRAP_TOMBSTONE = 0x93..=0x97`,
   `HISTORY_TOMBSTONE = 0x98`, and `HISTORY_REJECTED = 0x99` are allocated;
-  `0x9A..=0x9F` remain open for hot-path messages.
+  `FRAME_COMPRESSED = 0x9A` (proto.md §6.4) is allocated from the hot-path
+  reserve, which it belongs in: it wraps the hot path's largest frames.
+  `0x9B..=0x9F` remain open for hot-path messages.
 - Message IDs `0x24..=0x2F` and `0xA3..=0xAF`: reserved for further L1
   Terminal lifecycle / per-pane control frames (phux-4li.10 allocated
   `0x22..=0x23` C→S and `0xA1..=0xA2` S→C from these ranges).

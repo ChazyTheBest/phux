@@ -126,6 +126,13 @@ pub const TYPE_HISTORY_TOMBSTONE: u8 = 0x98;
 /// Discriminant for retryable cursor-scoped `HISTORY_REJECTED` (server to
 /// client, `docs/spec/L1.md` §4.5).
 pub const TYPE_HISTORY_REJECTED: u8 = 0x99;
+/// Discriminant for `FRAME_COMPRESSED` (server to client).
+///
+/// A negotiated envelope carrying one deflated inner frame
+/// (`docs/spec/proto.md` §6.4). Allocated from the `0x9A..=0x9F` hot-path
+/// reserve (`docs/spec/appendix-reserved.md` §1) because it wraps the hot
+/// path's largest frames.
+pub const TYPE_FRAME_COMPRESSED: u8 = 0x9A;
 
 // -----------------------------------------------------------------------------
 // L3 metadata frame discriminants — SPEC §7.4 (phux-4li.2).

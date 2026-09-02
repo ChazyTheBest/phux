@@ -4,14 +4,16 @@ use std::collections::HashSet;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use bytes::BytesMut;
 use phux_protocol::PROTOCOL_VERSION;
 #[cfg(not(all(feature = "native-engine", not(target_arch = "wasm32"))))]
 use phux_protocol::caps::BootstrapCapabilities;
 use phux_protocol::caps::{
-    BootstrapLimits, BootstrapProfile, ClientCapabilities, LayerSet, ServerCapabilities,
-    ServerFeature, ServerFeatureSet, select_bootstrap_profile,
+    BootstrapLimits, BootstrapProfile, ClientCapabilities, Compression, LayerSet,
+    ServerCapabilities, ServerFeature, ServerFeatureSet, select_bootstrap_profile,
 };
 use phux_protocol::wire::frame::{
     AgentEvent, DetachReason, ErrorCode, FrameKind, TERMINAL_AGENT_KEY,
@@ -41,6 +43,10 @@ struct NegotiatedConnection {
     profile: BootstrapProfile,
     limits: BootstrapLimits,
     server_features: ServerFeatureSet,
+    /// The frame compression HELLO selected (`docs/spec/proto.md` §6.4).
+    /// [`Compression::None`] for every consumer that offered nothing, which
+    /// is every local one.
+    compression: Compression,
 }
 
 impl NegotiatedConnection {
@@ -70,6 +76,7 @@ mod negotiated_feature_tests {
             profile: BootstrapProfile::SynthesizedVtRaw,
             limits: BootstrapLimits::default(),
             server_features,
+            compression: Compression::None,
         }
     }
 
@@ -1422,6 +1429,12 @@ struct ClientPlumbing {
     sibling_tasks: JoinSet<()>,
     /// Per-attach raw-output pumps.
     output_pumps: JoinSet<()>,
+    /// The frame compression the writer applies, published by HELLO.
+    ///
+    /// A shared cell rather than a constructor argument because the writer
+    /// task is spawned when the connection is accepted, which is strictly
+    /// before the HELLO that selects the compression has been read.
+    compression: Arc<AtomicU8>,
 }
 
 impl ClientPlumbing {
@@ -1432,13 +1445,33 @@ impl ClientPlumbing {
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Outbound>(DEFAULT_CLIENT_MAILBOX);
         let (writer_close, writer_close_rx) = tokio::sync::watch::channel(false);
         let mut sibling_tasks: JoinSet<()> = JoinSet::new();
-        sibling_tasks.spawn_local(writer_task(writer, out_rx, writer_close_rx, client_id));
+        let compression = Arc::new(AtomicU8::new(Compression::None.as_u8()));
+        sibling_tasks.spawn_local(writer_task(
+            writer,
+            out_rx,
+            writer_close_rx,
+            Arc::clone(&compression),
+            client_id,
+        ));
         Self {
             out_tx,
             writer_close,
             sibling_tasks,
             output_pumps: JoinSet::new(),
+            compression,
         }
+    }
+
+    /// Publish the compression HELLO selected to the writer task.
+    ///
+    /// Called after `HELLO_OK` is already queued, so the acknowledgement of
+    /// the selection is never itself compressed — a client that offered
+    /// compression could decode it either way, but keeping the frame that
+    /// *announces* the transform outside the transform is the cheaper thing to
+    /// reason about.
+    fn set_compression(&self, compression: Compression) {
+        self.compression
+            .store(compression.as_u8(), Ordering::Relaxed);
     }
 
     /// End one connection for a protocol violation, in the order §9 requires.
@@ -1620,6 +1653,11 @@ async fn negotiate_hello(
             phux_protocol::caps::OutputMode::Raw
         };
     let server_features = runtime_server_features();
+    // The client's offer is the whole input: a server never compresses toward
+    // a consumer that did not say it can inflate. The reference TUI offers
+    // only on a remote dial, so a UDS connection stays byte-for-byte what it
+    // was before this existed and pays no compressor.
+    let compression = client_caps.compression.select();
 
     // Cache all negotiated state exactly once before any stateful
     // frame can be processed. Subsequent decoding immediately uses
@@ -1630,6 +1668,7 @@ async fn negotiate_hello(
         profile: selected_profile,
         limits: bootstrap_limits,
         server_features,
+        compression,
     });
     state.with_mut(|s| {
         // SPEC §6.2: cache the negotiated layer set. The L3
@@ -1642,7 +1681,8 @@ async fn negotiate_hello(
         protocol_patch: PROTOCOL_VERSION.patch,
         server_caps: ServerCapabilities::new()
             .with_layers(LayerSet::all())
-            .with_features(server_features),
+            .with_features(server_features)
+            .with_compression(compression),
         server_id: state.with(|server| server.server_incarnation().as_bytes().to_vec()),
         selected_profile,
         bootstrap_limits,
@@ -1975,6 +2015,9 @@ where
                 {
                     plumbing.close(close, &state, client_id).await;
                     return Ok(());
+                }
+                if let Some(negotiated) = negotiated {
+                    plumbing.set_compression(negotiated.compression);
                 }
             }
             FrameKind::Ping { nonce } => reply_pong(&plumbing.out_tx, client_id, nonce).await,
@@ -3113,6 +3156,8 @@ const MAX_WRITE_COALESCE: usize = 32;
 /// everything after the sentinel is discarded by contract.
 fn encode_into_batch(
     message: Outbound,
+    compression: Compression,
+    scratch: &mut BytesMut,
     batch: &mut BytesMut,
     ends: &mut Vec<usize>,
 ) -> Option<String> {
@@ -3131,9 +3176,37 @@ fn encode_into_batch(
             Some(message),
         ),
     };
-    frame.encode(batch);
+    frame.encode_compressed(compress_policy(&frame, compression), scratch, batch);
     ends.push(batch.len());
     terminal_message
+}
+
+/// Which frames are worth wrapping, given what the connection negotiated.
+///
+/// The spec makes wrapping a per-frame choice by the sender (proto.md §6.4),
+/// and the choice here is **bootstrap and history payloads only**.
+///
+/// Those are the frames the feature exists for: a few large, structural
+/// records that a remote client must receive in full before it can paint
+/// anything, where 14x fewer bytes is 14x less time staring at a blank
+/// screen. Measured over a 60 ms-RTT link, restricting to them still cut a
+/// warm attach from 438 ms to 248 ms.
+///
+/// Live `TERMINAL_OUTPUT` is the opposite shape and measured worse: thousands
+/// of modest frames, each of which would cost the receiver one inflate plus
+/// one fresh allocation sized to the inflated frame, on the path where
+/// per-frame cost is exactly what matters. A `seq 1 300000` burst over a
+/// simulated 60 ms link ran slower with those frames wrapped than without,
+/// while the bytes it saved bought nothing a user can see — the burst is
+/// already scrolling past faster than it can be read. Compressing them may
+/// well pay on a genuinely narrow link; it is left out because this lane
+/// could not measure a link narrow enough to show it, and an unmeasured
+/// default is not a default.
+const fn compress_policy(frame: &FrameKind, negotiated: Compression) -> Compression {
+    match frame {
+        FrameKind::BootstrapChunk { .. } | FrameKind::HistoryPage { .. } => negotiated,
+        _ => Compression::None,
+    }
 }
 
 /// Absorb up to [`MAX_WRITE_COALESCE`] further messages that are *already*
@@ -3142,6 +3215,8 @@ fn encode_into_batch(
 /// handshake).
 fn drain_ready_into_batch(
     rx: &mut tokio::sync::mpsc::Receiver<Outbound>,
+    compression: Compression,
+    scratch: &mut BytesMut,
     batch: &mut BytesMut,
     ends: &mut Vec<usize>,
 ) -> Option<String> {
@@ -3149,7 +3224,7 @@ fn drain_ready_into_batch(
         let Ok(next) = rx.try_recv() else {
             return None;
         };
-        if let Some(message) = encode_into_batch(next, batch, ends) {
+        if let Some(message) = encode_into_batch(next, compression, scratch, batch, ends) {
             return Some(message);
         }
     }
@@ -3217,9 +3292,13 @@ pub(crate) async fn writer_task<W: FrameWriter>(
     mut writer: W,
     mut rx: tokio::sync::mpsc::Receiver<Outbound>,
     mut close: tokio::sync::watch::Receiver<bool>,
+    compression: Arc<AtomicU8>,
     client_id: ClientId,
 ) {
     let mut buf = BytesMut::with_capacity(1024);
+    // Staging buffer for the uncompressed image of a frame being wrapped.
+    // Reused across turns, like `buf`, so the envelope costs no allocation.
+    let mut scratch = BytesMut::new();
     // Exclusive end offset of each frame encoded into `buf` this turn, so a
     // message-oriented transport can still write them one message at a time.
     let mut ends: Vec<usize> = Vec::new();
@@ -3239,9 +3318,18 @@ pub(crate) async fn writer_task<W: FrameWriter>(
         // linger timer is introduced.
         buf.clear();
         ends.clear();
-        let mut terminal_message = encode_into_batch(message, &mut buf, &mut ends);
+        // Read once per turn, not per frame: the value is written exactly
+        // once, by the HELLO that selected it, and every frame in one batch
+        // therefore agrees on it. `Relaxed` is sufficient because the frames
+        // themselves are already ordered by the mailbox, and a turn that
+        // happened to read the pre-HELLO `None` would simply write that batch
+        // uncompressed — which is always legal.
+        let compression = Compression::from_u8(compression.load(Ordering::Relaxed));
+        let mut terminal_message =
+            encode_into_batch(message, compression, &mut scratch, &mut buf, &mut ends);
         if terminal_message.is_none() {
-            terminal_message = drain_ready_into_batch(&mut rx, &mut buf, &mut ends);
+            terminal_message =
+                drain_ready_into_batch(&mut rx, compression, &mut scratch, &mut buf, &mut ends);
         }
         if let Err(err) = writer.write_frames(&buf, &ends).await {
             debug!(?client_id, error = %err, "writer error on frame; client task ending");
@@ -3310,6 +3398,14 @@ mod writer_close_tests {
         }
     }
 
+    /// The pre-HELLO cell: these tests drive the writer directly, with no
+    /// handshake to select a compression.
+    fn uncompressed() -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+        std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            phux_protocol::caps::Compression::None.as_u8(),
+        ))
+    }
+
     /// A transport that records batches instead of frames, so a test can see
     /// how many transport writes a queue of frames actually costs.
     struct BatchRecordingWriter {
@@ -3351,7 +3447,7 @@ mod writer_close_tests {
         drop(tx);
 
         let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
-        writer_task(writer, rx, close_rx, ClientId(11)).await;
+        writer_task(writer, rx, close_rx, uncompressed(), ClientId(11)).await;
         assert_eq!(
             batches.borrow().as_slice(),
             [8],
@@ -3408,7 +3504,7 @@ mod writer_close_tests {
         drop(tx);
 
         let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
-        writer_task(writer, rx, close_rx, ClientId(13)).await;
+        writer_task(writer, rx, close_rx, uncompressed(), ClientId(13)).await;
 
         let written = frames.borrow();
         assert_eq!(written.len(), sent.len(), "one slice per queued frame");
@@ -3458,7 +3554,7 @@ mod writer_close_tests {
         drop(tx);
 
         let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
-        writer_task(writer, rx, close_rx, ClientId(14)).await;
+        writer_task(writer, rx, close_rx, uncompressed(), ClientId(14)).await;
 
         let written = frames.borrow();
         assert_eq!(written.len(), 3);
@@ -3491,8 +3587,13 @@ mod writer_close_tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
-                let task =
-                    tokio::task::spawn_local(writer_task(writer, rx, close_rx, ClientId(12)));
+                let task = tokio::task::spawn_local(writer_task(
+                    writer,
+                    rx,
+                    close_rx,
+                    uncompressed(),
+                    ClientId(12),
+                ));
                 tx.send(Outbound::Frame(FrameKind::Pong { nonce: 1 }))
                     .await
                     .expect("queue frame");
@@ -3536,7 +3637,7 @@ mod writer_close_tests {
             .expect("racing producer queues after sentinel");
 
         let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
-        writer_task(writer, rx, close_rx, ClientId(7)).await;
+        writer_task(writer, rx, close_rx, uncompressed(), ClientId(7)).await;
         assert_eq!(
             events.borrow().as_slice(),
             [

@@ -25,6 +25,8 @@ BH_LINES=60000
 BH_COLS=188
 BH_PANES=4
 PTY_PROBE="$REPO/scripts/bench/pty-echo.py"
+UDP_DELAY="$REPO/scripts/bench/udp-delay.py"
+RTT_MS=0
 PHUX_BIN="$REPO/target/release/phux"
 HERDR_BIN="${HERDR_BIN:-/opt/homebrew/bin/herdr}"
 TMUX_BIN="${TMUX_BIN:-tmux}"
@@ -49,6 +51,9 @@ Usage: scripts/bench/mux-compare.sh [options]
   --seq-lines N           throughput line count (default: 300000)
   --pty-iters N           byte-level echo samples (default: 60)
   --big-history           also run the 4-pane / 60k-line attach scenario
+  --rtt-ms N              run the phux-quic lane through a userspace UDP relay
+                          that adds N ms of round-trip delay (N/2 each way), so
+                          a loopback run can show what costs a round trip
 USAGE
 }
 
@@ -63,6 +68,7 @@ while (($#)); do
     --seq-lines) SEQ_LINES="$2"; shift 2 ;;
     --pty-iters) PTY_ITERS="$2"; shift 2 ;;
     --big-history) BIG_HISTORY=1; shift ;;
+    --rtt-ms) RTT_MS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -79,6 +85,9 @@ RUN="$(mktemp -d /tmp/muxbench-XXXXXX)"
 # Loopback listener ports, derived from the pid so parallel runs do not collide.
 WS_PORT=$(( 18000 + ($$ % 900) * 2 ))
 QUIC_PORT=$(( WS_PORT + 1 ))
+# The WAN-simulation relay sits in front of the QUIC listener on its own port.
+QUIC_RELAY_PORT=$(( WS_PORT + 900 ))
+RELAY_PID=""
 TMUX_SOCK="bench-$$"
 TMUX=("$TMUX_BIN" -L "$TMUX_SOCK")
 SERVER_PIDS=()
@@ -88,6 +97,8 @@ declare -A RAW=()
 
 cleanup() {
   "${TMUX[@]}" kill-server 2>/dev/null || true
+  [[ -n $RELAY_PID ]] && kill "$RELAY_PID" 2>/dev/null
+  RELAY_PID=""
   local pid signal
   for signal in TERM KILL; do
     for pid in "${SERVER_PIDS[@]:-}"; do
@@ -258,6 +269,28 @@ seed_herdr() {
   fi
 }
 
+# The relay is started once per quic lane run and torn down with the lane, so a
+# lane that is not measuring latency pays nothing for the flag existing.
+start_relay() {
+  local ready="$RUN/relay-ready"
+  rm -f "$ready"
+  log_cmd "python3 scripts/bench/udp-delay.py --listen 127.0.0.1:$QUIC_RELAY_PORT --to 127.0.0.1:$QUIC_PORT --delay-ms $(awk -v r="$RTT_MS" 'BEGIN{printf "%g", r/2}')"
+  python3 "$UDP_DELAY" --listen "127.0.0.1:$QUIC_RELAY_PORT" --to "127.0.0.1:$QUIC_PORT" \
+    --delay-ms "$(awk -v r="$RTT_MS" 'BEGIN{printf "%g", r/2}')" --ready-file "$ready" \
+    >>"$OUT_DIR/relay.log" 2>&1 &
+  RELAY_PID=$!
+  local deadline=$((SECONDS + 10))
+  while [[ ! -f $ready ]] && (( SECONDS < deadline )); do sleep 0.05; done
+  [[ -f $ready ]] || { printf 'udp relay never bound\n' >&2; return 1; }
+}
+
+stop_relay() {
+  [[ -n $RELAY_PID ]] || return 0
+  kill "$RELAY_PID" 2>/dev/null || true
+  wait_gone "$RELAY_PID"
+  RELAY_PID=""
+}
+
 # Detach keys are each multiplexer's documented binding: phux C-a d, herdr C-b q.
 # The three phux lanes differ only in the transport the client dials.
 setup_mux() {
@@ -270,7 +303,11 @@ setup_mux() {
     phux-ws) FAMILY=phux; MUX_DETACH=(C-a d)
       MUX_ARGV="$PHUX_BIN attach --ws ws://127.0.0.1:$WS_PORT bench" ;;
     phux-quic) FAMILY=phux; MUX_DETACH=(C-a d)
-      MUX_ARGV="$PHUX_BIN attach --quic 127.0.0.1:$QUIC_PORT bench" ;;
+      local port=$QUIC_PORT
+      # A nonzero --rtt-ms puts the delay relay between client and server; the
+      # server still binds its own port and never learns it is being shaped.
+      (( $(printf '%.0f' "$RTT_MS") > 0 )) && { start_relay || exit 2; port=$QUIC_RELAY_PORT; }
+      MUX_ARGV="$PHUX_BIN attach --quic 127.0.0.1:$port bench" ;;
     herdr) FAMILY=herdr; MUX_DETACH=(C-b q); MUX_ARGV="$HERDR_BIN" ;;
     tmux) FAMILY=tmux; MUX_DETACH=(); MUX_ARGV="/bin/sh" ;;
   esac
@@ -655,6 +692,7 @@ run_mux() {
   detach_session
   measure_handshake
   stop_server
+  stop_relay
 }
 
 cell() { local key=$1; printf '%s' "${RESULT[$key]:-n/a}"; }

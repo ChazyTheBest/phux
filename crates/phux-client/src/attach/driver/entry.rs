@@ -228,7 +228,7 @@ async fn handshake(
     let default_colors = probe_default_colors
         .then(crate::attach::terminal_probe::default_colors)
         .flatten();
-    let client_caps = attach_client_caps(default_colors);
+    let client_caps = attach_client_caps(default_colors, dial);
     let conn = Connection::connect_dial_with_hello(dial, attach_client_name(), client_caps).await?;
     let negotiated = conn.negotiated_bootstrap().ok_or_else(|| {
         AttachError::Protocol(

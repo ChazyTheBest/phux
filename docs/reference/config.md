@@ -49,7 +49,6 @@ Every scalar knob with its shipped default, serialized from the schema itself. K
 | `defaults.session-name-template` | `"${cwd-basename}"` |
 | `defaults.term` | `"xterm-256color"` |
 | `defaults.window-size` | `"smallest"` |
-| `experimental.predictive-echo` | `false` |
 | `keybindings.prefix` | `"C-a"` |
 | `keybindings.which-key` | `true` |
 | `keybindings.which-key-delay-ms` | `400` |

@@ -146,6 +146,110 @@ pub const DEFAULT_BOOTSTRAP_CHUNK_BYTES: u32 = 256 * 1024;
 /// Default advertised maximum for one history page (1 MiB).
 pub const DEFAULT_HISTORY_PAGE_BYTES: u32 = 1024 * 1024;
 
+/// A frame-payload compression algorithm (`docs/spec/proto.md` §6.4).
+///
+/// Compression is a **transport-visible, decode-invisible** transform: the
+/// server wraps an already-encoded frame in `FRAME_COMPRESSED` and the
+/// receiver's decoder inflates it back to the exact same bytes before
+/// dispatching, so every inner frame — a `BOOTSTRAP_CHUNK` payload above all —
+/// reaches its consumer byte-identical. That is what keeps it compatible with
+/// the §6.2 rule that native records "MUST remain byte-identical across
+/// server, transport, recorder, and federation relay".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum Compression {
+    /// No transform. Frames go on the wire exactly as encoded.
+    #[default]
+    None = 0,
+    /// Raw DEFLATE (RFC 1951), as produced by `flate2`'s `miniz_oxide` backend.
+    Deflate = 1,
+}
+
+impl Compression {
+    /// The wire tag.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode a wire tag, treating an unknown algorithm as [`Self::None`].
+    ///
+    /// Lenient by design: a server may only *select* an algorithm the client
+    /// offered, so an unrecognized selection means the peer is out of contract
+    /// and the safe reading is "nothing is compressed" — which then surfaces
+    /// as an ordinary decode error on the first wrapped frame rather than as a
+    /// silent misinterpretation of payload bytes.
+    #[must_use]
+    pub const fn from_u8(tag: u8) -> Self {
+        match tag {
+            1 => Self::Deflate,
+            _ => Self::None,
+        }
+    }
+}
+
+/// The set of compression algorithms a peer accepts (`HELLO` field 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CompressionSet(u8);
+
+impl CompressionSet {
+    /// Bit for [`Compression::Deflate`].
+    pub const DEFLATE: u8 = 0x01;
+
+    /// The empty set: accept no compressed frames.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// The set built from a raw bitset, unknown bits preserved but inert.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// The raw bitset for the wire.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Everything this build can decode.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self(Self::DEFLATE)
+    }
+
+    /// Whether the set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether `algorithm` is in the set.
+    #[must_use]
+    pub const fn contains(self, algorithm: Compression) -> bool {
+        match algorithm {
+            Compression::None => true,
+            Compression::Deflate => self.0 & Self::DEFLATE != 0,
+        }
+    }
+
+    /// The algorithm a server picks for a client offering this set.
+    ///
+    /// One entry today, so "select" is "take DEFLATE if offered". When a
+    /// second algorithm is added this becomes the preference order, and the
+    /// selection stays server-side exactly as profile selection is (§6.2).
+    #[must_use]
+    pub const fn select(self) -> Compression {
+        if self.contains(Compression::Deflate) {
+            Compression::Deflate
+        } else {
+            Compression::None
+        }
+    }
+}
+
 /// Negotiated per-frame byte bounds for bootstrap and history payloads.
 ///
 /// Construction rejects zero and values above the protocol hard caps. The
@@ -1085,6 +1189,12 @@ pub struct ClientCapabilities {
     pub default_colors: Option<TerminalDefaultColors>,
     /// Explicit bootstrap profiles, exact native codecs/features, and receive bounds.
     pub bootstrap: BootstrapCapabilities,
+    /// Frame compressions this client can inflate (`docs/spec/proto.md` §6.4).
+    ///
+    /// Empty is the compatibility value and the value every local consumer
+    /// wants: over a Unix socket the bytes never leave the machine, so
+    /// deflating them spends CPU on both ends to save nothing.
+    pub compression: CompressionSet,
 }
 
 /// Effective default colors reported by the client's outer terminal.
@@ -1122,7 +1232,15 @@ impl ClientCapabilities {
             output_mode: OutputMode::Raw,
             default_colors: None,
             bootstrap: BootstrapCapabilities::new(),
+            compression: CompressionSet::new(),
         }
+    }
+
+    /// Builder setter for [`Self::compression`].
+    #[must_use]
+    pub const fn with_compression(mut self, compression: CompressionSet) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Builder setter for [`Self::output_mode`].
@@ -1209,6 +1327,9 @@ pub struct ServerCapabilities {
     pub layers: LayerSet,
     /// Additive server-owned protocol features.
     pub features: ServerFeatureSet,
+    /// The frame compression this server selected for the connection
+    /// (`docs/spec/proto.md` §6.4). Always one the client offered.
+    pub compression: Compression,
 }
 
 impl ServerCapabilities {
@@ -1219,7 +1340,15 @@ impl ServerCapabilities {
         Self {
             layers: LayerSet::new(),
             features: ServerFeatureSet::new(),
+            compression: Compression::None,
         }
+    }
+
+    /// Builder setter for [`Self::compression`].
+    #[must_use]
+    pub const fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Builder setter for [`Self::layers`].

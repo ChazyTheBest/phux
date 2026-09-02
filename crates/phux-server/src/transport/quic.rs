@@ -189,6 +189,20 @@ impl FrameWriter for QuicWriter {
         self.send.write_all(frame).await.map_err(io::Error::other)
     }
 
+    /// One `write_all` for the whole batch, exactly as `UdsWriter` does.
+    ///
+    /// A QUIC bidi stream is a reliable ordered *byte* stream, not a datagram
+    /// flow: `QuicReader` reassembles frames off it by the length prefix each
+    /// one already carries, so the bytes it sees are identical either way.
+    /// What changes is the number of `SendStream::write_all` futures a burst
+    /// costs — a coalesced PTY burst of up to `MAX_WRITE_COALESCE` frames now
+    /// pays one poll and one copy into quinn's stream buffer instead of 32,
+    /// and quinn packs the result into full packets rather than being woken
+    /// per frame. `ends` is unused for exactly that reason.
+    async fn write_frames(&mut self, batch: &[u8], _ends: &[usize]) -> io::Result<()> {
+        self.send.write_all(batch).await.map_err(io::Error::other)
+    }
+
     async fn close(&mut self) -> io::Result<()> {
         self.send.finish().map_err(io::Error::other)
     }

@@ -458,6 +458,82 @@ fleet-wide break. See
 decision and [ADR-0060](../../ADR/0060-self-contained-session-recording.md)
 for that cost analysis.
 
+### 6.4 Frame compression
+
+An optional, negotiated, **decode-invisible** transform. It changes how many
+bytes a frame costs on the wire and nothing else: the frame a receiver
+dispatches is byte-for-byte the frame the sender encoded, which is what keeps
+it compatible with §6.2's rule that native records remain byte-identical
+across server, transport, recorder, and federation relay.
+
+```
+Compression = enum (u8) {
+    None    = 0,
+    Deflate = 1,   // raw DEFLATE, RFC 1951 (no zlib or gzip wrapper)
+}
+
+CompressionSet = bitset (u8) {
+    DEFLATE = 0x01,
+}
+```
+
+**Negotiation.** `HELLO` carries an optional top-level field `compression`
+(field id 6, `u8` `CompressionSet`): the algorithms the client can inflate.
+`HELLO_OK` answers with an optional top-level field `compression` (field id 9,
+`u8` `Compression`): the single algorithm the server selected. Both are
+additive field ids, skipped by declared length by a peer that does not know
+them, per §6.3 — they are *not* members of the `ClientCapabilities` /
+`ServerCapabilities` sub-records, whose byte order §6.2 fixes exactly.
+
+An absent or zero field means no compression, and that is the compatibility
+value on both sides. The server MUST NOT select an algorithm the client did
+not offer, and MUST NOT emit `FRAME_COMPRESSED` when it selected `None`.
+Unknown offer bits are ignored; an unknown selection is read as `None`, which
+surfaces as a decode error on the first wrapped frame rather than as a silent
+misreading of payload bytes.
+
+**The envelope.**
+
+```
+FRAME_COMPRESSED {                  // 0x9A, S -> C
+    algorithm: u8,                  // field 1, required
+    uncompressed_len: u32,          // field 2, required
+    payload: bytes,                 // field 3, required
+}
+```
+
+`payload` is the compressed image of one complete **inner frame body**: its
+type byte followed by its payload, i.e. everything a frame carries after the
+length prefix. The receiver inflates it and dispatches the result exactly as
+if those bytes had arrived unwrapped.
+
+A receiver MUST:
+
+- reject `uncompressed_len` of zero or above the §5 frame cap **before**
+  allocating, so an envelope can never ask for more memory than a legal frame;
+- inflate to **exactly** `uncompressed_len` bytes, rejecting both a stream
+  that ends short and one that would run long — a decoder that accepted a
+  short inflate would dispatch a truncated body, which can decode as a
+  different message;
+- reject an inner type byte of `FRAME_COMPRESSED`. Nesting has no use and
+  each layer multiplies the work one received frame costs.
+
+Each failure is `ERROR { MALFORMED_MESSAGE }` followed by close.
+
+**Per frame, not per connection.** Wrapping is the sender's choice for each
+frame. A sender SHOULD leave small frames unwrapped — a keystroke echo must
+never pay a compressor — and MUST leave a frame unwrapped when the transform
+does not shrink it. A receiver therefore sees wrapped and unwrapped frames
+interleaved on one connection and treats that as normal.
+
+**When to offer.** Compression trades CPU on both peers for bytes on the wire,
+so a consumer SHOULD offer it only when the wire is worth paying for. The
+reference TUI offers on its remote transports and offers nothing over the
+local Unix socket, where the bytes never leave the machine. The payload this
+exists for is the bootstrap prefix: a native checkpoint is whole engine pages
+at a fixed width per cell, which is hundreds of kilobytes for one pane and
+deflates by an order of magnitude.
+
 ---
 
 ## 7. Message catalog (proto tier)
@@ -532,6 +608,7 @@ have no catalog row; the mechanism is defined in
 | 0x81  | S → C     | `ATTACHED`        | [L1.md §replay](./L1.md) | shipped |
 | 0x82  | S → C     | `DETACHED`        | §7.2               | shipped   |
 | 0x83  | S → C     | `ATTACH_READY`    | [L1.md §replay](./L1.md) | shipped |
+| 0x9A  | S → C     | `FRAME_COMPRESSED`| §6.4               | shipped   |
 | 0xC1  | S → C     | `ERROR`           | §9                 | shipped   |
 | 0xC2  | S → C     | `COMMAND_RESULT`  | [L1.md §5](./L1.md)| shipped   |
 | 0xFF  | S → C     | `PONG`            | §7.4               | shipped   |

@@ -35,6 +35,9 @@ serde = { workspace = true }
 # Derives TryFrom<u32> for the wire's PhysicalKey enum (ADR-0024). Pure Rust,
 # wasm-safe; the same crate libghostty-vt uses for its key discriminants.
 int-enum = "1.2"
+# DEFLATE for the negotiated FRAME_COMPRESSED envelope; see the workspace
+# manifest for the justification and the measured ratio.
+flate2.workspace = true
 libghostty-vt = { workspace = true, optional = true }
 png = { workspace = true, optional = true }
 

@@ -43,6 +43,14 @@ pub mod hello {
     pub const PROTOCOL_PATCH: u32 = 4;
     /// `ClientCapabilities` blob (positional sub-record).
     pub const CLIENT_CAPS: u32 = 5;
+    /// Frame compressions the client accepts (`u8` bitset), additive.
+    ///
+    /// A top-level field rather than a member of the `CLIENT_CAPS`
+    /// sub-record because protocol 0.8 fixes that sub-record's byte order
+    /// exactly (`docs/spec/proto.md` §6.2): appending to it would be a
+    /// fleet-wide break, while an unknown top-level id is skipped by
+    /// declared length. Absent means "accepts nothing compressed".
+    pub const COMPRESSION: u32 = 6;
 }
 
 /// `HELLO_OK` body fields (`docs/spec/proto.md` §6.1).
@@ -63,6 +71,9 @@ pub mod hello_ok {
     pub const MAX_CHUNK_BYTES: u32 = 7;
     /// Negotiated maximum `HISTORY_PAGE.payload` bytes (`u32`).
     pub const MAX_HISTORY_PAGE_BYTES: u32 = 8;
+    /// Selected frame compression (`u8` enum tag), additive. Absent or `0`
+    /// means the server compresses nothing.
+    pub const COMPRESSION: u32 = 9;
 }
 
 /// `PING` / `PONG` body fields (`docs/spec/proto.md` §7.4).
@@ -221,6 +232,17 @@ pub mod bootstrap_chunk {
     pub const CHUNK_SEQ: u32 = 4;
     /// Opaque checkpoint bytes.
     pub const PAYLOAD: u32 = 5;
+}
+
+/// `FRAME_COMPRESSED` body fields (`docs/spec/proto.md` §6.4).
+pub mod frame_compressed {
+    /// Compression algorithm tag (`u8`).
+    pub const ALGORITHM: u32 = 1;
+    /// Exact byte length of the inflated inner frame body (`u32`).
+    pub const UNCOMPRESSED_LEN: u32 = 2;
+    /// Compressed image of one complete inner frame body: its type byte
+    /// followed by its payload, i.e. everything after the length prefix.
+    pub const PAYLOAD: u32 = 3;
 }
 
 /// `BOOTSTRAP_READY` body fields (`docs/spec/L1.md` §4.3).

@@ -174,6 +174,7 @@ pub(super) async fn send_unless_peer_gone(
 /// routine prevents reconnect and custom-capability paths from double-HELLO.
 pub(super) fn attach_client_caps(
     default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
+    dial: &crate::attach::Dial,
 ) -> ClientCapabilities {
     // Sniff `$COLORTERM` / `$TERM` / `$TERM_PROGRAM` per
     // `detect_color_support`. The advertised tier feeds the server's
@@ -193,6 +194,15 @@ pub(super) fn attach_client_caps(
         .with_layers(LayerSet::with(&[Layer::L3]));
     if let Some(colors) = default_colors {
         client_caps = client_caps.with_default_colors(colors);
+    }
+    // Offer frame compression on the remote lanes only (proto.md §6.4). The
+    // server compresses nothing it was not offered, so this one line is the
+    // whole gate: over UDS the bytes never leave the machine and deflating
+    // them would spend CPU on both ends to save a memcpy, while a remote
+    // attach ships a ~500 KiB native bootstrap prefix per pane that deflates
+    // 14x — the difference between a second and a blink on a home uplink.
+    if !matches!(dial, crate::attach::Dial::Uds(_)) {
+        client_caps = client_caps.with_compression(phux_protocol::caps::CompressionSet::all());
     }
     client_caps
 }

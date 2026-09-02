@@ -704,7 +704,7 @@ pub struct HookEntry {
 ///
 /// Anything here may be renamed, repurposed, or removed without a
 /// `SemVer` bump. Set explicitly only if you accept that contract.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentalCfg {
     /// Engage Mosh-class predictive local echo in `phux attach`.
@@ -723,9 +723,10 @@ pub struct ExperimentalCfg {
     /// timeout additionally expires any unconfirmed overlay after one
     /// second, on either screen.
     ///
-    /// Default `false` (phux-pxaj). Two main-screen cases the client
-    /// cannot detect keep the *default* off, though the opt-in is safe to
-    /// use:
+    /// Unset means **the transport decides** (see
+    /// [`Self::predictive_echo_for`]): on over a remote dial, off over the
+    /// local Unix socket. Two main-screen cases the client cannot detect are
+    /// why it is not simply on everywhere:
     ///
     /// 1. readline vi command-mode at the prompt (`set -o vi`) has no DEC
     ///    mode bit to detect it, so normal-mode keys are mispredicted as
@@ -736,29 +737,37 @@ pub struct ExperimentalCfg {
     ///    momentarily renders the typed characters locally, bounded by the
     ///    display timeout.
     ///
-    /// Making on-by-default safe still wants an RTT-adaptive gate (predict
-    /// only when the round trip is worth hiding — over local UDS it is
-    /// not). Until then it is opt-in.
+    /// ADR-0090 named the missing piece: "an RTT-adaptive gate (predict only
+    /// when the round trip is worth hiding — over local UDS it is not)". The
+    /// dial *is* that gate's coarse form, and it is known before the first
+    /// keystroke rather than estimated from one: a UDS attach echoes in
+    /// hundreds of microseconds, where a prediction can only cost the two
+    /// flicker cases above and buy nothing, while a `--remote` / `--quic` /
+    /// `--ws` attach pays a full network round trip per key, which is exactly
+    /// the latency the predictor exists to hide.
     ///
-    /// Set `true` to engage Mosh-class local echo (the predicted classes are
-    /// the conservative mosh-proven subset; a wrong guess is stomped by the
-    /// next authoritative frame, so the failure mode is a brief underlined
-    /// flicker in exchange for typing that doesn't wait a round trip per key).
-    #[serde(default = "default_predictive_echo", rename = "predictive-echo")]
-    pub predictive_echo: bool,
+    /// Set the key explicitly to override that in either direction — `true`
+    /// engages Mosh-class local echo everywhere including UDS, `false`
+    /// disables it everywhere including remote dials. An explicit value
+    /// always wins over the per-transport default.
+    #[serde(default, rename = "predictive-echo")]
+    pub predictive_echo: Option<bool>,
 }
 
-impl Default for ExperimentalCfg {
-    fn default() -> Self {
-        Self {
-            predictive_echo: default_predictive_echo(),
+impl ExperimentalCfg {
+    /// Resolve predictive echo for one attach, given whether its dial crosses
+    /// a network.
+    ///
+    /// An explicit `predictive-echo` in the config file wins in both
+    /// directions; with the key unset, a remote dial predicts and a local one
+    /// does not. See the field's docs for why the dial is the gate.
+    #[must_use]
+    pub const fn predictive_echo_for(&self, remote_dial: bool) -> bool {
+        match self.predictive_echo {
+            Some(explicit) => explicit,
+            None => remote_dial,
         }
     }
-}
-
-/// Serde default for [`ExperimentalCfg::predictive_echo`].
-const fn default_predictive_echo() -> bool {
-    false
 }
 
 // ---------------------------------------------------------------------------

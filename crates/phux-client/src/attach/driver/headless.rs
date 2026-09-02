@@ -512,7 +512,9 @@ pub async fn run_headless_rendered(
     /// Hard cap on waiting for the matching aggregate attach barrier.
     const ATTACH_READY_DEADLINE: Duration = Duration::from_secs(3);
 
-    let client_caps = attach_client_caps(None);
+    // Headless rendering is a local-socket path by signature, so it offers no
+    // compression — see `attach_client_caps`.
+    let client_caps = attach_client_caps(None, &crate::attach::Dial::uds(socket));
     let mut conn =
         Connection::connect_with_hello(socket, attach_client_name(), client_caps).await?;
     let negotiated = conn.negotiated_bootstrap().ok_or_else(|| {

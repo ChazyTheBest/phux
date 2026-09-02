@@ -8,6 +8,7 @@
 //! profile-negotiated bootstrap payloads. No cell-level diff or engine record
 //! parser exists in this crate.
 
+pub mod compress;
 pub mod decode;
 pub mod encode;
 pub mod error;

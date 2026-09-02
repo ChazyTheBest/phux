@@ -3,8 +3,6 @@ use std::process::ExitCode;
 
 use phux_client::attach::Dial;
 use phux_client::attach::connection::Connection;
-use phux_client::predict::PredictiveConfig;
-use phux_config::loader as config_loader;
 use phux_protocol::wire::frame::{
     AttachTarget, FrameKind, SESSION_CREATE_KEY, SESSION_CREATE_RESULT_KEY,
     SESSION_CREATE_RESULT_KEY_PREFIX, Scope,
@@ -129,20 +127,12 @@ pub(crate) fn run_new(
 
     let target = new_session_target(name.clone(), command, cwd);
 
-    let predict_cfg = match config_loader::load() {
-        Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo,
-        },
-        Err(err) => {
-            eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig::disabled()
-        }
-    };
-    match rt.block_on(run_attach_once(
-        &Dial::uds(&socket_path),
-        target,
-        predict_cfg,
-    )) {
+    // `phux new` is a local-socket verb by construction, so the shared
+    // resolver settles on the UDS answer: prediction off unless the config
+    // asks for it explicitly.
+    let dial = Dial::uds(&socket_path);
+    let predict_cfg = super::attach::predictive_config_for(&dial);
+    match rt.block_on(run_attach_once(&dial, target, predict_cfg)) {
         Ok(attach_end) => {
             // phux-i0e8.2.2: same one-line ending explanation as `phux
             // attach` — a last-pane death is named, a detach stays quiet.

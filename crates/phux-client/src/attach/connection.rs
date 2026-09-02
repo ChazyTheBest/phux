@@ -195,10 +195,17 @@ pub struct UdsWriter {
 pub struct QuicReader {
     recv: quinn::RecvStream,
     buf: BytesMut,
+    /// Landing pad for [`Self::poll_read_once`], zero-initialized once.
+    scratch: Box<[u8]>,
     _endpoint: quinn::Endpoint,
     _connection: quinn::Connection,
     bootstrap_limits: BootstrapLimits,
 }
+
+/// How much room [`QuicReader::poll_read_once`] offers quinn per non-blocking
+/// top-up. Sized to hold a full coalesced server write (`MAX_WRITE_COALESCE`
+/// frames of PTY output) so one poll usually drains the whole burst.
+const QUIC_TRY_READ_BYTES: usize = 64 * 1024;
 
 /// QUIC write half. Holds the endpoint + connection for the same reasons as
 /// [`QuicReader`]; its [`Drop`] issues a best-effort `CONNECTION_CLOSE`.
@@ -328,6 +335,7 @@ impl Connection {
             reader: FrameReader::Quic(QuicReader {
                 recv,
                 buf: BytesMut::with_capacity(8192),
+                scratch: vec![0_u8; QUIC_TRY_READ_BYTES].into_boxed_slice(),
                 _endpoint: endpoint.clone(),
                 _connection: connection.clone(),
                 bootstrap_limits: BootstrapLimits::default(),
@@ -1270,11 +1278,65 @@ impl QuicReader {
         }
     }
 
-    /// Drain a frame already sitting in the buffer behind the one [`Self::recv`]
-    /// just returned. quinn has no sync ready-check, so this never reads from
-    /// the stream — it only peels off bytes a prior `recv` over-read.
+    /// Drain a frame already sitting in the buffer behind the one
+    /// [`Self::recv`] just returned, topping the buffer up from the stream
+    /// first if quinn already holds more bytes.
+    ///
+    /// quinn exposes no `try_read`, but `RecvStream` is an [`AsyncRead`], so
+    /// "is there data without blocking" is answerable by polling that read
+    /// exactly once against a no-op waker: `Ready` means bytes were already
+    /// buffered in the connection, `Pending` means the socket would block and
+    /// we stop, which is the same contract [`UdsReader::try_recv`] offers via
+    /// `try_read_buf`. Abandoning a `Pending` poll is sound because quinn's
+    /// stream reads are cancel-safe (no byte is consumed by a poll that does
+    /// not return one) and because the caller's next `recv().await` re-polls
+    /// with the real waker, so the dropped no-op registration cannot lose a
+    /// wakeup.
+    ///
+    /// Without this the QUIC lane coalesced strictly less than UDS: it could
+    /// only peel off whatever one prior `read_buf` happened to over-read, so a
+    /// bulk burst (`seq 1 300000`, a full-screen repaint) decoded roughly one
+    /// frame per event-loop turn and paid a render plus a blocking flush for
+    /// each, instead of one paint per drained burst (phux-jhv8).
     fn try_recv(&mut self) -> Result<Option<FrameKind>, AttachError> {
-        decode_buffered(&mut self.buf, self.bootstrap_limits)
+        if let Some(frame) = decode_buffered(&mut self.buf, self.bootstrap_limits)? {
+            return Ok(Some(frame));
+        }
+        match self.poll_read_once()? {
+            // Zero bytes read is a clean stream finish; let the next `recv`
+            // name it `Disconnected` rather than inventing an ending here.
+            Some(0) | None => Ok(None),
+            Some(_) => decode_buffered(&mut self.buf, self.bootstrap_limits),
+        }
+    }
+
+    /// Poll one `AsyncRead` into `self.buf` against a no-op waker.
+    ///
+    /// `Ok(None)` means the read is pending — nothing was buffered and nothing
+    /// was consumed. `Ok(Some(n))` means `n` bytes landed in `self.buf`.
+    ///
+    /// The read lands in `scratch` and only the filled prefix is copied on.
+    /// `phux-client` is `#![forbid(unsafe_code)]`, so reading straight into
+    /// `buf`'s spare capacity is not available; the alternative — growing
+    /// `buf` with zeroes and truncating back — would memset the whole window
+    /// on *every* call, and this is called once per empty-buffer turn of a
+    /// bulk drain, which made a `seq 1 300000` burst pay that memset per
+    /// stream chunk. `scratch` is initialized once at construction and reused,
+    /// so a top-up costs one `memcpy` of exactly the bytes that arrived.
+    fn poll_read_once(&mut self) -> Result<Option<usize>, AttachError> {
+        use tokio::io::AsyncRead;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut read_buf = tokio::io::ReadBuf::new(&mut self.scratch);
+        let polled = std::pin::Pin::new(&mut self.recv).poll_read(&mut cx, &mut read_buf);
+        match polled {
+            std::task::Poll::Pending => Ok(None),
+            std::task::Poll::Ready(Err(err)) => Err(AttachError::Io(err)),
+            std::task::Poll::Ready(Ok(())) => {
+                let filled = read_buf.filled().len();
+                self.buf.extend_from_slice(&self.scratch[..filled]);
+                Ok(Some(filled))
+            }
+        }
     }
 }
 

@@ -764,10 +764,14 @@ or session comes into being:
   these applied — see [`agents.md`](./agents.md) §4.15.
 
 **Experimental knobs** live under `[experimental]`. Today the only key
-is `predictive-echo` (boolean, default `false`), which opts `phux attach`
-into Mosh-class predictive local echo — a client-side guess for the next
-keystroke, rendered with an underline, that is reconciled when the
-server's authoritative output arrives. The TOML key is parsed by
+is `predictive-echo` (boolean, **unset by default — the transport
+decides**), which controls Mosh-class predictive local echo in `phux
+attach` — a client-side guess for the next keystroke, rendered with an
+underline, that is reconciled when the server's authoritative output
+arrives. With the key unset, prediction is **on for a remote attach**
+(`--remote`, `--quic`, `--ws`) and **off over the local Unix socket**. Set
+it explicitly to override that in either direction: `true` predicts
+everywhere including UDS, `false` never predicts. The TOML key is parsed by
 `phux-config` and wired into the attach driver as `PredictiveConfig`.
 The prediction set is the conservative mosh-proven subset
 (single-grapheme inserts, end-of-line backspace, Ctrl-U at a known prompt
@@ -795,19 +799,31 @@ transport the server echo is already near-instant, so the benefit is most
 visible on the higher-latency remote transport
 ([ADR-0007](../../ADR/0007-mosh-class-transport-and-satellites.md)).
 
-**Why it is still off by default.** Two main-screen cases the client
-cannot detect keep the default conservative: readline **vi command-mode**
-at the prompt (`set -o vi`), where normal-mode keys are mispredicted as
-inserts until the tentative lock hides the overlay (a brief underlined
-flicker), and **no-echo prompts** (`sudo`/`ssh` passwords), where echo is
-suppressed by the server PTY's termios — invisible to the client — so a
-predicted insert momentarily renders the typed characters, bounded by the
-one-second display timeout. Making it safe on-by-default still wants an
-RTT-adaptive gate (predict only when the round trip is worth hiding);
-until then it is a deliberate opt-in.
+**Why the dial is the default.** Two main-screen cases the client cannot
+detect are why prediction is not simply on everywhere: readline **vi
+command-mode** at the prompt (`set -o vi`), where normal-mode keys are
+mispredicted as inserts until the tentative lock hides the overlay (a
+brief underlined flicker), and **no-echo prompts** (`sudo`/`ssh`
+passwords), where echo is suppressed by the server PTY's termios —
+invisible to the client — so a predicted insert momentarily renders the
+typed characters, bounded by the one-second display timeout.
+
+[ADR-0090](../../ADR/0090-confirmation-gated-predictive-echo.md) named the
+missing piece as "an RTT-adaptive gate (predict only when the round trip
+is worth hiding — over local UDS it is not)". The dial is that gate in its
+coarse form, and it has the advantage of being known before the first
+keystroke rather than estimated from one: a UDS attach echoes in hundreds
+of microseconds, where a prediction can only cost the two cases above and
+buy nothing, while every remote lane pays a full network round trip per
+key — exactly the latency the predictor exists to hide. A finer
+SRTT-derived gate can refine this later without changing the key's
+meaning.
 
 ```toml
 [experimental]
+# Unset: predict on --remote/--quic/--ws, not on the local socket.
+# true:  predict on every transport, UDS included.
+# false: never predict.
 predictive-echo = false
 ```
 

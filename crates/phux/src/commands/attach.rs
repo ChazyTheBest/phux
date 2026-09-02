@@ -135,18 +135,11 @@ pub(crate) fn run_naked(socket: Option<PathBuf>, rec: Option<&RecordSpec>) -> Ex
         }
     };
 
-    let predict_cfg = match config_loader::load() {
-        Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo,
-        },
-        Err(err) => {
-            eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig::disabled()
-        }
-    };
+    let dial = Dial::uds(&socket_path);
+    let predict_cfg = predictive_config_for(&dial);
 
     let result = rt.block_on(attach_with_reconnect(
-        &Dial::uds(&socket_path),
+        &dial,
         AttachTarget::Last,
         predict_cfg,
         Some(&default_name),
@@ -835,21 +828,13 @@ pub(crate) fn run_attach_rec(
     // Load user config to discover experimental opt-ins. Failures here
     // are non-fatal — we log and fall back to defaults so a syntax
     // error in config.toml doesn't lock the user out of their server.
-    let predict_cfg = match config_loader::load() {
-        Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo,
-        },
-        Err(err) => {
-            eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig::disabled()
-        }
-    };
-
+    //
     // No explicit name → behave like naked `phux`: try `Last`, then
     // create-and-attach the default session. This is robust to an empty
     // server (e.g. one whose auto-spawned seed pane exited before we
     // connected). An explicit name attaches to that session only.
     let dial = Dial::uds(&socket_path);
+    let predict_cfg = predictive_config_for(&dial);
     let result = match target {
         AttachTarget::Last => rt.block_on(attach_with_reconnect(
             &dial,
@@ -1063,15 +1048,7 @@ pub(crate) fn run_attach_quic(
         trust,
     });
 
-    let predict_cfg = match config_loader::load() {
-        Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo,
-        },
-        Err(err) => {
-            eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig::disabled()
-        }
-    };
+    let predict_cfg = predictive_config_for(&dial);
 
     let default_name = resolved_default_session_name();
     let (attach_target, default) = session.map_or_else(
@@ -1156,7 +1133,7 @@ pub(crate) fn run_attach_ws(
         }
     };
 
-    let predict_cfg = predictive_config_or_defaults();
+    let predict_cfg = predictive_config_for(&dial);
 
     let default_name = resolved_default_session_name();
     let (target, default) = session.map_or_else(
@@ -1223,17 +1200,43 @@ fn validated_ws_token(token: Option<String>) -> Result<Option<String>, ExitCode>
     }
 }
 
-/// The predictive-echo setting from the config file, falling back to the
-/// defaults (and saying so) when the config cannot be read.
-fn predictive_config_or_defaults() -> PredictiveConfig {
+/// The predictive-echo setting for one dial: the config file's explicit value
+/// if it has one, otherwise on for a remote transport and off for the local
+/// Unix socket.
+///
+/// Same shape as [`reconnect_policy`] — one policy resolved per dial lane —
+/// and for the same reason. ADR-0090 shipped confirmation-gated prediction but
+/// left it opt-in pending "an RTT-adaptive gate (predict only when the round
+/// trip is worth hiding — over local UDS it is not)". The dial answers that
+/// question before the first keystroke: UDS echo is a few hundred
+/// microseconds, so a prediction there can only pay the ADR's two flicker
+/// cases and hide nothing, while every remote lane pays a real round trip per
+/// key. Load failures fall back to defaults (and say so).
+pub(crate) fn predictive_config_for(dial: &Dial) -> PredictiveConfig {
     match config_loader::load() {
         Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo,
+            enabled: cfg.experimental.predictive_echo_for(dial_is_remote(dial)),
         },
         Err(err) => {
             eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig::disabled()
+            PredictiveConfig {
+                enabled: phux_config::ExperimentalCfg::default()
+                    .predictive_echo_for(dial_is_remote(dial)),
+            }
         }
+    }
+}
+
+/// Does this dial cross a network?
+///
+/// `--remote` resolves to one of the two remote lanes before it reaches a
+/// `Dial` (see [`run_attach_remote`]), so matching the two remote variants
+/// covers it too. An `ssh://` remote never builds a `Dial` at all — it execs
+/// `phux attach` on the far host, which then makes its own local decision.
+const fn dial_is_remote(dial: &Dial) -> bool {
+    match dial {
+        Dial::Uds(_) => false,
+        Dial::Quic(_) | Dial::Ws(_) => true,
     }
 }
 
@@ -1262,6 +1265,56 @@ mod tests {
     use phux_protocol::wire::frame::DetachReason;
 
     use super::*;
+
+    /// The dial is the coarse RTT gate ADR-0090 asked for: an unset
+    /// `predictive-echo` predicts on the two remote lanes and stays quiet on
+    /// the local socket, while an explicit config value beats the default in
+    /// both directions.
+    #[test]
+    fn predictive_echo_defaults_follow_the_dial() {
+        let uds = Dial::uds(std::path::Path::new("/tmp/phux-test.sock"));
+        let quic = Dial::Quic(QuicDial {
+            addr: "127.0.0.1:8788".parse().expect("addr"),
+            server_name: "localhost".to_owned(),
+            token: None,
+            trust: CertTrust::SkipVerify,
+        });
+        let ws = Dial::Ws(WsDial {
+            url: "wss://example.invalid:8787".to_owned(),
+            token: None,
+            trust: CertTrust::SkipVerify,
+            tls_server_name: None,
+        });
+
+        assert!(!dial_is_remote(&uds), "UDS never leaves the machine");
+        assert!(dial_is_remote(&quic));
+        assert!(dial_is_remote(&ws));
+
+        let unset = phux_config::ExperimentalCfg::default();
+        assert!(
+            !unset.predictive_echo_for(dial_is_remote(&uds)),
+            "UDS echo is a few hundred microseconds; a prediction hides nothing \
+             and can only pay ADR-0090's two flicker cases"
+        );
+        assert!(
+            unset.predictive_echo_for(dial_is_remote(&quic)),
+            "a QUIC attach pays a real round trip per key"
+        );
+        assert!(unset.predictive_echo_for(dial_is_remote(&ws)));
+
+        let forced_on = phux_config::ExperimentalCfg {
+            predictive_echo: Some(true),
+        };
+        assert!(forced_on.predictive_echo_for(dial_is_remote(&uds)));
+
+        let forced_off = phux_config::ExperimentalCfg {
+            predictive_echo: Some(false),
+        };
+        assert!(
+            !forced_off.predictive_echo_for(dial_is_remote(&quic)),
+            "an explicit opt-out must stick on every transport"
+        );
+    }
 
     /// phux-i0e8.2.2: the one-line ending explanation both CLI callers
     /// (`phux attach`, `phux new`) print after teardown. A detach says

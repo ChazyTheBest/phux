@@ -78,13 +78,18 @@ pub(crate) trait FrameWriter {
     /// `batch[ends[i - 1]..ends[i]]`, with an implicit `0` before the first).
     ///
     /// The default is one [`Self::write_frame`] per frame, which is what a
-    /// message-oriented transport (WebSocket, WebTransport, QUIC) requires:
-    /// there, a frame boundary IS a transport message boundary and merging
-    /// two frames into one write would corrupt the stream. A byte-stream
-    /// transport has no such constraint — its frames are self-delimiting via
-    /// the length prefix `FrameKind::encode` already wrote — so it can and
-    /// should override this with a single write of the whole batch. See
-    /// `UdsWriter`.
+    /// **message-oriented** transport requires: there, a frame boundary IS a
+    /// transport message boundary and merging two frames into one write would
+    /// corrupt the stream. WebSocket is the only such transport phux speaks —
+    /// its writer hands each frame to `Message::Binary`.
+    ///
+    /// A **byte-stream** transport has no such constraint: its frames are
+    /// self-delimiting via the length prefix `FrameKind::encode` already
+    /// wrote, so it overrides this with a single write of the whole batch.
+    /// UDS, QUIC, and WebTransport are all in this class — the QUIC and
+    /// WebTransport writers each own one reliable ordered *stream*, not a
+    /// datagram flow, and their readers reassemble by length prefix exactly
+    /// as `UdsReader` does. See `UdsWriter`, `QuicWriter`, `WtWriter`.
     async fn write_frames(&mut self, batch: &[u8], ends: &[usize]) -> io::Result<()> {
         let mut start = 0;
         for &end in ends {

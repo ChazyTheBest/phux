@@ -291,7 +291,7 @@ mod tests {
             .theme
             .slots
             .insert("fg".to_owned(), "#cdd6f4".to_owned());
-        config.experimental.predictive_echo = true;
+        config.experimental.predictive_echo = Some(true);
         config
     }
 
