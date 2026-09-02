@@ -1648,6 +1648,94 @@ mod tests {
         StatusBarPainter::new(bar, Position::Bottom)
     }
 
+    /// A realistic large-viewport truecolor repaint is BIGGER THAN THE
+    /// STDOUT SINK'S BACKLOG CAP, in one chunk.
+    ///
+    /// This is the size premise behind
+    /// `stdout_writer::an_oversized_frame_on_an_empty_queue_is_written_not_dropped`,
+    /// asserted here so the two cannot drift apart. Once the renderer stopped
+    /// flushing per pane (phux-l96p.2) and the composite frame stopped
+    /// flushing per component (phux-l96p.3), a full repaint became ONE chunk
+    /// handed to `StdoutSink` — and the sink's cap used to reject any chunk
+    /// that did not fit alongside the queue, which at this size meant
+    /// rejecting it even when the queue was empty. That froze the screen after
+    /// every full repaint at a large viewport.
+    ///
+    /// Measured on a grid small enough to bootstrap in one chunk
+    /// (`DEFAULT_BOOTSTRAP_CHUNK_BYTES` is 256 KiB and this content costs
+    /// about as many bytes going in as coming out), then extrapolated to the
+    /// 250x70 a full-screen terminal actually is. The content is one 24-bit
+    /// foreground and background per cell, which is what a half-block image
+    /// renderer (`chafa`, `timg`) or a gradient dashboard (`btop`) emits.
+    #[test]
+    fn a_large_truecolor_full_frame_exceeds_the_sink_backlog_cap() {
+        const COLS: u16 = 100;
+        const ROWS: u16 = 40;
+        /// The viewport the freeze was reported at.
+        const REAL_COLS: usize = 250;
+        const REAL_ROWS: usize = 70;
+
+        let pane = TerminalId::local(1);
+        let layout = LayoutState {
+            tree: Some(LayoutNode::Leaf(pane.clone())),
+            focus: Some(pane.clone()),
+        };
+        // Every cell a different fg+bg, so the renderer's SGR delta cannot
+        // coalesce runs — the pathological-but-real case.
+        let mut vt = Vec::new();
+        for row in 0..ROWS {
+            vt.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+            for col in 0..COLS {
+                let r = row.wrapping_mul(3).wrapping_add(col) % 256;
+                let g = col.wrapping_mul(7).wrapping_add(row) % 256;
+                let b = row.wrapping_mul(col) % 256;
+                vt.extend_from_slice(
+                    format!("\x1b[38;2;{r};{g};{b}m\x1b[48;2;{b};{r};{g}m\u{2580}").as_bytes(),
+                );
+            }
+        }
+        let kernel = published_kernel(std::slice::from_ref(&pane), COLS, ROWS, &vt);
+        let mut panes: HashMap<TerminalId, PaneSlot> = HashMap::new();
+        panes.insert(
+            pane.clone(),
+            PaneSlot::new_with_size(COLS, ROWS).expect("slot"),
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        paint_full_frame(
+            &mut out,
+            &layout,
+            &mut panes,
+            &kernel,
+            Some(&pane),
+            (COLS, ROWS),
+            None,
+            None,
+            None,
+            "demo",
+            &crate::render::theme::Theme::default(),
+        );
+
+        let cells = usize::from(COLS) * usize::from(ROWS);
+        let per_cell = out.len() / cells;
+        assert!(
+            per_cell >= 20,
+            "a truecolor cell costs about 40 bytes to emit; got {per_cell} \
+             from {} bytes over {cells} cells — if this collapsed, the \
+             renderer changed and the sink's sizing assumptions want revisiting",
+            out.len()
+        );
+        let full_screen = per_cell * REAL_COLS * REAL_ROWS;
+        assert!(
+            full_screen > crate::attach::stdout_writer::CAP_BYTES,
+            "a {REAL_COLS}x{REAL_ROWS} truecolor repaint is ~{full_screen} \
+             bytes in ONE chunk, which must exceed the sink's \
+             {} byte backlog cap — that is the case the cap used to reject \
+             outright, freezing the screen",
+            crate::attach::stdout_writer::CAP_BYTES
+        );
+    }
+
     /// `paint_full_frame` against an injected `Vec<u8>` sink composites
     /// the whole frame for a two-pane layout: it wraps ED2 + home and all
     /// component writes in synchronized output,

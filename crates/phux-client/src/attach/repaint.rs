@@ -174,7 +174,39 @@ pub(super) struct PaintPacer {
     /// construction (one entry per visible pane), so a linear dedup beats a
     /// hash set.
     pending: Vec<phux_protocol::ids::TerminalId>,
+    /// While set and unexpired, output counts as a REPLY to the user and is
+    /// not paced.
+    ///
+    /// Without this the pacer taxes exactly the latency that matters most.
+    /// The measured shape: p50 echo improved (222us -> 176us) while p99 went
+    /// 711us -> 17.4ms and the max to 19.1ms, with the slow keystrokes
+    /// clustered at one frame interval. The mechanism is a keystroke landing
+    /// just after some other paint opened a window — its echo is unsolicited
+    /// output as far as the pacer can tell, so it waited up to 16ms for a
+    /// deadline it should never have been subject to.
+    ///
+    /// Pacing exists to stop a program that floods the screen from repainting
+    /// faster than anyone can see. It was never meant to govern the echo of a
+    /// keypress, and this deadline is the distinction: unsolicited output is
+    /// paced, a reply to the user is not.
+    ///
+    /// A DEADLINE rather than a one-shot flag, because a reply is not always
+    /// one frame — a shell echo and the readline redraw that follows it
+    /// arrive as two, and a flag consumed by the first leaves the second (the
+    /// one carrying the glyph the user is waiting for) to wait out the window.
+    /// That is measurable: the one-shot version left the 8-22ms band at 4.3%
+    /// of keystrokes against 1.2% with pacing disabled outright.
+    input_until: Option<tokio::time::Instant>,
 }
+
+/// How long after an input batch output still counts as a reply to it.
+///
+/// Sized to cover a reply fragmented across several frames over the local
+/// transport — a UDS round trip is tens of microseconds — without handing a
+/// sustained flood a standing exemption. At 10 keystrokes a second this lifts
+/// pacing for a fifth of the time at most, and only for the pane the user is
+/// actually looking at.
+const INPUT_GRACE: Duration = Duration::from_millis(20);
 
 impl PaintPacer {
     /// Whether a composited frame may be emitted at `now`, arming the next
@@ -183,15 +215,48 @@ impl PaintPacer {
     /// The single decision point: callers that are admitted paint inline,
     /// callers that are refused [`Self::withhold`] every pane they touched.
     pub(super) fn admit(&mut self, now: tokio::time::Instant) -> bool {
-        let interval = frame_interval();
-        if interval.is_zero() {
+        if frame_interval().is_zero() {
             return true;
         }
+        // A frame that answers the user bypasses the window entirely, and the
+        // window then restarts from THIS paint rather than from whatever
+        // unsolicited output happened to open the last one.
+        //
+        // The grace is deliberately NOT consumed here: the rest of a
+        // fragmented reply must bypass too, or the frame carrying the glyph
+        // the user is waiting for is exactly the one that waits.
+        if self.input_until.is_some_and(|until| now < until) {
+            super::render_prof::note_paced_replies(1);
+            self.next_allowed = Some(now + frame_interval());
+            return true;
+        }
+        self.input_until = None;
         if self.next_allowed.is_some_and(|at| now < at) {
+            super::render_prof::note_paced_waits(1);
             return false;
         }
-        self.next_allowed = Some(now + interval);
+        self.next_allowed = Some(now + frame_interval());
         true
+    }
+
+    /// Note that the user just sent input, so the next output frame is a
+    /// reply to them and must paint immediately.
+    ///
+    /// Set from the one place every input batch funnels through, before the
+    /// events are dispatched — a key consumed by a local keybinding counts
+    /// too, because the repaint it triggers is just as much a response to the
+    /// user as a pane echo is.
+    pub(super) fn note_input(&mut self, now: tokio::time::Instant) {
+        self.input_until = Some(now + INPUT_GRACE);
+    }
+
+    /// Start the pacing window at `now`.
+    ///
+    /// Called from every path that actually emits a composited frame, so the
+    /// cadence is measured from paints rather than from arrivals. It does not
+    /// touch the input grace: only time expires that.
+    pub(super) fn rearm(&mut self, now: tokio::time::Instant) {
+        self.next_allowed = Some(now + frame_interval());
     }
 
     /// Remember that `terminal_id` owes a settle paint.
@@ -304,6 +369,91 @@ mod tests {
             pacer.deadline(),
             Some(t0 + frame_interval()),
             "a withheld pane arms the window's end"
+        );
+    }
+
+    /// The felt-latency rule: a frame that answers the user is not paced.
+    ///
+    /// Measured regression this pins down — p50 echo improved (222us ->
+    /// 176us) while p99 went 711us -> 17.4ms and max 2.9ms -> 19.1ms, the
+    /// slow keystrokes clustered at one frame interval. A keypress whose echo
+    /// happened to arrive just after some unrelated paint opened a window was
+    /// treated as unsolicited output and made to wait for a deadline it
+    /// should never have been subject to.
+    #[test]
+    fn input_in_flight_bypasses_a_window_that_would_otherwise_refuse() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        // Some unrelated output paints and opens a window.
+        assert!(pacer.admit(t0));
+        let mid = t0 + frame_interval() / 2;
+        assert!(
+            !pacer.admit(mid),
+            "unsolicited output inside the window is still paced"
+        );
+        // The user types. The echo that follows is a REPLY, not a flood.
+        pacer.note_input(mid);
+        assert!(
+            pacer.admit(mid),
+            "a frame answering the user must not wait for the window"
+        );
+    }
+
+    /// The grace covers a reply that arrives as SEVERAL frames.
+    ///
+    /// This is what the one-shot version got wrong, and it was worth 4.3% of
+    /// keystrokes landing in the 8-22ms band against 1.2% with pacing off: a
+    /// shell echo and the readline redraw behind it are two frames, and a
+    /// flag consumed by the first left the second — the one carrying the
+    /// glyph the user is waiting for — to wait out the window.
+    #[test]
+    fn the_grace_covers_a_reply_split_across_frames() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        pacer.note_input(t0);
+        assert!(pacer.admit(t0), "the first frame of the reply paints");
+        assert!(
+            pacer.admit(t0 + Duration::from_millis(1)),
+            "and so does the second, 1ms later, still inside the grace"
+        );
+        assert!(pacer.admit(t0 + Duration::from_millis(5)), "and the third");
+    }
+
+    /// The grace EXPIRES, so a flood never gets a standing exemption from one
+    /// keystroke: past the window, unsolicited output is paced again.
+    #[test]
+    fn the_input_grace_expires_and_pacing_resumes() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        pacer.note_input(t0);
+        assert!(pacer.admit(t0), "the reply paints");
+        // Past the grace, admission is decided by the window again. The
+        // first frame out there opens a fresh one...
+        let after_grace = t0 + INPUT_GRACE;
+        assert!(
+            pacer.admit(after_grace),
+            "the grace has lapsed and so has the window opened by the reply"
+        );
+        // ...and the next frame inside it is refused, which is pacing back in
+        // force. One keystroke buys a grace, never a standing exemption.
+        assert!(
+            !pacer.admit(after_grace + frame_interval() / 2),
+            "once the grace lapses the flood is paced again"
+        );
+    }
+
+    /// `rearm` restarts the window but must NOT cancel the grace: a settle
+    /// that lands mid-reply would otherwise make the rest of that reply wait,
+    /// which is the exact shape of the bug the grace exists to close.
+    #[test]
+    fn rearm_restarts_the_window_without_cancelling_the_grace() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        pacer.note_input(t0);
+        pacer.rearm(t0);
+        assert!(
+            pacer.admit(t0 + Duration::from_millis(1)),
+            "the rest of the reply still bypasses the window"
         );
     }
 

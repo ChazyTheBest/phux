@@ -21,6 +21,8 @@
 //! * `bar_composes` — runs of the status-bar widget pipeline.
 //! * `layouts` — `compute_layout_in` calls that missed the layout cache.
 //! * `flushes` / `bytes` — what reached the off-loop stdout writer.
+//! * `paced_replies` — frames admitted because they answer the user's input.
+//! * `paced_waits` — frames the pacer held back for its window.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -42,6 +44,8 @@ static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static BAR_COMPOSES: AtomicU64 = AtomicU64::new(0);
 static LAYOUTS: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
+static PACED_REPLIES: AtomicU64 = AtomicU64::new(0);
+static PACED_WAITS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `PHUX_RENDER_PROF` asked for counters, read from the environment
@@ -106,6 +110,19 @@ counter!(
     note_bytes,
     BYTES
 );
+counter!(
+    /// One frame admitted because it answers the user's input rather than
+    /// arriving unsolicited — the pacer's felt-latency exemption.
+    note_paced_replies,
+    PACED_REPLIES
+);
+counter!(
+    /// One frame the pacer made wait for its window. The pair
+    /// `paced_replies` / `paced_waits` is how a latency regression in the
+    /// scheduler is told apart from load on the box.
+    note_paced_waits,
+    PACED_WAITS
+);
 
 /// The reporting window. One line per second keeps the log readable while a
 /// 300k-line `seq` runs, and matches the cadence a human reads `ps` at.
@@ -145,6 +162,8 @@ fn tick_at(now: std::time::Instant) {
         bar_composes = BAR_COMPOSES.swap(0, REL),
         layouts = LAYOUTS.swap(0, REL),
         flushes = FLUSHES.swap(0, REL),
+        paced_replies = PACED_REPLIES.swap(0, REL),
+        paced_waits = PACED_WAITS.swap(0, REL),
         bytes = BYTES.swap(0, REL),
         window_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         "render_prof",

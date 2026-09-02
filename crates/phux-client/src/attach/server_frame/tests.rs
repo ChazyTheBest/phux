@@ -2122,6 +2122,92 @@ fn terminal_output_seq_zero_is_rejected() {
 /// output for the right (non-focused) pane and assert the captured VT
 /// carries a CUP into the right pane's rect origin plus the emitted
 /// graphemes — proving the regression without a live terminal.
+/// phux-l96p.3: the settle paints EVERY withheld pane, in one frame.
+///
+/// The mechanism behind the debt fold in `handle_frame_burst`. The bug it
+/// closes: `admit` pushes `next_allowed` to `now + interval` on an admitted
+/// burst, so the post-burst deadline guard can never fire on that pass, and
+/// the `paint_deadline` select arm sits third in a `biased` select behind
+/// `conn.recv()` — which a saturating producer keeps permanently ready. A
+/// pane that emitted one line during a refused window and then went quiet
+/// (`yes` in pane A, one line in pane B) stayed unpainted for as long as A
+/// kept talking. The fix folds the debt into the admitted burst's frame, so
+/// what matters is that a multi-pane settle really does paint them all, and
+/// as a SINGLE synchronized block rather than one per pane.
+#[test]
+fn a_settle_paints_every_withheld_pane_in_one_frame() {
+    let left = tid(1);
+    let right = tid(2);
+    let layout = two_pane_workspace(&left, &right, &left);
+    let mut focused = Some(left.clone());
+    let (mut engine, mut panes) = published_fixture(&[(&left, 80, 24, b""), (&right, 80, 24, b"")]);
+
+    // Both panes emit while their paint is withheld: the mirrors ingest, the
+    // screen sees nothing.
+    let mut withheld: Vec<u8> = Vec::new();
+    for (pane, bytes) in [(&left, &b"LEFTSIDE"[..]), (&right, &b"RIGHTSIDE"[..])] {
+        let seq = engine
+            .kernel
+            .published(pane)
+            .expect("published terminal")
+            .last_seq()
+            .checked_add(1)
+            .expect("live sequence");
+        let _ = drive_output_deferred(
+            &mut engine,
+            &mut withheld,
+            &mut layout.clone(),
+            &mut focused,
+            &mut panes,
+            pane,
+            bytes,
+            seq,
+        );
+    }
+    assert!(
+        withheld.is_empty(),
+        "withheld frames paint nothing: {withheld:?}"
+    );
+
+    // The settle: one composited frame covering both owed panes.
+    let mut out: Vec<u8> = Vec::new();
+    let _ = super::paint_output_frame(
+        super::OutputFrame {
+            out: &mut out,
+            kernel: &engine.kernel,
+            panes: &mut panes,
+            workspace: &layout,
+            zoomed: None,
+            focused_pane: focused.as_ref(),
+            status_bar: None,
+            sidebar: None,
+            viewport_dims: (80, 24),
+            session_name: "",
+            predict: &mut PredictionState::new(PredictiveConfig::disabled(), 80, 24),
+            overlay: &Overlay,
+        },
+        &[left.clone(), right.clone()],
+    );
+
+    let s = String::from_utf8_lossy(&out);
+    let visible = strip_csi(&s);
+    assert!(
+        visible.contains("LEFTSIDE"),
+        "the focused pane's withheld output must land; visible = {visible:?}"
+    );
+    assert!(
+        visible.contains("RIGHTSIDE"),
+        "the QUIET pane's withheld output must land too — this is the pane \
+         the bug stranded; visible = {visible:?}"
+    );
+    assert_eq!(
+        s.matches("\x1b[?2026h").count(),
+        1,
+        "both panes settle inside ONE synchronized block: {s:?}"
+    );
+    assert_eq!(s.matches("\x1b[?2026l").count(), 1, "and one close: {s:?}");
+}
+
 #[test]
 fn non_focused_pane_repaints_on_output() {
     let left = tid(1);

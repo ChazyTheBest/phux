@@ -31,11 +31,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-/// Backlog cap in bytes before the sink drops the stale queue and forces a
-/// resync. A single full-screen repaint is ~20–30 KB even at large multi-pane
-/// sizes, so this is comfortably above one legitimate frame (a healthy
-/// terminal never trips it) yet bounds memory under a stuck/slow sink.
-const CAP_BYTES: usize = 256 * 1024;
+/// Backlog cap in bytes: how much ALREADY-QUEUED work may pile up before the
+/// sink drops it and forces a resync.
+///
+/// This governs the backlog and never the frame in hand — see [`StdoutSink::flush`]
+/// for why that distinction is load-bearing. It bounds memory under a stuck or
+/// slow terminal; the queue's true ceiling is this plus the one frame being
+/// enqueued when the cap trips.
+pub(super) const CAP_BYTES: usize = 256 * 1024;
 
 /// Shared producer/consumer state behind the lock.
 struct QueueState {
@@ -55,6 +58,10 @@ struct QueueState {
     spare: Vec<Vec<u8>>,
     /// Running total of `chunks` byte lengths (cheap cap check).
     bytes: usize,
+    /// Largest recycled buffer the writer thread may return, published by the
+    /// sink from the frame sizes it actually ships. Both sides apply the same
+    /// limit, so a buffer is never pooled by one and rejected by the other.
+    spare_limit: usize,
     /// Set by [`WriterHandle::shutdown_and_join`]; tells the writer to drain
     /// and exit.
     shutdown: bool,
@@ -62,14 +69,25 @@ struct QueueState {
 
 /// Upper bound on recycled buffers held between the two sides.
 ///
-/// One in flight and one being filled is the steady state; a small pool
-/// absorbs a burst without letting a pathological run pin memory that the
-/// [`CAP_BYTES`] backlog check would otherwise have bounded.
-const SPARE_POOL: usize = 4;
+/// One in flight and one being filled is the steady state, which is what this
+/// is sized to now that a spare may be frame-sized rather than capped at a
+/// flat 64 KiB: two big-viewport buffers is a bounded amount of memory, four
+/// was not.
+const SPARE_POOL: usize = 2;
 
-/// Largest recycled buffer kept. A one-off giant frame (a full-screen repaint
-/// at a huge viewport) must not permanently pin its capacity.
-const SPARE_MAX_BYTES: usize = 64 * 1024;
+/// Floor for the recycled-buffer size limit — always worth pooling this much,
+/// even before a large frame has been seen.
+const SPARE_MIN_BYTES: usize = 64 * 1024;
+
+/// Absolute ceiling on a recycled buffer, so a pathological one-off frame
+/// cannot pin memory forever.
+///
+/// The limit actually applied is the largest chunk this sink has shipped,
+/// clamped between [`SPARE_MIN_BYTES`] and this. A flat 64 KiB ceiling meant
+/// recycling disengaged exactly where an allocation per frame costs most: a
+/// 250x70 truecolor repaint is ~400 KB, so every such frame allocated a fresh
+/// buffer and freed the old one while the pool sat unused.
+const SPARE_MAX_BYTES: usize = 1024 * 1024;
 
 struct Shared {
     queue: Mutex<QueueState>,
@@ -90,6 +108,11 @@ pub(super) struct StdoutSink {
     pending: Vec<u8>,
     /// Buffers reclaimed from the writer thread, ready to be refilled.
     recycled: Vec<Vec<u8>>,
+    /// Largest chunk this sink has shipped, which is what the recycling limit
+    /// is sized from. Monotone: a viewport that shrinks keeps the larger
+    /// limit, which costs at most [`SPARE_POOL`] buffers of memory and avoids
+    /// thrashing the pool across a resize.
+    high_water: usize,
 }
 
 impl StdoutSink {
@@ -100,9 +123,10 @@ impl StdoutSink {
     /// function rather than a method so the caller can hold the lock guard —
     /// which borrows `self.shared` — while handing over `self.recycled`.
     fn reclaim(recycled: &mut Vec<Vec<u8>>, q: &mut QueueState) {
+        let limit = q.spare_limit;
         while recycled.len() < SPARE_POOL {
             let Some(mut buf) = q.spare.pop() else { break };
-            if buf.capacity() > SPARE_MAX_BYTES {
+            if buf.capacity() > limit {
                 continue;
             }
             buf.clear();
@@ -111,6 +135,16 @@ impl StdoutSink {
         // Anything left in `spare` beyond what we want is dropped here rather
         // than accumulating.
         q.spare.clear();
+    }
+
+    /// Return `buf` to `pool` if there is room for it and it is not larger
+    /// than `limit`. Both sides of the queue pool through the same rule.
+    fn pool(pool: &mut Vec<Vec<u8>>, mut buf: Vec<u8>, limit: usize) {
+        if pool.len() >= SPARE_POOL || buf.capacity() > limit {
+            return;
+        }
+        buf.clear();
+        pool.push(buf);
     }
 }
 
@@ -147,21 +181,47 @@ impl Write for StdoutSink {
             // `pending` a valid empty buffer at all times.
             let recycled = self.recycled.pop().unwrap_or_default();
             let chunk = std::mem::replace(&mut self.pending, recycled);
-            if q.bytes.saturating_add(chunk.len()) > CAP_BYTES {
-                // Writer is behind. Drop the stale backlog AND this chunk (a
-                // diff that would corrupt the screen if applied after the gap)
-                // and ask the driver to repaint the latest state from scratch.
+            // Grow the recycling limit to the frames this terminal actually
+            // produces, bounded, and publish it for the writer side.
+            self.high_water = self.high_water.max(chunk.len());
+            q.spare_limit = self.high_water.clamp(SPARE_MIN_BYTES, SPARE_MAX_BYTES);
+            // The cap governs the EXISTING BACKLOG, never the frame in hand.
+            //
+            // It used to read `q.bytes + chunk.len() > CAP_BYTES`, which made
+            // a single frame larger than the cap undroppable-into: with an
+            // empty queue the sum is still over, so the frame was discarded
+            // and `needs_resync` set; the driver answered with
+            // `paint_full_frame`, which produces the SAME oversized chunk,
+            // which was discarded again. A 250x70 truecolor repaint is around
+            // 400 KB — one `chafa` render, or `btop`'s gradients — so the
+            // screen simply stopped updating after any full repaint (resize,
+            // split, overlay dismiss) while every wake-up burned a full
+            // render. Making the frame in hand unconditional at an
+            // under-cap queue is what breaks that loop: a fresh frame is
+            // never the stale diff the cap exists to drop.
+            if q.bytes > CAP_BYTES {
+                // A real backlog: the writer is behind and these queued diffs
+                // will never reach the glass. Drop them and ask the driver for
+                // a self-contained repaint.
+                //
+                // The frame in hand goes too, and only here: dropping the
+                // backlog is what CREATES the gap, and this chunk's diff was
+                // computed against the state those dropped bytes would have
+                // produced. Applying it over the gap would paint garbage. The
+                // resync repaint that follows is self-contained (`ED2` plus a
+                // full redraw) and lands on an empty queue, so it is enqueued
+                // by the branch below and the screen converges.
                 q.chunks.clear();
                 q.bytes = 0;
                 self.needs_resync.store(true, Ordering::Release);
+                tracing::debug!(
+                    dropped_bytes = chunk.len(),
+                    "stdout backlog over cap; dropping queued diffs and resyncing",
+                );
                 // The dropped chunk's allocation is still useful; keep it
                 // rather than freeing it on the very path where the sink is
                 // under the most pressure.
-                if self.recycled.len() < SPARE_POOL && chunk.capacity() <= SPARE_MAX_BYTES {
-                    let mut chunk = chunk;
-                    chunk.clear();
-                    self.recycled.push(chunk);
-                }
+                Self::pool(&mut self.recycled, chunk, q.spare_limit);
             } else {
                 q.bytes += chunk.len();
                 q.chunks.push_back(chunk);
@@ -223,6 +283,7 @@ fn spawn_writer_into<W: Write + Send + 'static>(inner: W) -> (StdoutSink, Writer
             chunks: VecDeque::new(),
             spare: Vec::new(),
             bytes: 0,
+            spare_limit: SPARE_MIN_BYTES,
             shutdown: false,
         }),
         cv: Condvar::new(),
@@ -237,6 +298,7 @@ fn spawn_writer_into<W: Write + Send + 'static>(inner: W) -> (StdoutSink, Writer
         needs_resync: Arc::new(AtomicBool::new(false)),
         pending: Vec::with_capacity(8192),
         recycled: Vec::with_capacity(SPARE_POOL),
+        high_water: 0,
     };
     (
         sink,
@@ -285,16 +347,13 @@ fn writer_loop<W: Write>(shared: &Shared, mut out: W) {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let limit = q.spare_limit;
             #[allow(
                 clippy::iter_with_drain,
                 reason = "`chunks` is reused across loop iterations; `into_iter` would consume the allocation this loop exists to keep"
             )]
-            for mut buf in chunks.drain(..) {
-                if q.spare.len() >= SPARE_POOL || buf.capacity() > SPARE_MAX_BYTES {
-                    continue;
-                }
-                buf.clear();
-                q.spare.push(buf);
+            for buf in chunks.drain(..) {
+                StdoutSink::pool(&mut q.spare, buf, limit);
             }
         }
     }
@@ -371,6 +430,7 @@ mod tests {
                 chunks: VecDeque::new(),
                 spare: Vec::new(),
                 bytes: 0,
+                spare_limit: SPARE_MIN_BYTES,
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -380,14 +440,28 @@ mod tests {
             needs_resync: Arc::new(AtomicBool::new(false)),
             pending: Vec::new(),
             recycled: Vec::new(),
+            high_water: 0,
         };
         // Queue just under the cap.
         sink.write_all(&vec![0u8; CAP_BYTES - 1]).expect("write");
         sink.flush().expect("flush");
         assert!(!sink.needs_resync.load(Ordering::Acquire));
         assert_eq!(shared.queue.lock().expect("lock").chunks.len(), 1);
-        // The next chunk trips the cap: backlog dropped, resync set.
+        // The next chunk is ACCEPTED even though it carries the queue over
+        // the cap. The boundary moved by exactly one flush when the cap was
+        // narrowed to the backlog alone, and that is the whole point: the
+        // frame in hand is never the stale diff the cap exists to drop, so it
+        // is enqueued and the queue is left over-cap for the next flush to
+        // notice.
         sink.write_all(&[1u8, 2, 3]).expect("write");
+        sink.flush().expect("flush");
+        assert!(
+            !sink.needs_resync.load(Ordering::Acquire),
+            "the chunk that crosses the cap still lands"
+        );
+        assert_eq!(shared.queue.lock().expect("lock").chunks.len(), 2);
+        // NOW the backlog is over the cap, so the following flush drops it.
+        sink.write_all(&[4u8]).expect("write");
         sink.flush().expect("flush");
         assert!(sink.needs_resync.load(Ordering::Acquire));
         let (chunks_empty, bytes) = {
@@ -443,6 +517,7 @@ mod tests {
                 chunks: VecDeque::new(),
                 spare: vec![Vec::with_capacity(SPARE_MAX_BYTES + 1)],
                 bytes: 0,
+                spare_limit: SPARE_MIN_BYTES,
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -452,6 +527,7 @@ mod tests {
             needs_resync: Arc::new(AtomicBool::new(false)),
             pending: Vec::new(),
             recycled: Vec::new(),
+            high_water: 0,
         };
         {
             let mut q = shared.queue.lock().expect("lock");
@@ -461,6 +537,163 @@ mod tests {
             sink.recycled.is_empty(),
             "an oversized buffer must be dropped, not pooled"
         );
+    }
+
+    /// The regression this file exists to prevent shipping twice.
+    ///
+    /// Once the renderer stopped flushing per pane, `paint_full_frame`
+    /// accumulated the whole viewport into ONE chunk. A 250x70 truecolor
+    /// repaint is around 400 KB, which is over `CAP_BYTES` on its own — and
+    /// the old check summed the queue with the incoming chunk, so an EMPTY
+    /// queue still refused it. The driver answered `needs_resync` with
+    /// `paint_full_frame`, which produced the same oversized chunk, which was
+    /// refused again: the screen stopped updating after any full repaint
+    /// while every wake-up burned a full render.
+    #[test]
+    fn an_oversized_frame_on_an_empty_queue_is_written_not_dropped() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(QueueState {
+                chunks: VecDeque::new(),
+                spare: Vec::new(),
+                bytes: 0,
+                spare_limit: SPARE_MIN_BYTES,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let mut sink = StdoutSink {
+            shared: Arc::clone(&shared),
+            needs_resync: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            recycled: Vec::new(),
+            high_water: 0,
+        };
+        // Larger than CAP_BYTES: one big-viewport truecolor frame.
+        let frame = vec![b'#'; 300 * 1024];
+        sink.write_all(&frame).expect("write");
+        sink.flush().expect("flush");
+
+        let q = shared.queue.lock().expect("lock");
+        assert_eq!(q.chunks.len(), 1, "the frame must be queued, not dropped");
+        assert_eq!(q.bytes, frame.len());
+        drop(q);
+        assert!(
+            !sink.needs_resync.load(Ordering::Acquire),
+            "a frame the terminal has not fallen behind on is not a resync"
+        );
+    }
+
+    /// Repeated oversized frames still make progress: each lands on a queue
+    /// the previous one left over-cap, so the sink alternates between
+    /// enqueuing and asking for a resync — but it never refuses two in a row,
+    /// which is what the freeze was.
+    #[test]
+    fn repeated_oversized_frames_keep_reaching_the_queue() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(QueueState {
+                chunks: VecDeque::new(),
+                spare: Vec::new(),
+                bytes: 0,
+                spare_limit: SPARE_MIN_BYTES,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let mut sink = StdoutSink {
+            shared: Arc::clone(&shared),
+            needs_resync: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            recycled: Vec::new(),
+            high_water: 0,
+        };
+        let mut queued = 0usize;
+        for _ in 0..6 {
+            sink.write_all(&vec![b'#'; 300 * 1024]).expect("write");
+            sink.flush().expect("flush");
+            let q = shared.queue.lock().expect("lock");
+            queued += q.chunks.len();
+            drop(q);
+        }
+        assert!(
+            queued >= 3,
+            "with a stuck writer at least every other frame must still be \
+             queued; only {queued} of 6 were"
+        );
+        // Memory stayed bounded: the queue never holds more than the cap plus
+        // the one frame that tripped it.
+        let bytes = {
+            let q = shared.queue.lock().expect("lock");
+            q.bytes
+        };
+        assert!(
+            bytes <= CAP_BYTES + 300 * 1024,
+            "queue grew past its bound: {bytes} bytes"
+        );
+    }
+
+    /// A genuine backlog still gets dropped — the cap is not disabled, only
+    /// moved off the frame in hand.
+    #[test]
+    fn a_backlog_over_the_cap_is_still_dropped_and_resyncs() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(QueueState {
+                chunks: VecDeque::new(),
+                spare: Vec::new(),
+                bytes: 0,
+                spare_limit: SPARE_MIN_BYTES,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let mut sink = StdoutSink {
+            shared: Arc::clone(&shared),
+            needs_resync: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            recycled: Vec::new(),
+            high_water: 0,
+        };
+        // Small frames, no draining writer: the backlog builds past the cap.
+        for _ in 0..40 {
+            sink.write_all(&vec![b'x'; 8 * 1024]).expect("write");
+            sink.flush().expect("flush");
+        }
+        assert!(
+            sink.needs_resync.load(Ordering::Acquire),
+            "a real backlog must still trip the cap"
+        );
+        let bytes = {
+            let q = shared.queue.lock().expect("lock");
+            q.bytes
+        };
+        assert!(
+            bytes <= CAP_BYTES + 8 * 1024,
+            "the backlog must be bounded: {bytes} bytes"
+        );
+    }
+
+    /// The recycling limit follows the frames the terminal actually produces.
+    /// A flat 64 KiB ceiling meant the pool disengaged at exactly the frame
+    /// size where an allocation per frame costs most.
+    #[test]
+    fn the_spare_limit_grows_to_the_frames_actually_shipped() {
+        let (mut sink, handle) = spawn_stdout_writer();
+        sink.write_all(&vec![b'#'; 200 * 1024]).expect("write");
+        sink.flush().expect("flush");
+        let limit = {
+            let q = sink
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            q.spare_limit
+        };
+        assert!(
+            limit >= 200 * 1024,
+            "a 200 KiB frame must raise the recycling limit above the old \
+             flat 64 KiB ceiling; limit={limit}"
+        );
+        assert!(limit <= SPARE_MAX_BYTES, "and stay bounded; limit={limit}");
+        handle.shutdown_and_join();
     }
 
     #[test]

@@ -1715,3 +1715,31 @@ fn copy_mode_status_block_cell_count_differs_from_linear() {
         "ordered block: 3 rows * 5 band cols = 15"
     );
 }
+
+/// phux-l96p.3 review: an ADMITTED burst must discharge the pacer's debt.
+///
+/// The scenario the fix closes: `yes` floods pane A while pane B emits one
+/// line during a refused window and then goes quiet. `admit` re-arms the
+/// window on every admitted burst, so the deadline term is false exactly when
+/// a burst paints — and the `paint_deadline` arm is third in a `biased`
+/// select behind `conn.recv()`, which A keeps permanently ready. B stayed
+/// unpainted until the socket happened to drain.
+#[test]
+fn an_admitted_burst_settles_the_withheld_debt() {
+    use super::loop_state::burst_settles_debt;
+
+    assert!(
+        burst_settles_debt(true, false),
+        "an admitted burst discharges the debt in its own frame — the term \
+         that was missing, and the only one that can fire while a producer \
+         saturates the socket"
+    );
+    assert!(
+        burst_settles_debt(false, true),
+        "a refused burst that outran its own window still settles"
+    );
+    assert!(
+        !burst_settles_debt(false, false),
+        "a refused burst inside its window leaves the debt to the timer"
+    );
+}

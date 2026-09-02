@@ -72,7 +72,10 @@ done
 mkdir -p "$OUT_DIR"
 
 # The run root must stay short: a unix socket path is capped at 104 bytes.
-RUN="/tmp/muxbench-$$"
+# `mktemp -d` (not a bare pid) so a stale directory from a killed run, or a
+# recycled pid, can never be adopted and then `rm -rf`d on exit — the same
+# rule scripts/render-bench.sh follows.
+RUN="$(mktemp -d /tmp/muxbench-XXXXXX)"
 # Loopback listener ports, derived from the pid so parallel runs do not collide.
 WS_PORT=$(( 18000 + ($$ % 900) * 2 ))
 QUIC_PORT=$(( WS_PORT + 1 ))

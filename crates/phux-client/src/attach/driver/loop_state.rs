@@ -398,6 +398,21 @@ fn drain_frame_batch(
     Ok(batch)
 }
 
+/// Whether an inbound burst must discharge the pacer's withheld debt before
+/// it parks, rather than leaving it to the `paint_deadline` select arm.
+///
+/// Both inputs are cases the timer cannot be relied on for, and the FIRST is
+/// the one that was missing (phux-l96p.3 review): an admitted burst has just
+/// pushed `next_allowed` out to `now + interval`, so `deadline_passed` is
+/// false by construction on that pass — and the `paint_deadline` arm sits
+/// third in a `biased` select behind `conn.recv()`, which a saturating
+/// producer keeps permanently ready. Without the `paint_now` term a pane that
+/// emitted once during a refused window and then went quiet stayed unpainted
+/// for as long as any other pane kept talking.
+pub(super) const fn burst_settles_debt(paint_now: bool, deadline_passed: bool) -> bool {
+    paint_now || deadline_passed
+}
+
 /// phux-foz.7: did this frame change anything the agent-fleet dashboard
 /// projects (agent records, asked/lease state, layout/pane set, session
 /// graph)? Read before the move-y outcome fields are consumed, acted on after
@@ -1394,7 +1409,7 @@ impl SessionLoop {
             // above the other timers (but below stdin and inbound frames) so a
             // settle cannot be starved by a chatty widget tick.
             () = paint_sleep => {
-                self.on_paint_deadline(out, sidebar);
+                self.settle_withheld_panes(out, sidebar);
                 Ok(Step::Continue)
             }
 
@@ -1538,6 +1553,14 @@ impl SessionLoop {
             self.input_events = events;
             return Ok(Step::Continue);
         }
+        // phux-l96p.3: the user just did something, so whatever output comes
+        // back is a REPLY and must not be paced. Set here rather than at the
+        // connection's send because this is the one funnel every input batch
+        // passes through (`on_stdin` and the bare-ESC flush both land here),
+        // and because a key consumed by a local keybinding counts too: the
+        // repaint it triggers is as much a response to the user as a pane
+        // echo. Cleared by the next paint (`PaintPacer::rearm`).
+        self.pacer.note_input(tokio::time::Instant::now());
         // Capture the pre-dispatch view so zoom and sidebar toggles can
         // diff against it and resize each changed pane's PTY. Taken
         // before dispatch mutates either piece of view geometry.
@@ -1778,19 +1801,30 @@ impl SessionLoop {
             }
         }
         self.drain_repaint(out, sidebar, &mut repaint);
-        // phux-l96p.3: if handling this burst outran the pacing window,
-        // settle here instead of waiting for the `paint_deadline` arm. The
-        // inbound arm is `biased` ahead of that timer, so a socket that is
-        // continuously readable would keep winning the race and the screen
-        // would freeze while the mirrors raced ahead. In practice the drain
-        // empties the socket and the timer gets its turn; this closes the case
-        // where it does not, and costs one `Instant` comparison otherwise.
-        if self
-            .pacer
-            .deadline()
-            .is_some_and(|at| at <= tokio::time::Instant::now())
-        {
-            self.on_paint_deadline(out, sidebar);
+        // phux-l96p.3: settle whatever the pacer is still holding, rather
+        // than leaving it to the `paint_deadline` arm. Two ways to get here,
+        // and BOTH are cases the timer cannot be relied on for:
+        //
+        // * This burst was admitted. `admit` has just pushed `next_allowed`
+        //   out to `now + interval`, so the deadline check below can never
+        //   fire on this pass — and the `paint_deadline` arm sits third in a
+        //   `biased` select behind `conn.recv()`, which a saturating producer
+        //   keeps permanently ready. A pane that emitted one line during an
+        //   earlier refused window and then went quiet would stay unpainted
+        //   for as long as any other pane kept talking. The debt belongs in
+        //   this frame.
+        // * Handling the burst itself outran the window, same starvation
+        //   shape without the admitted-burst part.
+        //
+        // Placed after `drain_repaint` so a `RepaintLevel::Full` in this batch
+        // has already cleared the debt it just redrew.
+        if burst_settles_debt(
+            paint_now,
+            self.pacer
+                .deadline()
+                .is_some_and(|at| at <= tokio::time::Instant::now()),
+        ) {
+            self.settle_withheld_panes(out, sidebar);
         }
         // phux-k0cw.10: the first paint is behind us, so the
         // peer sweep can go out now. Placed after the drain,
@@ -2481,8 +2515,12 @@ impl SessionLoop {
         self.repaint_view(out, sidebar, drained.level);
     }
 
-    /// phux-l96p.3: the frame pacer's window expired — settle every pane whose
-    /// paint was withheld, as ONE composited frame.
+    /// phux-l96p.3: paint every pane whose paint the pacer withheld, as ONE
+    /// composited frame.
+    ///
+    /// Reached from the `paint_deadline` select arm when the window expires,
+    /// and from the end of an admitted burst — see `handle_frame_burst` for
+    /// why the timer alone cannot be trusted to get there.
     ///
     /// Suppression is re-evaluated here rather than inherited from the frames
     /// that were withheld: an overlay may have opened, or a pane may have
@@ -2490,7 +2528,7 @@ impl SessionLoop {
     /// recovery (the overlay repaints the view on dismiss; the sync-output
     /// watchdog exposes a stuck transaction), so a pane suppressed at settle
     /// time is dropped rather than held indefinitely.
-    fn on_paint_deadline<W: crate::attach::RenderSink>(
+    fn settle_withheld_panes<W: crate::attach::RenderSink>(
         &mut self,
         out: &mut W,
         sidebar: Option<SidebarReservation>,
@@ -2501,7 +2539,7 @@ impl SessionLoop {
         }
         // Arm the next window from the settle, not from the burst that filled
         // it, so a sustained producer paints on a steady cadence.
-        self.pacer.admit(tokio::time::Instant::now());
+        self.pacer.rearm(tokio::time::Instant::now());
         if self.overlays.is_active() {
             return;
         }
