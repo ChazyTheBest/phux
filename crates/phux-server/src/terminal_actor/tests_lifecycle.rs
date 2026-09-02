@@ -25,7 +25,7 @@ fn seeded_default_colors_are_installed_before_actor_run() {
         80,
         24,
         None,
-        100,
+        test_scrollback(100),
         CancellationToken::new(),
         Some(colors),
     )
@@ -337,7 +337,7 @@ async fn adopted_actor_replays_seed_and_serves_live_pty() {
                 pid,
                 20,
                 5,
-                1000,
+                test_scrollback(1000),
                 CancellationToken::new(),
                 b"resumed",
             )
@@ -456,7 +456,7 @@ async fn signal_freezes_resumes_and_kills_the_child() {
                 pid,
                 20,
                 5,
-                1000,
+                test_scrollback(1000),
                 CancellationToken::new(),
                 b"",
             )
@@ -595,8 +595,14 @@ async fn pane_kill_lets_foreground_process_flush_before_death() {
             cmd.env("PHUX_TEST_ARMED", &armed);
 
             let token = CancellationToken::new();
-            let bundle = TerminalActor::build_with_token(20, 5, Some(cmd), 1000, token.clone())
-                .expect("build actor");
+            let bundle = TerminalActor::build_with_token(
+                20,
+                5,
+                Some(cmd),
+                test_scrollback(1000),
+                token.clone(),
+            )
+            .expect("build actor");
             let actor = bundle.actor;
             let pty = actor.pty.as_ref().expect("test actor has PTY");
             let shell_group = i32::try_from(pty.child.process_id().expect("shell pid"))
@@ -780,6 +786,50 @@ fn native_step_allocation_never_exceeds_remaining_capture_budget() {
         native_step_bytes(10, 10, 8),
         Err(crate::native_state::NativeStateError::LimitExceeded)
     ));
+}
+
+/// `defaults.history-bytes` reaches libghostty and is the bound that binds.
+///
+/// The regression this guards is the original ADR-0094 bug in its new shape:
+/// if only the line limit were installed, both panes below would retain the
+/// same one-standard-page of history and the byte key would be decorative.
+#[test]
+fn configured_history_bytes_decides_retained_scrollback() {
+    fn retained_rows(bytes: u32) -> usize {
+        let bundle = TerminalActor::build_with_token(
+            200,
+            50,
+            None,
+            phux_config::ScrollbackLimits::new(500_000, bytes),
+            CancellationToken::new(),
+        )
+        .expect("actor");
+        {
+            let mut terminal = bundle.actor.terminal.borrow_mut();
+            for row in 0..40_000 {
+                terminal.vt_write(format!("scrollback row {row}\r\n").as_bytes());
+            }
+        }
+        let rows = bundle
+            .actor
+            .terminal
+            .borrow()
+            .scrollback_rows()
+            .expect("retained scrollback rows");
+        bundle.token.cancel();
+        rows
+    }
+
+    let shallow = retained_rows(phux_config::DEFAULT_HISTORY_BYTES);
+    let deep = retained_rows(8 * 1024 * 1024);
+    assert!(
+        deep > shallow * 2,
+        "a 4x byte bound must retain materially more history: {shallow} -> {deep}",
+    );
+    assert!(
+        shallow > 0,
+        "the shipped byte bound must still retain history, saw {shallow}",
+    );
 }
 
 /// The bootstrap scratch is sized for one record, not for the connection's
@@ -1346,7 +1396,7 @@ async fn actor_responds_to_pwd_request_with_pty_child_cwd() {
                 20,
                 5,
                 Some(cmd),
-                DEFAULT_MAX_SCROLLBACK,
+                DEFAULT_SCROLLBACK,
                 CancellationToken::new(),
             )
             .expect("build_with_token");
@@ -1448,9 +1498,8 @@ async fn parent_token_cancel_cascades_to_pane_actor() {
         .run_until(async {
             let parent = CancellationToken::new();
             let child = parent.child_token();
-            let bundle =
-                TerminalActor::build_with_token(20, 5, None, DEFAULT_MAX_SCROLLBACK, child)
-                    .expect("build_with_token");
+            let bundle = TerminalActor::build_with_token(20, 5, None, DEFAULT_SCROLLBACK, child)
+                .expect("build_with_token");
             let join = tokio::task::spawn_local(bundle.actor.run());
 
             parent.cancel();

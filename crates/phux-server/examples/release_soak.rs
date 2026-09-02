@@ -33,6 +33,10 @@ const DAY: Duration = Duration::from_secs(86_400);
 const CLIENTS: usize = 8;
 const STALLED: usize = 7;
 const HISTORY_LINES: u32 = 50_000;
+/// Byte bound paired with [`HISTORY_LINES`]. The soak deliberately runs the
+/// shipped default so the retained-history cost it measures is the one users
+/// actually pay.
+const HISTORY_BYTES: u32 = phux_config::DEFAULT_HISTORY_BYTES;
 
 #[derive(Debug)]
 struct Config {
@@ -837,7 +841,7 @@ fn server_child() -> ExitCode {
         pre_seeded_session: Some("soak".to_owned()),
         seed_with_pty: true,
         seed_command: Some(command),
-        history_limit: HISTORY_LINES,
+        scrollback: phux_config::ScrollbackLimits::new(HISTORY_LINES, HISTORY_BYTES),
         ..ServerConfig::with_default_socket()
     };
     let runtime = tokio::runtime::Builder::new_current_thread()

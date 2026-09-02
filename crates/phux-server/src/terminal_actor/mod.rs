@@ -81,44 +81,17 @@ pub use spawn::*;
 pub use sync::*;
 pub use tick::*;
 
-/// Per-Terminal scrollback cap used by the no-config convenience
-/// constructors ([`TerminalActor::new`] / [`TerminalActor::new_with_command`]).
-/// A tmux-style mid-range value; the runtime path overrides it with
-/// `defaults.history-limit` via [`TerminalActor::build_with_token`].
+/// Line half of [`DEFAULT_SCROLLBACK`]: a tmux-style mid-range value.
 const DEFAULT_MAX_SCROLLBACK: u32 = 10_000;
 
-/// Hard per-pane ceiling on retained scrollback memory (ADR-0094).
-///
-/// libghostty enforces a byte limit and a line limit together and prunes on
-/// whichever is reached first. `defaults.history-limit` sets the line limit;
-/// this is the byte limit phux installs beside it, so one pane's retained
-/// history can never cost more than this no matter how wide the grid is or
-/// how many styles, graphemes, and hyperlinks its rows carry.
-///
-/// The value is chosen against the engine's history lease, not against memory
-/// alone. `detach_ready` encodes every retained history page eagerly, in one
-/// actor turn, on the attach critical path, at roughly 6.5 ms and 1.7 MiB of
-/// transient host memory per retained MiB, per pane (measured at 200x50 on
-/// an M-series host; a page compressed while idle costs several times that to
-/// recommit). Retention and attach latency therefore trade directly:
-///
-/// | ceiling | rows kept @200 cols | `detach_ready` |
-/// |---------|--------------------|----------------|
-/// | engine default | 229 | 2 us |
-/// | 2 MiB | 943 | 8 ms |
-/// | 4 MiB | 2133 | 22 ms |
-/// | 10 MiB | 5703 | 65 ms |
-/// | 32 MiB | 19031 | 222 ms |
-///
-/// 2 MiB is the smallest value that is a real bound at every grid width (the
-/// engine floors its own byte limit at two standard pages) while keeping a
-/// four-pane attach inside a couple of hundred milliseconds. Raising it is a
-/// one-line change once the engine can lease history lazily instead of
-/// materialising it at READY.
-///
-/// Pruning is page-granular, so real usage lands within one standard
-/// libghostty page (a few hundred KiB) of this number.
-pub(crate) const MAX_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
+/// Per-pane scrollback bounds used by the no-config convenience constructors
+/// ([`TerminalActor::new`] / [`TerminalActor::new_with_command`]). The runtime
+/// path overrides both halves with `defaults.history-limit` and
+/// `defaults.history-bytes` via [`TerminalActor::build_with_token`]; the byte
+/// half is the shipped schema default, because on any but a narrow grid it is
+/// the bound that actually binds (ADR-0094).
+const DEFAULT_SCROLLBACK: phux_config::ScrollbackLimits =
+    phux_config::ScrollbackLimits::new(DEFAULT_MAX_SCROLLBACK, phux_config::DEFAULT_HISTORY_BYTES);
 
 /// Fallback per-cell pixel size `(width, height)` used to derive the PTY
 /// `winsize` pixel fields and XTWINOPS size reports until a client announces

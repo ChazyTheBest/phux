@@ -1239,11 +1239,11 @@ pub(crate) async fn resolve_create_if_missing(
     // Slow path: create the session + seed pane. Snapshot the server's
     // configured PTY mode and (optional) override command before
     // releasing the state borrow.
-    let (with_pty, override_cmd, history_limit, term, shell, login_shell) = state.with(|s| {
+    let (with_pty, override_cmd, scrollback, term, shell, login_shell) = state.with(|s| {
         (
             s.attach_create_seeds_pty(),
             s.attach_create_seed_command(),
-            s.history_limit(),
+            s.scrollback_limits(),
             s.term().to_owned(),
             s.shell().to_owned(),
             s.login_shell(),
@@ -1292,7 +1292,7 @@ pub(crate) async fn resolve_create_if_missing(
             state,
             &name,
             seed_cmd,
-            history_limit,
+            scrollback,
             root_token,
             default_colors,
         )
@@ -1301,7 +1301,7 @@ pub(crate) async fn resolve_create_if_missing(
         // child to exec it on. We still create the session+pane so
         // the snapshot path has a target — this is the shape every
         // existing `spawn_server` test uses.
-        seed_session_with_actor(state, &name, history_limit, root_token)
+        seed_session_with_actor(state, &name, scrollback, root_token)
     };
 
     if let Err(err) = seed_result {
@@ -1894,9 +1894,9 @@ pub(crate) async fn handle_spawn_terminal(
         }
     };
 
-    let (history_limit, default_colors) = state.with(|s| {
+    let (scrollback, default_colors) = state.with(|s| {
         (
-            s.history_limit(),
+            s.scrollback_limits(),
             s.attached()
                 .get(&client_id)
                 .and_then(|client| client.client_caps.default_colors),
@@ -1910,7 +1910,7 @@ pub(crate) async fn handle_spawn_terminal(
         root_token,
         PaneSpawnPlan {
             builder,
-            history_limit,
+            scrollback,
             default_colors,
             agent_session,
             initial_size,
@@ -1975,7 +1975,7 @@ struct PaneSpawnPlan {
     /// The child to exec, fully configured from the wire frame.
     builder: portable_pty::CommandBuilder,
     /// Scrollback rows the new pane retains.
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     /// Host palette the pane starts with, when the spawner advertised one.
     default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
     /// Opaque native agent-session provenance to install before publication.
@@ -1998,7 +1998,7 @@ fn spawn_pane_or_refusal(
         state,
         ownership,
         plan.builder,
-        plan.history_limit,
+        plan.scrollback,
         root_token,
         plan.default_colors,
         plan.agent_session,

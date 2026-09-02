@@ -1046,7 +1046,7 @@ mod tests {
                 crate::runtime::commands::seed_session_with_actor(
                     &state,
                     "authenticated",
-                    100,
+                    phux_config::ScrollbackLimits::default(),
                     &root_token,
                 )
                 .expect("seed attached-session target");

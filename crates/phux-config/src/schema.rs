@@ -140,14 +140,38 @@ pub struct DefaultsCfg {
     ///
     /// This is an upper bound, not a reservation, and it is not the only
     /// one: libghostty enforces a byte limit beside the line limit and
-    /// prunes on whichever is reached first. `phux-server` installs that
-    /// byte limit explicitly (`MAX_SCROLLBACK_BYTES`, ADR-0094) so one
-    /// pane's retained history has a hard memory ceiling whatever this
-    /// value says. On a wide grid the byte limit is what binds, so a large
-    /// `history-limit` buys depth only until a pane's history reaches that
-    /// ceiling.
+    /// prunes on whichever is reached first. [`Self::history_bytes`] is
+    /// that byte limit (ADR-0094). On a wide grid the byte limit is
+    /// usually what binds, so raising this alone buys no depth.
     #[serde(default = "default_history_limit", rename = "history-limit")]
     pub history_limit: u32,
+
+    /// Bytes of scrollback retained per pane.
+    ///
+    /// The second half of the pair libghostty prunes on, and the one that
+    /// actually bounds a pane's memory: a row's cost depends on width,
+    /// styles, graphemes, and hyperlinks, so [`Self::history_limit`]
+    /// bounds memory only for one particular kind of content. Pruning is
+    /// page-granular, so real usage lands within one standard libghostty
+    /// page (a few hundred KiB) of this number, and the engine will not
+    /// prune below one standard page of history however small this is set.
+    ///
+    /// Raising it buys depth and costs attach latency, because the native
+    /// bootstrap materialises every retained page when a client attaches
+    /// (ADR-0094). Measured at 200x50, per pane, per attach:
+    ///
+    /// | `history-bytes` | rows kept @200 cols | added attach cost |
+    /// |---|---|---|
+    /// | 2 MiB (default) | ~943 | ~8 ms |
+    /// | 4 MiB | ~2133 | ~22 ms |
+    /// | 10 MiB | ~5703 | ~65 ms |
+    /// | 32 MiB | ~19031 | ~222 ms |
+    ///
+    /// That cost is paid on the single server thread for every pane in the
+    /// session, so a deep default is a slow attach for every client. The
+    /// accepted ceiling is [`MAX_HISTORY_BYTES`].
+    #[serde(default = "default_history_bytes", rename = "history-bytes")]
+    pub history_bytes: u32,
 
     /// Whether the client enables its own outer-terminal mouse tracking
     /// on attach (ADR-0048). `true` (default) emits DECSET
@@ -229,6 +253,7 @@ impl Default for DefaultsCfg {
             shell: None,
             term: default_term(),
             history_limit: default_history_limit(),
+            history_bytes: default_history_bytes(),
             mouse: true,
             cwd_inheritance: CwdInheritance::default(),
             spawn_on_attach: None,
@@ -245,6 +270,62 @@ fn default_term() -> String {
 }
 const fn default_history_limit() -> u32 {
     50_000
+}
+
+/// The pair of per-pane scrollback bounds libghostty prunes on.
+///
+/// libghostty applies a line limit and a byte limit together and prunes on
+/// whichever is reached first, so neither number means anything without the
+/// other. Carrying them as one value keeps every plumbing site — server
+/// config, shared state, pane construction — from growing a second parameter
+/// that can be threaded independently and get out of step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbackLimits {
+    /// Rows of history, from `defaults.history-limit`.
+    pub lines: u32,
+    /// Bytes of history, from `defaults.history-bytes`. Usually the binding
+    /// one; see [`DefaultsCfg::history_bytes`] for what raising it costs.
+    pub bytes: u32,
+}
+
+impl ScrollbackLimits {
+    /// Pair an explicit line and byte bound.
+    #[must_use]
+    pub const fn new(lines: u32, bytes: u32) -> Self {
+        Self { lines, bytes }
+    }
+}
+
+impl Default for ScrollbackLimits {
+    fn default() -> Self {
+        Self::new(default_history_limit(), default_history_bytes())
+    }
+}
+
+impl DefaultsCfg {
+    /// The configured scrollback bounds as one value.
+    #[must_use]
+    pub const fn scrollback_limits(&self) -> ScrollbackLimits {
+        ScrollbackLimits::new(self.history_limit, self.history_bytes)
+    }
+}
+
+/// Largest accepted `defaults.history-bytes`, in bytes (64 MiB).
+///
+/// Not a memory-safety bound — it is a latency bound. Retained history is
+/// re-encoded per pane on every attach (ADR-0094), so 64 MiB of history is
+/// already most of a second of blocked server thread per pane. A value above
+/// this is rejected by `phux config check` rather than silently accepted.
+pub const MAX_HISTORY_BYTES: u32 = 64 * 1024 * 1024;
+
+/// Shipped `defaults.history-bytes`: 2 MiB per pane.
+///
+/// See [`DefaultsCfg::history_bytes`] for the depth-versus-attach-latency
+/// curve this value sits on.
+pub const DEFAULT_HISTORY_BYTES: u32 = 2 * 1024 * 1024;
+
+const fn default_history_bytes() -> u32 {
+    DEFAULT_HISTORY_BYTES
 }
 const fn default_true() -> bool {
     true

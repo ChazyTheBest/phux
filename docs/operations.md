@@ -56,6 +56,38 @@ standard no-server diagnostic and `--json` answers `{"running": false, ...}`
 on stdout — both exit 1. Everything it reports is client-side sourcing over
 the existing wire; no protocol surface exists for it.
 
+### Per-pane memory and scrollback depth
+
+A server's resident memory is mostly its panes' retained history, and that is
+bounded twice. `defaults.history-limit` is the line bound and
+`defaults.history-bytes` the byte bound; libghostty prunes on whichever is
+reached first, so on anything but a narrow grid the byte bound is what binds
+and raising `history-limit` alone changes nothing
+([ADR-0094](../ADR/0094-explicit-per-pane-scrollback-byte-ceiling.md)).
+
+The shipped `history-bytes` is 2 MiB per pane, which keeps roughly 2,700 rows
+at 80 columns and 940 at 200. Raise it if you want deeper scrollback, but
+price it first: the native bootstrap re-encodes every retained page for each
+pane when a client attaches, on the single server thread, so the cost lands on
+attach latency for **every** client, not just on RSS. Measured at 200x50, per
+pane, per attach:
+
+| `history-bytes` | rows kept @200 cols | added attach cost |
+|---|---|---|
+| 2 MiB (default) | ~943 | ~8 ms |
+| 4 MiB | ~2133 | ~22 ms |
+| 10 MiB | ~5703 | ~65 ms |
+| 32 MiB | ~19031 | ~222 ms |
+
+Multiply by the number of panes in the session. `phux config check` rejects a
+value above 64 MiB. Pruning is page-granular, so a pane keeps at least one
+standard libghostty page of history however small the bound is set, and real
+usage lands within a page of the configured number.
+
+Peak matters more than steady state here: the host allocator keeps pages after
+the engine frees its records, so RSS does not fall back after a detach. A
+server that attached once with deep history stays at that high-water mark.
+
 ## Logging and observability
 
 Logs are both an operator surface and a leak surface; [ADR-0028](../ADR/0028-runtime-log-control.md) owns that decision and its slicing, and this section is the home for the facts.

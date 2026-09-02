@@ -214,3 +214,11 @@ pub(super) fn drain_outputs(rx: &mut mpsc::Receiver<Outbound>) -> Vec<(u64, Vec<
 pub(super) fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+/// Test-only: scrollback bounds for a test pane that only cares about the line
+/// count. The byte bound is the shipped default, so a test never accidentally
+/// exercises a retention policy no user runs.
+#[cfg(test)]
+pub(super) const fn test_scrollback(lines: u32) -> phux_config::ScrollbackLimits {
+    phux_config::ScrollbackLimits::new(lines, phux_config::DEFAULT_HISTORY_BYTES)
+}

@@ -609,7 +609,13 @@ A minimal config:
 [defaults]
 shell                 = "/bin/zsh"         # unset: $SHELL, fallback /bin/sh
 term                  = "xterm-256color"   # TERM advertised to spawned panes
-history-limit         = 50000
+# Scrollback is bounded twice and pruned on whichever bound is reached first
+# (ADR-0094). On a wide grid the BYTE bound is the one that binds, so raising
+# history-limit alone buys no depth. Raising history-bytes costs attach
+# latency, not just memory: ~8 ms per pane per attach at 2 MiB, ~65 ms at
+# 10 MiB. Max 67108864 (64 MiB).
+history-limit         = 50000              # rows, per pane
+history-bytes         = 2097152            # 2 MiB, per pane
 # Sane-default spawn knobs (phux-4li.1):
 cwd-inheritance       = "inherit-focused"
 session-name-template = "default"

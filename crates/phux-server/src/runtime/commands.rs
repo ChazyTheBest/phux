@@ -66,16 +66,16 @@ fn announce_seed_pane(state: &SharedState, wire_terminal_id: &phux_protocol::ids
 pub(crate) fn seed_session_with_actor(
     state: &SharedState,
     name: &str,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
 ) -> Result<phux_core::ids::TerminalId, crate::terminal_actor::TerminalActorError> {
-    seed_session_with_actor_and_metadata(state, name, history_limit, root_token, None)
+    seed_session_with_actor_and_metadata(state, name, scrollback, root_token, None)
 }
 
 fn seed_session_with_actor_and_metadata(
     state: &SharedState,
     name: &str,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
     agent_session: Option<Vec<u8>>,
 ) -> Result<phux_core::ids::TerminalId, crate::terminal_actor::TerminalActorError> {
@@ -96,19 +96,15 @@ fn seed_session_with_actor_and_metadata(
     // client's viewport arrives (phux-4hp's VIEWPORT_RESIZE wiring).
     let terminal_token = root_token.child_token();
     let (cols, rows) = DEFAULT_SPAWN_DIMS;
-    let bundle = match TerminalActor::build_with_token(
-        cols,
-        rows,
-        None,
-        history_limit,
-        terminal_token.clone(),
-    ) {
-        Ok(bundle) => bundle,
-        Err(err) => {
-            state.with_mut(|s| s.reap_terminal(terminal));
-            return Err(err);
-        }
-    };
+    let bundle =
+        match TerminalActor::build_with_token(cols, rows, None, scrollback, terminal_token.clone())
+        {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                state.with_mut(|s| s.reap_terminal(terminal));
+                return Err(err);
+            }
+        };
     let crate::terminal_actor::TerminalActorBundle {
         actor,
         handle,
@@ -151,10 +147,10 @@ pub fn seed_session_with_pty(
     state: &SharedState,
     name: &str,
     cmd: portable_pty::CommandBuilder,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
 ) -> Result<phux_core::ids::TerminalId, crate::terminal_actor::TerminalActorError> {
-    seed_session_with_pty_and_colors(state, name, cmd, history_limit, root_token, None)
+    seed_session_with_pty_and_colors(state, name, cmd, scrollback, root_token, None)
 }
 
 /// Palette-seeded variant used when a client's HELLO creates the session.
@@ -162,7 +158,7 @@ pub fn seed_session_with_pty_and_colors(
     state: &SharedState,
     name: &str,
     cmd: portable_pty::CommandBuilder,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
     default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
 ) -> Result<phux_core::ids::TerminalId, crate::terminal_actor::TerminalActorError> {
@@ -170,7 +166,7 @@ pub fn seed_session_with_pty_and_colors(
         state,
         name,
         cmd,
-        history_limit,
+        scrollback,
         root_token,
         default_colors,
         None,
@@ -181,7 +177,7 @@ fn seed_session_with_pty_and_colors_and_metadata(
     state: &SharedState,
     name: &str,
     mut cmd: portable_pty::CommandBuilder,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
     default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
     agent_session: Option<Vec<u8>>,
@@ -212,7 +208,7 @@ fn seed_session_with_pty_and_colors_and_metadata(
         cols,
         rows,
         Some(cmd),
-        history_limit,
+        scrollback,
         terminal_token.clone(),
         default_colors,
     ) {
@@ -272,14 +268,14 @@ pub fn spawn_pane_with_pty(
     state: &SharedState,
     session: phux_core::ids::SessionId,
     cmd: portable_pty::CommandBuilder,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
 ) -> Result<Option<phux_core::ids::TerminalId>, crate::terminal_actor::TerminalActorError> {
     spawn_pane_with_pty_and_colors(
         state,
         &SpawnOwnership::Session(session),
         cmd,
-        history_limit,
+        scrollback,
         root_token,
         None,
         None,
@@ -314,7 +310,7 @@ pub(crate) fn spawn_pane_with_pty_and_colors(
     state: &SharedState,
     ownership: &SpawnOwnership,
     mut cmd: portable_pty::CommandBuilder,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
     default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
     agent_session: Option<Vec<u8>>,
@@ -361,7 +357,7 @@ pub(crate) fn spawn_pane_with_pty_and_colors(
         cols,
         rows,
         Some(cmd),
-        history_limit,
+        scrollback,
         terminal_token.clone(),
         default_colors,
     ) {
@@ -2739,11 +2735,11 @@ pub(crate) fn create_named_session(
         return Err(format!("session {name:?} already exists"));
     }
 
-    let (with_pty, override_cmd, history_limit, term, shell, login_shell) = state.with(|s| {
+    let (with_pty, override_cmd, scrollback, term, shell, login_shell) = state.with(|s| {
         (
             s.attach_create_seeds_pty(),
             s.attach_create_seed_command(),
-            s.history_limit(),
+            s.scrollback_limits(),
             s.term().to_owned(),
             s.shell().to_owned(),
             s.login_shell(),
@@ -2782,13 +2778,13 @@ pub(crate) fn create_named_session(
             state,
             name,
             seed_cmd,
-            history_limit,
+            scrollback,
             root_token,
             None,
             agent_session,
         )
     } else {
-        seed_session_with_actor_and_metadata(state, name, history_limit, root_token, agent_session)
+        seed_session_with_actor_and_metadata(state, name, scrollback, root_token, agent_session)
     };
 
     match seed_result {

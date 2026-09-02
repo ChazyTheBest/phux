@@ -35,11 +35,12 @@ native-engine = []
 [dependencies]
 phux-protocol = { workspace = true, features = ["server"] }
 phux-core.workspace = true
-# phux-config supplies the canonical `defaults.history-limit` default
-# (`DefaultsCfg::default().history_limit`) so `ServerConfig::with_default_socket`
-# does not duplicate the `50_000` constant. The dep is config-shape only:
-# the server reads the schema's default and threads the resolved value into
-# each `TerminalActor`'s scrollback cap.
+# phux-config supplies the canonical scrollback bounds — `ScrollbackLimits`
+# plus the `defaults.history-limit` / `defaults.history-bytes` defaults
+# (`DefaultsCfg::default().scrollback_limits()`) — so
+# `ServerConfig::with_default_socket` does not duplicate them. The dep is
+# config-shape only: the server reads the schema's defaults and threads the
+# resolved pair into each `TerminalActor`'s scrollback configuration.
 phux-config.workspace = true
 # phux-plugin supplies the shared child-process runner (`run_command_spec`:
 # env injection, kill_on_drop, timeout) behind the server-side event-hook

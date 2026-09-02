@@ -101,14 +101,15 @@ pub struct ServerConfig {
     /// falls back to [`crate::terminal_actor::default_shell_command`]
     /// over the resolved default shell ([`Self::shell`]).
     pub seed_command: Option<portable_pty::CommandBuilder>,
-    /// Lines of scrollback retained per pane (`defaults.history-limit`,
-    /// SPEC DESIGN.md §4.2). Threaded into every `TerminalActor`'s
-    /// scrollback cap at construction — both the pre-seeded session and
-    /// any session created later via `AttachTarget::CreateIfMissing` or
-    /// `SPAWN_TERMINAL`. The binary populates this from
-    /// `phux_config`'s `defaults.history-limit`;
-    /// [`Self::with_default_socket`] uses the schema default.
-    pub history_limit: u32,
+    /// Per-pane scrollback bounds (`defaults.history-limit` and
+    /// `defaults.history-bytes`, SPEC DESIGN.md §4.2). Threaded into every
+    /// `TerminalActor`'s scrollback configuration at construction — both the
+    /// pre-seeded session and any session created later via
+    /// `AttachTarget::CreateIfMissing` or `SPAWN_TERMINAL`. libghostty prunes
+    /// on whichever bound is reached first, and on a wide grid that is
+    /// usually the byte bound (ADR-0094). The binary populates this from
+    /// `phux_config`; [`Self::with_default_socket`] uses the schema defaults.
+    pub scrollback: phux_config::ScrollbackLimits,
     /// How a freshly-spawned pane chooses its working directory
     /// (`defaults.cwd-inheritance`, SPEC DESIGN.md). Threaded into
     /// shared state so `SPAWN_TERMINAL` resolves the new pane's CWD when
@@ -264,7 +265,7 @@ impl ServerConfig {
             pre_seeded_session: None,
             seed_with_pty: false,
             seed_command: None,
-            history_limit: phux_config::DefaultsCfg::default().history_limit,
+            scrollback: phux_config::DefaultsCfg::default().scrollback_limits(),
             cwd_inheritance: phux_config::CwdInheritance::default(),
             term: phux_config::DefaultsCfg::default().term,
             shell: crate::terminal_actor::resolve_shell(None),
@@ -710,7 +711,7 @@ impl ServerRuntime {
         let pre_seeded = self.cfg.pre_seeded_session.clone();
         let seed_with_pty = self.cfg.seed_with_pty;
         let seed_command = self.cfg.seed_command.clone();
-        let history_limit = self.cfg.history_limit;
+        let scrollback = self.cfg.scrollback;
         // WebSocket listen address: the `--listen` flag (via `listen_ws`)
         // wins; otherwise fall back to `PHUX_WS_ADDR` inside the accept setup.
         let ws_addr_override = self.ws_addr;
@@ -805,7 +806,7 @@ impl ServerRuntime {
                         name,
                         seed_with_pty,
                         seed_command,
-                        history_limit,
+                        scrollback,
                         &root_token,
                     );
                 }
@@ -1003,10 +1004,10 @@ fn mirror_config_into_state(cfg: &ServerConfig, socket_path: &Path, state: &Shar
     // `PHUX_SOCKET` (phux-cufw) — an in-pane `phux` then targets this server
     // even off the default socket path.
     state.with_mut(|s| s.set_server_socket_path(socket_path.to_path_buf()));
-    // Mirror `defaults.history-limit` so the attach-time creation path
-    // (`CreateIfMissing`) and `SPAWN_TERMINAL` build their panes with the
-    // configured cap.
-    state.with_mut(|s| s.set_history_limit(cfg.history_limit));
+    // Mirror `defaults.history-limit` / `defaults.history-bytes` so the
+    // attach-time creation path (`CreateIfMissing`) and `SPAWN_TERMINAL`
+    // build their panes with the configured bounds.
+    state.with_mut(|s| s.set_scrollback_limits(cfg.scrollback));
     // Mirror `defaults.cwd-inheritance` so the `SPAWN_TERMINAL` handler
     // resolves a new pane's working directory from the configured policy.
     state.with_mut(|s| s.set_cwd_inheritance(cfg.cwd_inheritance));
@@ -1155,7 +1156,7 @@ fn seed_initial_session(
     name: &str,
     seed_with_pty: bool,
     seed_command: Option<portable_pty::CommandBuilder>,
-    history_limit: u32,
+    scrollback: phux_config::ScrollbackLimits,
     root_token: &CancellationToken,
 ) {
     let seeded = if seed_with_pty {
@@ -1163,11 +1164,11 @@ fn seed_initial_session(
             state,
             name,
             seed_pane_command(state, seed_command),
-            history_limit,
+            scrollback,
             root_token,
         )
     } else {
-        seed_session_with_actor(state, name, history_limit, root_token)
+        seed_session_with_actor(state, name, scrollback, root_token)
     };
     if let Err(err) = seeded {
         warn!(
@@ -2872,7 +2873,13 @@ mod tests {
                 s.set_hook_dispatcher(crate::hooks::HookDispatcher::from_sender(tx));
             });
             let token = CancellationToken::new();
-            seed_session_with_actor(&state, "hooked", 100, &token).expect("seed");
+            seed_session_with_actor(
+                &state,
+                "hooked",
+                phux_config::ScrollbackLimits::new(100, phux_config::DEFAULT_HISTORY_BYTES),
+                &token,
+            )
+            .expect("seed");
             let event = rx.try_recv().expect("after-new-pane fired");
             assert_eq!(event.name, crate::hooks::AFTER_NEW_PANE);
             assert_eq!(

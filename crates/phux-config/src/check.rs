@@ -46,7 +46,7 @@ use crate::keybind::{KeybindError, Resolver, parse_chord, parse_chord_sequence};
 use crate::schema::{Widget, WidgetSpec};
 use crate::widget::{WidgetError, WidgetRegistry};
 use crate::{
-    Action, Config, ConfigError, HookEntry, KeybindingsCfg, LayerSource,
+    Action, Config, ConfigError, DefaultsCfg, HookEntry, KeybindingsCfg, LayerSource,
     merged_config_with_provenance, vocab,
 };
 
@@ -242,9 +242,40 @@ fn semantic_pass(
     provenance: &crate::ConfigProvenance,
     findings: &mut Vec<Finding>,
 ) {
+    defaults_findings(&config.defaults, provenance, findings);
     keybinding_findings(&config.keybindings, provenance, findings);
     hook_findings(&config.hooks, provenance, findings);
     status_widget_findings(&config.status, provenance, findings);
+}
+
+/// Semantic validation for `[defaults]` values whose *range* matters.
+///
+/// `defaults.history-bytes` is the only one so far. It parses as any `u32`,
+/// but a value above [`crate::MAX_HISTORY_BYTES`] is not a memory question —
+/// retained history is re-encoded per pane on every attach (ADR-0094), so a
+/// large value buys deep scrollback at a cost measured in blocked server
+/// thread. Flag it here rather than clamping silently, so the operator learns
+/// what they asked for instead of wondering why their setting did nothing.
+fn defaults_findings(
+    defaults: &DefaultsCfg,
+    provenance: &crate::ConfigProvenance,
+    findings: &mut Vec<Finding>,
+) {
+    if defaults.history_bytes > crate::MAX_HISTORY_BYTES {
+        push_semantic(
+            findings,
+            provenance,
+            "defaults.history-bytes".to_owned(),
+            Fault::BadValue,
+            format!(
+                "{} exceeds the accepted maximum of {} bytes (64 MiB); retained history is \
+                 re-encoded per pane on every attach, so a larger value blocks the server \
+                 thread for most of a second per pane",
+                defaults.history_bytes,
+                crate::MAX_HISTORY_BYTES,
+            ),
+        );
+    }
 }
 
 /// Semantic keybinding validation (phux-i0e8.3.2), catching the two
@@ -683,6 +714,35 @@ mod tests {
     fn a_valid_config_reports_nothing() {
         let report = run("[keybindings]\nwhich-key = false\n\n[sidebar]\nenabled = true\n");
         assert!(report.is_ok(), "false positives: {:?}", report.findings);
+    }
+
+    /// `history-bytes` above the accepted maximum is a located finding, not a
+    /// silent clamp: the operator asked for scrollback depth that would cost
+    /// most of a second of blocked server thread per pane at every attach.
+    #[test]
+    fn an_oversized_history_bytes_is_flagged_with_the_maximum() {
+        let report = run("[defaults]\nhistory-bytes = 134217728\n");
+        assert_eq!(paths(&report), vec!["defaults.history-bytes"]);
+        let finding = &report.findings[0];
+        assert_eq!(finding.fault, Fault::BadValue);
+        assert!(
+            finding.message.contains("67108864"),
+            "message must name the maximum: {}",
+            finding.message,
+        );
+    }
+
+    /// The maximum itself, and any value under it, is accepted.
+    #[test]
+    fn history_bytes_at_or_under_the_maximum_is_clean() {
+        for bytes in [1_u32, 2 * 1024 * 1024, crate::MAX_HISTORY_BYTES] {
+            let report = run(&format!("[defaults]\nhistory-bytes = {bytes}\n"));
+            assert!(
+                report.is_ok(),
+                "false positive at {bytes}: {:?}",
+                report.findings
+            );
+        }
     }
 
     /// Free-form key spaces must not be flagged by the *schema* walk.

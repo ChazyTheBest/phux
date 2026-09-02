@@ -6,15 +6,16 @@
 use super::{
     CancellationToken, CanonicalTerminal, Cell, ColorQueryScanner, CommandBuilder,
     ConsumerAckRequest, ConsumerAttachRequest, ConsumerDetachRequest, ControlRequest,
-    DEFAULT_CELL_PX, DEFAULT_INPUT_MAILBOX, DEFAULT_MAX_SCROLLBACK, DEFAULT_OUTPUT_BROADCAST,
-    EncodedInputRequest, GhosttyTerminal, HashMap, InputEncoderSnapshot, MAX_SCROLLBACK_BYTES,
-    NativeRequestReceivers, PerTerminalFocusEncoder, PerTerminalKeyEncoder,
-    PerTerminalMouseEncoder, PerTerminalPasteEncoder, PtySource, Rc, RefCell, SizeReportSize,
-    SnapshotSynthesizer, SubscribeToEventsRequest, TerminalActor, TerminalActorBundle,
-    TerminalActorError, TerminalHandle, TerminalLifecycle, TerminalOptions,
-    UnsubscribeFromEventsRequest, VecDeque, adopt_pty, broadcast, color_query_reply,
-    default_shell_command, mpsc, oneshot, osc133, resolve_shell, spawn_pty, watch,
+    DEFAULT_CELL_PX, DEFAULT_INPUT_MAILBOX, DEFAULT_OUTPUT_BROADCAST, DEFAULT_SCROLLBACK,
+    EncodedInputRequest, GhosttyTerminal, HashMap, InputEncoderSnapshot, NativeRequestReceivers,
+    PerTerminalFocusEncoder, PerTerminalKeyEncoder, PerTerminalMouseEncoder,
+    PerTerminalPasteEncoder, PtySource, Rc, RefCell, SizeReportSize, SnapshotSynthesizer,
+    SubscribeToEventsRequest, TerminalActor, TerminalActorBundle, TerminalActorError,
+    TerminalHandle, TerminalLifecycle, TerminalOptions, UnsubscribeFromEventsRequest, VecDeque,
+    adopt_pty, broadcast, color_query_reply, default_shell_command, mpsc, oneshot, osc133,
+    resolve_shell, spawn_pty, watch,
 };
+use phux_config::ScrollbackLimits;
 
 impl TerminalActor {
     /// Build a fresh actor of the given dimensions **without** a backing
@@ -22,9 +23,9 @@ impl TerminalActor {
     /// without driving a real process.
     ///
     /// The `GhosttyTerminal` is allocated via libghostty's default allocator
-    /// (NULL alloc → `'static` lifetimes). `max_scrollback` is
-    /// `DEFAULT_MAX_SCROLLBACK` — a tmux-style mid-range value the
-    /// runtime overrides with `defaults.history-limit` via
+    /// (NULL alloc → `'static` lifetimes). Scrollback is `DEFAULT_SCROLLBACK`
+    /// — a tmux-style mid-range value the runtime overrides with
+    /// `defaults.history-limit` / `defaults.history-bytes` via
     /// [`Self::build_with_token`].
     #[allow(clippy::new_ret_no_self, reason = "bundle-shaped constructor")]
     pub fn new(cols: u16, rows: u16) -> Result<TerminalActorBundle, TerminalActorError> {
@@ -32,7 +33,7 @@ impl TerminalActor {
             cols,
             rows,
             PtySource::None,
-            DEFAULT_MAX_SCROLLBACK,
+            DEFAULT_SCROLLBACK,
             CancellationToken::new(),
             None,
         )
@@ -53,7 +54,7 @@ impl TerminalActor {
             cols,
             rows,
             PtySource::Spawn(cmd),
-            DEFAULT_MAX_SCROLLBACK,
+            DEFAULT_SCROLLBACK,
             CancellationToken::new(),
             None,
         )
@@ -84,14 +85,14 @@ impl TerminalActor {
         cols: u16,
         rows: u16,
         cmd: Option<CommandBuilder>,
-        max_scrollback: u32,
+        scrollback: ScrollbackLimits,
         token: CancellationToken,
     ) -> Result<TerminalActorBundle, TerminalActorError> {
         Self::build(
             cols,
             rows,
             cmd.map_or(PtySource::None, PtySource::Spawn),
-            max_scrollback,
+            scrollback,
             token,
             None,
         )
@@ -103,7 +104,7 @@ impl TerminalActor {
         cols: u16,
         rows: u16,
         cmd: Option<CommandBuilder>,
-        max_scrollback: u32,
+        scrollback: ScrollbackLimits,
         token: CancellationToken,
         default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
     ) -> Result<TerminalActorBundle, TerminalActorError> {
@@ -111,7 +112,7 @@ impl TerminalActor {
             cols,
             rows,
             cmd.map_or(PtySource::None, PtySource::Spawn),
-            max_scrollback,
+            scrollback,
             token,
             default_colors,
         )
@@ -129,7 +130,7 @@ impl TerminalActor {
         child_pid: i32,
         cols: u16,
         rows: u16,
-        max_scrollback: u32,
+        scrollback: ScrollbackLimits,
         token: CancellationToken,
         seed: &[u8],
     ) -> Result<TerminalActorBundle, TerminalActorError> {
@@ -140,7 +141,7 @@ impl TerminalActor {
                 master_fd,
                 child_pid,
             },
-            max_scrollback,
+            scrollback,
             token,
             None,
         )?;
@@ -157,7 +158,7 @@ impl TerminalActor {
         cols: u16,
         rows: u16,
         pty_source: PtySource,
-        max_scrollback: u32,
+        scrollback: ScrollbackLimits,
         token: CancellationToken,
         default_colors: Option<phux_protocol::caps::TerminalDefaultColors>,
     ) -> Result<TerminalActorBundle, TerminalActorError> {
@@ -167,7 +168,7 @@ impl TerminalActor {
             // `defaults.history-limit` is a `u32` on the wire/config; the
             // libghostty option is `usize`. The widen is lossless on all
             // supported targets.
-            max_scrollback: max_scrollback as usize,
+            max_scrollback: scrollback.lines as usize,
         })?;
         // `TerminalOptions::max_scrollback` is only libghostty's *line* limit.
         // The engine enforces a byte limit alongside it and applies whichever
@@ -175,11 +176,10 @@ impl TerminalActor {
         // Ghostty's 10_000-byte constructor default — floored at two standard
         // pages. That byte floor, not `history-limit`, decided how much
         // history a phux pane kept: 810 rows at 80 columns and 295 rows at
-        // 200 columns, whatever `history-limit` said. Install an explicit
-        // per-pane ceiling so the configured line limit is the one that binds
-        // until retained history actually costs
-        // `MAX_SCROLLBACK_BYTES` (ADR-0094).
-        terminal.set_scrollback_max_bytes(Some(MAX_SCROLLBACK_BYTES))?;
+        // 200 columns, whatever `history-limit` said. Install
+        // `defaults.history-bytes` explicitly so both bounds are the
+        // operator's (ADR-0094).
+        terminal.set_scrollback_max_bytes(Some(scrollback.bytes as usize))?;
         phux_protocol::kitty_replay::configure_terminal_for_kitty_graphics(&mut terminal)?;
         if let Some(colors) = default_colors {
             Self::install_default_colors(&mut terminal, colors)?;

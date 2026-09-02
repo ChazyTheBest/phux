@@ -45,9 +45,9 @@ pub use layer::{
 pub use remote::RemoteConfigEntry;
 pub use satellite::SatelliteConfigEntry;
 pub use schema::{
-    Action, ChromeCfg, Config, CwdInheritance, DefaultsCfg, ExperimentalCfg, HookEntry,
-    KeybindingsCfg, ParamAction, SidebarCfg, SidebarPosition, StatusCfg, StatusPosition, ThemeCfg,
-    Widget, WidgetSpec, WindowSize,
+    Action, ChromeCfg, Config, CwdInheritance, DEFAULT_HISTORY_BYTES, DefaultsCfg, ExperimentalCfg,
+    HookEntry, KeybindingsCfg, MAX_HISTORY_BYTES, ParamAction, ScrollbackLimits, SidebarCfg,
+    SidebarPosition, StatusCfg, StatusPosition, ThemeCfg, Widget, WidgetSpec, WindowSize,
 };
 pub use widget::{
     Cell, CellStyle, SessionNameWidget, SpacerWidget, StatusBar, StatusWidget, TextWidget,

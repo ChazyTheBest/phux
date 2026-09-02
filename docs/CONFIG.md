@@ -139,6 +139,7 @@ layers (merge order; later layers win):
   [3] /home/me/.config/phux/config.toml (user)
 
 keys:
+  defaults.history-bytes  <- [1] defaults
   defaults.history-limit  <- [2] distro.toml
   keybindings.prefix      <- [3] user
   status.right[0]         <- [1] defaults
@@ -172,7 +173,21 @@ A bundled name `n` resolves to `<dir>/n/n.toml` across, in order: `$PHUX_DISTROS
 
 ## Schema overview
 
-The complete schema is a generated reference: [`docs/reference/config.md`](./reference/config.md) lists every section, every scalar knob with its shipped default, and the annotated default config embedded in the binary. It renders from the compiled binary and is byte-pinned by a freshness test, so it cannot drift from the code. The subsections below cover only the material that benefits from narrative — keybindings, widgets, hooks, and plugins.
+The complete schema is a generated reference: [`docs/reference/config.md`](./reference/config.md) lists every section, every scalar knob with its shipped default, and the annotated default config embedded in the binary. It renders from the compiled binary and is byte-pinned by a freshness test, so it cannot drift from the code. The subsections below cover only the material that benefits from narrative — scrollback, keybindings, widgets, hooks, and plugins.
+
+### Scrollback: two bounds, and only one of them usually binds
+
+Per-pane history has a line bound and a byte bound, and libghostty prunes on whichever is reached first:
+
+```toml
+[defaults]
+history-limit = 50000     # rows per pane
+history-bytes = 2097152   # 2 MiB per pane
+```
+
+A row's cost depends on how wide it is and how many styles, graphemes, and hyperlinks it carries, so `history-limit` bounds memory only for one particular kind of content. `history-bytes` bounds it for all of them — which means on anything but a narrow grid `history-bytes` is what actually binds, and **raising `history-limit` on its own buys no extra scrollback.** The default keeps roughly 2,700 rows at 80 columns and 940 at 200.
+
+If you want deeper scrollback, raise `history-bytes`. It is not only a memory setting: when a client attaches, the server re-encodes every retained page of every pane in the session, on one thread, so the cost shows up as attach latency for every client. Roughly, per pane, per attach: 2 MiB adds ~8 ms, 4 MiB ~22 ms, 10 MiB ~65 ms, 32 MiB ~222 ms. `phux config check` rejects anything above 64 MiB. See [ADR-0094](../ADR/0094-explicit-per-pane-scrollback-byte-ceiling.md) for the measurements.
 
 ### Keybindings
 

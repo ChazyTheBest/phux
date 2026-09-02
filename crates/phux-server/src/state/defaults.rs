@@ -38,18 +38,19 @@ impl ServerState {
         self.config.attach_create_seed_command.clone()
     }
 
-    /// Set the per-pane scrollback cap (`defaults.history-limit`) used
-    /// by the attach-time creation path and `SPAWN_TERMINAL`. Called
-    /// once at server startup to mirror
-    /// [`crate::runtime::ServerConfig::history_limit`] into state.
-    pub const fn set_history_limit(&mut self, history_limit: u32) {
-        self.config.history_limit = history_limit;
+    /// Set the per-pane scrollback bounds (`defaults.history-limit` and
+    /// `defaults.history-bytes`) used by the attach-time creation path
+    /// and `SPAWN_TERMINAL`. Called once at server startup to mirror
+    /// [`crate::runtime::ServerConfig::scrollback`] into state.
+    pub const fn set_scrollback_limits(&mut self, scrollback: phux_config::ScrollbackLimits) {
+        self.config.scrollback = scrollback;
     }
 
-    /// Read the per-pane scrollback cap set by [`Self::set_history_limit`].
+    /// Read the per-pane scrollback bounds set by
+    /// [`Self::set_scrollback_limits`].
     #[must_use]
-    pub const fn history_limit(&self) -> u32 {
-        self.config.history_limit
+    pub const fn scrollback_limits(&self) -> phux_config::ScrollbackLimits {
+        self.config.scrollback
     }
 
     /// Set the working-directory inheritance policy

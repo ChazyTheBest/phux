@@ -32,7 +32,25 @@
 # TERM=ghostty — but htop, the app that broke last time, is unproven, so
 # the shipped default stays conservative.
 term = "xterm-256color"
+# Per-pane scrollback, bounded twice: libghostty prunes on whichever of the
+# line limit and the byte limit is reached first (ADR-0094). On anything but a
+# narrow grid the BYTE limit is what binds, so raising history-limit alone
+# buys no depth. history-bytes is the one that costs, and what it costs is
+# attach latency, not just memory: the native bootstrap re-encodes every
+# retained page for each pane when a client attaches, on the single server
+# thread. Measured at 200x50, per pane, per attach:
+#
+#   history-bytes   rows kept @80 cols   @200 cols   added attach cost
+#   2 MiB (default) ~2669                ~943        ~8 ms
+#   4 MiB           ~5600                ~2133       ~22 ms
+#   10 MiB          ~14400               ~5703       ~65 ms
+#   32 MiB          ~47500               ~19031      ~222 ms
+#
+# Raise history-bytes if you want deep scrollback and can pay for it at
+# attach; 67108864 (64 MiB) is the accepted maximum. Pruning is page-granular,
+# so the engine keeps at least one standard page of history whatever you set.
 history-limit = 50000
+history-bytes = 2097152
 # Client-side outer-terminal mouse tracking on attach (ADR-0048): divider
 # drag-to-resize and click-to-focus work without an inner program turning
 # mouse mode on. false = pass-through-only (native click-drag selection).

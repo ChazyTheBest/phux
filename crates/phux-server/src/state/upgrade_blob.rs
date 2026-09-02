@@ -385,7 +385,7 @@ impl ServerState {
         blob: &StateBlob,
         window_core: &HashMap<u32, WindowId>,
     ) -> Result<RebuiltPanes, RebuildError> {
-        let max_scrollback = self.config.history_limit;
+        let scrollback = self.config.scrollback;
         let mut panes = RebuiltPanes {
             core_ids: HashMap::new(),
             exit_watchers: Vec::with_capacity(blob.panes.len()),
@@ -404,7 +404,7 @@ impl ServerState {
                 desc.title.clone_from(&p.title);
             }
 
-            let bundle = pane_actor_bundle(p, max_scrollback)?;
+            let bundle = pane_actor_bundle(p, scrollback)?;
             // Pre-bind the wire id so `spawn_terminal_actor`'s intern is a
             // no-op (it returns the existing mapping instead of allocating a
             // fresh one that would diverge from the blob).
@@ -490,7 +490,7 @@ impl ServerState {
 /// corrupt handoff, not a no-PTY pane.
 fn pane_actor_bundle(
     p: &PaneBlob,
-    max_scrollback: u32,
+    scrollback: phux_config::ScrollbackLimits,
 ) -> Result<crate::terminal_actor::TerminalActorBundle, RebuildError> {
     let seed = pane_seed(p);
     Ok(match (p.master_fd, p.child_pid) {
@@ -499,7 +499,7 @@ fn pane_actor_bundle(
             child_pid,
             p.cols,
             p.rows,
-            max_scrollback,
+            scrollback,
             CancellationToken::new(),
             &seed,
         )?,

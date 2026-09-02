@@ -206,7 +206,9 @@ fn build_server_config(
     let seed_command = seed_command
         .map(|command| phux_server::terminal_actor::shell_command(&shell, command, login_shell));
 
-    // `defaults.history-limit` bounds each pane's retained scrollback.
+    // `defaults.history-limit` and `defaults.history-bytes` bound each pane's
+    // retained scrollback; libghostty prunes on whichever is reached first,
+    // and on a wide grid that is usually the byte bound (ADR-0094).
     // `defaults.cwd-inheritance` selects how `SPAWN_TERMINAL` resolves a
     // new pane's working directory. `defaults.term` is the `TERM`
     // advertised to every server-spawned pane (a per-spawn
@@ -218,7 +220,7 @@ fn build_server_config(
         pre_seeded_session: Some(session.to_owned()),
         seed_with_pty: true,
         seed_command,
-        history_limit: defaults.history_limit,
+        scrollback: defaults.scrollback_limits(),
         cwd_inheritance: defaults.cwd_inheritance,
         term: defaults.term,
         shell,

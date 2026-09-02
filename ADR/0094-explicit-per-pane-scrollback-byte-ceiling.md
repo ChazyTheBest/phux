@@ -11,12 +11,16 @@ engine prunes on whichever of its line and byte limits is reached first. A
 terminal built through the C API keeps Ghostty's 10_000-byte constructor
 default, so that byte limit — not `history-limit` — decided how deep a phux
 pane's history was: about 810 rows at 80 columns and 295 at 200, whatever the
-config said. phux now installs the byte limit itself, as a named constant with
-a measured cost, because retained history is not free at attach time: the
-engine materialises every retained page when a client bootstraps.
+config said. phux now installs the byte limit itself, from a config key of its
+own — `defaults.history-bytes`, 2 MiB — because retained history is not free
+at attach time: the engine materialises every retained page when a client
+bootstraps, so the operator is choosing scrollback depth *and* attach latency
+with one number and deserves to see both.
 
 Status: Accepted
 Date: 2026-09-02
+Amended: 2026-09-02 — the ceiling became `defaults.history-bytes` rather than a
+private constant. See "Decision", item 2.
 
 ## Context
 
@@ -55,12 +59,32 @@ attach, on the single server thread.
 
 ## Decision
 
-`TerminalActor::build` calls `set_scrollback_max_bytes(MAX_SCROLLBACK_BYTES)`
-immediately after constructing the canonical terminal.
-`MAX_SCROLLBACK_BYTES` is 2 MiB.
+**1. phux sets the byte limit.** `TerminalActor::build` calls
+`set_scrollback_max_bytes` immediately after constructing the canonical
+terminal, so neither bound is inherited from an engine constructor default.
 
-`defaults.history-limit` keeps its line semantics and its 50000 default. No
-config key changes, gains a sibling, or changes units.
+**2. The byte limit is a config key: `defaults.history-bytes`, default 2 MiB.**
+`defaults.history-limit` keeps its line semantics and its 50000 default, and
+the two travel together as one `ScrollbackLimits` value from config through
+server state to pane construction. `phux config check` rejects a
+`history-bytes` above `MAX_HISTORY_BYTES` (64 MiB) with a located finding
+rather than clamping silently.
+
+This is a reversal of the first version of this ADR, which made 2 MiB a
+private constant on the argument that the number was not usefully tunable. The
+measurements below say the opposite: the curve is steep, monotonic, and
+*legible* — every extra MiB buys a predictable ~475 rows at 200 columns and
+costs a predictable ~6.5 ms of per-pane attach latency. That is exactly the
+shape of a decision an operator can make better than a default can, because
+only they know whether their session is one pane they attach to hourly or
+twelve panes they attach to constantly. Withholding the knob does not spare
+them the tradeoff; it only hides it.
+
+Both keys are documented together, with the curve, everywhere the schema is
+user-facing: `default.toml`, `docs/CONFIG.md`, `docs/consumers/tui.md`,
+`docs/operations.md`, and the generated `docs/reference/config.md`. Documenting
+`history-limit` without `history-bytes` is what made the original bug invisible
+for as long as it was, so the pair is never described alone.
 
 ## Rationale
 
@@ -74,7 +98,16 @@ decision rather than a constant inherited from an engine constructor.
 The bound is expressed in bytes rather than lines because bytes are what the
 host actually spends. A row's cost depends on width, styles, graphemes and
 hyperlinks, so a line limit bounds memory only for one particular kind of
-content; a byte limit bounds it for all of them.
+content; a byte limit bounds it for all of them. That is also why the two keys
+must be presented as a pair rather than as a primary knob and a footnote: a
+user who reads only `history-limit` will set it to 200000, see no change, and
+have no way to find out why.
+
+The 64 MiB maximum is a latency bound, not a memory one. At 64 MiB a single
+pane's history lease is already most of a second of blocked server thread, and
+a session of those is an attach nobody would call working. Rejecting the value
+at `config check` time tells the operator that; accepting and clamping it would
+not.
 
 ## Tradeoffs
 
@@ -93,18 +126,25 @@ matters, not steady state. Choosing 2 MiB therefore spends about 31 MB of
 permanent high-water RSS and about 75 ms of four-pane attach latency to turn
 295 retained rows into 943. Raising it further multiplies both.
 
-Lifting the ceiling toward herdr's 10 MiB is a one-constant change, but it is
-gated on the engine leasing history lazily instead of materialising it at
-READY. Until then the cost curve above is the whole argument.
+Shipping the ceiling as a knob means a user can configure a slow attach for
+themselves, and a 64 MiB session of panes is a visibly bad experience the
+config accepts up to its maximum. That is the accepted cost of not hiding the
+tradeoff: `config check`, the schema docs, `default.toml`, and this ADR all
+carry the curve, so the choice is informed rather than blind. Raising the
+shipped default toward herdr's 10 MiB remains gated on the engine leasing
+history lazily instead of materialising it at READY.
 
 ## Alternatives considered
 
 - **Leave it alone.** Cheapest attach, lowest RSS, but `history-limit` stays
   a value the engine ignores and a 200-column pane keeps 295 rows of history.
-- **Make `history-limit` mean bytes, or add a `history-bytes` sibling.** A
-  breaking config change and a second knob for a bound the user cannot
-  usefully tune, because its real cost is attach latency rather than memory.
-  Revisit if and when the history lease becomes lazy.
+- **Make `history-limit` mean bytes.** Rejected: it is the tmux-shaped name
+  and tmux users read it as lines. Silently changing its units would turn
+  every existing config into a misconfiguration no error could catch.
+- **Keep 2 MiB as a private constant** (the first version of this decision).
+  Rejected on amendment — see "Decision", item 2. The argument was that attach
+  latency is not something a user should have to price; the answer is that
+  they are paying it either way, and a default cannot know their pane count.
 - **Bound `DetachOptions` instead of retention.** The engine treats an
   exceeded detach budget as a hard error rather than a truncation, so a pane
   with deep history would fail its bootstrap instead of shipping less history.

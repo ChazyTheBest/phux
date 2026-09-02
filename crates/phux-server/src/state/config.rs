@@ -27,17 +27,18 @@ use portable_pty::CommandBuilder;
 /// with `-D warnings`, so a bare `pub` here would fail CI.)
 #[derive(Debug)]
 pub(super) struct ServerConfig {
-    /// Lines of scrollback retained per pane (`defaults.history-limit`).
-    /// Mirrors [`crate::runtime::ServerConfig::history_limit`] so the
+    /// Per-pane scrollback bounds (`defaults.history-limit` and
+    /// `defaults.history-bytes`).
+    /// Mirrors [`crate::runtime::ServerConfig::scrollback`] so the
     /// attach-time creation path (`AttachTarget::CreateIfMissing`) and
     /// `SPAWN_TERMINAL` build their `TerminalActor`s with the configured
     /// cap without an extra channel to the runtime. Set by the runtime
-    /// via [`super::ServerState::set_history_limit`] right after
+    /// via [`super::ServerState::set_scrollback_limits`] right after
     /// `SharedState::new`.
     ///
     /// Defaults to the `phux_config` schema default so tests that never
     /// call the setter still get a sane bound.
-    pub(super) history_limit: u32,
+    pub(super) scrollback: phux_config::ScrollbackLimits,
     /// How a freshly-spawned pane chooses its working directory
     /// (`defaults.cwd-inheritance`). Mirrors
     /// [`crate::runtime::ServerConfig::cwd_inheritance`] so the
@@ -135,7 +136,7 @@ pub(super) struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            history_limit: phux_config::DefaultsCfg::default().history_limit,
+            scrollback: phux_config::DefaultsCfg::default().scrollback_limits(),
             cwd_inheritance: phux_config::CwdInheritance::default(),
             term: phux_config::DefaultsCfg::default().term,
             shell: crate::terminal_actor::resolve_shell(None),
