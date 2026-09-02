@@ -3156,6 +3156,57 @@ fn drain_ready_into_batch(
     None
 }
 
+/// Take the next mailbox item, honouring the close control.
+///
+/// Clears `close_control_open` once the control has fired or gone away, so
+/// later turns wait on the mailbox alone. `None` means the mailbox is done.
+async fn next_outbound(
+    rx: &mut tokio::sync::mpsc::Receiver<Outbound>,
+    close: &mut tokio::sync::watch::Receiver<bool>,
+    close_control_open: &mut bool,
+) -> Option<Outbound> {
+    loop {
+        if !*close_control_open {
+            return rx.recv().await;
+        }
+        tokio::select! {
+            biased;
+            changed = close.changed() => {
+                if changed.is_ok() && *close.borrow_and_update() {
+                    rx.close();
+                }
+                *close_control_open = false;
+            }
+            message = rx.recv() => return message,
+        }
+    }
+}
+
+/// Write the `DETACHED` that follows an ordered terminal `ERROR`, then flush
+/// and close.
+///
+/// The flush matters on a buffering transport: the `ERROR` is already inside
+/// the batch this call follows, and without it both frames could sit in
+/// tungstenite's write buffer while the close tears the connection down.
+async fn finish_with_terminal_error<W: FrameWriter>(
+    writer: &mut W,
+    buf: &mut BytesMut,
+    message: String,
+    client_id: ClientId,
+) {
+    buf.clear();
+    FrameKind::Detached {
+        reason: Some(DetachReason::ProtocolError),
+        message,
+    }
+    .encode(buf);
+    if let Err(err) = writer.write_frame(buf).await {
+        debug!(?client_id, error = %err, "writer error on terminal DETACHED");
+    }
+    let _ = writer.flush().await;
+    let _ = writer.close().await;
+}
+
 /// Writer task: drain the per-client outbound channel and write each
 /// message to the socket. Encodes [`Outbound::Frame`] via
 /// `FrameKind::encode`.
@@ -3174,25 +3225,8 @@ pub(crate) async fn writer_task<W: FrameWriter>(
     let mut ends: Vec<usize> = Vec::new();
     let mut close_control_open = true;
     loop {
-        let message = if close_control_open {
-            tokio::select! {
-                biased;
-                changed = close.changed() => {
-                    match changed {
-                        Ok(()) if *close.borrow_and_update() => {
-                            rx.close();
-                            close_control_open = false;
-                        }
-                        _ => close_control_open = false,
-                    }
-                    continue;
-                }
-                message = rx.recv() => message,
-            }
-        } else {
-            rx.recv().await
-        };
-        let Some(message) = message else {
+        let Some(message) = next_outbound(&mut rx, &mut close, &mut close_control_open).await
+        else {
             break;
         };
         // Encode this message plus everything already queued behind it into
@@ -3215,15 +3249,15 @@ pub(crate) async fn writer_task<W: FrameWriter>(
             return;
         }
         if let Some(message) = terminal_message {
-            buf.clear();
-            FrameKind::Detached {
-                reason: Some(DetachReason::ProtocolError),
-                message,
-            }
-            .encode(&mut buf);
-            if let Err(err) = writer.write_frame(&buf).await {
-                debug!(?client_id, error = %err, "writer error on terminal DETACHED");
-            }
+            finish_with_terminal_error(&mut writer, &mut buf, message, client_id).await;
+            return;
+        }
+        // phux-l96p.10: `write_frames` is allowed to only buffer — the
+        // WebSocket transport does, because one frame must still be one
+        // binary message — so the batch leaves here, once, rather than
+        // paying a flush per 4 KiB `TERMINAL_OUTPUT`.
+        if let Err(err) = writer.flush().await {
+            debug!(?client_id, error = %err, "writer flush failed; client task ending");
             let _ = writer.close().await;
             return;
         }

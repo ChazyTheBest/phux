@@ -94,6 +94,19 @@ pub(crate) trait FrameWriter {
         Ok(())
     }
 
+    /// Push whatever [`Self::write_frames`] buffered out to the peer.
+    ///
+    /// The writer task calls this once per drain of the outbound mailbox, not
+    /// once per frame. That is what lets a message-oriented transport keep the
+    /// one-message-per-frame framing `write_frames` requires and still pay a
+    /// single `write(2)` for the whole burst: `WsWriter::write_frame` only
+    /// feeds tungstenite's buffer, and this is where it leaves. Stream
+    /// transports write straight through, so the default is a no-op and their
+    /// per-frame cost is unchanged.
+    async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Finish the server-to-client stream after its final frame.
     async fn close(&mut self) -> io::Result<()>;
 }
@@ -431,11 +444,24 @@ pub(crate) struct WsWriter {
 }
 
 impl FrameWriter for WsWriter {
+    /// Queue one frame as one binary message **without** flushing.
+    ///
+    /// `SinkExt::send` is `feed` + `flush`, and flushing per frame is what
+    /// made this transport the slow one (phux-l96p.10): a `seq 1 300000`
+    /// burst is tens of thousands of 4 KiB frames, and each one cost a
+    /// separate `write(2)` of a partial TCP segment. `feed` lets tungstenite
+    /// accumulate them in its 128 KiB write buffer; the writer task flushes
+    /// once per drain of the outbound mailbox, so a burst leaves as full
+    /// segments and an idle connection still flushes on its single frame.
     async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         self.tx
-            .send(Message::Binary(frame.to_vec()))
+            .feed(Message::Binary(frame.to_vec()))
             .await
             .map_err(io::Error::other)
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        SinkExt::flush(&mut self.tx).await.map_err(io::Error::other)
     }
 
     async fn close(&mut self) -> io::Result<()> {
@@ -452,6 +478,18 @@ impl Incoming for WsListener {
         // The remote ephemeral port is neither useful for pairing diagnosis nor
         // stable enough to be an identity field. Retain only the source IP.
         let source_ip = peer.ip();
+
+        // Nagle off (phux-l96p.10). A terminal is a latency wire: the server
+        // answers a keystroke with a short `TERMINAL_OUTPUT`, which Nagle
+        // holds until the peer's delayed ACK returns, adding tens of
+        // milliseconds to every echo. UDS has no such algorithm and QUIC does
+        // not implement one, which is why only this transport showed a 33 ms
+        // echo p99 against 0.7 ms on the other two. Failure is not fatal —
+        // the connection still works, only slower — so it is logged, not
+        // propagated.
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::debug!(error = %err, "could not disable Nagle on accepted WebSocket TCP stream");
+        }
 
         // TLS handshake first (if configured), so the bearer token in the
         // upgrade request is already encrypted when we read it. The underlying

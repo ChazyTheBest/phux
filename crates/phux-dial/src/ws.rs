@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -237,6 +237,13 @@ pub async fn dial(d: &WsDial) -> Result<Ws, DialError> {
                 DialError::Connect(msg)
             }
         })?;
+    // Nagle off (phux-l96p.10): a keystroke leaves this socket as one small
+    // `INPUT_KEY`, and Nagle holds it until the peer's delayed ACK returns.
+    // The server disables it on its half for the same reason; both halves
+    // matter, because either one alone still pays the delay in one direction.
+    // A failure here costs latency, not correctness, so it is ignored rather
+    // than failing the dial (and this crate carries no logger of its own).
+    let _ = tcp.set_nodelay(true);
     let stream = if target.secure {
         ClientStream::Tls(Box::new(tls_connect(tcp, &target, d).await?))
     } else {
@@ -442,6 +449,45 @@ impl WsReader {
                 // Text / ping / pong / raw: not a phux frame, but proof the
                 // path is still carrying bytes. tungstenite has already
                 // queued the automatic pong for a peer ping.
+                Some(Ok(_)) => self.keepalive.note_inbound(Instant::now()),
+            }
+        }
+    }
+
+    /// Take the next phux frame **only if one is already decodable**, without
+    /// awaiting the socket.
+    ///
+    /// This is the WebSocket half of the burst coalescing the UDS and QUIC
+    /// lanes already had (phux-jhv8): without it the attach loop runs a full
+    /// render pass per 4 KiB `TERMINAL_OUTPUT`, which on a `seq 1 300000`
+    /// burst is tens of thousands of paints and is the client half of why
+    /// this lane could not keep up (phux-l96p.10).
+    ///
+    /// Implemented as a single non-blocking poll of the message stream. The
+    /// common hit is tungstenite's own read buffer, which usually holds
+    /// several messages after one socket read. Polling with a no-op waker is
+    /// safe here because the caller always returns to an awaiting
+    /// [`recv_message_alive`], which re-registers the real waker, and tokio's
+    /// readiness flag — not the stored waker — is what makes that poll
+    /// observe data that arrived in between.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport failures as [`DialError`]. A clean close is
+    /// reported as `Ok(None)`, exactly like "nothing ready yet": the next
+    /// awaiting read surfaces the disconnect.
+    pub fn try_recv_message(&mut self) -> Result<Option<Vec<u8>>, DialError> {
+        loop {
+            let Some(next) = self.rx.next().now_or_never() else {
+                return Ok(None);
+            };
+            match next {
+                None | Some(Ok(Message::Close(_))) => return Ok(None),
+                Some(Ok(Message::Binary(data))) => {
+                    self.keepalive.note_inbound(Instant::now());
+                    return Ok(Some(data));
+                }
+                Some(Err(err)) => return Err(ws_error(err)),
                 Some(Ok(_)) => self.keepalive.note_inbound(Instant::now()),
             }
         }

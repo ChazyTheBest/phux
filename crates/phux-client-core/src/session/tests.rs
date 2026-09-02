@@ -2444,3 +2444,117 @@ fn generation_token_is_lossless_and_changes_per_generation() {
         key(2, 1).generation_token()
     );
 }
+
+/// phux-l96p.10: the gap resync's replacement generation is adopted whole.
+///
+/// After a broadcast gap the server republishes the pane as a *new* bootstrap
+/// generation whose `base_seq` is the actor's current raw sequence — far
+/// beyond anything the old generation reached, because the whole point is that
+/// the frames in between were dropped. The kernel must take that base as the
+/// new origin and accept `base + 1` as the very next live frame; treating the
+/// jump as a `SequenceGap` is what turned a recoverable gap into
+/// `session kernel rejected terminal_output: live sequence gap at N;
+/// expected M` and a dead pane.
+///
+/// Both server shapes are covered, because the two bootstrap profiles differ:
+/// the native path tombstones the old generation first, the synthesized path
+/// republishes without one. In both, output still addressed to the old
+/// generation must be *ignored* (`RetiredGeneration`), never a sequence error.
+#[test]
+fn gap_resync_replacement_generation_resets_the_live_sequence() {
+    for tombstone_first in [true, false] {
+        let terminal_id = terminal(7);
+        let stream_id = stream(17);
+        let old = bootstrap(27);
+        let replacement = bootstrap(28);
+        let mut kernel = kernel(ReadyMode::ChunkFirst);
+        let mut effects = EffectBuffer::new();
+
+        publish_direct(&mut kernel, &terminal_id, stream_id, old, 41, &mut effects);
+        kernel
+            .update(
+                KernelInput::TerminalOutput {
+                    terminal_id: &terminal_id,
+                    stream_id,
+                    bootstrap_id: old,
+                    seq: 42,
+                    payload: b"before-the-gap",
+                },
+                &mut effects,
+            )
+            .unwrap();
+
+        if tombstone_first {
+            kernel
+                .update(
+                    KernelInput::Tombstone {
+                        terminal_id: &terminal_id,
+                        stream_id,
+                        bootstrap_id: old,
+                        reason: TombstoneReason::OutboundGap,
+                        last_valid_seq: 42,
+                    },
+                    &mut effects,
+                )
+                .unwrap();
+        }
+
+        // The dropped window: the actor is thousands of sequences further on.
+        let resync_base = 9_000;
+        publish_direct(
+            &mut kernel,
+            &terminal_id,
+            stream_id,
+            replacement,
+            resync_base,
+            &mut effects,
+        );
+        assert_eq!(
+            kernel.published(&terminal_id).unwrap().key().bootstrap_id,
+            replacement,
+            "tombstone_first={tombstone_first}: replacement must become the published generation",
+        );
+        assert_eq!(
+            kernel.published(&terminal_id).unwrap().last_seq(),
+            resync_base,
+            "tombstone_first={tombstone_first}: the replacement's base_seq is the new origin",
+        );
+
+        kernel
+            .update(
+                KernelInput::TerminalOutput {
+                    terminal_id: &terminal_id,
+                    stream_id,
+                    bootstrap_id: replacement,
+                    seq: resync_base + 1,
+                    payload: b"after-the-gap",
+                },
+                &mut effects,
+            )
+            .unwrap_or_else(|err| {
+                panic!("tombstone_first={tombstone_first}: first frame after the resync was rejected: {err}")
+            });
+        assert_eq!(
+            kernel.published(&terminal_id).unwrap().last_seq(),
+            resync_base + 1
+        );
+
+        // A frame the pump had already queued against the old generation is
+        // ignorable, not fatal: `engine_route` folds `RetiredGeneration` into
+        // "ignored", and any other error would detach the client.
+        let stale = kernel.update(
+            KernelInput::TerminalOutput {
+                terminal_id: &terminal_id,
+                stream_id,
+                bootstrap_id: old,
+                seq: 43,
+                payload: b"stale",
+            },
+            &mut effects,
+        );
+        assert!(
+            matches!(stale, Err(KernelError::RetiredGeneration { .. })),
+            "tombstone_first={tombstone_first}: stale generation output must be ignored, got {stale:?}",
+        );
+    }
+}

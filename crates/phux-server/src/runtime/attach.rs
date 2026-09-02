@@ -445,6 +445,23 @@ struct PumpGeneration {
     /// Cleared by a tombstone and set again once a replacement bootstrap is
     /// published; nothing may be forwarded in between.
     generation_active: bool,
+    /// Set the moment the broadcast drops a window under this pump, cleared
+    /// when the replacement generation is published.
+    ///
+    /// While it is set the pump forwards nothing (phux-l96p.10). Two things
+    /// depend on that. First, the client mirror is exactly sequenced: a
+    /// `TERMINAL_OUTPUT` whose `seq` skips the dropped window is a
+    /// `SequenceGap`, which the client treats as a protocol error and detaches
+    /// on — so forwarding "the rest" after a gap does not degrade the session,
+    /// it ends it. Second, a pump that keeps awaiting mailbox capacity for
+    /// frames the client cannot use consumes the broadcast at the *client's*
+    /// speed, and the in-band resync it just asked for is delivered on that
+    /// same broadcast: at PTY speed the resync is overwritten before the pump
+    /// reaches it, and the next lag re-arms the same trap. Dropping instead of
+    /// queueing lets the pump consume at memory speed, so the resync always
+    /// arrives. This is tmux's rule — a consumer far enough behind gets one
+    /// fresh screen, not a replay of everything it missed.
+    gap_pending: bool,
 }
 
 impl PumpGeneration {
@@ -455,6 +472,7 @@ impl PumpGeneration {
             last_forwarded_seq: published_cut,
             bootstrap_id,
             generation_active: true,
+            gap_pending: false,
         }
     }
 }
@@ -587,7 +605,10 @@ impl OutputPumpContext {
         seq: u64,
         bytes: &bytes::Bytes,
     ) -> ControlFlow<Option<PumpFault>> {
-        if !generation.generation_active || seq <= generation.published_cut {
+        if !generation.generation_active
+            || generation.gap_pending
+            || seq <= generation.published_cut
+        {
             return ControlFlow::Continue(());
         }
         let frame = self.output_frame(generation, seq, bytes);
@@ -747,6 +768,7 @@ impl OutputPumpContext {
             generation.last_forwarded_seq = seq;
         }
         generation.generation_active = true;
+        generation.gap_pending = false;
         Ok(())
     }
 
@@ -777,6 +799,7 @@ impl OutputPumpContext {
         generation.published_cut = resync.base_seq;
         generation.last_forwarded_seq = resync.base_seq;
         generation.generation_active = true;
+        generation.gap_pending = false;
         ControlFlow::Continue(())
     }
 
@@ -814,19 +837,65 @@ impl OutputPumpContext {
             .await
     }
 
-    /// A dropped broadcast window leaves the client's mirror stale: ask the
-    /// actor for an in-band resync, and lose the generation if it cannot
-    /// deliver one.
-    async fn request_gap_resync(&self, dropped: u64) -> ControlFlow<Option<PumpFault>> {
+    /// A dropped broadcast window leaves the client's mirror stale: fence the
+    /// generation, ask the actor for an in-band resync, and lose the
+    /// generation if it cannot deliver one.
+    ///
+    /// The fence (`gap_pending`) is set *before* the request and is what makes
+    /// the resync land — see [`PumpGeneration::gap_pending`]. It is set even
+    /// when the request itself fails, so the frames between here and the
+    /// pump's exit are never the gapped ones that would detach the client.
+    async fn request_gap_resync(
+        &self,
+        generation: &mut PumpGeneration,
+        dropped: u64,
+    ) -> ControlFlow<Option<PumpFault>> {
+        let already_pending = generation.gap_pending;
+        generation.gap_pending = true;
+        if already_pending {
+            debug!(
+                terminal_id = ?self.wire_terminal_id,
+                dropped,
+                "{} lagged again while a resync was already in flight; re-requesting",
+                self.lag_label,
+            );
+        } else {
+            warn!(
+                terminal_id = ?self.wire_terminal_id,
+                dropped,
+                "{} lagged; requesting in-band resync",
+                self.lag_label,
+            );
+        }
+        if enqueue_output_resync(&self.resize).await {
+            return ControlFlow::Continue(());
+        }
+        self.fail_unrecoverable_gap().await
+    }
+
+    /// The resync asked for at the last gap has not arrived within
+    /// [`GAP_RESYNC_RETRY`]: ask again.
+    ///
+    /// A pump waiting on a resync forwards nothing, so a request the actor
+    /// accepted but never answered (its snapshot synthesis failed, say) would
+    /// otherwise leave the client on a screen that can never change — silence
+    /// being the one failure the old behaviour did not have. Re-asking costs
+    /// one coalesced grid synthesis per retry and makes convergence
+    /// unconditional rather than conditional on the actor's first answer.
+    async fn retry_gap_resync(&self) -> ControlFlow<Option<PumpFault>> {
         warn!(
             terminal_id = ?self.wire_terminal_id,
-            dropped,
-            "{} lagged; requesting in-band resync",
+            "{} is still waiting on its in-band resync; re-requesting",
             self.lag_label,
         );
         if enqueue_output_resync(&self.resize).await {
             return ControlFlow::Continue(());
         }
+        self.fail_unrecoverable_gap().await
+    }
+
+    /// Tell the client the gap is unrecoverable and end the pump.
+    async fn fail_unrecoverable_gap(&self) -> ControlFlow<Option<PumpFault>> {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             self.out_tx.send(Outbound::Frame(FrameKind::Error {
@@ -837,6 +906,46 @@ impl OutputPumpContext {
         )
         .await;
         ControlFlow::Break(Some(PumpFault::GenerationLost))
+    }
+}
+
+/// How long a fenced pump waits for the replacement generation before asking
+/// for it again.
+///
+/// An order of magnitude above the actor's `RESIZE_RESYNC_DEBOUNCE`, so a
+/// resync that is merely coalescing is never mistaken for one that was lost.
+const GAP_RESYNC_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What one turn of [`next_pump_event`] produced.
+enum PumpStep {
+    /// Dispatch this broadcast result.
+    Event(Result<PaneOutput, tokio::sync::broadcast::error::RecvError>),
+    /// The turn was spent re-asking for a stalled resync; take another.
+    Again,
+    /// The pump cannot continue.
+    Stop(Option<PumpFault>),
+}
+
+/// The next broadcast event for a pump.
+///
+/// A pump that is not fenced simply awaits the broadcast. A fenced one bounds
+/// that wait: it is forwarding nothing until the replacement generation lands,
+/// so without a bound a resync that never arrived would be indistinguishable
+/// from a pane with nothing to say.
+async fn next_pump_event(
+    ctx: &OutputPumpContext,
+    generation: &PumpGeneration,
+    output_rx: &mut tokio::sync::broadcast::Receiver<PaneOutput>,
+) -> PumpStep {
+    if !generation.gap_pending {
+        return PumpStep::Event(output_rx.recv().await);
+    }
+    match tokio::time::timeout(GAP_RESYNC_RETRY, output_rx.recv()).await {
+        Ok(received) => PumpStep::Event(received),
+        Err(_) => match ctx.retry_gap_resync().await {
+            ControlFlow::Continue(()) => PumpStep::Again,
+            ControlFlow::Break(fault) => PumpStep::Stop(fault),
+        },
     }
 }
 
@@ -867,7 +976,11 @@ async fn run_output_pump(
         return Some(fault);
     }
     loop {
-        let received = output_rx.recv().await;
+        let received = match next_pump_event(ctx, &generation, &mut output_rx).await {
+            PumpStep::Event(received) => received,
+            PumpStep::Again => continue,
+            PumpStep::Stop(fault) => return fault,
+        };
         let step = match received {
             Ok(PaneOutput::Live { seq, bytes }) => {
                 ctx.forward_live(&mut generation, seq, &bytes).await
@@ -896,7 +1009,7 @@ async fn run_output_pump(
                 .await
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                ctx.request_gap_resync(n).await
+                ctx.request_gap_resync(&mut generation, n).await
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => ControlFlow::Break(None),
         };

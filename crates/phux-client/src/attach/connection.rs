@@ -1039,15 +1039,16 @@ impl FrameReader {
     /// Non-blocking sibling of [`Self::recv`]: decode a frame only if one is
     /// already buffered (or, for UDS, becomes readable without blocking).
     ///
-    /// Returns `Ok(None)` when the next frame is not yet fully available. Both
-    /// transports drain a coalesced burst out of their receive buffer; the UDS
+    /// Returns `Ok(None)` when the next frame is not yet fully available. Every
+    /// transport drains a coalesced burst out of its receive buffer; the UDS
     /// path additionally tops up from the socket without blocking (quinn exposes
-    /// no sync ready-check, so QUIC drains buffered bytes only).
+    /// no sync ready-check, so QUIC drains buffered bytes only), and the
+    /// WebSocket path takes whatever tungstenite has already decoded.
     pub fn try_recv(&mut self) -> Result<Option<FrameKind>, AttachError> {
         match self {
             Self::Uds(r) => r.try_recv(),
             Self::Quic(r) => r.try_recv(),
-            Self::Ws(_) => Ok(None),
+            Self::Ws(r) => r.try_recv(),
         }
     }
 }
@@ -1197,6 +1198,19 @@ impl WsReader {
     async fn recv_alive(&mut self, writer: &mut ws::WsWriter) -> Result<FrameKind, AttachError> {
         let message = ws::recv_message_alive(&mut self.inner, writer).await?;
         self.decode(message)
+    }
+
+    /// Peel off a message tungstenite has already decoded, so the attach loop
+    /// coalesces a burst into one paint on this lane too (phux-l96p.10).
+    ///
+    /// `Ok(None)` covers both "nothing buffered" and a close seen without
+    /// awaiting: the caller's next `recv` reports the disconnect, and the
+    /// batch it has already collected is still applied.
+    fn try_recv(&mut self) -> Result<Option<FrameKind>, AttachError> {
+        let Some(message) = self.inner.try_recv_message()? else {
+            return Ok(None);
+        };
+        self.decode(Some(message)).map(Some)
     }
 
     fn decode(&self, message: Option<Vec<u8>>) -> Result<FrameKind, AttachError> {
