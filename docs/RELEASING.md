@@ -78,16 +78,33 @@ Required secrets:
 |---|---|---|---|
 | `HOMEBREW_TAP_DEPLOY_KEY` | `release.yml` | Automatic push to `phall1/homebrew-tap`. If absent, the release still publishes and the tap step warns/skips. | yes |
 | `CARGO_REGISTRY_TOKEN` | `publish-crate.yml` | Publishing `phux-protocol` to crates.io. Not needed for binary/Homebrew-only releases. | yes |
-| `NPM_TOKEN` | `agent-integration-release.yml` | Publishing `@phux/opencode` and `@phux/pi`; npm trusted publishing should also be configured for provenance. | **no — see below** |
+| _(none)_ | `agent-integration-release.yml` | Publishing `@phux/*` to npm — uses OIDC trusted publishing, not a secret. See below. | n/a |
+There is deliberately **no npm secret**. `agent-integration-release.yml` publishes
+through [npm trusted publishing](https://docs.npmjs.com/trusted-publishers), which
+exchanges the workflow's OIDC identity for a short-lived registry credential, so
+there is no long-lived token to leak, rotate, or find missing at release time.
 
-`NPM_TOKEN` has never been configured, so `@phux/opencode` and `@phux/pi` have
-never reached npm and both are 404 on the registry. The lane now fails closed at
-its first step with that instruction rather than dying inside `npm publish`, so
-the gap is legible instead of mysterious — but it is still a gap. To close it,
-create an npm automation token with publish rights on the `@phux` scope, add it
-as the `NPM_TOKEN` repository secret, then dispatch **Release agent integration**
-against each stuck component tag with `dry_run=false`. The lane is idempotent:
-it verifies rather than republishes a version already on the registry.
+Three things that lane depends on, all enforced in CI by
+`scripts/check-install-surface.sh` so they cannot drift back:
+
+- **The publish job runs on `ubuntu-latest`.** npm rejects OIDC from self-hosted
+  runners, and this repo's other jobs run on Blacksmith. The expensive gates stay
+  on Blacksmith; only the small publish job is GitHub-hosted.
+- **Each package's `repository.url` matches this repository exactly**
+  (`https://github.com/no-phux/phux.git`). npm validates it during the token
+  exchange and when attaching provenance.
+- **No `NODE_AUTH_TOKEN`/`NPM_TOKEN` is wired in.** Its presence would mean the
+  lane had silently reverted to a long-lived credential.
+
+**Trusted publishing cannot perform a package's *first* publish.** A trusted
+publisher is configured on npmjs.com against a package that already exists, so a
+brand-new package has to be bootstrapped once by a human with an authenticated
+`npm publish`, after which the trusted publisher is configured and every later
+release is hands-off. Budget for that the first time a new `@phux/*` package
+ships; it is a one-time cost per package, not per release.
+
+The lane is idempotent: it verifies rather than republishes a version already on
+the registry, so re-dispatching a tag is always safe.
 
 ## When a release goes quiet
 
