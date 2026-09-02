@@ -30,7 +30,9 @@ use phux_protocol::ids::TerminalId;
 use ratatui::buffer::{Buffer, Cell as RatatuiCell, CellDiffOption};
 use ratatui::style::{Color, Modifier};
 
-use super::paint::{SidebarReservation, bar_inset, content_rect, sidebar_rect};
+#[cfg(test)]
+use super::paint::content_rect;
+use super::paint::{ContentLayout, SidebarReservation, bar_inset, content_layout, sidebar_rect};
 use super::pane_state::PaneSlot;
 use crate::layout::LayoutState;
 use crate::render::chrome::dividers::compose_buffer as compose_divider_buffer;
@@ -67,7 +69,10 @@ pub(super) fn compose_full_frame_cells(
 ) -> RenderedFrame {
     let (cols, rows) = viewport_dims;
     let bar = status_bar.map(StatusBarPainter::position);
-    let content = content_rect(viewport_dims, bar, sidebar);
+    let ContentLayout {
+        rect: content,
+        rail,
+    } = content_layout(viewport_dims, bar, sidebar);
     let multi = super::multi_pane::compute_layout_in(layout_state, content, viewport_dims);
 
     let mut frame = RenderedFrame::blank(cols, rows);
@@ -101,7 +106,7 @@ pub(super) fn compose_full_frame_cells(
     // non-blank cells never clobbers pane content.
     let divider_buf = {
         let panes_ref = &*panes;
-        compose_divider_buffer(&multi, content, focused_pane, theme, |id| {
+        compose_divider_buffer(&multi, content, rail, focused_pane, theme, |id| {
             super::pane_state::pane_label(panes_ref, id)
         })
     };

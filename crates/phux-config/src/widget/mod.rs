@@ -218,6 +218,27 @@ pub struct WidgetCells {
     pub cells: Vec<Cell>,
 }
 
+/// The advance width of `ch` in terminal cells, or `None` for a
+/// character that must never reach a VT emitter.
+///
+/// Control characters are refused explicitly rather than left to
+/// `unicode-width` happening to return `None`: a status-bar string can
+/// come from a window name, a `cwd`, or an `exec` widget's stdout, so it
+/// is untrusted input on a path that writes escape sequences.
+#[must_use]
+pub fn cell_width(ch: char) -> Option<usize> {
+    if ch.is_control() {
+        return None;
+    }
+    unicode_width::UnicodeWidthChar::width(ch)
+}
+
+/// The width of `s` in terminal cells, ignoring anything unprintable.
+#[must_use]
+pub fn display_width(s: &str) -> usize {
+    s.chars().filter_map(cell_width).sum()
+}
+
 impl WidgetCells {
     /// Build a [`WidgetCells`] from a plain string. Each `char` becomes a
     /// single-cell grapheme; styling is left at default. This is the
@@ -236,14 +257,42 @@ impl WidgetCells {
         reason = "style is cloned into each cell; by-value keeps the builder call sites ergonomic"
     )]
     pub fn from_styled(s: &str, style: Option<CellStyle>) -> Self {
-        let cells = s
-            .chars()
-            .map(|c| Cell {
-                text: smallvec::smallvec![c],
+        let mut cells: Vec<Cell> = Vec::with_capacity(s.len());
+        for ch in s.chars() {
+            let Some(width) = cell_width(ch) else {
+                // A control character never becomes a cell: chrome text
+                // reaches a VT emitter, and the status bar renders
+                // strings a user (or a shell, via a window name) chose.
+                continue;
+            };
+            if width == 0 {
+                // A combining mark, variation selector or ZWJ belongs to
+                // the cell before it — which is exactly what `Cell::text`
+                // documents ("first element is the base codepoint;
+                // remaining elements are combining codepoints").
+                if let Some(last) = cells.last_mut() {
+                    last.text.push(ch);
+                }
+                continue;
+            }
+            cells.push(Cell {
+                text: smallvec::smallvec![ch],
                 style: style.clone(),
                 hit: None,
-            })
-            .collect();
+            });
+            // A double-width character claims a second COLUMN, so it
+            // claims a second cell. `cells.len()` is the bar's width
+            // contract — the fitting pass, the narrowing order and the
+            // click map all count cells — and it is only true if the
+            // count matches what the terminal will actually advance.
+            for _ in 1..width {
+                cells.push(Cell {
+                    text: smallvec::SmallVec::new(),
+                    style: style.clone(),
+                    hit: None,
+                });
+            }
+        }
         Self { cells }
     }
 
@@ -781,6 +830,62 @@ pub enum WidgetError {
         /// Human-readable explanation.
         message: String,
     },
+}
+
+#[cfg(test)]
+mod cell_width_tests {
+    use super::{WidgetCells, display_width};
+
+    /// `cells.len()` IS the status bar's width contract — the fitting
+    /// pass, the narrowing order, ADR-0087's elastic slack and the click
+    /// map all measure in cells. A double-width character therefore has
+    /// to occupy two of them. Counting it as one made a CJK window name
+    /// render about twice as wide as the bar believed, overflow the row,
+    /// and wrap into the pane grid below.
+    #[test]
+    fn a_double_width_char_claims_two_cells() {
+        let cells = WidgetCells::from_text("日本");
+        assert_eq!(cells.cells.len(), 4, "two CJK characters are four columns");
+        assert_eq!(cells.cells.len(), display_width("日本"));
+        // The claimed cell paints nothing; the terminal already advanced.
+        assert!(cells.cells[1].text.is_empty());
+        assert!(cells.cells[3].text.is_empty());
+        assert_eq!(cells.cells[0].text.as_slice(), ['日']);
+        assert_eq!(cells.cells[2].text.as_slice(), ['本']);
+    }
+
+    /// ASCII is unchanged — one char, one cell — so every existing bar
+    /// composes byte-identically.
+    #[test]
+    fn ascii_is_one_cell_per_char() {
+        let cells = WidgetCells::from_text("0:main");
+        assert_eq!(cells.cells.len(), 6);
+    }
+
+    /// A combining mark belongs to the cell before it, which is exactly
+    /// what `Cell::text` documents. One cell per mark would have made
+    /// `"cafe\u{301}"` five columns wide when it renders as four.
+    #[test]
+    fn a_combining_mark_joins_its_base_cell() {
+        let cells = WidgetCells::from_text("cafe\u{301}");
+        assert_eq!(cells.cells.len(), 4);
+        assert_eq!(cells.cells[3].text.as_slice(), ['e', '\u{301}']);
+    }
+
+    /// A status-bar string can come from a window name, a `cwd`, or an
+    /// `exec` widget's stdout, and it reaches an emitter that writes
+    /// escape sequences. No control character becomes a cell.
+    #[test]
+    fn control_characters_never_become_cells() {
+        let cells = WidgetCells::from_text("a\u{1b}[31mb\u{7}");
+        let text: String = cells
+            .cells
+            .iter()
+            .flat_map(|c| c.text.iter().copied())
+            .collect();
+        assert_eq!(text, "a[31mb");
+        assert!(!text.contains('\u{1b}'));
+    }
 }
 
 #[cfg(test)]

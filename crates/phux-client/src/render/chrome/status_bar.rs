@@ -318,16 +318,30 @@ fn write_buffer<W: Write>(
     // after this returns.
     write!(out, "\x1b[{one_based_row};{one_based_col}H\x1b[0m")?;
     let mut prev_styled = false;
-    for x in 0..cols {
+    let mut x = 0;
+    while x < cols {
         let cell = &buffer[(x, 0)];
         // phux-ahv.3: per-cell SGR (shared with the overlay painter).
         crate::render::sgr::emit_cell_sgr(out, cell, &mut prev_styled)?;
         let sym = cell.symbol();
-        if sym.is_empty() {
+        // The row is one uninterrupted run from a single CUP, so what it
+        // writes has to advance the terminal exactly `cols` columns. A
+        // DOUBLE-WIDTH character advances two and claims the cell after
+        // it (`WidgetCells::from_styled` reserves that cell); emitting
+        // anything into the claimed cell — a space, as this did before
+        // phux-l96p.8's fix pass — pushed the row one column too far per
+        // wide character, overflowed the bar and wrapped it into the
+        // pane grid.
+        let advance = if sym.is_empty() {
             out.write_all(b" ")?;
+            1
         } else {
             out.write_all(sym.as_bytes())?;
-        }
+            u16::try_from(crate::render::display_width(sym))
+                .unwrap_or(1)
+                .max(1)
+        };
+        x = x.saturating_add(advance);
     }
     // SGR reset on exit so the next paint inherits no attributes from us.
     out.write_all(b"\x1b[0m")?;

@@ -1050,19 +1050,37 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Emit `buf` to `out` at `rect`'s origin, row by row, with a per-cell SGR
 /// delta (shared with the overlay + status-bar painters).
+///
+/// A row is written as one uninterrupted run from its own `CUP`, so the
+/// emitted cells have to advance the terminal's cursor exactly as many
+/// columns as the strip reserved. A DOUBLE-WIDTH character advances two,
+/// and ratatui leaves the cell it spills into empty; writing a space
+/// there — as this did before phux-l96p.8's fix pass — advanced the row
+/// one column too far per wide character, and a CJK window name walked
+/// the whole strip out of its reserved columns and over the panes
+/// beside it (ADR-0020). Skipping the spilled-into cells keeps the
+/// column budget and the cursor in agreement.
 fn emit<W: Write>(out: &mut W, buf: &Buffer, rect: Rect) -> io::Result<()> {
     for row in 0..rect.h {
         write!(out, "\x1b[{};{}H\x1b[0m", rect.y + row + 1, rect.x + 1)?;
         let mut prev_styled = false;
-        for col in 0..rect.w {
+        let mut col = 0;
+        while col < rect.w {
             let cell = &buf[(col, row)];
             crate::render::sgr::emit_cell_sgr(out, cell, &mut prev_styled)?;
             let sym = cell.symbol();
-            if sym.is_empty() {
+            let advance = if sym.is_empty() {
                 out.write_all(b" ")?;
+                1
             } else {
                 out.write_all(sym.as_bytes())?;
-            }
+                // Clamp: a symbol the strip believes is zero-width would
+                // otherwise spin this loop forever.
+                u16::try_from(crate::render::display_width(sym))
+                    .unwrap_or(1)
+                    .max(1)
+            };
+            col = col.saturating_add(advance);
         }
         out.write_all(b"\x1b[0m")?;
     }
@@ -1275,6 +1293,78 @@ mod tests {
         assert!(p.set_needs_you(vec![done.clone()]));
         assert!(!p.set_needs_you(vec![done.clone()]));
         assert!(p.set_needs_you(vec![AgentEntry { seen: true, ..done }]));
+    }
+
+    /// phux-l96p.8 fix pass: a row must advance the terminal's cursor
+    /// exactly `rect.w` columns.
+    ///
+    /// The strip emits each row as one uninterrupted run from its own
+    /// `CUP`, so its column budget is only as good as its idea of how
+    /// wide each glyph is. A DOUBLE-WIDTH character advances two columns
+    /// and ratatui leaves the cell it spills into empty; writing a space
+    /// there advanced the row one column too far per wide character, and
+    /// a CJK window name walked the whole strip out of its reserved
+    /// columns and over the panes beside it — libghostty's cells
+    /// (ADR-0020).
+    #[test]
+    fn a_wide_window_name_stays_inside_the_strip() {
+        let mut p = SidebarPainter::new(Theme::default());
+        assert!(p.set_windows(vec![win("日本語のペイン名前がとても長い", true)]));
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 8,
+        };
+        let painted = paint_to_string(&mut p, rect);
+        // Each emitted row is one run from one CUP, so the emitted
+        // GLYPH widths per row must total the strip's width exactly —
+        // one column too many and the next row starts inside a pane.
+        let rows = rows_of(&painted);
+        assert_eq!(rows.len(), usize::from(rect.h), "one run per strip row");
+        for row in rows {
+            assert_eq!(
+                crate::render::display_width(&row),
+                usize::from(rect.w),
+                "row {row:?} does not advance the cursor exactly {} columns",
+                rect.w
+            );
+        }
+    }
+
+    /// Split an emitted strip into its per-row glyph runs (the text
+    /// between one row's `CUP` and the next).
+    fn rows_of(painted: &str) -> Vec<String> {
+        let mut rows: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = painted.chars().peekable();
+        let mut started = false;
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                }
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        if d == 'H' {
+                            if started {
+                                rows.push(std::mem::take(&mut cur));
+                            }
+                            started = true;
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            if started {
+                cur.push(c);
+            }
+        }
+        if started {
+            rows.push(cur);
+        }
+        rows
     }
 
     fn paint_to_string(painter: &mut SidebarPainter, rect: Rect) -> String {

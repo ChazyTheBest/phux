@@ -478,7 +478,10 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
     )
     .entered();
     let bar = status_bar.as_ref().map(|p| p.position());
-    let content = content_rect(viewport_dims, bar, sidebar);
+    let ContentLayout {
+        rect: content,
+        rail,
+    } = content_layout(viewport_dims, bar, sidebar);
     let multi = super::multi_pane::compute_layout_in(layout_state, content, viewport_dims);
     // Component painters flush independently. Keep their intermediate states
     // hidden from the outer terminal while the destructive frame is rebuilt.
@@ -514,6 +517,7 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
         out,
         &multi,
         content,
+        rail,
         focused_pane,
         theme,
         |id| super::pane_state::pane_label(panes_ref, id),
@@ -629,7 +633,10 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
     )
     .entered();
     let bar = status_bar.as_ref().map(|p| p.position());
-    let content = content_rect(viewport_dims, bar, sidebar);
+    let ContentLayout {
+        rect: content,
+        rail,
+    } = content_layout(viewport_dims, bar, sidebar);
     let multi = super::multi_pane::compute_layout_in(layout_state, content, viewport_dims);
     // The focused pane's LAST authoritative cursor — read, never re-derived by
     // a render. `None` (hidden / not yet rendered) falls back to the pane's
@@ -653,6 +660,7 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
         out,
         &multi,
         content,
+        rail,
         focused_pane,
         theme,
         |id| super::pane_state::pane_label(panes, id),
@@ -976,6 +984,34 @@ pub(super) fn content_rect(
     bar: Option<Position>,
     sidebar: Option<SidebarReservation>,
 ) -> crate::layout::Rect {
+    content_layout(outer, bar, sidebar).rect
+}
+
+/// The pane area AND the pane-grid rail row above it.
+///
+/// The rail row is REPORTED rather than left to be inferred from
+/// `rect.y`, because `rect.y` is 1 for two unrelated reasons: a rail was
+/// reserved, or a top-docked status bar pushed the content down. On a
+/// viewport too short to spare a rail row those two coincide, and a
+/// consumer inferring the rail would paint a rule straight across the
+/// status bar's own row — over a bar that, being unchanged, never
+/// repaints to correct it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ContentLayout {
+    /// The rectangle panes tile into.
+    pub rect: crate::layout::Rect,
+    /// The row reserved above `rect` for the pane-grid rail, or `None`
+    /// when the viewport was too short to spare one.
+    pub rail: Option<u16>,
+}
+
+/// Split `outer` into the status-bar row, the pane-grid rail, the
+/// sidebar strip, and the pane area that survives them.
+pub(super) fn content_layout(
+    outer: (u16, u16),
+    bar: Option<Position>,
+    sidebar: Option<SidebarReservation>,
+) -> ContentLayout {
     let (cols, rows) = outer;
     let h = if bar.is_some() {
         rows.saturating_sub(1)
@@ -995,8 +1031,12 @@ pub(super) fn content_rect(
     // on split windows would move the panes under the user on every
     // split. Yielded whole on a viewport too short to spare it, so a
     // two-row terminal still shows a pane instead of only chrome.
-    let (y, h) = if h >= 2 { (y + 1, h - 1) } else { (y, h) };
-    sidebar.map_or(
+    let (y, h, rail) = if h >= 2 {
+        (y + 1, h - 1, Some(y))
+    } else {
+        (y, h, None)
+    };
+    let rect = sidebar.map_or(
         crate::layout::Rect {
             x: 0,
             y,
@@ -1012,7 +1052,8 @@ pub(super) fn content_rect(
             };
             crate::layout::Rect { x, y, w, h }
         },
-    )
+    );
+    ContentLayout { rect, rail }
 }
 
 /// The sidebar strip's own `Rect` — the columns [`content_rect`] reserved for
@@ -1325,6 +1366,49 @@ mod tests {
                         w: vw,
                         h: vh - 1,
                     },
+                    "outer={outer:?} bar={bar:?}"
+                );
+            }
+        }
+    }
+
+    /// phux-l96p.8 fix pass: the rail row is REPORTED, never inferred
+    /// from `rect.y`. With a top-docked bar on a two-row viewport the
+    /// bar takes row 0 and `rect.y` is 1 — but no rail was reserved, and
+    /// a consumer inferring `rect.y - 1` would paint a rule across the
+    /// bar's own row.
+    #[test]
+    fn a_two_row_top_bar_reports_no_rail() {
+        let two = content_layout((40, 2), Some(Position::Top), None);
+        assert_eq!(two.rect.y, 1, "the bar still takes row 0");
+        assert_eq!(two.rect.h, 1, "the single remaining row goes to the pane");
+        assert_eq!(
+            two.rail, None,
+            "no rail was reserved, so `rect.y - 1` is the BAR's row"
+        );
+        // With room, the rail is reported and sits under the bar.
+        let roomy = content_layout((40, 24), Some(Position::Top), None);
+        assert_eq!(roomy.rail, Some(1));
+        assert_eq!(roomy.rect.y, 2);
+        // Bottom bar (the default) puts the rail at row 0.
+        let bottom = content_layout((40, 24), Some(Position::Bottom), None);
+        assert_eq!(bottom.rail, Some(0));
+        assert_eq!(bottom.rect.y, 1);
+        // And a one-row viewport reserves nothing at all.
+        let tiny = content_layout((40, 1), Some(Position::Bottom), None);
+        assert_eq!(tiny.rail, None);
+    }
+
+    /// `content_rect` stays the projection of `content_layout`, so the
+    /// twenty-odd call sites that only want the rectangle cannot drift
+    /// from the one that also needs the rail.
+    #[test]
+    fn content_rect_is_content_layouts_rect() {
+        for outer in [(80u16, 24u16), (40, 2), (10, 1), (200, 50)] {
+            for bar in [None, Some(Position::Top), Some(Position::Bottom)] {
+                assert_eq!(
+                    content_rect(outer, bar, None),
+                    content_layout(outer, bar, None).rect,
                     "outer={outer:?} bar={bar:?}"
                 );
             }

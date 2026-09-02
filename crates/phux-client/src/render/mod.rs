@@ -40,13 +40,24 @@ pub use theme::Theme;
 /// list rows, and status widgets all cut the same way.
 pub const ELLIPSIS: char = phux_config::widget::ELLIPSIS;
 
-/// Clip `s` to at most `max` display cells, marking the cut with
+/// Clip `s` to at most `max` display CELLS, marking the cut with
 /// [`ELLIPSIS`].
 ///
-/// The ellipsis *replaces* the last surviving character rather than being
-/// appended, so the result is exactly `min(len, max)` cells wide and
-/// callers can do width arithmetic on it. `max == 0` yields the empty
-/// string; a string that already fits is returned untouched.
+/// The ellipsis *replaces* the last surviving cell rather than being
+/// appended, so the result is at most `max` cells wide and callers can
+/// do width arithmetic on it. `max == 0` yields the empty string; a
+/// string that already fits is returned untouched.
+///
+/// Cells, not chars. Chrome text is arbitrary input — a window name, a
+/// branch, a pane's OSC-2 title — so a CJK or emoji label measured by
+/// `chars().count()` is clipped to roughly twice its budget and overruns
+/// whatever was supposed to sit beside it. A double-width character that
+/// would straddle the budget is dropped whole rather than half-drawn.
+///
+/// Zero-width characters (combining marks, variation selectors, ZWJ)
+/// ride along with the character they belong to and never consume
+/// budget; control characters are dropped, because chrome text reaches
+/// an emitter that writes escape sequences.
 ///
 /// Every chrome surface that shortens text goes through here. A row that
 /// silently drops its tail is indistinguishable from a row whose content
@@ -57,18 +68,60 @@ pub fn clip_text(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
-        return s.to_owned();
+    if display_width(s) <= max {
+        return s.chars().filter(|c| !c.is_control()).collect();
     }
-    s.chars()
-        .take(max - 1)
-        .chain(std::iter::once(ELLIPSIS))
-        .collect()
+    // The cut costs one cell for the ellipsis.
+    let budget = max - 1;
+    let mut out = String::with_capacity(s.len().min(budget * 4 + 4));
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let Some(w) = cell_width(ch) else {
+            continue;
+        };
+        if w == 0 {
+            // A mark with no base yet would be a stray combining
+            // character; one with a base belongs to it and is free.
+            if !out.is_empty() {
+                out.push(ch);
+            }
+            continue;
+        }
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push(ELLIPSIS);
+    out
+}
+
+/// The advance width of `ch` in terminal cells, or `None` for a
+/// character that must never reach a VT emitter.
+///
+/// Control characters are refused explicitly rather than left to
+/// `unicode-width` happening to return `None` for them: chrome text is
+/// untrusted (a pane names itself via OSC 2), and an `\x1b` reaching the
+/// emitter would let that pane inject escape sequences into phux's own
+/// chrome.
+#[must_use]
+pub fn cell_width(ch: char) -> Option<usize> {
+    if ch.is_control() {
+        return None;
+    }
+    unicode_width::UnicodeWidthChar::width(ch)
+}
+
+/// The width of `s` in terminal cells, ignoring anything unprintable.
+#[must_use]
+pub fn display_width(s: &str) -> usize {
+    s.chars().filter_map(cell_width).sum()
 }
 
 #[cfg(test)]
 mod clip_text_tests {
-    use super::clip_text;
+    use super::{clip_text, display_width};
 
     #[test]
     fn a_string_that_fits_is_untouched() {
@@ -94,5 +147,56 @@ mod clip_text_tests {
     fn multibyte_text_is_counted_in_characters() {
         assert_eq!(clip_text("échantillon", 4), "éch\u{2026}");
         assert_eq!(clip_text("échantillon", 4).chars().count(), 4);
+    }
+
+    /// CELLS, not chars. A CJK label clipped by `chars().count()` is
+    /// twice its budget wide, which is how the sidebar strip and a pane
+    /// title used to overrun the columns reserved for them.
+    #[test]
+    fn wide_text_is_counted_in_cells() {
+        // Never OVER the budget, which is the property callers rely on.
+        for max in 1..12 {
+            assert!(
+                display_width(clip_text("日本語のテスト", max).as_str()) <= max,
+                "budget {max} overrun"
+            );
+        }
+        // A budget a whole number of glyphs fits is used exactly: 7 =
+        // three double-width characters plus the ellipsis.
+        assert_eq!(clip_text("日本語のテスト", 7), "日本語\u{2026}");
+        // Exactly the budget: untouched, no ellipsis.
+        assert_eq!(clip_text("日本語", 6), "日本語");
+    }
+
+    /// A double-width character that would straddle the last cell is
+    /// dropped whole. Half a glyph is not a shorter glyph.
+    #[test]
+    fn a_wide_char_never_straddles_the_budget() {
+        // Budget 4 = ellipsis + 3 cells: one CJK char (2) fits, the
+        // second would need cells 3-4 and does not.
+        let out = clip_text("日本語", 4);
+        assert_eq!(out, "日\u{2026}");
+        assert!(display_width(&out) <= 4);
+    }
+
+    /// Zero-width marks ride with their base and cost no budget, so a
+    /// decomposed or emoji-qualified label is not truncated at the first
+    /// one.
+    #[test]
+    fn zero_width_marks_ride_with_their_base() {
+        assert_eq!(clip_text("cafe\u{301}/src", 8), "cafe\u{301}/src");
+        assert_eq!(
+            clip_text("\u{2705}\u{fe0f} build", 20),
+            "\u{2705}\u{fe0f} build"
+        );
+    }
+
+    /// Control characters never survive: chrome text reaches an emitter
+    /// that writes escape sequences, and a pane names itself.
+    #[test]
+    fn control_characters_are_dropped() {
+        assert_eq!(clip_text("a\u{1b}[31mb", 40), "a[31mb");
+        assert_eq!(clip_text("a\u{7}b", 40), "ab");
+        assert!(!clip_text("x\u{1b}]0;evil\u{7}y", 3).contains('\u{1b}'));
     }
 }

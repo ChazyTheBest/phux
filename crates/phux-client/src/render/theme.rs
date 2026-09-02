@@ -53,6 +53,35 @@
 //! [`pane_title_focus`]: Theme::pane_title_focus
 //! [`text`]: Theme::text
 //!
+//! ## Contrast
+//!
+//! Every slot that paints TEXT OR A RULE must clear **4.5:1** against
+//! [`Theme::surface`] (#1a1b26, the shipped panel fill and a fair stand-in for
+//! a dark terminal background). That is the WCAG 2.1 AA floor for normal
+//! text, and it is the floor here too, because a chrome rule you cannot
+//! see is not subtle — it is missing.
+//!
+//! "Recessive" is a RELATIONSHIP between slots, not a licence to sit at
+//! the edge of visibility. The register is therefore expressed as three
+//! rungs that all clear the floor:
+//!
+//! | Rung                                 | Slot                  | Ratio |
+//! |--------------------------------------|-----------------------|-------|
+//! | structure (rules, modal borders)     | `border` / `divider`  | 4.7:1 |
+//! | recessive text (hints, sub-lines)    | `dim` and its trackers| 5.6:1 |
+//! | what you are looking at              | `accent` (plus BOLD)  | 6.8:1 |
+//!
+//! Focus is separated from the rest by three things at once — a brighter
+//! tone, a SATURATED hue against desaturated blue-greys, and `BOLD` — so
+//! the hierarchy survives a terminal that flattens any one of them.
+//! `contrast_floor_is_met` asserts the floor; it is a test rather than a
+//! comment so a future retune cannot quietly drop below it.
+//!
+//! The floor is measured against a dark background because the shipped
+//! palette is a dark one throughout. On a light terminal the recessive
+//! rungs land near 3.5:1; `[theme]` is the escape hatch, and every slot
+//! below is overridable.
+//!
 //! ## Overrides
 //!
 //! [`Theme::from_cfg`] reads `[theme]` from `phux_config` — a free-form
@@ -167,14 +196,19 @@ impl Default for Theme {
             // deliberately inherit the user's own foreground so the
             // readable body text of a modal is never our decision.
             action: Color::Reset,
-            // #565f89 — the recessive register. Branch sub-lines, footer
-            // hints, affordances, empty-state placeholders, inactive
-            // window tabs and idle agents all share it, so "not what you
-            // are looking at" is one tone across the whole chrome.
-            dim: Color::Rgb(0x56, 0x5f, 0x89),
-            // #3b4261 — a step below `dim`: rules and modal borders read
-            // as structure, never as content.
-            border: Color::Rgb(0x3b, 0x42, 0x61),
+            // #8a93ab — the recessive TEXT register. Branch sub-lines,
+            // footer hints, affordances, empty-state placeholders,
+            // inactive window tabs and idle agents all share it, so "not
+            // what you are looking at" is one tone across the whole
+            // chrome. Recessive is a relationship, not an excuse to be
+            // unreadable: this clears the 4.5:1 floor documented above
+            // (5.6:1), where the shipped #565f89 managed 2.8:1.
+            dim: Color::Rgb(0x8a, 0x93, 0xab),
+            // #7c86a6 — a step below `dim`: rules and modal borders read
+            // as structure, never as content. Still above the 4.5:1
+            // floor (4.7:1); the shipped #3b4261 was 1.7:1, which is a
+            // rule many people simply cannot see.
+            border: Color::Rgb(0x7c, 0x86, 0xa6),
             title: Color::Rgb(0x7a, 0xa2, 0xf7),
             // #e0af68 — warm sand for section headings, so a heading is
             // legible as a heading without competing with `accent`.
@@ -204,22 +238,22 @@ impl Default for Theme {
             // Sidebar section headers sit in the same recessive register
             // as `dim`: a quiet lowercase label that gives structure
             // without claiming attention.
-            sidebar_section: Color::Rgb(0x56, 0x5f, 0x89),
+            sidebar_section: Color::Rgb(0x8a, 0x93, 0xab),
             // Agent lifecycle colors, deliberately on-palette. Idle
             // recedes into the `dim` tone ("nothing needs you"), working
             // rides the `chord` green of live progress, blocked shares
             // the `attention` orange, done settles into a calm cyan.
-            agent_idle: Color::Rgb(0x56, 0x5f, 0x89),
+            agent_idle: Color::Rgb(0x8a, 0x93, 0xab),
             agent_working: Color::Rgb(0x9e, 0xce, 0x6a),
             agent_blocked: Color::Rgb(0xff, 0x9e, 0x64),
             agent_done: Color::Rgb(0x7d, 0xcf, 0xff),
             // Rules share `border`'s tone: one material for all
             // structure. Focus tints that same grid with `accent`.
-            divider: Color::Rgb(0x3b, 0x42, 0x61),
+            divider: Color::Rgb(0x7c, 0x86, 0xa6),
             divider_focus: Color::Rgb(0x7a, 0xa2, 0xf7),
             // A pane label is an affordance, not content: dim when the
             // pane is elsewhere, accent when it is under your hands.
-            pane_title: Color::Rgb(0x56, 0x5f, 0x89),
+            pane_title: Color::Rgb(0x8a, 0x93, 0xab),
             pane_title_focus: Color::Rgb(0x7a, 0xa2, 0xf7),
             // #c0caf5 — the tokyonight foreground, shared with
             // `selection_fg` so a selected row is the same text on a
@@ -319,8 +353,8 @@ mod tests {
         assert_eq!(t.accent, Color::Rgb(0x7a, 0xa2, 0xf7));
         assert_eq!(t.chord, Color::Rgb(0x9e, 0xce, 0x6a));
         assert_eq!(t.action, Color::Reset);
-        assert_eq!(t.dim, Color::Rgb(0x56, 0x5f, 0x89));
-        assert_eq!(t.border, Color::Rgb(0x3b, 0x42, 0x61));
+        assert_eq!(t.dim, Color::Rgb(0x8a, 0x93, 0xab));
+        assert_eq!(t.border, Color::Rgb(0x7c, 0x86, 0xa6));
         assert_eq!(t.title, Color::Rgb(0x7a, 0xa2, 0xf7));
         assert_eq!(t.section_header, Color::Rgb(0xe0, 0xaf, 0x68));
         assert_eq!(t.error, Color::Rgb(0xf7, 0x76, 0x8e));
@@ -330,8 +364,8 @@ mod tests {
         assert_eq!(t.selection_fg, Color::Rgb(0xc0, 0xca, 0xf5));
         assert_eq!(t.selection_bg, Color::Rgb(0x33, 0x46, 0x7c));
         assert_eq!(t.attention, Color::Rgb(0xff, 0x9e, 0x64));
-        assert_eq!(t.sidebar_section, Color::Rgb(0x56, 0x5f, 0x89));
-        assert_eq!(t.agent_idle, Color::Rgb(0x56, 0x5f, 0x89));
+        assert_eq!(t.sidebar_section, Color::Rgb(0x8a, 0x93, 0xab));
+        assert_eq!(t.agent_idle, Color::Rgb(0x8a, 0x93, 0xab));
         assert_eq!(t.agent_working, Color::Rgb(0x9e, 0xce, 0x6a));
         assert_eq!(t.agent_blocked, Color::Rgb(0xff, 0x9e, 0x64));
         assert_eq!(t.agent_done, Color::Rgb(0x7d, 0xcf, 0xff));
@@ -342,9 +376,9 @@ mod tests {
     #[test]
     fn structural_slots_match_shipped_colors() {
         let t = Theme::default();
-        assert_eq!(t.divider, Color::Rgb(0x3b, 0x42, 0x61));
+        assert_eq!(t.divider, Color::Rgb(0x7c, 0x86, 0xa6));
         assert_eq!(t.divider_focus, Color::Rgb(0x7a, 0xa2, 0xf7));
-        assert_eq!(t.pane_title, Color::Rgb(0x56, 0x5f, 0x89));
+        assert_eq!(t.pane_title, Color::Rgb(0x8a, 0x93, 0xab));
         assert_eq!(t.pane_title_focus, Color::Rgb(0x7a, 0xa2, 0xf7));
         assert_eq!(t.text, Color::Rgb(0xc0, 0xca, 0xf5));
     }
@@ -457,6 +491,92 @@ mod tests {
         assert_eq!(t.selection_fg, Color::Indexed(15));
         // Untouched slots keep their defaults.
         assert_eq!(t.accent, Theme::default().accent);
+    }
+
+    /// Relative luminance per WCAG 2.1, for the contrast assertion below.
+    fn channel(v: u8) -> f64 {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(c: Color) -> f64 {
+        let Color::Rgb(r, g, b) = c else {
+            panic!("contrast is only defined for the rgb slots: {c:?}")
+        };
+        0.0722f64.mul_add(
+            channel(b),
+            0.2126f64.mul_add(channel(r), 0.7152 * channel(g)),
+        )
+    }
+
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The palette's accessibility floor, as a test rather than a
+    /// comment: every slot that paints text or a rule clears WCAG AA
+    /// (4.5:1) against the shipped `surface`.
+    ///
+    /// This exists because the first cut of the structural roles shipped
+    /// a `divider` at 1.7:1 and a `pane_title` at 2.8:1 — recessive to
+    /// the point of being absent for anyone without excellent contrast
+    /// vision on a well-calibrated display.
+    #[test]
+    fn contrast_floor_is_met() {
+        let t = Theme::default();
+        let bg = t.surface;
+        for (name, slot) in [
+            ("divider", t.divider),
+            ("divider_focus", t.divider_focus),
+            ("pane_title", t.pane_title),
+            ("pane_title_focus", t.pane_title_focus),
+            ("border", t.border),
+            ("dim", t.dim),
+            ("sidebar_section", t.sidebar_section),
+            ("agent_idle", t.agent_idle),
+            ("agent_working", t.agent_working),
+            ("agent_blocked", t.agent_blocked),
+            ("agent_done", t.agent_done),
+            ("accent", t.accent),
+            ("chord", t.chord),
+            ("text", t.text),
+            ("section_header", t.section_header),
+            ("error", t.error),
+            ("attention", t.attention),
+        ] {
+            let ratio = contrast(slot, bg);
+            assert!(
+                ratio >= 4.5,
+                "{name} is {ratio:.2}:1 against surface; the floor is 4.5:1"
+            );
+        }
+    }
+
+    /// The three rungs stay ordered. Focus must read as brighter than
+    /// recessive text, which must read as brighter than the rules — a
+    /// retune that clears the floor by flattening the hierarchy would
+    /// otherwise pass `contrast_floor_is_met` and look wrong.
+    #[test]
+    fn the_recessive_rungs_stay_ordered() {
+        let t = Theme::default();
+        let bg = t.surface;
+        let rules = contrast(t.divider, bg);
+        let recessive = contrast(t.dim, bg);
+        let focus = contrast(t.accent, bg);
+        assert!(
+            rules < recessive,
+            "rules ({rules:.2}) must recede behind recessive text ({recessive:.2})"
+        );
+        assert!(
+            recessive < focus,
+            "recessive text ({recessive:.2}) must recede behind focus ({focus:.2})"
+        );
     }
 
     #[test]

@@ -1228,8 +1228,8 @@ Recognized slots:
 | `accent`         | `#7aa2f7`   | Modal titles, query caret, active tab fill |
 | `chord`          | `#9ece6a`   | Keybinding chords in the help table       |
 | `action`         | terminal fg | Action labels                             |
-| `dim`            | `#565f89`   | Footer hints, "no bindings" notice, inactive window tabs, sidebar branch/affordance/empty-state text |
-| `border`         | `#3b4261`   | Modal borders + the sidebar separator rule |
+| `dim`            | `#8a93ab`   | Footer hints, "no bindings" notice, inactive window tabs, sidebar branch/affordance/empty-state text |
+| `border`         | `#7c86a6`   | Modal borders + the sidebar separator rule |
 | `title`          | `#7aa2f7`   | Titles that diverge from `accent`         |
 | `section_header` | `#e0af68`   | Section headings inside help and pickers  |
 | `error`          | `#f7768e`   | Error / alarm text                        |
@@ -1239,21 +1239,39 @@ Recognized slots:
 | `selection_fg`   | `#c0caf5`   | Selected list row / copy-mode strip foreground |
 | `selection_bg`   | `#33467c`   | Selected list row / copy-mode strip background |
 | `attention`      | `#ff9e64`   | Agent-attention chrome (asked marker/hint, fleet-dashboard hot rows) |
-| `sidebar_section`| `#565f89`   | Sidebar `needs you` / `here` / `spaces` zone headers + affordance action glyphs |
-| `agent_idle`     | `#565f89`   | Sidebar agent row in the `idle` state      |
+| `sidebar_section`| `#8a93ab`   | Sidebar `needs you` / `here` / `spaces` zone headers + affordance action glyphs |
+| `agent_idle`     | `#8a93ab`   | Sidebar agent row in the `idle` state      |
 | `agent_working`  | `#9ece6a`   | Sidebar agent row in the `working` state   |
 | `agent_blocked`  | `#ff9e64`   | Sidebar agent row in the `blocked` state   |
 | `agent_done`     | `#7dcfff`   | Sidebar agent row in the `done` state      |
-| `divider`        | `#3b4261`   | Pane rules off the focused pane's frame    |
+| `divider`        | `#7c86a6`   | Pane rules off the focused pane's frame    |
 | `divider_focus`  | `#7aa2f7`   | The focused pane's own rules (also bold)   |
-| `pane_title`     | `#565f89`   | An unfocused pane's label on its top rule  |
+| `pane_title`     | `#8a93ab`   | An unfocused pane's label on its top rule  |
 | `pane_title_focus`| `#7aa2f7`  | The focused pane's label (also bold)       |
 
 The shipped palette is deliberately **muted-chrome / bright-content**: the
 always-on chrome (sidebar headers, branch sub-lines, affordances, the
 separator rule, inactive tabs, empty-state placeholders) sits in one
-cohesive recessive register (`#3b4261` → `#565f89`), so pane content and
+cohesive recessive register (`#7c86a6` → `#8a93ab`), so pane content and
 the blue `accent` carry the eye.
+
+Recessive is a *relationship*, not a licence to be invisible. Every slot
+that paints text or a rule clears **4.5:1** (WCAG AA) against `surface`,
+in three ordered rungs:
+
+| Rung                              | Slot                     | Ratio |
+|-----------------------------------|--------------------------|-------|
+| structure (rules, modal borders)  | `border` / `divider`     | 4.7:1 |
+| recessive text (hints, sub-lines) | `dim` and its trackers   | 5.6:1 |
+| what you are looking at           | `accent` (plus **bold**) | 6.8:1 |
+
+Focus is separated from the rest by three things at once — a brighter
+tone, a saturated hue against desaturated blue-greys, and bold — so the
+hierarchy survives a terminal that flattens any one of them. The floor is
+asserted by a test (`contrast_floor_is_met`), so a retune cannot quietly
+drop below it. It is measured against a dark background because the
+shipped palette is a dark one throughout; on a light terminal the
+recessive rungs land near 3.5:1, and `[theme]` is the escape hatch.
 
 It is also a *system*, not a bag of colors — several slots share a tone on
 purpose, and a retint should keep them in step:
@@ -1287,9 +1305,9 @@ handful of keys.
 [theme]
 accent = "#7aa2f7"
 chord = "#9ece6a"
-border = "#3b4261"
-dim = "#565f89"
-sidebar_section = "#565f89"
+border = "#7c86a6"
+dim = "#8a93ab"
+sidebar_section = "#8a93ab"
 shadow = "#16161e"
 ```
 

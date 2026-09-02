@@ -396,12 +396,15 @@ which-key-delay-ms = 400
 # the padding also widens the mouse target by two columns per tab.
 #
 # The two colors below are the theme's `accent` (#7aa2f7) over the
-# tokyonight base, and the same muted blue the `dim` / `sidebar_section`
-# theme slots use for recessive chrome. They are spelled out rather than
-# named because widget styles are plain data — see `[theme]` in
+# tokyonight base, and the same muted blue-grey the `dim` /
+# `sidebar_section` theme slots use for recessive chrome. Both chips
+# clear 4.5:1 against their own background (the active chip 6.8:1, the
+# inactive 5.6:1), which is the palette-wide contrast floor documented in
+# crates/phux-client/src/render/theme.rs. They are spelled out rather
+# than named because widget styles are plain data — see `[theme]` in
 # docs/consumers/tui.md section 4.4 for the slot list.
 left = [
-  { kind = "windows", format = " {index}:{name} ", separator = "", active = { fg = "#1a1b26", bg = "#7aa2f7", bold = true }, inactive = { fg = "#565f89", bg = "#1a1b26" } },
+  { kind = "windows", format = " {index}:{name} ", separator = "", active = { fg = "#1a1b26", bg = "#7aa2f7", bold = true }, inactive = { fg = "#8a93ab", bg = "#1a1b26" } },
 ]
 center = [{ kind = "help-hints" }]
 # The right slot changes shape with the terminal, via the universal
@@ -434,8 +437,8 @@ right = [
 # title           = "#7aa2f7"  # section/window titles (tracks accent)
 # chord           = "#9ece6a"  # keybinding chords in help + which-key
 # action          = "reset"    # action labels — inherit your terminal fg
-# dim             = "#565f89"  # the recessive register: hints, sub-lines
-# border          = "#3b4261"  # rules and modal borders
+# dim             = "#8a93ab"  # the recessive register: hints, sub-lines
+# border          = "#7c86a6"  # rules and modal borders
 # section_header  = "#e0af68"  # headings inside help / pickers
 # error           = "#f7768e"  # error and alarm text
 # text            = "#c0caf5"  # body copy ON a filled panel (see surface)
@@ -444,15 +447,20 @@ right = [
 # selection_fg    = "#c0caf5"  # selected list row / copy-mode strip fg
 # selection_bg    = "#33467c"  # selected list row / copy-mode strip bg
 # attention       = "#ff9e64"  # "needs you": asked-marker, blocked agents
-# sidebar_section = "#565f89"  # the sidebar's `spaces` / `agents` headers
-# agent_idle      = "#565f89"  # agent lifecycle: nothing needs you
+# sidebar_section = "#8a93ab"  # the sidebar's `spaces` / `agents` headers
+# agent_idle      = "#8a93ab"  # agent lifecycle: nothing needs you
 # agent_working   = "#9ece6a"  # agent lifecycle: live progress
 # agent_blocked   = "#ff9e64"  # agent lifecycle: waiting on a human
 # agent_done      = "#7dcfff"  # agent lifecycle: finished
-# divider         = "#3b4261"  # pane rules off the focused frame
+# divider         = "#7c86a6"  # pane rules off the focused frame
 # divider_focus   = "#7aa2f7"  # the focused pane's own rules (also bold)
-# pane_title      = "#565f89"  # an unfocused pane's label on its top rule
+# pane_title      = "#8a93ab"  # an unfocused pane's label on its top rule
 # pane_title_focus = "#7aa2f7" # the focused pane's label (also bold)
+#
+# Every slot above that paints text or a rule clears 4.5:1 (WCAG AA)
+# against `surface`, in three ordered rungs: rules 4.7:1, recessive text
+# 5.6:1, focus 6.8:1 plus BOLD. Retinting one slot is fine; dropping a
+# rung below the floor makes chrome that some people cannot see at all.
 
 # The window sidebar (prefix-b toggles it): a vertical strip in three
 # zones, ON by default.

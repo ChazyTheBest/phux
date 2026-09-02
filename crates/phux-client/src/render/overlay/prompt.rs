@@ -126,7 +126,7 @@ impl RenderOverlay for PromptOverlay {
         // visible without driving the host terminal cursor (the overlay
         // paint hides it).
         let line = Line::from(vec![
-            Span::raw(self.input.clone()),
+            Span::styled(self.input.clone(), Style::default().fg(self.theme.text)),
             Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
         ]);
         Modal::new(&self.theme, self.title.clone(), vec![line]).render_into(modal_area, buf);

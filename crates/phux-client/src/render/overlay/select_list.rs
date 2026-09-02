@@ -459,7 +459,7 @@ impl SelectList {
         // Query line: a `> ` prompt, the text, and a reverse-video caret.
         lines.push(Line::from(vec![
             Span::styled("> ".to_owned(), Style::default().fg(self.theme.accent)),
-            Span::raw(self.query.clone()),
+            Span::styled(self.query.clone(), Style::default().fg(self.theme.text)),
             Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
         ]));
         lines.push(Line::from(""));

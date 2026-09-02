@@ -101,6 +101,16 @@ pub static HELP_BINDINGS: &[HardcodedBinding] = &[HardcodedBinding {
 /// continues into. A pane narrower than this simply gets no title.
 const TITLE_CHROME_CELLS: u16 = 4;
 
+/// Bytes of UTF-8 one chrome cell can hold.
+///
+/// A cell holds one grapheme cluster: a base character plus whatever
+/// zero-width marks follow it. Four bytes covers any single scalar;
+/// sixteen leaves room for a base plus a few combining marks, which is
+/// every realistic pane title. A cluster longer than this keeps the
+/// marks that fit — a truncated cluster still renders as its base, which
+/// is what the reader needs.
+const CELL_BYTES: usize = 16;
+
 /// What to write into one pane's top rule.
 ///
 /// Borrowed rather than owned: the caller already holds the pane's
@@ -131,25 +141,181 @@ impl PaneLabel<'_> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Cell buffer
+// -----------------------------------------------------------------------------
+
+/// One cell's grapheme, stored inline.
+///
+/// Inline rather than a `String` so composing a frame allocates nothing
+/// per cell: the chrome repaints on every OSC-2 title change, and a
+/// heap allocation per painted cell would make a title change cost more
+/// than the frame it appears in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Sym {
+    buf: [u8; CELL_BYTES],
+    len: u8,
+}
+
+impl Sym {
+    /// The empty symbol: a cell that is positioned but paints nothing.
+    ///
+    /// Load-bearing, not a placeholder. It is what the composer writes
+    /// into the trailing half of a double-width glyph: the emitter skips
+    /// it AND breaks its run there, so the next cell re-anchors with its
+    /// own `CUP` instead of trusting where the terminal's cursor ended
+    /// up after drawing a wide character.
+    const EMPTY: Self = Self {
+        buf: [0; CELL_BYTES],
+        len: 0,
+    };
+
+    /// Store `s`, truncated to whole UTF-8 characters that fit.
+    fn new(s: &str) -> Self {
+        let mut out = Self::EMPTY;
+        for ch in s.chars() {
+            out.push(ch);
+        }
+        out
+    }
+
+    /// Append `ch` if the remaining room holds it; otherwise drop it.
+    fn push(&mut self, ch: char) {
+        let len = usize::from(self.len);
+        let room = CELL_BYTES - len;
+        if ch.len_utf8() > room {
+            return;
+        }
+        let written = ch.encode_utf8(&mut self.buf[len..]).len();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "len + written <= CELL_BYTES = 16, which fits u8"
+        )]
+        {
+            self.len = (len + written) as u8;
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // SAFETY-equivalent without unsafe: every push wrote whole
+        // `char`s through `encode_utf8`, so the prefix is valid UTF-8;
+        // `from_utf8` cannot fail, and an unexpected failure degrades to
+        // an unpainted cell rather than a panic.
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or("")
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// One painted chrome cell.
+#[derive(Clone, Copy)]
+struct ChromeCell {
+    x: u16,
+    y: u16,
+    sym: Sym,
+    style: Style,
+}
+
+/// The chrome cells of one frame, in paint order.
+///
+/// The whole point of collecting cells instead of painting a
+/// viewport-sized `Buffer` is cost: the chrome touches a rail row, a
+/// handful of divider rows and columns, and some title spans — a few
+/// hundred cells. A 250x70 terminal is 17,500. The chrome repaints on
+/// every pane-title change, so composing and scanning the viewport each
+/// time would make a title change an `O(viewport)` event.
+#[derive(Default)]
+struct ChromeCells {
+    cells: Vec<ChromeCell>,
+}
+
+impl ChromeCells {
+    fn clear(&mut self) {
+        self.cells.clear();
+    }
+
+    /// Record one cell. A later write to the same coordinate wins, which
+    /// is what lets a title overwrite the rule the rail laid down first.
+    fn put(&mut self, x: u16, y: u16, sym: Sym, style: Style) {
+        self.cells.push(ChromeCell { x, y, sym, style });
+    }
+
+    fn put_str(&mut self, x: u16, y: u16, symbol: &str, style: Style) {
+        self.put(x, y, Sym::new(symbol), style);
+    }
+
+    /// Order the cells for emission and drop everything that must not be
+    /// painted: duplicates (keeping the last write) and anything that
+    /// landed inside a pane interior.
+    ///
+    /// The interior filter is the ADR-0020 skip-cell carve-out. It is
+    /// applied here, once, over the cells actually produced, so no path
+    /// through this module can emit into a pane whatever the layout
+    /// hands it.
+    fn finalize(&mut self, layout: &PaneLayout) {
+        let (cols, rows) = layout.viewport;
+        self.cells
+            .retain(|c| c.x < cols && c.y < rows && !in_any_pane(layout, c.x, c.y));
+        // Stable, so the insertion order of equal coordinates survives
+        // and "last write wins" is well defined.
+        self.cells.sort_by_key(|c| (c.y, c.x));
+        let mut kept: usize = 0;
+        for i in 0..self.cells.len() {
+            let last_of_run = i + 1 == self.cells.len()
+                || (self.cells[i + 1].y, self.cells[i + 1].x) != (self.cells[i].y, self.cells[i].x);
+            if last_of_run {
+                self.cells[kept] = self.cells[i];
+                kept += 1;
+            }
+        }
+        self.cells.truncate(kept);
+    }
+}
+
+/// `true` when `(x, y)` sits inside any pane's interior rectangle.
+fn in_any_pane(layout: &PaneLayout, x: u16, y: u16) -> bool {
+    layout
+        .rects
+        .values()
+        .any(|r| x >= r.x && y >= r.y && x < r.x.saturating_add(r.w) && y < r.y.saturating_add(r.h))
+}
+
+thread_local! {
+    /// Scratch cell list, reused across frames so a steady-state repaint
+    /// allocates nothing. The chrome paints from the attach driver's
+    /// single current-thread runtime and never re-enters itself, so a
+    /// thread-local is the whole synchronisation story.
+    static SCRATCH: std::cell::RefCell<ChromeCells> =
+        std::cell::RefCell::new(ChromeCells::default());
+}
+
+// -----------------------------------------------------------------------------
+// Public entry points
+// -----------------------------------------------------------------------------
+
 /// Render the divider layer for `layout` to `out`.
 ///
-/// `content` is the pane area `Rect` the layout was tiled into; the rail
-/// is drawn on the row immediately above it (skipped when `content.y`
-/// is 0, i.e. no row was reserved). `focused` is the CLIENT's focused
-/// pane — the authority for which frame is emphasised. `label_of`
-/// supplies each pane's title; return `None` for a pane that should stay
-/// unlabelled.
+/// `content` is the pane area `Rect` the layout was tiled into and
+/// `rail` is the row reserved above it, as reported by
+/// `attach::paint::content_layout`. `rail` is passed rather than
+/// inferred from `content.y`, because a top-docked status bar also
+/// pushes the content down a row: inferring would paint a rule across
+/// the bar's own row on a viewport too short to have reserved one.
+/// `focused` is the CLIENT's focused pane — the authority for which
+/// frame is emphasised. `label_of` supplies each pane's title; return
+/// `None` for a pane that should stay unlabelled.
 ///
 /// # Behavior
 ///
-/// - No-op when there is no chrome to draw at all (no dividers and no
-///   rail row).
+/// - No-op when there is no chrome to draw at all.
 /// - Emits a leading `\x1b[0m` SGR reset, then the chrome cells as
 ///   style-coalesced runs, then a trailing `\x1b[0m`.
 /// - **Does not** emit a final cursor position. The focused pane's
 ///   render runs after this and owns cursor placement, per the
 ///   chrome <-> pane handoff documented in ADR-0020.
-/// - Pane interior cells are marked `Cell::skip` and never emitted —
+/// - Cells inside a pane interior are dropped and never emitted —
 ///   libghostty owns those cells exclusively.
 ///
 /// # Errors
@@ -159,6 +325,7 @@ pub fn render_dividers<'p, W, F>(
     out: &mut W,
     layout: &PaneLayout,
     content: Rect,
+    rail: Option<u16>,
     focused: Option<&TerminalId>,
     theme: &Theme,
     label_of: F,
@@ -171,34 +338,33 @@ where
     if cols == 0 || rows == 0 {
         return Ok(());
     }
-    if layout.dividers.is_empty() && rail_row(content).is_none_or(|y| y >= rows) {
+    if layout.dividers.is_empty() && rail.is_none_or(|y| y >= rows) {
         return Ok(());
     }
 
-    let buffer = compose_buffer(layout, content, focused, theme, label_of);
-    emit_buffer(out, &buffer)
-}
-
-/// The row the pane-grid rail occupies, or `None` when the pane area is
-/// flush with the top of the viewport (nothing was reserved for it).
-#[must_use]
-pub const fn rail_row(content: Rect) -> Option<u16> {
-    if content.y == 0 || content.w == 0 || content.h == 0 {
-        None
-    } else {
-        Some(content.y - 1)
-    }
+    SCRATCH.with(|scratch| {
+        let mut cells = scratch.borrow_mut();
+        cells.clear();
+        build_cells(&mut cells, layout, content, rail, focused, theme, label_of);
+        cells.finalize(layout);
+        emit_cells(out, &cells.cells)
+    })
 }
 
 /// Build the ratatui `Buffer` for the chrome layer.
 ///
 /// Public-in-crate so the skip-cell invariant test can introspect the
-/// buffer without re-emitting bytes, and so the rendered-frame compositor
-/// (`phux snapshot --rendered`, phux-l5xa) can overlay the chrome cells
-/// into its dense cell grid without re-parsing emitted VT.
+/// composition without re-emitting bytes, and so the rendered-frame
+/// compositor (`phux snapshot --rendered`, phux-l5xa) can overlay the
+/// chrome cells into its dense cell grid without re-parsing emitted VT.
+///
+/// This is the COLD path: it materialises a viewport-sized buffer
+/// because its consumer wants one. The live paint path
+/// ([`render_dividers`]) never builds it.
 pub(crate) fn compose_buffer<'p, F>(
     layout: &PaneLayout,
     content: Rect,
+    rail: Option<u16>,
     focused: Option<&TerminalId>,
     theme: &Theme,
     label_of: F,
@@ -207,19 +373,11 @@ where
     F: Fn(&TerminalId) -> Option<PaneLabel<'p>>,
 {
     let (cols, rows) = layout.viewport;
-    // The focused pane's rect is the whole emphasis model: a rule is on
-    // the focused frame exactly when it lies on that rect's perimeter.
-    let frame = focused.and_then(|id| layout.rects.get(id)).copied();
-    let area = RataRect::new(0, 0, cols, rows);
-    let mut buf = Buffer::empty(area);
-
-    // 1. Mark the WHOLE viewport skip. Everything this composer does not
-    //    explicitly paint belongs to somebody else — a pane interior
-    //    (libghostty owns those cells and ratatui must not emit into
-    //    them), the sidebar strip, the status row, or an overlay. Only
-    //    the cells written below clear the flag, so the layer can never
-    //    emit a blank over another layer's content, and a pane interior
-    //    is covered whether or not its `Rect` was well-formed.
+    let mut buf = Buffer::empty(RataRect::new(0, 0, cols, rows));
+    // Everything this composer does not explicitly paint belongs to
+    // somebody else — a pane interior, the sidebar strip, the status
+    // row, an overlay — so the whole viewport starts skipped and only
+    // the cells below clear the flag.
     for y in 0..rows {
         for x in 0..cols {
             if let Some(cell) = buf.cell_mut((x, y)) {
@@ -227,36 +385,52 @@ where
             }
         }
     }
-
-    // 2. Paint each divider glyph. compute_layout has already resolved
-    //    junction shapes per cell, so we just drop the symbol in and
-    //    tint it by its focus flag. Setting the symbol does NOT clear
-    //    skip on its own, so we explicitly unset skip here — without
-    //    that, a degenerate layout where a divider cell overlapped a
-    //    pane rect would silently drop the divider.
-    let mut sbuf = [0u8; 4];
-    for cell in &layout.dividers {
-        if cell.x >= cols || cell.y >= rows {
-            continue;
-        }
-        let symbol = cell.ch.encode_utf8(&mut sbuf);
-        if let Some(c) = buf.cell_mut((cell.x, cell.y)) {
-            c.set_symbol(symbol);
-            c.set_style(rule_style(theme, on_frame(frame, cell.x, cell.y)));
-            c.set_diff_option(CellDiffOption::None);
+    let mut cells = ChromeCells::default();
+    build_cells(&mut cells, layout, content, rail, focused, theme, label_of);
+    cells.finalize(layout);
+    for c in &cells.cells {
+        if let Some(cell) = buf.cell_mut((c.x, c.y)) {
+            cell.set_symbol(c.sym.as_str());
+            cell.set_style(c.style);
+            cell.set_diff_option(CellDiffOption::None);
         }
     }
-
-    // 3. Close the grid at the top. The rail runs the full width of the
-    //    pane area and turns into a `\u{252c}` wherever a vertical rule drops
-    //    out of it, so the grid reads as one frame rather than as loose
-    //    lines that happen to line up.
-    draw_rail(&mut buf, layout, content, frame, theme);
-
-    // 4. Inset each pane's title into the rule above it.
-    draw_titles(&mut buf, layout, content, focused, theme, label_of);
-
     buf
+}
+
+// -----------------------------------------------------------------------------
+// Composition
+// -----------------------------------------------------------------------------
+
+/// Compose one frame's chrome: rules, then the rail, then titles over
+/// both.
+fn build_cells<'p, F>(
+    cells: &mut ChromeCells,
+    layout: &PaneLayout,
+    content: Rect,
+    rail: Option<u16>,
+    focused: Option<&TerminalId>,
+    theme: &Theme,
+    label_of: F,
+) where
+    F: Fn(&TerminalId) -> Option<PaneLabel<'p>>,
+{
+    // The focused pane's rect is the whole emphasis model: a rule is on
+    // the focused frame exactly when it lies on that rect's perimeter.
+    let frame = focused.and_then(|id| layout.rects.get(id)).copied();
+
+    for cell in &layout.dividers {
+        let mut sym = Sym::EMPTY;
+        sym.push(cell.ch);
+        cells.put(
+            cell.x,
+            cell.y,
+            sym,
+            rule_style(theme, on_frame(frame, cell.x, cell.y)),
+        );
+    }
+    draw_rail(cells, layout, content, rail, frame, theme);
+    draw_titles(cells, layout, rail, focused, theme, label_of);
 }
 
 /// The style of one rule cell.
@@ -282,28 +456,23 @@ fn rule_style(theme: &Theme, focused: bool) -> Style {
 /// once and tee the columns they occupy. Probing every column against
 /// the divider list instead would be `O(columns x dividers)` per frame.
 fn draw_rail(
-    buf: &mut Buffer,
+    cells: &mut ChromeCells,
     layout: &PaneLayout,
     content: Rect,
+    rail: Option<u16>,
     frame: Option<Rect>,
     theme: &Theme,
 ) {
-    let Some(y) = rail_row(content) else {
+    let Some(y) = rail else {
         return;
     };
     let (cols, rows) = layout.viewport;
-    if y >= rows {
+    if y >= rows || content.w == 0 || content.h == 0 {
         return;
     }
     let x1 = content.x.saturating_add(content.w).min(cols);
     for x in content.x..x1 {
-        put(
-            buf,
-            x,
-            y,
-            "\u{2500}",
-            rule_style(theme, on_frame(frame, x, y)),
-        );
+        cells.put_str(x, y, "\u{2500}", rule_style(theme, on_frame(frame, x, y)));
     }
     for cell in &layout.dividers {
         if cell.y == content.y
@@ -315,7 +484,7 @@ fn draw_rail(
             )
         {
             let style = rule_style(theme, on_frame(frame, cell.x, y));
-            put(buf, cell.x, y, "\u{252c}", style);
+            cells.put_str(cell.x, y, "\u{252c}", style);
         }
     }
 }
@@ -326,7 +495,7 @@ fn draw_rail(
 ///
 /// This is the whole focus model, and it is deliberately geometric: any
 /// rule cell touching the focused pane is part of its frame, whichever
-/// split produced it, so a `┼` where the focused pane's left rule
+/// split produced it, so a `\u{253c}` where the focused pane's left rule
 /// crosses an unrelated horizontal rule is emphasised rather than left
 /// recessive in the middle of the frame.
 fn on_frame(frame: Option<Rect>, x: u16, y: u16) -> bool {
@@ -343,9 +512,9 @@ fn on_frame(frame: Option<Rect>, x: u16, y: u16) -> bool {
 
 /// Inset each pane's title into the rule above it.
 fn draw_titles<'p, F>(
-    buf: &mut Buffer,
+    cells: &mut ChromeCells,
     layout: &PaneLayout,
-    content: Rect,
+    rail: Option<u16>,
     focused: Option<&TerminalId>,
     theme: &Theme,
     label_of: F,
@@ -353,30 +522,34 @@ fn draw_titles<'p, F>(
     F: Fn(&TerminalId) -> Option<PaneLabel<'p>>,
 {
     for (id, rect) in &layout.rects {
+        // A zero-height leaf has no pane to label — and it shares its
+        // `y` with the leaf below it, so labelling it would make which
+        // title survives depend on hash iteration order.
+        if rect.h == 0 || rect.w <= TITLE_CHROME_CELLS {
+            continue;
+        }
         // The rule above the pane: the rail for a top-row pane, the
         // interior horizontal divider otherwise. A pane whose top row is
-        // 0 has no rule to write into.
+        // 0 has no rule to write into, and a pane sitting directly under
+        // a reserved-but-unpainted row must not invent one.
         let Some(y) = rect.y.checked_sub(1) else {
             continue;
         };
-        if y >= layout.viewport.1 || rect.w <= TITLE_CHROME_CELLS {
+        if y >= layout.viewport.1 || (rail != Some(y) && !layout.dividers.iter().any(|d| d.y == y))
+        {
             continue;
         }
         let Some(label) = label_of(id) else {
             continue;
         };
-        draw_one_title(buf, *rect, y, &label, theme, focused == Some(id));
+        draw_one_title(cells, *rect, y, &label, theme, focused == Some(id));
     }
-    // `content` is only consulted for the rail's extent, which
-    // `draw_rail` already handled; naming it here keeps the two passes'
-    // signatures symmetric for the caller.
-    let _ = content;
 }
 
 /// Write ` <badge> <label> ` into the rule at row `y`, starting one cell
 /// inside the pane's left edge.
 fn draw_one_title(
-    buf: &mut Buffer,
+    cells: &mut ChromeCells,
     rect: Rect,
     y: u16,
     label: &PaneLabel<'_>,
@@ -411,27 +584,63 @@ fn draw_one_title(
     });
 
     let mut x = rect.x + 1;
-    x = put(buf, x, y, " ", pad);
+    x = put_measured(cells, x, y, " ", pad);
     if let Some(b) = badge {
         let mut style = Style::default().fg(b.color);
         if b.emphatic {
             style = style.add_modifier(Modifier::BOLD);
         }
-        x = put(buf, x, y, b.glyph, style);
-        x = put(buf, x, y, " ", pad);
+        x = put_measured(cells, x, y, b.glyph, style);
+        x = put_measured(cells, x, y, " ", pad);
     }
-    x = put_clipped(buf, x, y, text, budget, title_style);
-    put(buf, x, y, " ", pad);
+    x = put_clipped(cells, x, y, text, budget, title_style);
+    put_measured(cells, x, y, " ", pad);
 }
 
-/// Write one already-1-cell symbol and return the next column.
-fn put(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) -> u16 {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_symbol(symbol);
-        cell.set_style(style);
-        cell.set_diff_option(CellDiffOption::None);
+/// The advance width of `ch` in terminal cells, or `None` for something
+/// that must never reach the wire.
+///
+/// Control characters are refused EXPLICITLY rather than left to
+/// `unicode-width` returning `None` for them. A pane title is an
+/// arbitrary OSC-2 string chosen by whatever runs in the pane, so it is
+/// untrusted input on a path that writes escape sequences: an `\x1b`
+/// reaching the emitter would let a pane's own title inject VT into the
+/// chrome. The check is stated here so a future rewrite of the width
+/// logic cannot quietly reopen it.
+fn cell_width(ch: char) -> Option<usize> {
+    if ch.is_control() {
+        return None;
     }
-    x.saturating_add(1)
+    UnicodeWidthChar::width(ch)
+}
+
+/// Write a symbol that is expected to advance one cell, blanking any
+/// trailing cells it actually claims. Returns the next column.
+fn put_measured(cells: &mut ChromeCells, x: u16, y: u16, symbol: &str, style: Style) -> u16 {
+    let width = symbol.chars().filter_map(cell_width).sum::<usize>().max(1);
+    cells.put_str(x, y, symbol, style);
+    blank_continuations(cells, x, y, width, style)
+}
+
+/// Reserve the trailing cells of a glyph `width` cells wide and return
+/// the column after it.
+///
+/// The trailing cells get [`Sym::EMPTY`], which does two jobs. It stops
+/// the rail's rule showing through the right half of a wide glyph (a
+/// literal space there would be WRITTEN, overprinting that half), and it
+/// breaks the emitter's run so the next cell re-anchors with its own
+/// `CUP`. Without the break, the emitter would advance its cursor one
+/// column per cell while the terminal advanced two, and every later cell
+/// in the run would slide right — far enough, on a narrow pane with a
+/// CJK title, to push the ellipsis past the divider and wrap it into the
+/// pane's first content row, which libghostty owns (ADR-0020).
+fn blank_continuations(cells: &mut ChromeCells, x: u16, y: u16, width: usize, style: Style) -> u16 {
+    let mut cur = x.saturating_add(1);
+    for _ in 1..width {
+        cells.put(cur, y, Sym::EMPTY, style);
+        cur = cur.saturating_add(1);
+    }
+    cur
 }
 
 /// Write `text` clipped to `budget` DISPLAY CELLS, marking a cut with
@@ -439,91 +648,101 @@ fn put(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) -> u16 {
 ///
 /// Display cells, not chars: a pane title is an arbitrary OSC-2 string,
 /// so a CJK or emoji title measured by `chars().count()` overflows its
-/// budget and writes over the rule that was supposed to close it. Wide
-/// characters occupy their leading cell and blank the trailing one, the
-/// way every terminal lays them out.
+/// budget and writes over the rule that was supposed to close it.
 ///
-/// Allocation-free by construction: cells are written in place, so a
-/// per-frame `String` per pane never exists.
-fn put_clipped(buf: &mut Buffer, x: u16, y: u16, text: &str, budget: usize, style: Style) -> u16 {
+/// Zero-width characters — combining marks, variation selectors, ZWJ,
+/// bidi controls — are appended to the cell they belong to rather than
+/// ending the string. Stopping at the first one truncated `"cafe\u{301}/src"`
+/// to `"cafe"` and `"\u{2705}\u{fe0f} build"` to the emoji alone, silently: they
+/// carry no width, so the budget check that produces the ellipsis never
+/// fired either.
+///
+/// Allocation-free by construction: cells carry their grapheme inline,
+/// so a per-frame `String` per pane never exists.
+fn put_clipped(
+    cells: &mut ChromeCells,
+    x: u16,
+    y: u16,
+    text: &str,
+    budget: usize,
+    style: Style,
+) -> u16 {
     if budget == 0 {
         return x;
     }
-    let total: usize = text.chars().filter_map(UnicodeWidthChar::width).sum();
+    let total: usize = text.chars().filter_map(cell_width).sum();
     let fits = total <= budget;
     // When it does not fit, the last cell is spent on the ellipsis.
     let text_budget = if fits { budget } else { budget - 1 };
 
     let mut cur = x;
     let mut used = 0usize;
-    let mut sym = [0u8; 4];
+    // Index into `cells` of the cell zero-width marks attach to.
+    let mut base: Option<usize> = None;
     for ch in text.chars() {
-        let Some(w) = UnicodeWidthChar::width(ch) else {
+        let Some(w) = cell_width(ch) else {
             continue;
         };
-        if w == 0 || used + w > text_budget {
+        if w == 0 {
+            if let Some(i) = base {
+                cells.cells[i].sym.push(ch);
+            }
+            continue;
+        }
+        if used + w > text_budget {
             break;
         }
-        cur = put(buf, cur, y, ch.encode_utf8(&mut sym), style);
-        // A wide glyph owns its trailing cell; blank it so the rule does
-        // not show through the right half of the character.
-        for _ in 1..w {
-            cur = put(buf, cur, y, " ", style);
-        }
+        let mut sym = Sym::EMPTY;
+        sym.push(ch);
+        base = Some(cells.cells.len());
+        cells.put(cur, y, sym, style);
+        cur = blank_continuations(cells, cur, y, w, style);
         used += w;
     }
     if !fits {
-        cur = put(buf, cur, y, ELLIPSIS.encode_utf8(&mut sym), style);
+        cur = put_measured(cells, cur, y, ELLIPSIS.encode_utf8(&mut [0u8; 4]), style);
     }
     cur
 }
 
-/// Emit non-skip cells in `buf` as positioned VT paints.
+// -----------------------------------------------------------------------------
+// Emission
+// -----------------------------------------------------------------------------
+
+/// Emit `cells` (row-major, deduplicated) as positioned VT paints.
 ///
-/// Iteration is row-major. Consecutive cells in a row that share a style
-/// are emitted as ONE `CUP` plus one SGR plus their symbols, so a rail
-/// spanning 160 columns costs one escape sequence rather than 160 — the
-/// styling added by phux-l96p.8 must not multiply the frame's byte cost.
-/// A gap (a skip cell, or a blank) closes the run.
-///
-/// Skip is the only content filter — cells with an empty symbol but
-/// skip=false are also skipped so we don't paint stray spaces over
-/// future overlay layers.
-fn emit_buffer<W: Write>(out: &mut W, buf: &Buffer) -> io::Result<()> {
+/// Consecutive cells in a row that share a style are emitted as ONE
+/// `CUP` plus one SGR plus their symbols, so a rail spanning 160 columns
+/// costs one escape sequence rather than 160. A gap, a style change, or
+/// an empty symbol closes the run, and the next cell re-anchors — which
+/// is what keeps the emitter's idea of the cursor and the terminal's in
+/// agreement across a double-width glyph.
+fn emit_cells<W: Write>(out: &mut W, cells: &[ChromeCell]) -> io::Result<()> {
     out.write_all(b"\x1b[0m")?;
-    let area = buf.area;
     let mut style: Option<Style> = None;
-    for y in area.y..area.y.saturating_add(area.height) {
-        // `run` is the column the current run of same-styled cells would
-        // continue at; `None` means no run is open.
-        let mut run: Option<u16> = None;
-        for x in area.x..area.x.saturating_add(area.width) {
-            // `(x, y)` is in-bounds by construction (we iterate `area`),
-            // but `cell` is `Option`-returning; treat any miss as a
-            // silent skip rather than panic — keeps the chrome layer
-            // resilient if a future ratatui upgrade changes bounds
-            // semantics.
-            let Some(cell) = buf.cell((x, y)) else {
-                run = None;
-                continue;
-            };
-            if cell.diff_option == CellDiffOption::Skip || cell.symbol().is_empty() {
-                run = None;
-                continue;
-            }
-            let cell_style = cell.style();
-            if style != Some(cell_style) {
-                write_style(out, cell_style)?;
-                style = Some(cell_style);
-                run = None;
-            }
-            if run != Some(x) {
-                // CUP is 1-based.
-                write!(out, "\x1b[{};{}H", y.saturating_add(1), x.saturating_add(1))?;
-            }
-            out.write_all(cell.symbol().as_bytes())?;
-            run = Some(x.saturating_add(1));
+    // The column the current run would continue at; `None` = no open run.
+    let mut run: Option<(u16, u16)> = None;
+    for cell in cells {
+        if cell.sym.is_empty() {
+            run = None;
+            continue;
         }
+        if style != Some(cell.style) {
+            write_style(out, cell.style)?;
+            style = Some(cell.style);
+            run = None;
+        }
+        if run != Some((cell.y, cell.x)) {
+            // CUP is 1-based.
+            write!(
+                out,
+                "\x1b[{};{}H",
+                cell.y.saturating_add(1),
+                cell.x.saturating_add(1)
+            )?;
+        }
+        out.write_all(cell.sym.as_str().as_bytes())?;
+        run = Some((cell.y, cell.x.saturating_add(1)));
     }
     // Trailing reset so the next layer (status bar, focused pane render)
     // doesn't inherit any chrome SGR.
@@ -596,6 +815,12 @@ mod tests {
         None
     }
 
+    /// The rail row the fixtures reserve: `railed()` puts the pane area
+    /// at row 1, so the rail is row 0; `full()` reserves nothing.
+    fn rail_row(content: Rect) -> Option<u16> {
+        content.y.checked_sub(1)
+    }
+
     /// Render to a string with a fixed label on every pane.
     fn render(layout: &PaneLayout, content: Rect, label: Option<&'static str>) -> String {
         render_with_focus(layout, content, Some(&t(1)), label)
@@ -608,8 +833,19 @@ mod tests {
         focus: Option<&TerminalId>,
         label: Option<&'static str>,
     ) -> String {
+        render_full(layout, content, rail_row(content), focus, label)
+    }
+
+    /// Render with every knob explicit.
+    fn render_full(
+        layout: &PaneLayout,
+        content: Rect,
+        rail: Option<u16>,
+        focus: Option<&TerminalId>,
+        label: Option<&'static str>,
+    ) -> String {
         let mut bytes: Vec<u8> = Vec::new();
-        render_dividers(&mut bytes, layout, content, focus, &theme(), |_| {
+        render_dividers(&mut bytes, layout, content, rail, focus, &theme(), |_| {
             label.map(|text| PaneLabel {
                 text,
                 agent: None,
@@ -938,14 +1174,22 @@ mod tests {
         let content = railed(80, 24);
         let layout = split_layout(content);
         let mut bytes: Vec<u8> = Vec::new();
-        render_dividers(&mut bytes, &layout, content, Some(&t(1)), &theme(), |_| {
-            Some(PaneLabel {
-                text: "claude",
-                agent: None,
-                attention: true,
-                seen: true,
-            })
-        })
+        render_dividers(
+            &mut bytes,
+            &layout,
+            content,
+            rail_row(content),
+            Some(&t(1)),
+            &theme(),
+            |_| {
+                Some(PaneLabel {
+                    text: "claude",
+                    agent: None,
+                    attention: true,
+                    seen: true,
+                })
+            },
+        )
         .unwrap();
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains('●'), "expected the attention badge in {s:?}");
@@ -1000,6 +1244,254 @@ mod tests {
         );
     }
 
+    /// phux-l96p.8 fix pass, the load-bearing one. A double-width glyph
+    /// advances the terminal's cursor TWO columns; the emitter used to
+    /// advance its own idea of the cursor by one per cell and write a
+    /// literal space into the trailing half, so every later cell in the
+    /// run slid one column right per wide character. With a CJK title on
+    /// a narrow pane the run walked past the pane's right edge and, with
+    /// DECAWM on, wrapped into the pane's FIRST CONTENT ROW — cells
+    /// libghostty owns (ADR-0020).
+    ///
+    /// Asserted on the decoded cursor positions, not on the glyphs: the
+    /// question is where the terminal puts them.
+    #[test]
+    fn a_wide_title_never_walks_out_of_its_pane() {
+        let content = railed(40, 10);
+        let layout = split_layout(content);
+        let s = render(&layout, content, Some("日本語のペイン名前"));
+        let rail_y = rail_row(content).expect("a rail");
+        let right_edge = content.x.saturating_add(content.w);
+        for (x, y, sym) in painted_cells(&s) {
+            assert!(
+                x < right_edge,
+                "chrome cell {sym:?} landed at column {x}, past the pane area's \
+                 right edge {right_edge} — it would wrap into a pane row"
+            );
+            assert!(
+                y == rail_y || layout.dividers.iter().any(|d| d.y == y),
+                "chrome cell {sym:?} landed on row {y}, which is neither the \
+                 rail nor a divider row"
+            );
+        }
+        // And nothing at all reaches a pane interior.
+        for (x, y, sym) in painted_cells(&s) {
+            for r in layout.rects.values() {
+                assert!(
+                    !rect_contains(*r, x, y),
+                    "painted {sym:?} at ({x}, {y}) inside pane rect {r:?}"
+                );
+            }
+        }
+    }
+
+    /// The mechanism behind the fix: a wide glyph's trailing cell is
+    /// reserved but paints nothing, which breaks the run so the next
+    /// cell re-anchors with its own CUP instead of trusting the
+    /// emitter's column arithmetic.
+    #[test]
+    fn a_wide_glyph_breaks_the_run_and_the_next_cell_reanchors() {
+        let content = railed(40, 10);
+        let layout = split_layout(content);
+        let s = render(&layout, content, Some("日x"));
+        let cells = painted_cells(&s);
+        let wide = cells
+            .iter()
+            .find(|(_, _, sym)| sym == "日")
+            .expect("the wide glyph is painted");
+        let after = cells
+            .iter()
+            .find(|(_, _, sym)| sym == "x")
+            .expect("the glyph after it is painted");
+        assert_eq!(
+            after.0,
+            wide.0 + 2,
+            "the character after a double-width glyph belongs two columns on"
+        );
+        // Nothing is painted in the trailing half.
+        assert!(
+            !cells
+                .iter()
+                .any(|(x, y, _)| *x == wide.0 + 1 && *y == wide.1),
+            "the trailing half of a wide glyph must stay unpainted"
+        );
+        // That column boundary is a real CUP, not an assumed advance.
+        assert!(
+            extract_cups(&s).contains(&(after.1 + 1, after.0 + 1)),
+            "the cell after a wide glyph must re-anchor with its own CUP"
+        );
+    }
+
+    /// A badge is followed by its own padding space in a different
+    /// style, so an ambiguous-width badge glyph cannot drift the title
+    /// after it: the style change re-anchors the run. Asserted so a
+    /// future restyle that makes badge and pad share a style has to
+    /// think about it.
+    #[test]
+    fn a_badge_is_followed_by_its_own_cup() {
+        let content = railed(60, 10);
+        let layout = split_layout(content);
+        let mut bytes: Vec<u8> = Vec::new();
+        render_dividers(
+            &mut bytes,
+            &layout,
+            content,
+            rail_row(content),
+            Some(&t(1)),
+            &theme(),
+            |_| {
+                Some(PaneLabel {
+                    text: "claude",
+                    agent: Some(AgentMetaState::Working),
+                    attention: false,
+                    seen: true,
+                })
+            },
+        )
+        .unwrap();
+        let s = String::from_utf8(bytes).unwrap();
+        let cells = painted_cells(&s);
+        let badge = cells
+            .iter()
+            .find(|(_, _, sym)| sym == "◐")
+            .expect("the badge is painted");
+        assert!(
+            extract_cups(&s).contains(&(badge.1 + 1, badge.0 + 2)),
+            "the cell after the badge must carry its own CUP"
+        );
+    }
+
+    /// Zero-width characters ride with the character they belong to.
+    /// Breaking at the first one truncated `"cafe\u{301}/src"` to `"cafe"` and
+    /// `"\u{2705}\u{fe0f} build"` to the emoji alone — silently, because a
+    /// zero-width character costs no budget and so never triggered the
+    /// ellipsis that marks a cut.
+    #[test]
+    fn zero_width_marks_do_not_truncate_a_title() {
+        let content = railed(60, 10);
+        let layout = split_layout(content);
+        for (title, tail) in [
+            ("cafe\u{301}/src", "/src"),
+            ("\u{2705}\u{fe0f} build", "build"),
+        ] {
+            let s = render(&layout, content, Some(title));
+            assert!(
+                s.contains(tail),
+                "{title:?} lost its tail {tail:?}; got {s:?}"
+            );
+            assert!(
+                !s.contains(ELLIPSIS),
+                "{title:?} fits, so nothing should be marked as cut"
+            );
+        }
+    }
+
+    /// A combining mark stays in its base character's cell rather than
+    /// claiming a column of its own.
+    #[test]
+    fn a_combining_mark_shares_its_base_cell() {
+        let content = railed(60, 10);
+        let layout = split_layout(content);
+        let s = render(&layout, content, Some("e\u{301}x"));
+        let cells = painted_cells(&s);
+        let base = cells
+            .iter()
+            .find(|(_, _, sym)| sym.starts_with('e'))
+            .expect("the base character is painted");
+        assert_eq!(base.2, "e\u{301}", "the mark rides with its base");
+        let next = cells
+            .iter()
+            .find(|(_, _, sym)| sym == "x")
+            .expect("the next character is painted");
+        assert_eq!(next.0, base.0 + 1, "the mark consumed no column");
+    }
+
+    /// A pane names ITSELF, via OSC 2, so a title is untrusted input on
+    /// a path that writes escape sequences. No control byte from a title
+    /// may reach the wire, or a pane could inject VT into phux's chrome.
+    #[test]
+    fn a_title_can_never_inject_an_escape_sequence() {
+        let content = railed(60, 10);
+        let layout = split_layout(content);
+        let s = render(&layout, content, Some("a\u{1b}]0;pwned\u{7}b\u{9b}c"));
+        // Every ESC in the output belongs to the emitter's own SGR/CUP...
+        for seq in s.split('\u{1b}').skip(1) {
+            assert!(
+                seq.starts_with('['),
+                "a non-CSI escape reached the wire: {seq:?}"
+            );
+        }
+        // ...and no other control byte survives at all, C1 included, so
+        // the title's payload is left as inert printable text.
+        assert!(
+            s.chars().all(|c| c == '\u{1b}' || !c.is_control()),
+            "a control character reached the wire: {s:?}"
+        );
+        assert!(
+            s.contains("a]0;pwnedbc"),
+            "the inert payload should remain: {s:?}"
+        );
+    }
+
+    /// phux-l96p.8 fix pass: the rail row is REPORTED by the layout, not
+    /// inferred from `content.y`. A top-docked status bar also puts the
+    /// content at row 1, so on a viewport too short to reserve a rail the
+    /// inference painted a rule straight across the bar's own row — over
+    /// a bar that, being unchanged, never repaints to correct it.
+    #[test]
+    fn a_top_bar_without_a_rail_is_never_painted_over() {
+        // Two rows: the bar takes row 0, and the single remaining row
+        // goes to the pane rather than to chrome.
+        let content = Rect {
+            x: 0,
+            y: 1,
+            w: 40,
+            h: 1,
+        };
+        let state = LayoutState {
+            tree: Some(leaf(1)),
+            focus: Some(t(1)),
+        };
+        let layout = compute_layout_in(&state, content, (40, 2));
+        // `rail: None` is what `content_layout` reports here.
+        let s = render_full(&layout, content, None, Some(&t(1)), Some("shell"));
+        assert!(
+            painted_cells(&s).iter().all(|(_, y, _)| *y != 0),
+            "the status-bar row must stay untouched; got {s:?}"
+        );
+    }
+
+    /// A zero-height leaf has no pane to label, and shares its `y` with
+    /// the leaf below it — so labelling it would make which title
+    /// survives depend on `HashMap` iteration order.
+    #[test]
+    fn a_zero_height_leaf_is_not_labelled() {
+        let content = railed(40, 6);
+        let mut layout = split_layout(content);
+        // Collapse pane 2 onto pane 1's row.
+        let one = layout.rects.get(&t(1)).copied().expect("pane 1");
+        layout.rects.insert(
+            t(2),
+            Rect {
+                x: one.x,
+                y: one.y,
+                w: one.w,
+                h: 0,
+            },
+        );
+        let a = render(&layout, content, Some("Pane"));
+        let b = render(&layout, content, Some("Pane"));
+        assert_eq!(a, b, "a zero-height leaf must not make the frame unstable");
+        // Exactly one title on that rule: pane 1's. `P` occurs once per
+        // label, so counting it counts labels.
+        let rail_y = rail_row(content).expect("a rail");
+        let titles = painted_cells(&a)
+            .iter()
+            .filter(|(_, y, sym)| *y == rail_y && sym == "P")
+            .count();
+        assert_eq!(titles, 1, "expected exactly one label on the rail");
+    }
+
     /// Buffer-level introspection: every cell inside a pane Rect has
     /// `skip = true` after compose; every divider cell has `skip =
     /// false` and the right symbol. This is the structural twin of
@@ -1009,7 +1501,14 @@ mod tests {
     fn compose_buffer_marks_pane_interiors_skip() {
         let content = railed(80, 24);
         let layout = split_layout(content);
-        let buf = compose_buffer(&layout, content, Some(&t(1)), &theme(), unlabelled);
+        let buf = compose_buffer(
+            &layout,
+            content,
+            rail_row(content),
+            Some(&t(1)),
+            &theme(),
+            unlabelled,
+        );
         for r in layout.rects.values() {
             for y in r.y..r.y + r.h {
                 for x in r.x..r.x + r.w {
@@ -1098,6 +1597,8 @@ mod tests {
 
     /// Map each painted cell to `(symbol, accented)`, where `accented`
     /// means the cell carried the focus style (bold + `divider_focus`).
+    ///
+    /// Width-aware for the same reason [`painted_cells`] is.
     fn styled_cells(s: &str) -> HashMap<(u16, u16), (String, bool)> {
         let focus_sgr = format!("\x1b[1m{}", sgr_fg(theme().divider_focus));
         let mut out = HashMap::new();
@@ -1106,8 +1607,12 @@ mod tests {
         let mut rest = s;
         while let Some(i) = rest.find('\x1b') {
             for c in rest[..i].chars() {
+                let w = u16::try_from(crate::render::cell_width(c).unwrap_or(0)).unwrap_or(1);
+                if w == 0 {
+                    continue;
+                }
                 out.insert((x, y), (c.to_string(), accented));
-                x = x.saturating_add(1);
+                x = x.saturating_add(w);
             }
             let tail = &rest[i..];
             if tail.starts_with(&focus_sgr) {
@@ -1131,8 +1636,12 @@ mod tests {
             rest = &tail[end..];
         }
         for c in rest.chars() {
+            let w = u16::try_from(crate::render::cell_width(c).unwrap_or(0)).unwrap_or(1);
+            if w == 0 {
+                continue;
+            }
             out.insert((x, y), (c.to_string(), accented));
-            x = x.saturating_add(1);
+            x = x.saturating_add(w);
         }
         out
     }
@@ -1147,6 +1656,12 @@ mod tests {
     /// Decode the emitted stream into `(x, y, symbol)` per painted cell,
     /// tracking the cursor across a run so cells written without their
     /// own CUP are still located.
+    ///
+    /// The cursor advances by each glyph's DISPLAY WIDTH, exactly as a
+    /// terminal does. A harness that advanced one column per character
+    /// would share the very bug this decoder exists to catch — it would
+    /// place a run's cells where the emitter *thinks* they land rather
+    /// than where they actually land.
     fn painted_cells(s: &str) -> Vec<(u16, u16, String)> {
         let mut out = Vec::new();
         let (mut x, mut y) = (0u16, 0u16);
@@ -1173,8 +1688,17 @@ mod tests {
                 }
                 continue;
             }
+            let w = u16::try_from(crate::render::cell_width(c).unwrap_or(0)).unwrap_or(1);
+            if w == 0 {
+                // A combining mark joins the cell already emitted.
+                if let Some(last) = out.last_mut() {
+                    let (_, _, sym): &mut (u16, u16, String) = last;
+                    sym.push(c);
+                }
+                continue;
+            }
             out.push((x, y, c.to_string()));
-            x = x.saturating_add(1);
+            x = x.saturating_add(w);
         }
         out
     }

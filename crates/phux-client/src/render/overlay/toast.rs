@@ -13,7 +13,8 @@
 use phux_protocol::input::key::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 
 use super::widgets::{Modal, centered_panel};
 use super::{OverlayCommand, RenderOverlay};
@@ -60,7 +61,20 @@ impl ToastOverlay {
 impl RenderOverlay for ToastOverlay {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let modal_area = self.bounds(area).unwrap_or(area);
-        let body: Vec<Line<'_>> = self.lines.iter().map(|l| Line::from(l.as_str())).collect();
+        // Styled, not raw: the modal fills its panel with `surface`, so
+        // body copy that inherits the terminal foreground is invisible on
+        // a light terminal — and a config-reload error is exactly the
+        // text a user cannot afford to miss.
+        let body: Vec<Line<'_>> = self
+            .lines
+            .iter()
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.as_str(),
+                    Style::default().fg(self.theme.text),
+                ))
+            })
+            .collect();
         let footer = if self.passthrough {
             "Start typing - this note will close"
         } else {
