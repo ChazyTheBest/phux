@@ -980,10 +980,12 @@ mod tests {
     #[test]
     fn divider_resize_vertical_split_honours_status_bar_budget() {
         // A Vertical split (horizontal divider, y-driven) over a 80x24
-        // viewport with a status bar reserved: the content is 23 rows, so
-        // the split's budget is 23 - 1 = 22. The SAME pointer y maps to a
-        // different ratio with vs without the bar, proving the drag tracks
-        // the painted divider rather than the full-viewport budget.
+        // viewport with a status bar reserved: the bar takes a row and
+        // the pane-grid rail takes another, so the content is 22 rows
+        // starting at y = 1 and the split's budget is 22 - 1 = 21. The
+        // SAME pointer y maps to a different ratio with vs without the
+        // bar, proving the drag tracks the painted divider rather than
+        // the full-viewport budget.
         let state = two_pane_v();
         let path = NodePath::root();
         let with_bar = apply_divider_resize(
@@ -1014,16 +1016,17 @@ mod tests {
             };
             *ratio
         };
-        // y=11 over a 22-cell budget (bar) is a larger ratio than over a
-        // 23-cell budget (no bar): the shorter content makes the same row
-        // sit proportionally lower.
+        // y=11 is row 10 of the content (the rail owns row 0). Over a
+        // 21-cell budget (bar) that is a larger ratio than over a
+        // 22-cell budget (no bar): the shorter content makes the same
+        // row sit proportionally lower.
         assert!(
-            (r(&with_bar) - 11.0 / 22.0).abs() < 1e-3,
+            (r(&with_bar) - 10.0 / 21.0).abs() < 1e-3,
             "bar: {}",
             r(&with_bar)
         );
         assert!(
-            (r(&no_bar) - 11.0 / 23.0).abs() < 1e-3,
+            (r(&no_bar) - 10.0 / 22.0).abs() < 1e-3,
             "no bar: {}",
             r(&no_bar)
         );

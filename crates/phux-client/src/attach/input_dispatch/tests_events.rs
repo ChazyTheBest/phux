@@ -1691,9 +1691,10 @@ async fn forwarded_input_mouse_scales_cells_to_surface_pixels() {
         (8, 16),
     )
     .await;
-    // Pane 2's content starts one column right of the divider.
+    // Pane 2's content starts one column right of the divider, and one
+    // row under the pane-grid rail (phux-l96p.8).
     let expected_x = (70.0 - f64::from(dx) - 1.0) * 8.0;
-    let expected_y = 5.0 * 16.0;
+    let expected_y = (5.0 - 1.0) * 16.0;
     match received.as_slice() {
         [FrameKind::InputMouse { event, .. }] => {
             assert!((event.x - expected_x).abs() < f64::EPSILON);

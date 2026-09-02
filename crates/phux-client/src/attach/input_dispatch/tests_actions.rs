@@ -142,8 +142,12 @@ fn focused_pane_rect_tracks_rendered_pane_bounds() {
         Some(crate::render::chrome::status_bar::Position::Bottom),
         None,
     );
-    assert_eq!(split_rect.y, 0);
-    assert_eq!(split_rect.h, 23, "status bar row is not copy-mode content");
+    // Row 0 is the pane-grid rail (phux-l96p.8); panes start at row 1.
+    assert_eq!(split_rect.y, 1);
+    assert_eq!(
+        split_rect.h, 22,
+        "neither the status-bar row nor the pane rail is copy-mode content"
+    );
     assert_eq!(split_rect.x + split_rect.w, 80);
     assert!(
         split_rect.w < 80,
@@ -168,13 +172,15 @@ fn focused_pane_rect_tracks_rendered_pane_bounds() {
         Some(crate::render::chrome::status_bar::Position::Bottom),
         None,
     );
+    // A zoomed pane takes the whole content rect — which is still the
+    // content rect: the rail is chrome, and zoom does not reclaim it.
     assert_eq!(
         zoomed_rect,
         Rect {
             x: 0,
-            y: 0,
+            y: 1,
             w: 80,
-            h: 23
+            h: 22
         }
     );
 }
@@ -405,11 +411,11 @@ fn spawn_initial_size_of(frame: &FrameKind) -> Option<(u16, u16)> {
 /// the server bootstraps the pane there instead of at 80x24 and then
 /// being told the truth by a resize that throws the checkpoint away.
 ///
-/// The 80x24 viewport with no chrome tiles to a full 80x24 content rect;
-/// a horizontal split spends one divider column, leaving 79 to share
-/// 40/39 — so the new (right-hand) leaf is 39x24. Asserting the exact
-/// number, not merely "some size", is what makes this a regression guard
-/// rather than a smoke test.
+/// The 80x24 viewport tiles to an 80x23 content rect (row 0 is the
+/// pane-grid rail, phux-l96p.8); a horizontal split spends one divider
+/// column, leaving 79 to share 40/39 — so the new (right-hand) leaf is
+/// 39x23. Asserting the exact number, not merely "some size", is what
+/// makes this a regression guard rather than a smoke test.
 #[test]
 fn split_pane_spawn_carries_the_new_leafs_tile() {
     let mut workspace = Workspace::single(tid(1));
@@ -420,7 +426,7 @@ fn split_pane_spawn_carries_the_new_leafs_tile() {
     );
     let effects = run(&action, &mut workspace);
     let (_req, _pending, frame) = effects.spawn_terminal.expect("split parks a SPAWN");
-    assert_eq!(spawn_initial_size_of(&frame), Some((39, 24)));
+    assert_eq!(spawn_initial_size_of(&frame), Some((39, 23)));
 }
 
 /// A `new-window` seeds a window holding one leaf, so the pane fills the
@@ -430,7 +436,7 @@ fn new_window_spawn_carries_the_full_content_rect() {
     let mut workspace = Workspace::single(tid(1));
     let effects = run(&bare_action("new-window"), &mut workspace);
     let (_req, _pending, frame) = effects.spawn_window.expect("new-window parks a SPAWN");
-    assert_eq!(spawn_initial_size_of(&frame), Some((80, 24)));
+    assert_eq!(spawn_initial_size_of(&frame), Some((80, 23)));
 }
 
 /// Against a server that never advertised the capability the field stays

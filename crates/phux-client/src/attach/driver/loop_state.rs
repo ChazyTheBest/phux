@@ -839,6 +839,7 @@ impl SessionLoop {
                 sidebar,
                 Some(&mut self.sidebar_painter),
                 &self.session_name,
+                &self.theme,
             ),
             RepaintLevel::Full => paint_full_frame(
                 out,
@@ -851,6 +852,7 @@ impl SessionLoop {
                 sidebar,
                 Some(&mut self.sidebar_painter),
                 &self.session_name,
+                &self.theme,
             ),
         })
     }

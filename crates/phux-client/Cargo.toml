@@ -105,6 +105,14 @@ rustix = { version = "0.38", default-features = false, features = ["std", "termi
 # unicode-width, and unicode-segmentation) moved to `phux-client-core` with
 # phux-0fv, so those deps are declared there now, not here.
 serde = { workspace = true }
+# phux-l96p.8: pane titles are arbitrary OSC-2 strings, so the chrome
+# clips them to a CELL budget rather than a char count — a CJK or emoji
+# title measured by `chars().count()` overruns its budget and overwrites
+# the rule that was supposed to close it. This re-declares a crate the
+# workspace already vendors and pins for `phux-client-core`'s predict
+# layer (see the note above), so it adds a second consumer, not new
+# third-party code, to the build graph.
+unicode-width = { workspace = true }
 # Shared remote-transport establishment (phux-v45.3): QUIC/WS dialing, the
 # fingerprint-pin TLS trust policy, and the bearer-token auth moved to
 # `phux-dial` so the federation hub's outbound dialer (phux-server) reuses

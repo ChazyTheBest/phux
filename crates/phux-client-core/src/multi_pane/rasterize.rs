@@ -12,6 +12,18 @@ pub struct DividerCell {
     /// Row in outer-viewport coordinates.
     pub y: u16,
     /// The pre-resolved box-drawing character.
+    ///
+    /// Always from the LIGHT box-drawing set. This layer resolves SHAPE
+    /// only; emphasis (which rules bound the focused pane) belongs to
+    /// the chrome layer, which holds the client's authoritative focus.
+    ///
+    /// Focus used to be encoded here as a HEAVY glyph. That was wrong
+    /// twice over: it read the layout tree's remembered focus rather
+    /// than the client's, and mixing weights forces the mixed-junction
+    /// pictographs (`\u{2545}` `\u{2546}` `\u{2548}` `\u{2549}` `\u{2542}` `\u{253f}` ...), which most
+    /// terminal fonts either lack outright or draw with strokes that do
+    /// not meet their light neighbours — a grid that looks broken rather
+    /// than emphasised.
     pub ch: char,
 }
 
@@ -41,9 +53,8 @@ pub struct DividerHit {
 // -----------------------------------------------------------------------------
 
 /// One divider segment: either a vertical line (from a Horizontal
-/// split) or a horizontal line (from a Vertical split). Lives in
-/// outer-viewport cell coordinates and remembers which two subtrees
-/// it separates so we can resolve "is the focused pane adjacent?".
+/// split) or a horizontal line (from a Vertical split), in
+/// outer-viewport cell coordinates.
 #[derive(Debug, Clone)]
 pub(super) struct DividerSegment {
     /// Direction of the *line itself*: a Horizontal split produces a
@@ -56,11 +67,6 @@ pub(super) struct DividerSegment {
     a1: u16,
     /// Cell index on the perpendicular (cross) axis.
     cross: u16,
-    /// Leaves of the subtree on the "low" side of the segment (left for
-    /// Horizontal, top for Vertical). Used to resolve focus adjacency.
-    low_leaves: Vec<TerminalId>,
-    /// Leaves of the subtree on the "high" side.
-    high_leaves: Vec<TerminalId>,
     /// Path from the layout root to the [`LayoutNode::Split`] this
     /// segment is the divider for. Carried so the divider→split identity
     /// survives into [`DividerHit`] (a press on this line resolves to
@@ -178,8 +184,6 @@ fn walk_layout_at(
                         a0: bounds.y,
                         a1: bounds.y + bounds.h.saturating_sub(1),
                         cross: divider_x,
-                        low_leaves: collect_leaves(left),
-                        high_leaves: collect_leaves(right),
                         node_path: path.clone(),
                     });
                 }
@@ -230,8 +234,6 @@ fn walk_layout_at(
                         a0: bounds.x,
                         a1: bounds.x + bounds.w.saturating_sub(1),
                         cross: divider_y,
-                        low_leaves: collect_leaves(left),
-                        high_leaves: collect_leaves(right),
                         node_path: path.clone(),
                     });
                 }
@@ -273,14 +275,17 @@ fn walk_layout_at(
 }
 
 /// Per-cell record of the divider grid: which edges are present at one
-/// coordinate, and which of them are heavy? Order of bits is [N, E, S,
-/// W]; weight is parallel.
+/// coordinate. Order is [N, E, S, W].
 #[derive(Default, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the four fields ARE the four cardinal directions; a bitflag or an array would only obscure which edge is which at every use site"
+)]
 struct DividerEdges {
-    north: Option<bool>, // Some(heavy?) when an edge points north
-    east: Option<bool>,
-    south: Option<bool>,
-    west: Option<bool>,
+    north: bool,
+    east: bool,
+    south: bool,
+    west: bool,
 }
 
 /// The four cardinal neighbours of one grid coordinate. A direction is
@@ -317,71 +322,19 @@ impl DividerEdges {
     /// Inherit a junction edge toward each cardinal neighbour that is a
     /// divider cell and that we don't already have an edge toward. The
     /// inherited weight matches the neighbour's touching edge.
-    fn inherit_junctions(&mut self, neighbours: &Neighbours) {
-        if self.north.is_none() {
-            // The neighbour's south edge is what touches us.
-            self.north = neighbours.north.and_then(|n| n.south.or(n.north));
+    const fn inherit_junctions(&mut self, neighbours: &Neighbours) {
+        if !self.north {
+            self.north = neighbours.north.is_some();
         }
-        if self.south.is_none() {
-            self.south = neighbours.south.and_then(|n| n.north.or(n.south));
+        if !self.south {
+            self.south = neighbours.south.is_some();
         }
-        if self.east.is_none() {
-            self.east = neighbours.east.and_then(|n| n.west.or(n.east));
+        if !self.east {
+            self.east = neighbours.east.is_some();
         }
-        if self.west.is_none() {
-            self.west = neighbours.west.and_then(|n| n.east.or(n.west));
+        if !self.west {
+            self.west = neighbours.west.is_some();
         }
-    }
-}
-
-/// Does the focused pane's rect share an edge with a vertical line at
-/// column `seg.cross`? Adjacent iff the focused rect's left edge ==
-/// cross+1 OR right edge == cross, AND it overlaps the segment's y
-/// range.
-const fn rect_borders_vertical_line(rect: Rect, seg: &DividerSegment) -> bool {
-    let adjacent_x =
-        rect.x == seg.cross.saturating_add(1) || rect.x.saturating_add(rect.w) == seg.cross;
-    let overlaps_y = rect.y <= seg.a1 && rect.y.saturating_add(rect.h).saturating_sub(1) >= seg.a0;
-    adjacent_x && overlaps_y
-}
-
-/// Mirror of [`rect_borders_vertical_line`] for a horizontal line at row
-/// `seg.cross`.
-const fn rect_borders_horizontal_line(rect: Rect, seg: &DividerSegment) -> bool {
-    let adjacent_y =
-        rect.y == seg.cross.saturating_add(1) || rect.y.saturating_add(rect.h) == seg.cross;
-    let overlaps_x = rect.x <= seg.a1 && rect.x.saturating_add(rect.w).saturating_sub(1) >= seg.a0;
-    adjacent_y && overlaps_x
-}
-
-/// Does the segment touch the focused pane? Focused pane is adjacent
-/// iff its `TerminalId` is in either `low_leaves` or `high_leaves` AND
-/// its rect borders the segment along the cross axis. We use membership
-/// only — the rasterizer doesn't need the exact rect contact test
-/// because every leaf in a subtree is adjacent to *its* outer divider
-/// (binary-split-tree invariant).
-fn segment_heavy(
-    seg: &DividerSegment,
-    focus: Option<&TerminalId>,
-    rects: &HashMap<TerminalId, Rect>,
-) -> bool {
-    let Some(fid) = focus else {
-        return false;
-    };
-    let touches = seg.low_leaves.contains(fid) || seg.high_leaves.contains(fid);
-    if !touches {
-        return false;
-    }
-    // Confirm the focused pane's rect actually shares an edge with
-    // this segment. Otherwise we'd mark non-adjacent dividers heavy
-    // when the focused pane is deep in one subtree.
-    let Some(fr) = rects.get(fid) else {
-        return false;
-    };
-    match seg.split {
-        SplitDir::Horizontal => rect_borders_vertical_line(*fr, seg),
-        SplitDir::Vertical => rect_borders_horizontal_line(*fr, seg),
-        _ => false,
     }
 }
 
@@ -389,7 +342,6 @@ fn segment_heavy(
 fn lay_down_vertical_line(
     grid: &mut HashMap<(u16, u16), DividerEdges>,
     seg: &DividerSegment,
-    heavy: bool,
     vcols: u16,
     vrows: u16,
 ) {
@@ -400,10 +352,10 @@ fn lay_down_vertical_line(
     for y in seg.a0..=seg.a1.min(vrows.saturating_sub(1)) {
         let cell = grid.entry((x, y)).or_default();
         if y > seg.a0 {
-            cell.north = Some(heavy);
+            cell.north = true;
         }
         if y < seg.a1 {
-            cell.south = Some(heavy);
+            cell.south = true;
         }
     }
 }
@@ -412,7 +364,6 @@ fn lay_down_vertical_line(
 fn lay_down_horizontal_line(
     grid: &mut HashMap<(u16, u16), DividerEdges>,
     seg: &DividerSegment,
-    heavy: bool,
     vcols: u16,
     vrows: u16,
 ) {
@@ -423,10 +374,10 @@ fn lay_down_horizontal_line(
     for x in seg.a0..=seg.a1.min(vcols.saturating_sub(1)) {
         let cell = grid.entry((x, y)).or_default();
         if x > seg.a0 {
-            cell.west = Some(heavy);
+            cell.west = true;
         }
         if x < seg.a1 {
-            cell.east = Some(heavy);
+            cell.east = true;
         }
     }
 }
@@ -437,13 +388,12 @@ fn lay_down_horizontal_line(
 fn lay_down_segment(
     grid: &mut HashMap<(u16, u16), DividerEdges>,
     seg: &DividerSegment,
-    heavy: bool,
     viewport: (u16, u16),
 ) {
     let (vcols, vrows) = viewport;
     match seg.split {
-        SplitDir::Horizontal => lay_down_vertical_line(grid, seg, heavy, vcols, vrows),
-        SplitDir::Vertical => lay_down_horizontal_line(grid, seg, heavy, vcols, vrows),
+        SplitDir::Horizontal => lay_down_vertical_line(grid, seg, vcols, vrows),
+        SplitDir::Vertical => lay_down_horizontal_line(grid, seg, vcols, vrows),
         _ => {}
     }
 }
@@ -477,25 +427,23 @@ fn into_divider_cells(grid: &HashMap<(u16, u16), DividerEdges>) -> Vec<DividerCe
             DividerCell {
                 x,
                 y,
-                ch: pick_box_char(cell.north, cell.east, cell.south, cell.west),
+                ch: pick_box_char(cell),
             }
         })
         .collect()
 }
 
 /// Final pass: convert `DividerSegment`s into the per-cell
-/// `DividerCell`s the painter consumes. Resolves heavy/light per
-/// segment edge by checking focus adjacency, and picks junction
-/// characters when two segments cross.
-pub(super) fn rasterize(
-    segments: &[DividerSegment],
-    focus: Option<&TerminalId>,
-    rects: &HashMap<TerminalId, Rect>,
-    viewport: (u16, u16),
-) -> Vec<DividerCell> {
+/// `DividerCell`s the painter consumes: pick the junction character
+/// wherever segments cross or terminate against each other.
+///
+/// SHAPE only. Which rules bound the focused pane is decided by the
+/// chrome layer, which holds the client's authoritative focus; this
+/// walk only knows the layout tree.
+pub(super) fn rasterize(segments: &[DividerSegment], viewport: (u16, u16)) -> Vec<DividerCell> {
     let mut grid: HashMap<(u16, u16), DividerEdges> = HashMap::new();
     for seg in segments {
-        lay_down_segment(&mut grid, seg, segment_heavy(seg, focus, rects), viewport);
+        lay_down_segment(&mut grid, seg, viewport);
     }
     inherit_junction_edges(&mut grid);
     into_divider_cells(&grid)
@@ -547,107 +495,31 @@ pub(super) fn divider_hits(segments: &[DividerSegment], viewport: (u16, u16)) ->
         .collect()
 }
 
-/// Pick the box-drawing character for a cell given which of its four
-/// edges are present, and (per edge) whether that edge is heavy.
+/// Pick the box-drawing character for a cell from which of its four
+/// edges are present.
 ///
-/// Falls back to the all-light glyph when a cell has incident heavy
-/// edges in a configuration Unicode 16 doesn't define a mixed
-/// pictograph for (very rare; v0.1 only generates 2-edge crosses and
-/// 4-edge plusses).
-#[allow(
-    clippy::match_same_arms,
-    reason = "single-edge stubs share the glyph of the longer line they continue (`│` / `─` / `┃` / `━`); merging them via `|` defeats the `unnested_or_patterns` lint. Keep the 1-edge-per-arm form for documentation."
-)]
-const fn pick_box_char(
-    north: Option<bool>,
-    east: Option<bool>,
-    south: Option<bool>,
-    west: Option<bool>,
-) -> char {
-    use EdgeKind::{Absent, Heavy, Light};
-    // Compact tag: (present, heavy) per side. 256-entry decision table
-    // at most, but we only hit a small subset; an explicit match is
-    // more readable than a numeric lookup.
-    let n = edge_kind(north);
-    let e = edge_kind(east);
-    let s = edge_kind(south);
-    let w = edge_kind(west);
-
-    match (n, e, s, w) {
-        // Pure straight pieces (and single-edge stubs treated as straight)
-        (Absent, Absent, Absent, Absent) => ' ',
-        (Light, Absent, Light, Absent) => '\u{2502}', // │
-        (Light, Absent, Absent, Absent) => '\u{2502}',
-        (Absent, Absent, Light, Absent) => '\u{2502}',
-        (Heavy, Absent, Heavy, Absent) => '\u{2503}', // ┃
-        (Heavy, Absent, Absent, Absent) => '\u{2503}',
-        (Absent, Absent, Heavy, Absent) => '\u{2503}',
-        (Absent, Light, Absent, Light) => '\u{2500}', // ─
-        (Absent, Light, Absent, Absent) => '\u{2500}',
-        (Absent, Absent, Absent, Light) => '\u{2500}',
-        (Absent, Heavy, Absent, Heavy) => '\u{2501}', // ━
-        (Absent, Heavy, Absent, Absent) => '\u{2501}',
-        (Absent, Absent, Absent, Heavy) => '\u{2501}',
-
-        // Corner pieces (light-only and heavy-only)
-        (Absent, Light, Light, Absent) => '\u{250C}', // ┌
-        (Absent, Heavy, Heavy, Absent) => '\u{250F}', // ┏
-        (Absent, Absent, Light, Light) => '\u{2510}', // ┐
-        (Absent, Absent, Heavy, Heavy) => '\u{2513}', // ┓
-        (Light, Light, Absent, Absent) => '\u{2514}', // └
-        (Heavy, Heavy, Absent, Absent) => '\u{2517}', // ┗
-        (Light, Absent, Absent, Light) => '\u{2518}', // ┘
-        (Heavy, Absent, Absent, Heavy) => '\u{251B}', // ┛
-
-        // T-pieces (light backbone + light/heavy stems).
-        (Light, Light, Light, Absent) => '\u{251C}', // ├
-        (Heavy, Heavy, Heavy, Absent) => '\u{2523}', // ┣
-        (Heavy, Light, Heavy, Absent) => '\u{2520}', // ┠
-        (Light, Heavy, Light, Absent) => '\u{251D}', // ┝
-        (Light, Absent, Light, Light) => '\u{2524}', // ┤
-        (Heavy, Absent, Heavy, Heavy) => '\u{252B}', // ┫
-        (Heavy, Absent, Heavy, Light) => '\u{2528}', // ┨
-        (Light, Absent, Light, Heavy) => '\u{2525}', // ┥
-        (Absent, Light, Light, Light) => '\u{252C}', // ┬
-        (Absent, Heavy, Heavy, Heavy) => '\u{2533}', // ┳
-        (Absent, Heavy, Light, Heavy) => '\u{252F}', // ┯
-        (Absent, Light, Heavy, Light) => '\u{2530}', // ┰
-        (Light, Light, Absent, Light) => '\u{2534}', // ┴
-        (Heavy, Heavy, Absent, Heavy) => '\u{253B}', // ┻
-        (Light, Heavy, Absent, Heavy) => '\u{2537}', // ┷
-        (Heavy, Light, Absent, Light) => '\u{2538}', // ┸
-
-        // Four-way crosses (pure)
-        (Light, Light, Light, Light) => '\u{253C}', // ┼
-        (Heavy, Heavy, Heavy, Heavy) => '\u{254B}', // ╋
-        // Mixed-weight crosses (heavy on one axis)
-        (Heavy, Light, Heavy, Light) => '\u{2542}', // ╂
-        (Light, Heavy, Light, Heavy) => '\u{253F}', // ┿
-        // Mixed-weight crosses (heavy on adjacent edges, approximated)
-        (Light, Heavy, Heavy, Light) => '\u{2545}', // ╅
-        (Heavy, Heavy, Light, Light) => '\u{2546}', // ╆
-        (Heavy, Light, Light, Heavy) => '\u{2548}', // ╈
-        (Light, Light, Heavy, Heavy) => '\u{2549}', // ╉
-
-        // Any remaining shape (very rare; would require non-binary
-        // junctions). Fall back to a hollow space so it visually
-        // signals "missing glyph" instead of pretending to be a cross.
-        _ => ' ',
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EdgeKind {
-    Absent,
-    Light,
-    Heavy,
-}
-
-const fn edge_kind(e: Option<bool>) -> EdgeKind {
-    match e {
-        None => EdgeKind::Absent,
-        Some(false) => EdgeKind::Light,
-        Some(true) => EdgeKind::Heavy,
+/// The LIGHT set only, so every junction has a glyph that terminal
+/// fonts actually ship and whose strokes meet its neighbours'.
+const fn pick_box_char(edges: DividerEdges) -> char {
+    match (edges.north, edges.east, edges.south, edges.west) {
+        // No incident edge: nothing to draw.
+        (false, false, false, false) => ' ',
+        // Four-way cross.
+        (true, true, true, true) => '\u{253C}', // ┼
+        // T-pieces.
+        (true, false, true, true) => '\u{2524}', // ┤
+        (true, true, true, false) => '\u{251C}', // ├
+        (true, true, false, true) => '\u{2534}', // ┴
+        (false, true, true, true) => '\u{252C}', // ┬
+        // Corners.
+        (false, true, true, false) => '\u{250C}', // ┌
+        (false, false, true, true) => '\u{2510}', // ┐
+        (true, true, false, false) => '\u{2514}', // └
+        (true, false, false, true) => '\u{2518}', // ┘
+        // Nothing east or west: a vertical run, or a stub continuing one.
+        (_, false, _, false) => '\u{2502}', // │
+        // Nothing north or south: a horizontal run, or a stub of one.
+        (false, _, false, _) => '\u{2500}', // ─
     }
 }
 
@@ -711,22 +583,5 @@ pub(super) fn freeze_split_dim(content: u16, ratio: f32, min_low: u16, min_high:
     match min_low.checked_add(min_high) {
         Some(needed) if content >= needed => low.clamp(min_low, content - min_high),
         _ => low,
-    }
-}
-
-fn collect_leaves(node: &LayoutNode) -> Vec<TerminalId> {
-    let mut out = Vec::new();
-    collect_leaves_into(node, &mut out);
-    out
-}
-
-fn collect_leaves_into(node: &LayoutNode, out: &mut Vec<TerminalId>) {
-    match node {
-        LayoutNode::Leaf(p) => out.push(p.clone()),
-        LayoutNode::Split { left, right, .. } => {
-            collect_leaves_into(left, out);
-            collect_leaves_into(right, out);
-        }
-        _ => {}
     }
 }

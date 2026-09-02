@@ -1,10 +1,11 @@
 ---
-source: crates/phux-client/src/attach/driver.rs
+source: crates/phux-client/src/attach/driver/tests.rs
 expression: "rows.iter().map(|r| r.trim_end()).collect::<Vec<_>>().join(\"\\n\")"
 ---
-here               │PANE-BASE
-● w1-agent         │
+here               │────────────────────────────────────────────────────────────
+● w1-agent         │PANE-BASE
   foz10-br         │
+                   │
                    │
                    │
                    │┌──────────────────── command palette ─────────────────────┐
@@ -14,7 +15,6 @@ here               │PANE-BASE
                    ││new-window                                                │
                    ││                                                          │
                    ││Enter select  ·  Esc cancel  ·  type to filter            │
-                   ││                                                          │
                    ││                                                          │
                    ││                                                          │
                    ││                                                          │

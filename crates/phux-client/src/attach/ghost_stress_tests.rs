@@ -285,6 +285,7 @@ impl Rig {
                 self.sidebar,
                 None,
                 &self.session_name,
+                &crate::render::theme::Theme::default(),
             );
         }
         self.glass.vt_write(&out);

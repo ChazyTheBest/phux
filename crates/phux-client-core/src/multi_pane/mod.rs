@@ -244,53 +244,52 @@ mod tests {
         }
     }
 
+    /// This layer resolves SHAPE, not emphasis: the rule between two
+    /// panes is the light `│` whether or not either pane is focused.
+    /// Which rules bound the focused pane is decided in the chrome layer
+    /// (`render::chrome::dividers`), which holds the client's
+    /// authoritative focus — the layout tree's own `focus` lags it.
+    /// (Before phux-l96p.8 this asserted a heavy `\u{2503}`.)
     #[test]
-    fn focused_pane_gets_heavy_divider() {
+    fn every_rule_uses_one_stroke_weight() {
         let tree = split_at(&leaf(1), &t(1), &t(2), SplitDir::Horizontal, 0.5).unwrap();
-        let state = LayoutState {
-            tree: Some(tree),
-            focus: Some(t(1)),
-        };
-        let out = compute_layout(&state, (80, 24));
-        // The divider runs between pane A (focused) and pane B, so the
-        // whole column should be heavy.
-        for cell in &out.dividers {
-            assert_eq!(cell.ch, '\u{2503}', "expected heavy │, got {:?}", cell.ch);
+        for focus in [Some(t(1)), Some(t(2)), None] {
+            let state = LayoutState {
+                tree: Some(tree.clone()),
+                focus,
+            };
+            let out = compute_layout(&state, (80, 24));
+            for cell in &out.dividers {
+                assert_eq!(cell.ch, '\u{2502}', "expected light │, got {:?}", cell.ch);
+            }
         }
     }
 
+    /// Three panes, two divider columns: both are the same light glyph,
+    /// and neither changes when focus moves.
     #[test]
-    fn unfocused_layout_uses_light_dividers() {
-        // Three panes split vertically twice with focus on pane 1; the
-        // second divider (between 2 and 3) shouldn't be heavy.
+    fn a_focus_move_does_not_change_any_glyph() {
         let t1 = split_at(&leaf(1), &t(1), &t(2), SplitDir::Horizontal, 0.5).unwrap();
         let t2 = split_at(&t1, &t(2), &t(3), SplitDir::Horizontal, 0.5).unwrap();
-        let state = LayoutState {
-            tree: Some(t2),
-            focus: Some(t(1)),
-        };
-        let out = compute_layout(&state, (80, 24));
-        // Group dividers by column.
-        let mut by_col: std::collections::HashMap<u16, Vec<char>> =
-            std::collections::HashMap::new();
-        for c in &out.dividers {
-            by_col.entry(c.x).or_default().push(c.ch);
-        }
-        // Two distinct divider columns expected.
-        assert_eq!(by_col.len(), 2, "got cols: {:?}", by_col.keys());
-        let cols: Vec<u16> = {
-            let mut k: Vec<_> = by_col.keys().copied().collect();
-            k.sort_unstable();
-            k
-        };
-        // Leftmost divider is adjacent to focused pane 1 ⇒ heavy.
-        for ch in &by_col[&cols[0]] {
-            assert_eq!(*ch, '\u{2503}', "leftmost divider should be heavy");
-        }
-        // Rightmost divider sits between panes 2 and 3, not adjacent
-        // to focused pane 1 ⇒ light.
-        for ch in &by_col[&cols[1]] {
-            assert_eq!(*ch, '\u{2502}', "rightmost divider should be light");
+        let with_1 = compute_layout(
+            &LayoutState {
+                tree: Some(t2.clone()),
+                focus: Some(t(1)),
+            },
+            (80, 24),
+        );
+        let with_3 = compute_layout(
+            &LayoutState {
+                tree: Some(t2),
+                focus: Some(t(3)),
+            },
+            (80, 24),
+        );
+        assert_eq!(with_1.dividers, with_3.dividers);
+        let cols: std::collections::BTreeSet<u16> = with_1.dividers.iter().map(|c| c.x).collect();
+        assert_eq!(cols.len(), 2, "expected two divider columns: {cols:?}");
+        for c in &with_1.dividers {
+            assert_eq!(c.ch, '\u{2502}');
         }
     }
 
@@ -310,27 +309,10 @@ mod tests {
         // Look for at least one T-piece — the horizontal divider runs
         // only in the left half (where pane 1/3 sit) and meets the
         // vertical divider at a T.
-        let has_t = out.dividers.iter().any(|c| {
-            matches!(
-                c.ch,
-                '\u{252C}'
-                    | '\u{2534}'
-                    | '\u{251C}'
-                    | '\u{2524}'
-                    | '\u{2533}'
-                    | '\u{253B}'
-                    | '\u{2523}'
-                    | '\u{252B}'
-                    | '\u{251D}'
-                    | '\u{2520}'
-                    | '\u{2525}'
-                    | '\u{2528}'
-                    | '\u{252F}'
-                    | '\u{2530}'
-                    | '\u{2537}'
-                    | '\u{2538}'
-            )
-        });
+        let has_t = out
+            .dividers
+            .iter()
+            .any(|c| matches!(c.ch, '\u{252C}' | '\u{2534}' | '\u{251C}' | '\u{2524}'));
         assert!(has_t, "expected at least one T-piece in cross-split chrome");
     }
 

@@ -447,7 +447,7 @@ which-key-delay-ms = 400
 # named because widget styles are plain data — see `[theme]` in
 # docs/consumers/tui.md section 4.4 for the slot list.
 left = [
-  { kind = "windows", format = " {index}:{name} ", separator = "", active = { fg = "#1a1b26", bg = "#7aa2f7", bold = true }, inactive = { fg = "#565f89" } },
+  { kind = "windows", format = " {index}:{name} ", separator = "", active = { fg = "#1a1b26", bg = "#7aa2f7", bold = true }, inactive = { fg = "#565f89", bg = "#1a1b26" } },
 ]
 center = [{ kind = "help-hints" }]
 # The right slot changes shape with the terminal, via the universal
@@ -484,7 +484,8 @@ right = [
 # border          = "#3b4261"  # rules and modal borders
 # section_header  = "#e0af68"  # headings inside help / pickers
 # error           = "#f7768e"  # error and alarm text
-# surface         = "reset"    # modal interior fill; reset = transparent
+# text            = "#c0caf5"  # body copy ON a filled panel (see surface)
+# surface         = "#1a1b26"  # modal interior fill; "reset" = transparent
 # shadow          = "#16161e"  # floating-modal drop shadow
 # selection_fg    = "#c0caf5"  # selected list row / copy-mode strip fg
 # selection_bg    = "#33467c"  # selected list row / copy-mode strip bg
@@ -494,6 +495,10 @@ right = [
 # agent_working   = "#9ece6a"  # agent lifecycle: live progress
 # agent_blocked   = "#ff9e64"  # agent lifecycle: waiting on a human
 # agent_done      = "#7dcfff"  # agent lifecycle: finished
+# divider         = "#3b4261"  # pane rules off the focused frame
+# divider_focus   = "#7aa2f7"  # the focused pane's own rules (also bold)
+# pane_title      = "#565f89"  # an unfocused pane's label on its top rule
+# pane_title_focus = "#7aa2f7" # the focused pane's label (also bold)
 
 # The window sidebar (prefix-b toggles it): a vertical strip in three
 # zones, ON by default.

@@ -63,6 +63,7 @@ pub(super) fn compose_full_frame_cells(
     sidebar_painter: Option<&SidebarPainter>,
     session_name: &str,
     now: SystemTime,
+    theme: &crate::render::theme::Theme,
 ) -> RenderedFrame {
     let (cols, rows) = viewport_dims;
     let bar = status_bar.map(StatusBarPainter::position);
@@ -98,7 +99,12 @@ pub(super) fn compose_full_frame_cells(
     // Overlay dividers. The divider buffer marks pane interiors `Skip` and
     // carries only the box-drawing glyphs, so overlaying its non-skip,
     // non-blank cells never clobbers pane content.
-    let divider_buf = compose_divider_buffer(&multi);
+    let divider_buf = {
+        let panes_ref = &*panes;
+        compose_divider_buffer(&multi, content, focused_pane, theme, |id| {
+            super::pane_state::pane_label(panes_ref, id)
+        })
+    };
     overlay_buffer(&mut frame, &divider_buf, (0, 0), true);
 
     // Overlay the sidebar strip into its reserved columns (phux-4h5a). The
@@ -345,13 +351,16 @@ mod tests {
             None,
             "demo",
             UNIX_EPOCH,
+            &crate::render::theme::Theme::default(),
         );
 
         assert_eq!((frame.cols, frame.rows), (80, 24));
-        // No status bar ⇒ panes tile the full viewport; reuse compute_layout
-        // to learn each pane's exact origin.
-        let multi = super::super::multi_pane::compute_layout(
+        // No status bar ⇒ panes tile the whole viewport bar the pane-grid
+        // rail; reuse the SAME content rect the compositor used to learn
+        // each pane's exact origin.
+        let multi = super::super::multi_pane::compute_layout_in(
             workspace.active_window().expect("active window"),
+            content_rect((80, 24), None, None),
             (80, 24),
         );
         let left_rect = multi.rects.get(&left).copied().expect("left rect");
@@ -373,7 +382,7 @@ mod tests {
 
         // A divider glyph sits in the gap column between the two rects.
         let gap = left_rect.x + left_rect.w;
-        let divider = frame.cell(0, gap).expect("gap cell");
+        let divider = frame.cell(left_rect.y, gap).expect("gap cell");
         assert!(
             divider.grapheme != " " && !divider.grapheme.is_empty(),
             "expected a divider glyph at the split column {gap}, got {:?}",
@@ -445,6 +454,7 @@ mod tests {
             Some(&sidebar_painter),
             "demo",
             UNIX_EPOCH,
+            &crate::render::theme::Theme::default(),
         );
 
         // (a) The strip occupies columns 0..20. Its separator rule sits in the
@@ -514,8 +524,13 @@ mod tests {
             None,
             "demo",
             UNIX_EPOCH,
+            &crate::render::theme::Theme::default(),
         );
-        let off_multi = super::super::multi_pane::compute_layout(ls, (80, 24));
+        let off_multi = super::super::multi_pane::compute_layout_in(
+            ls,
+            content_rect((80, 24), None, None),
+            (80, 24),
+        );
         let off_left = off_multi.rects.get(&left).copied().expect("off left rect");
         assert_eq!(off_left.x, 0, "disabled path tiles from the origin");
         assert_eq!(
@@ -565,6 +580,7 @@ mod tests {
             None,
             "alpha",
             UNIX_EPOCH,
+            &crate::render::theme::Theme::default(),
         );
 
         // The bottom row (23) carries the session name from the bar.
@@ -575,8 +591,9 @@ mod tests {
             bottom.contains("alpha"),
             "status-bar row must show the session name, got {bottom:?}"
         );
-        // Pane content still lands on the top row (above the reserved bar).
-        assert_eq!(frame.cell(0, 0).expect("top-left").grapheme, "h");
+        // Row 0 is the pane-grid rail; pane content starts on row 1,
+        // above the reserved bar.
+        assert_eq!(frame.cell(1, 0).expect("first pane row").grapheme, "h");
     }
 
     /// phux-qtw8: with the sidebar open the bar row belongs to the STRIP in the
@@ -630,6 +647,7 @@ mod tests {
             Some(&sidebar_painter),
             "alpha",
             UNIX_EPOCH,
+            &crate::render::theme::Theme::default(),
         );
 
         // The bar row's first 20 columns are the strip's, so the tab text

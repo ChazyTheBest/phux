@@ -1307,6 +1307,7 @@ fn shipped_frame_rows(view: (u16, u16), windows: &[WindowInfo]) -> Vec<String> {
         None,
         None,
         "phux",
+        &crate::render::theme::Theme::default(),
     );
 
     let mut probe = PaneSlot::new_with_size(cols, rows).expect("probe slot");

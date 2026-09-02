@@ -237,6 +237,7 @@ pub(super) fn handle_config_reload<W: crate::attach::RenderSink>(
                     sidebar,
                     Some(sidebar_painter),
                     session_name,
+                    theme,
                 );
             }
         }

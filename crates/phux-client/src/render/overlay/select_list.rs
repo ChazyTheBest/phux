@@ -553,7 +553,7 @@ impl SelectList {
                     .fg(self.theme.attention)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(self.theme.action)
+                Style::default().fg(self.theme.text)
             };
             Line::from(vec![
                 Span::styled(label, label_style),
@@ -1414,7 +1414,7 @@ mod tests {
         // Unselected rows: attention label takes the theme's attention
         // color; a calm row keeps the action slot.
         let calm = sl.item_line(&sl.items[0], false, 40);
-        assert_eq!(calm.spans[0].style.fg, Some(theme.action));
+        assert_eq!(calm.spans[0].style.fg, Some(theme.text));
         let hot = sl.item_line(&sl.items[1], false, 40);
         assert_eq!(hot.spans[0].style.fg, Some(theme.attention));
         assert!(hot.spans[0].style.add_modifier.contains(Modifier::BOLD));

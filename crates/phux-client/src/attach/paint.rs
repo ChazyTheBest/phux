@@ -184,6 +184,7 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
     sidebar: Option<SidebarReservation>,
     sidebar_painter: Option<&mut crate::render::chrome::sidebar::SidebarPainter>,
     session_name: &str,
+    theme: &crate::render::theme::Theme,
 ) -> StatusBarPaint {
     // The full screen paint (ratatui chrome + per-pane libghostty render).
     // Its close-duration is the client-side render-lag signal the flywheel
@@ -228,7 +229,15 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
             );
         }
     }
-    let _ = crate::render::chrome::dividers::render_dividers(out, &multi, focused_pane);
+    let panes_ref = &*panes;
+    let _ = crate::render::chrome::dividers::render_dividers(
+        out,
+        &multi,
+        content,
+        focused_pane,
+        theme,
+        |id| super::pane_state::pane_label(panes_ref, id),
+    );
     // Paint the sidebar strip into its reserved columns. The ED2 above cleared
     // it, so invalidate the painter's cache to force a re-emit even if the
     // window list is byte-identical to the previous frame. The strip occupies
@@ -340,6 +349,7 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
     sidebar: Option<SidebarReservation>,
     sidebar_painter: Option<&mut crate::render::chrome::sidebar::SidebarPainter>,
     session_name: &str,
+    theme: &crate::render::theme::Theme,
 ) -> StatusBarPaint {
     let _paint = tracing::debug_span!(
         "paint_chrome_in_place",
@@ -362,6 +372,20 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
     // Sidebar/status painters flush independently. Publish their updates and
     // final cursor restoration as one outer-terminal transaction.
     let sync = SyncOutput::begin(out).ok();
+    // phux-l96p.8: the pane grid's rules and TITLES are chrome, and a
+    // pane title changing is exactly a `RepaintLevel::Chrome` event
+    // (`handler`'s `chrome_dirty`). Repainting the grid here is what
+    // makes a title land without waiting for the next full frame; it
+    // costs only the chrome cells, and the skip-cell carve-out means it
+    // still cannot touch a pane interior.
+    let _ = crate::render::chrome::dividers::render_dividers(
+        out,
+        &multi,
+        content,
+        focused_pane,
+        theme,
+        |id| super::pane_state::pane_label(panes, id),
+    );
     if let (Some(res), Some(painter)) = (sidebar, sidebar_painter) {
         let _ = painter.paint(out, sidebar_rect(viewport_dims, res));
     }
@@ -619,6 +643,14 @@ pub(super) fn content_rect(
         Some(Position::Top) => 1,
         Some(Position::Bottom) | None => 0,
     };
+    // phux-l96p.8: one more row above the pane area for the pane-grid
+    // RAIL — the rule that closes the divider grid at the top and holds
+    // each top-row pane's title. It is unconditional so that every pane
+    // has a rule above it to be labelled in; a rail that appeared only
+    // on split windows would move the panes under the user on every
+    // split. Yielded whole on a viewport too short to spare it, so a
+    // two-row terminal still shows a pane instead of only chrome.
+    let (y, h) = if h >= 2 { (y + 1, h - 1) } else { (y, h) };
     sidebar.map_or(
         crate::layout::Rect {
             x: 0,
@@ -846,24 +878,45 @@ mod tests {
         }
     }
 
-    /// phux-4h5a: the disabled-path invariant. `content_rect(.., None)` must
-    /// yield exactly `Rect { 0, 0, pane_viewport(..).0, pane_viewport(..).1 }`
-    /// so the sidebar-off tiling stays byte-identical to the pre-sidebar one.
+    /// phux-4h5a / phux-l96p.8: the disabled-path invariant. With no
+    /// sidebar the content rect is the full width, anchored one row down
+    /// from where `pane_viewport` starts — that row is the pane-grid
+    /// RAIL, which holds every top-row pane's title. Height is
+    /// `pane_viewport`'s less the rail.
     #[test]
-    fn content_rect_disabled_equals_pane_viewport_rect() {
-        for outer in [(80u16, 24u16), (1, 1), (200, 50), (0, 0)] {
+    fn content_rect_disabled_is_pane_viewport_less_the_rail() {
+        for outer in [(80u16, 24u16), (200, 50)] {
             for bar in [None, Some(Position::Bottom)] {
                 let (vw, vh) = pane_viewport(outer, bar.is_some());
                 assert_eq!(
                     content_rect(outer, bar, None),
                     crate::layout::Rect {
                         x: 0,
-                        y: 0,
+                        y: 1,
                         w: vw,
-                        h: vh,
+                        h: vh - 1,
                     },
                     "outer={outer:?} bar={bar:?}"
                 );
+            }
+        }
+    }
+
+    /// phux-l96p.8: the rail costs a row only when there is a row to
+    /// spare. A viewport with one usable row keeps it for the pane —
+    /// chrome must never be the only thing on screen.
+    #[test]
+    fn a_viewport_too_short_for_a_rail_keeps_its_only_row() {
+        for outer in [(10u16, 1u16), (10, 2)] {
+            for bar in [None, Some(Position::Bottom)] {
+                let (_, vh) = pane_viewport(outer, bar.is_some());
+                let rect = content_rect(outer, bar, None);
+                if vh >= 2 {
+                    assert_eq!(rect.h, vh - 1, "outer={outer:?} bar={bar:?}");
+                } else {
+                    assert_eq!(rect.h, vh, "outer={outer:?} bar={bar:?}");
+                    assert_eq!(rect.y, 0, "outer={outer:?} bar={bar:?}");
+                }
             }
         }
     }
@@ -874,13 +927,14 @@ mod tests {
     #[test]
     fn content_rect_top_bar_shifts_origin_down_one_row() {
         let outer = (80, 24);
+        // One row for the bar, one for the rail below it.
         assert_eq!(
             content_rect(outer, Some(Position::Top), None),
             crate::layout::Rect {
                 x: 0,
-                y: 1,
+                y: 2,
                 w: 80,
-                h: 23,
+                h: 22,
             }
         );
         // Composes with a left sidebar: x inset and y shift together.
@@ -895,13 +949,13 @@ mod tests {
             ),
             crate::layout::Rect {
                 x: 20,
-                y: 1,
+                y: 2,
                 w: 60,
-                h: 23,
+                h: 22,
             }
         );
         // Degenerate 1-row viewport: the reservation empties the content
-        // rect without underflowing.
+        // rect without underflowing, and no rail is taken from nothing.
         let tiny = content_rect((10, 1), Some(Position::Top), None);
         assert_eq!(tiny.h, 0);
         assert_eq!(tiny.y, 1);
@@ -913,7 +967,7 @@ mod tests {
     #[test]
     fn content_rect_insets_for_left_and_right_sidebar() {
         let outer = (80, 24);
-        // No bar, left dock, width 20: x = 20, w = 60, h = 24.
+        // No bar, left dock, width 20: x = 20, w = 60, h = 23 (rail).
         let left = content_rect(
             outer,
             None,
@@ -926,12 +980,12 @@ mod tests {
             left,
             crate::layout::Rect {
                 x: 20,
-                y: 0,
+                y: 1,
                 w: 60,
-                h: 24,
+                h: 23,
             }
         );
-        // With bar, right dock, width 20: x = 0, w = 60, h = 23.
+        // With bar, right dock, width 20: x = 0, w = 60, h = 22 (bar + rail).
         let right = content_rect(
             outer,
             Some(Position::Bottom),
@@ -944,9 +998,9 @@ mod tests {
             right,
             crate::layout::Rect {
                 x: 0,
-                y: 0,
+                y: 1,
                 w: 60,
-                h: 23,
+                h: 22,
             }
         );
         // An over-wide sidebar clamps to the viewport: zero content width, no
@@ -1117,6 +1171,7 @@ mod tests {
             None,
             None,
             "demo",
+            &crate::render::theme::Theme::default(),
         );
 
         let s = String::from_utf8_lossy(&out);
@@ -1199,6 +1254,7 @@ mod tests {
             None,
             None,
             "demo",
+            &crate::render::theme::Theme::default(),
         )
     }
 
@@ -1461,6 +1517,7 @@ mod tests {
             Some(res),
             Some(&mut sidebar_painter),
             "demo",
+            &crate::render::theme::Theme::default(),
         );
         let s = String::from_utf8_lossy(&out);
         assert!(
@@ -1515,6 +1572,7 @@ mod tests {
             Some(res),
             Some(&mut sidebar_painter),
             "demo",
+            &crate::render::theme::Theme::default(),
         );
         assert!(
             String::from_utf8_lossy(&first).contains("\x1b[2;1H"),
@@ -1532,6 +1590,7 @@ mod tests {
             Some(res),
             Some(&mut sidebar_painter),
             "demo",
+            &crate::render::theme::Theme::default(),
         );
         let s = String::from_utf8_lossy(&second);
         assert!(
@@ -1551,7 +1610,7 @@ mod tests {
     fn paint_chrome_in_place_restores_the_cursor_without_a_status_bar() {
         let id = TerminalId::local(1);
         // A real leaf so the focused pane HAS a rect: with a 20-column left
-        // strip its origin is (x = 20, y = 0).
+        // strip and the pane-grid rail its origin is (x = 20, y = 1).
         let layout = LayoutState {
             tree: Some(LayoutNode::Leaf(id.clone())),
             focus: Some(id.clone()),
@@ -1572,6 +1631,7 @@ mod tests {
             Some(res),
             Some(&mut sidebar_painter),
             "demo",
+            &crate::render::theme::Theme::default(),
         );
         let s = String::from_utf8_lossy(&out);
         // The strip painted (so the cursor really is inside it) ...
@@ -1596,9 +1656,10 @@ mod tests {
             "only the sync-output close may follow the cursor tail; out = {s:?}"
         );
         // The pane never rendered, so the fallback parks (hidden) at the
-        // focused pane's rect origin — column 21, right of the 20-col strip.
+        // focused pane's rect origin — column 21, right of the 20-col
+        // strip, and row 2, under the pane-grid rail.
         assert!(
-            s.contains("\x1b[1;21H\x1b[?25l"),
+            s.contains("\x1b[2;21H\x1b[?25l"),
             "cursor must park at the focused pane's origin, not in the strip; \
              out = {s:?}"
         );

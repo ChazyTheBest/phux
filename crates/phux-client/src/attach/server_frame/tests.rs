@@ -2067,6 +2067,7 @@ fn drive_snapshot(
             None,
             None,
             &session_name,
+            &crate::render::theme::Theme::default(),
         );
     }
     outcome
@@ -2171,11 +2172,12 @@ fn focused_pane_repaints_on_output() {
     );
 
     let s = String::from_utf8_lossy(&out);
-    // Focused pane renders at column 1 (left pane origin). Glyphs are
-    // interleaved with SGR resets, so assert on ordered chars.
+    // Focused pane renders at its origin — column 1, row 2 (row 1 is the
+    // pane-grid rail, phux-l96p.8). Glyphs are interleaved with SGR
+    // resets, so assert on ordered chars.
     assert!(
-        s.contains("\x1b[1;1H"),
-        "expected CUP into left pane origin (col 1); out = {s:?}"
+        s.contains("\x1b[2;1H"),
+        "expected CUP into left pane origin (row 2, col 1); out = {s:?}"
     );
     for ch in ['w', 'o', 'r', 'l', 'd'] {
         assert!(

@@ -373,6 +373,7 @@ impl HeadlessSession {
             Some(&sidebar_painter),
             &self.session_name,
             SystemTime::now(),
+            &crate::render::theme::Theme::default(),
         )
     }
 }

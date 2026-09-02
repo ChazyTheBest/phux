@@ -259,6 +259,33 @@ impl PaneSlot {
     }
 }
 
+/// The chrome label for one pane: its cached OSC-2 title plus the
+/// attention state that decides its badge.
+///
+/// The title is what the pane's own program says it is — the shell's
+/// `cwd`, an editor's filename, an agent harness's banner. phux does not
+/// invent a name for a pane it did not name, so a pane whose program
+/// never set a title gets no label rather than a placeholder.
+///
+/// The declared agent lifecycle state (ADR-0040) is deliberately NOT
+/// read here: those records live in the driver's `agent_meta` index,
+/// which the paint path is not handed. `PaneLabel::agent` exists so that
+/// wiring is a field assignment when the index reaches this layer; until
+/// then a pane that has ASKED for a human still badges, because
+/// `PaneSlot::attention` is the ADR-0035 flag and is already local.
+pub(super) fn pane_label<'a>(
+    panes: &'a HashMap<TerminalId, PaneSlot>,
+    id: &TerminalId,
+) -> Option<crate::render::chrome::dividers::PaneLabel<'a>> {
+    let slot = panes.get(id)?;
+    Some(crate::render::chrome::dividers::PaneLabel {
+        text: slot.last_title.as_str(),
+        agent: None,
+        attention: slot.attention,
+        seen: slot.seen,
+    })
+}
+
 /// Build a protocol-0.7 test session with atomically published synthesized replicas.
 ///
 /// Test helpers must seed terminal state through the same ATTACHED,

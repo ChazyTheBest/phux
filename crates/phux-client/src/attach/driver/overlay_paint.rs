@@ -94,6 +94,7 @@ pub(super) fn paint_active_overlay<W: crate::attach::RenderSink>(
                     sidebar,
                     sidebar_painter,
                     session_name,
+                    theme,
                 )
             });
         if let Some(slot) = panes.get_mut(fid) {
@@ -132,6 +133,7 @@ pub(super) fn paint_active_overlay<W: crate::attach::RenderSink>(
                         sidebar,
                         sidebar_painter,
                         session_name,
+                        theme,
                     )
                 });
         let _ = overlays.paint_clipped(out, viewport_dims, overlay_content, clip, theme.shadow);

@@ -176,8 +176,13 @@ impl<'a> Modal<'a> {
         let block = Block::default()
             .borders(Borders::ALL)
             // Fill the box with the theme surface so the modal reads as a
-            // solid panel floating over the live panes. Default `Reset`
-            // inherits the terminal background (no visible change).
+            // solid panel floating over the live panes rather than as
+            // text that appeared in the grid. phux cannot DIM the
+            // backdrop the way a single-buffer TUI can — the pane cells
+            // belong to libghostty and the chrome never re-emits them
+            // (ADR-0020) — so the panel's own contrast plus the drop
+            // shadow are what separate it from what is behind it. Set
+            // `[theme] surface = "reset"` for a transparent modal.
             .style(Style::default().bg(self.theme.surface))
             .border_style(Style::default().fg(self.theme.border))
             .title(Span::styled(
@@ -472,7 +477,7 @@ impl KeyChordTable {
             Span::raw("  "),
             Span::styled(
                 row.description.clone(),
-                Style::default().fg(self.theme.action),
+                Style::default().fg(self.theme.text),
             ),
         ])
     }

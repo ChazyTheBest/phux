@@ -335,7 +335,7 @@ impl ContextMenu {
                     Line::from(vec![
                         Span::styled(
                             format!("{lead}{label}"),
-                            Style::default().fg(self.theme.action),
+                            Style::default().fg(self.theme.text),
                         ),
                         Span::raw(" ".repeat(gap)),
                         Span::styled(format!("{sec}{trail}"), Style::default().fg(self.theme.dim)),

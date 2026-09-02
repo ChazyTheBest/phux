@@ -1,9 +1,9 @@
 ---
-source: crates/phux-client/src/attach/driver.rs
+source: crates/phux-client/src/attach/driver/tests.rs
 expression: "rows.join(\"\\n\")"
 ---
+────────────────────────────────────
 PANE-BASE
-
 
 
 

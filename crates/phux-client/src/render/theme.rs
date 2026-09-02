@@ -24,6 +24,12 @@
 //! - [`error`] — error / alarm text.
 //! - [`sidebar_section`] — the sidebar's muted `spaces` / `agents`
 //!   section headers (phux-foz.9).
+//! - [`divider`] / [`divider_focus`] — the pane-divider rules: the
+//!   recessive structural tone, and the focused pane's own frame.
+//! - [`pane_title`] / [`pane_title_focus`] — the label inset into a
+//!   pane's top rule.
+//! - [`text`] — body copy that sits on a filled [`Theme::surface`] panel, where
+//!   inheriting the terminal foreground would be unreadable.
 //! - [`agent_idle`] / [`agent_working`] / [`agent_blocked`] /
 //!   [`agent_done`] — agent lifecycle state colors in the sidebar's
 //!   agents section (phux-foz.9).
@@ -41,6 +47,11 @@
 //! [`agent_working`]: Theme::agent_working
 //! [`agent_blocked`]: Theme::agent_blocked
 //! [`agent_done`]: Theme::agent_done
+//! [`divider`]: Theme::divider
+//! [`divider_focus`]: Theme::divider_focus
+//! [`pane_title`]: Theme::pane_title
+//! [`pane_title_focus`]: Theme::pane_title_focus
+//! [`text`]: Theme::text
 //!
 //! ## Overrides
 //!
@@ -113,6 +124,32 @@ pub struct Theme {
     pub agent_blocked: Color,
     /// Agent lifecycle coloring (phux-foz.9): a `done` agent row.
     pub agent_done: Color,
+    /// Pane-divider rules that do not touch the focused pane. The
+    /// recessive structural register: a rule is scaffolding, never
+    /// content. Defaults to the same tone as `border` so every rule in
+    /// the chrome — modal frames, the sidebar's edge, the pane grid —
+    /// reads as one material.
+    pub divider: Color,
+    /// The rules bounding the FOCUSED pane. Focus is carried by color
+    /// (plus `BOLD`), never by a heavier box-drawing weight: mixed-weight
+    /// junctions (`\u{2545}`, `\u{2548}`, ...) are missing or misaligned in
+    /// most terminal fonts, so a uniformly light grid tinted at the focus
+    /// is both sharper and more portable.
+    pub divider_focus: Color,
+    /// A pane's label, inset into its top rule, when the pane is not
+    /// focused. Recessive like every other unfocused affordance.
+    pub pane_title: Color,
+    /// The focused pane's label. Rides `accent` (with `BOLD`) so "where
+    /// am I typing" is answerable from the frame alone.
+    pub pane_title_focus: Color,
+    /// Body copy painted ON a filled `surface` panel.
+    ///
+    /// Distinct from `action` on purpose. `action` is `Reset` because it
+    /// labels things drawn on the HOST background (the sidebar, the
+    /// status row), which the user chose. A modal panel supplies its own
+    /// background, so its text has to supply its own foreground or it
+    /// inverts into unreadability on a light terminal.
+    pub text: Color,
 }
 
 impl Default for Theme {
@@ -145,10 +182,13 @@ impl Default for Theme {
             // #f7768e — an explicit red rather than ANSI `Red`, which
             // maps to wildly different hues across terminal palettes.
             error: Color::Rgb(0xf7, 0x76, 0x8e),
-            // Reset = no fill (inherit terminal bg); opt-in via config.
-            // Keeping modals transparent means phux never fights a
-            // terminal background the user chose deliberately.
-            surface: Color::Reset,
+            // #1a1b26 — the tokyonight base. An overlay is a panel
+            // FLOATING over live panes, and a panel that inherits the
+            // terminal background has no edge except its border: the
+            // eye reads it as text that appeared in the grid rather
+            // than as a surface on top of it. Set `surface = "reset"`
+            // to go back to a transparent modal.
+            surface: Color::Rgb(0x1a, 0x1b, 0x26),
             // #16161e — one shade under the tokyonight base, so the
             // drop-shadow reads as depth on a dark terminal and as a
             // thin dark edge on a light one.
@@ -173,6 +213,18 @@ impl Default for Theme {
             agent_working: Color::Rgb(0x9e, 0xce, 0x6a),
             agent_blocked: Color::Rgb(0xff, 0x9e, 0x64),
             agent_done: Color::Rgb(0x7d, 0xcf, 0xff),
+            // Rules share `border`'s tone: one material for all
+            // structure. Focus tints that same grid with `accent`.
+            divider: Color::Rgb(0x3b, 0x42, 0x61),
+            divider_focus: Color::Rgb(0x7a, 0xa2, 0xf7),
+            // A pane label is an affordance, not content: dim when the
+            // pane is elsewhere, accent when it is under your hands.
+            pane_title: Color::Rgb(0x56, 0x5f, 0x89),
+            pane_title_focus: Color::Rgb(0x7a, 0xa2, 0xf7),
+            // #c0caf5 — the tokyonight foreground, shared with
+            // `selection_fg` so a selected row is the same text on a
+            // different bed rather than a different text.
+            text: Color::Rgb(0xc0, 0xca, 0xf5),
         }
     }
 }
@@ -231,6 +283,11 @@ impl Theme {
             "agent_working" => Some(&mut self.agent_working),
             "agent_blocked" => Some(&mut self.agent_blocked),
             "agent_done" => Some(&mut self.agent_done),
+            "divider" => Some(&mut self.divider),
+            "divider_focus" => Some(&mut self.divider_focus),
+            "pane_title" => Some(&mut self.pane_title),
+            "pane_title_focus" => Some(&mut self.pane_title_focus),
+            "text" => Some(&mut self.text),
             _ => None,
         }
     }
@@ -268,7 +325,7 @@ mod tests {
         assert_eq!(t.section_header, Color::Rgb(0xe0, 0xaf, 0x68));
         assert_eq!(t.error, Color::Rgb(0xf7, 0x76, 0x8e));
         // Design tokens for floating-modal depth + selection chrome.
-        assert_eq!(t.surface, Color::Reset);
+        assert_eq!(t.surface, Color::Rgb(0x1a, 0x1b, 0x26));
         assert_eq!(t.shadow, Color::Rgb(0x16, 0x16, 0x1e));
         assert_eq!(t.selection_fg, Color::Rgb(0xc0, 0xca, 0xf5));
         assert_eq!(t.selection_bg, Color::Rgb(0x33, 0x46, 0x7c));
@@ -278,6 +335,18 @@ mod tests {
         assert_eq!(t.agent_working, Color::Rgb(0x9e, 0xce, 0x6a));
         assert_eq!(t.agent_blocked, Color::Rgb(0xff, 0x9e, 0x64));
         assert_eq!(t.agent_done, Color::Rgb(0x7d, 0xcf, 0xff));
+    }
+
+    /// The structural chrome roles (phux-l96p.8) ride the same tokyonight
+    /// palette; split from the test above only to keep each one readable.
+    #[test]
+    fn structural_slots_match_shipped_colors() {
+        let t = Theme::default();
+        assert_eq!(t.divider, Color::Rgb(0x3b, 0x42, 0x61));
+        assert_eq!(t.divider_focus, Color::Rgb(0x7a, 0xa2, 0xf7));
+        assert_eq!(t.pane_title, Color::Rgb(0x56, 0x5f, 0x89));
+        assert_eq!(t.pane_title_focus, Color::Rgb(0x7a, 0xa2, 0xf7));
+        assert_eq!(t.text, Color::Rgb(0xc0, 0xca, 0xf5));
     }
 
     /// The shipped palette is a system, not a bag of colors: the slots
@@ -299,6 +368,26 @@ mod tests {
         assert_eq!(
             t.agent_working, t.chord,
             "working shares the live-progress green"
+        );
+        assert_eq!(
+            t.divider, t.border,
+            "every rule in the chrome is one material"
+        );
+        assert_eq!(
+            t.divider_focus, t.accent,
+            "the focused frame rides the one phux hue"
+        );
+        assert_eq!(
+            t.pane_title, t.dim,
+            "an unfocused pane label recedes like any dim chrome"
+        );
+        assert_eq!(
+            t.pane_title_focus, t.accent,
+            "the focused pane label rides the same hue as its frame"
+        );
+        assert_eq!(
+            t.text, t.selection_fg,
+            "panel body copy and a selected row are the same text"
         );
     }
 
@@ -326,6 +415,32 @@ mod tests {
         let t = Theme::from_cfg(&cfg(&[("attention", "#f38ba8")]));
         assert_eq!(t.attention, Color::Rgb(0xf3, 0x8b, 0xa8));
         assert_eq!(t.accent, Theme::default().accent);
+    }
+
+    #[test]
+    fn structural_chrome_slots_are_overridable() {
+        let t = Theme::from_cfg(&cfg(&[
+            ("divider", "#45475a"),
+            ("divider_focus", "#89b4fa"),
+            ("pane_title", "#6c7086"),
+            ("pane_title_focus", "#89b4fa"),
+            ("text", "#cdd6f4"),
+        ]));
+        assert_eq!(t.divider, Color::Rgb(0x45, 0x47, 0x5a));
+        assert_eq!(t.divider_focus, Color::Rgb(0x89, 0xb4, 0xfa));
+        assert_eq!(t.pane_title, Color::Rgb(0x6c, 0x70, 0x86));
+        assert_eq!(t.pane_title_focus, Color::Rgb(0x89, 0xb4, 0xfa));
+        assert_eq!(t.text, Color::Rgb(0xcd, 0xd6, 0xf4));
+        assert_eq!(t.accent, Theme::default().accent);
+    }
+
+    /// A transparent modal stays one config line away: the shipped
+    /// default fills the panel, but `surface = "reset"` restores the
+    /// pre-polish see-through box.
+    #[test]
+    fn surface_can_be_made_transparent_again() {
+        let t = Theme::from_cfg(&cfg(&[("surface", "reset")]));
+        assert_eq!(t.surface, Color::Reset);
     }
 
     #[test]

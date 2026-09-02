@@ -2194,6 +2194,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

@@ -108,10 +108,12 @@ pub fn compute_layout_in(
     walk_layout(tree, content, &mut segments, &mut rects);
 
     // Rasterize the segments into per-cell divider entries, resolving
-    // junctions and heavy/light weights against the focused pane. Clamp to
-    // the full viewport, not `content` — segments already carry inset
-    // coordinates, and the clamp only guards the screen edge.
-    let dividers = rasterize(&segments, layout.focus.as_ref(), &rects, viewport_dims);
+    // junction SHAPES. Clamp to the full viewport, not `content` —
+    // segments already carry inset coordinates, and the clamp only
+    // guards the screen edge. Emphasis (which rules bound the focused
+    // pane) is the chrome layer's job: it holds the client's
+    // authoritative focus, which the layout tree's own `focus` can lag.
+    let dividers = rasterize(&segments, viewport_dims);
     // Same segments, same viewport clamp: the grab map's cells are
     // exactly the cells `rasterize` paints a glyph into.
     let divider_hits = divider_hits(&segments, viewport_dims);

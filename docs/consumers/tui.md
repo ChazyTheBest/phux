@@ -1227,7 +1227,8 @@ Recognized slots:
 | `title`          | `#7aa2f7`   | Titles that diverge from `accent`         |
 | `section_header` | `#e0af68`   | Section headings inside help and pickers  |
 | `error`          | `#f7768e`   | Error / alarm text                        |
-| `surface`        | terminal bg | Modal interior background                 |
+| `text`           | `#c0caf5`   | Body copy on a filled `surface` panel     |
+| `surface`        | `#1a1b26`   | Modal interior background (`"reset"` = transparent) |
 | `shadow`         | `#16161e`   | Modal drop shadow                         |
 | `selection_fg`   | `#c0caf5`   | Selected list row / copy-mode strip foreground |
 | `selection_bg`   | `#33467c`   | Selected list row / copy-mode strip background |
@@ -1237,6 +1238,10 @@ Recognized slots:
 | `agent_working`  | `#9ece6a`   | Sidebar agent row in the `working` state   |
 | `agent_blocked`  | `#ff9e64`   | Sidebar agent row in the `blocked` state   |
 | `agent_done`     | `#7dcfff`   | Sidebar agent row in the `done` state      |
+| `divider`        | `#3b4261`   | Pane rules off the focused pane's frame    |
+| `divider_focus`  | `#7aa2f7`   | The focused pane's own rules (also bold)   |
+| `pane_title`     | `#565f89`   | An unfocused pane's label on its top rule  |
+| `pane_title_focus`| `#7aa2f7`  | The focused pane's label (also bold)       |
 
 The shipped palette is deliberately **muted-chrome / bright-content**: the
 always-on chrome (sidebar headers, branch sub-lines, affordances, the
@@ -1253,6 +1258,21 @@ purpose, and a retint should keep them in step:
 - `agent_blocked` tracks `attention`: a blocked agent and an attention
   marker are one fact seen from two places.
 - `agent_working` tracks `chord`: the green of live progress.
+- `divider` tracks `border`: every rule in the chrome — modal frames, the
+  sidebar's edge, the pane grid — is one material.
+- `divider_focus` and `pane_title_focus` track `accent`: a focused pane's
+  frame and its label are the same statement made twice.
+- `pane_title` tracks `dim`: an unfocused label recedes like every other
+  unfocused affordance.
+- `text` tracks `selection_fg`: a selected row is the same text on a
+  different bed, not a different text.
+
+`action` and `text` are deliberately *not* the same slot. `action` is
+`reset` because it labels things drawn on the HOST background — the
+sidebar, the status row — which is the background you chose. A modal
+panel supplies its own background (`surface`), so its body copy has to
+supply its own foreground or it inverts into unreadability on a light
+terminal.
 
 Every value is a slot, so a theme retints the whole chrome by overriding a
 handful of keys.
@@ -1705,6 +1725,41 @@ persistence in L3 metadata under `phux.tui.layout/v1`, and the
 keybind-action wiring — is settled by
 [ADR-0019](../../ADR/0019-tui-multi-pane-rendering.md) and tracked under
 the `phux-4li` epic.
+
+### 6.1.1 The pane grid: shared rules, one weight, titles on the rail
+
+Panes **share** their rules. A split costs exactly one cell of chrome, not
+two adjacent borders, so a 2x2 window is one `│` column and one `─` row
+crossing at a `┼`. Junctions are resolved per cell from the lines that
+actually meet there (`│ ─ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼`).
+
+Above the pane area sits the **rail**: one row that closes the grid at the
+top and holds each top-row pane's title, tee-ing into `┬` wherever a
+vertical rule drops out of it. It costs one row of the viewport and is
+always reserved, so splitting a window never moves the panes you were
+already looking at. A viewport with only one usable row keeps it for the
+pane.
+
+Every rule is drawn in the **light** box-drawing set. Focus is carried by
+colour — `divider_focus` plus bold on the focused pane's own rules and its
+title, `divider` everywhere else — not by a heavier stroke. Heavy rules
+force the mixed-weight junction glyphs (`╅ ╆ ╈ ╉ ╂ ┿`) at every
+crossing, and most terminal fonts either lack them outright or draw
+strokes that miss their light neighbours, so an emphasised grid read as a
+broken one.
+
+A pane's title is its own **OSC-2 terminal title** — what the program in
+the pane says it is: the shell's directory, an editor's filename, an agent
+harness's banner. It is inset one cell into the rule above the pane,
+wrapped in single spaces, and clipped by DISPLAY WIDTH with the shared `…`
+so a CJK or emoji title cannot overrun the rule that closes it. A pane
+whose program never set a title gets no label: phux does not invent a name
+for a pane it did not name.
+
+A pane that has asked for a human ([ADR-0035](../../ADR/0035-agent-asked-event.md))
+badges with a filled `●` in the `attention` tone ahead of its title — the
+same glyph and tone the sidebar's row for that pane uses, because a pane's
+state must not read differently depending on where you look at it.
 
 ### 6.2 Resize behavior
 

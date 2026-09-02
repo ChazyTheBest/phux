@@ -34,7 +34,7 @@ use std::io::{self, Write};
 use phux_config::widget::WindowInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as RataRect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -748,19 +748,6 @@ impl SidebarPainter {
         self.compose(rect)
     }
 
-    /// The theme color for an agent lifecycle state (phux-foz.9).
-    /// `Unknown` renders in the de-emphasis color — an undeclared state
-    /// should not pretend to be information.
-    const fn state_color(&self, state: AgentMetaState) -> Color {
-        match state {
-            AgentMetaState::Idle => self.theme.agent_idle,
-            AgentMetaState::Working => self.theme.agent_working,
-            AgentMetaState::Blocked => self.theme.agent_blocked,
-            AgentMetaState::Done => self.theme.agent_done,
-            AgentMetaState::Unknown => self.theme.dim,
-        }
-    }
-
     /// Render a muted lowercase section header (phux-foz.9).
     fn header_line(&self, label: &str, text_w: u16) -> Line<'static> {
         Line::from(Span::styled(
@@ -850,15 +837,12 @@ impl SidebarPainter {
     /// pane you already visited relaxes to the same hollow ring as `idle`. A
     /// `working` agent gets the half-filled ring: alive, but wanting nothing.
     fn agent_line(&self, e: &AgentEntry, text_w: u16) -> Line<'static> {
-        let color = self.state_color(e.state);
-        let unreviewed_done = e.state == AgentMetaState::Done && !e.seen;
-        let glyph = match e.state {
-            AgentMetaState::Blocked => "●",
-            // "look at me": finished, unread.
-            AgentMetaState::Done if !e.seen => "◆",
-            AgentMetaState::Working => "◐",
-            AgentMetaState::Done | AgentMetaState::Idle | AgentMetaState::Unknown => "○",
-        };
+        // ONE badge vocabulary for the whole chrome: the same call feeds
+        // a pane's own title (`render::chrome::dividers`), so a working
+        // agent can never be a `◐` here and something else there.
+        let badge = crate::render::chrome::agent_badge(&self.theme, e.state, e.attention, e.seen);
+        let color = badge.color;
+        let glyph = badge.glyph;
         let avail = usize::from(text_w).saturating_sub(2); // glyph + space
         let state_text = format!("{} - {}", e.state.as_str(), e.name);
         // A cross-session row is labelled by its SESSION, not its window: the
@@ -874,7 +858,7 @@ impl SidebarPainter {
             .saturating_sub(1);
         let state_label = truncate(&state_text, state_budget);
         let mut glyph_style = Style::default().fg(color);
-        if e.attention || unreviewed_done {
+        if badge.emphatic {
             glyph_style = glyph_style.add_modifier(Modifier::BOLD);
         }
         Line::from(vec![
