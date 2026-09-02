@@ -1753,3 +1753,43 @@ fn an_admitted_burst_settles_the_withheld_debt() {
         "a refused burst inside its window leaves the debt to the timer"
     );
 }
+
+/// phux-l96p.3 wave-two review: pointer MOTION must not arm the reply grace.
+///
+/// The mouse is reported to the server under `?1002h` from attach, so a
+/// divider drag, a selection sweep, or simply crossing the window emits
+/// ordinary `InputEvent`s at well over 50 a second. Each one used to refresh
+/// a 20ms grace, which kept the grace permanently alive and pacing
+/// permanently OFF for the whole client — defeating the coalescing the pacer
+/// exists to do. Press and release still arm it: a click into a mouse-aware
+/// program does get a reply.
+#[test]
+fn pointer_motion_does_not_arm_the_reply_grace() {
+    use phux_protocol::input::InputEvent;
+    use phux_protocol::input::key::ModSet;
+    use phux_protocol::input::mouse::{MouseAction, MouseButton, MouseEvent};
+
+    let mouse = |action| {
+        InputEvent::Mouse(MouseEvent {
+            action,
+            button: MouseButton::Left,
+            mods: ModSet::empty(),
+            x: 4.0,
+            y: 2.0,
+        })
+    };
+
+    assert!(
+        !super::loop_state::input_expects_a_reply(&mouse(MouseAction::Motion)),
+        "motion is continuous and answers nothing; arming on it disables \
+         pacing for every pane"
+    );
+    assert!(
+        super::loop_state::input_expects_a_reply(&mouse(MouseAction::Press)),
+        "a click can be answered"
+    );
+    assert!(
+        super::loop_state::input_expects_a_reply(&mouse(MouseAction::Release)),
+        "and so can its release"
+    );
+}

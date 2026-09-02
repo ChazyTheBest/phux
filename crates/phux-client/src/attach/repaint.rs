@@ -174,39 +174,66 @@ pub(super) struct PaintPacer {
     /// construction (one entry per visible pane), so a linear dedup beats a
     /// hash set.
     pending: Vec<phux_protocol::ids::TerminalId>,
-    /// While set and unexpired, output counts as a REPLY to the user and is
-    /// not paced.
+    /// The pane the user's last input was routed to, when it went out, and
+    /// whether its reply has been timed yet.
     ///
-    /// Without this the pacer taxes exactly the latency that matters most.
-    /// The measured shape: p50 echo improved (222us -> 176us) while p99 went
-    /// 711us -> 17.4ms and the max to 19.1ms, with the slow keystrokes
-    /// clustered at one frame interval. The mechanism is a keystroke landing
-    /// just after some other paint opened a window — its echo is unsolicited
-    /// output as far as the pacer can tell, so it waited up to 16ms for a
-    /// deadline it should never have been subject to.
-    ///
-    /// Pacing exists to stop a program that floods the screen from repainting
-    /// faster than anyone can see. It was never meant to govern the echo of a
-    /// keypress, and this deadline is the distinction: unsolicited output is
-    /// paced, a reply to the user is not.
-    ///
-    /// A DEADLINE rather than a one-shot flag, because a reply is not always
-    /// one frame — a shell echo and the readline redraw that follows it
-    /// arrive as two, and a flag consumed by the first leaves the second (the
-    /// one carrying the glyph the user is waiting for) to wait out the window.
-    /// That is measurable: the one-shot version left the 8-22ms band at 4.3%
-    /// of keystrokes against 1.2% with pacing disabled outright.
-    input_until: Option<tokio::time::Instant>,
+    /// PANE-KEYED, and that is load-bearing. A single global flag meant any
+    /// input anywhere lifted pacing for EVERY pane: typing in one pane
+    /// un-paced a `yes` flood in another, which is precisely the coalescing
+    /// the pacer exists to do. The reply that must not wait is the one from
+    /// the pane the user acted on; every other pane's output is still
+    /// unsolicited.
+    last_input: Option<InputMark>,
+    /// Smoothed input-to-first-output latency, which is what the grace has to
+    /// cover. Measured rather than assumed — see [`Self::note_reply_latency`].
+    reply_rtt: Duration,
 }
 
-/// How long after an input batch output still counts as a reply to it.
+/// One input batch, and the reply still owed to it.
+#[derive(Debug, Clone)]
+struct InputMark {
+    /// The pane the batch was routed to — the focused pane after dispatch, so
+    /// a click that moves focus marks the pane the user just selected.
+    pane: phux_protocol::ids::TerminalId,
+    /// When the batch went out.
+    at: tokio::time::Instant,
+    /// Whether this batch's reply has already contributed an RTT sample. One
+    /// sample per batch: a reply spread over several frames must not count as
+    /// several increasingly-late round trips.
+    sampled: bool,
+}
+
+/// Floor for the input grace, and the whole grace on a local socket.
 ///
-/// Sized to cover a reply fragmented across several frames over the local
-/// transport — a UDS round trip is tens of microseconds — without handing a
-/// sustained flood a standing exemption. At 10 keystrokes a second this lifts
-/// pacing for a fifth of the time at most, and only for the pane the user is
-/// actually looking at.
-const INPUT_GRACE: Duration = Duration::from_millis(20);
+/// Covers a reply fragmented across several frames — a shell echo and the
+/// readline redraw behind it — over a transport whose round trip is tens of
+/// microseconds.
+const BASE_INPUT_GRACE: Duration = Duration::from_millis(20);
+
+/// Ceiling for the input grace however slow the link.
+///
+/// Past this the pacer would be doing nothing at all on a busy screen, and a
+/// user on a link this slow has bigger latency problems than frame pacing.
+const MAX_INPUT_GRACE: Duration = Duration::from_millis(250);
+
+/// Largest reply latency still treated as a round trip.
+///
+/// Beyond this the user has run something slow, not typed into a distant
+/// server; folding it into the estimate would widen the grace for a
+/// keystroke's echo on the strength of a command that took a second to print.
+const MAX_RTT_SAMPLE: Duration = Duration::from_millis(500);
+
+/// `PHUX_INPUT_GRACE_MS` pins the input grace, bypassing the measurement.
+/// `0` disables the grace, so every frame is paced.
+fn input_grace_override() -> Option<Duration> {
+    static CACHED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PHUX_INPUT_GRACE_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+    })
+}
 
 impl PaintPacer {
     /// Whether a composited frame may be emitted at `now`, arming the next
@@ -214,7 +241,9 @@ impl PaintPacer {
     ///
     /// The single decision point: callers that are admitted paint inline,
     /// callers that are refused [`Self::withhold`] every pane they touched.
-    pub(super) fn admit(&mut self, now: tokio::time::Instant) -> bool {
+    /// `is_reply` comes from [`Self::observe_reply`] and says whether this
+    /// burst answers the user's own input, which is never paced.
+    pub(super) fn admit(&mut self, now: tokio::time::Instant, is_reply: bool) -> bool {
         if frame_interval().is_zero() {
             return true;
         }
@@ -225,12 +254,11 @@ impl PaintPacer {
         // The grace is deliberately NOT consumed here: the rest of a
         // fragmented reply must bypass too, or the frame carrying the glyph
         // the user is waiting for is exactly the one that waits.
-        if self.input_until.is_some_and(|until| now < until) {
+        if is_reply {
             super::render_prof::note_paced_replies(1);
             self.next_allowed = Some(now + frame_interval());
             return true;
         }
-        self.input_until = None;
         if self.next_allowed.is_some_and(|at| now < at) {
             super::render_prof::note_paced_waits(1);
             return false;
@@ -239,15 +267,124 @@ impl PaintPacer {
         true
     }
 
-    /// Note that the user just sent input, so the next output frame is a
-    /// reply to them and must paint immediately.
+    /// Fold a burst's target panes into the reply tracker, and report whether
+    /// the burst answers the user's last input.
     ///
-    /// Set from the one place every input batch funnels through, before the
-    /// events are dispatched — a key consumed by a local keybinding counts
-    /// too, because the repaint it triggers is just as much a response to the
-    /// user as a pane echo is.
-    pub(super) fn note_input(&mut self, now: tokio::time::Instant) {
-        self.input_until = Some(now + INPUT_GRACE);
+    /// Does two jobs in one pass over the burst because both need the same
+    /// question answered — does this burst carry output for the pane the user
+    /// acted on?
+    ///
+    /// * If so, and this batch has not been timed yet, the elapsed time is an
+    ///   input-to-output sample: exactly the latency the grace must cover,
+    ///   including the transport, the server, and the shell's own turnaround.
+    /// * The return value says whether the grace is still open, which is what
+    ///   [`Self::admit`] keys the exemption on.
+    ///
+    /// The mark survives a matching burst so a multi-frame reply keeps
+    /// bypassing; only time expires it.
+    pub(super) fn observe_reply<'a>(
+        &mut self,
+        now: tokio::time::Instant,
+        panes: impl IntoIterator<Item = &'a phux_protocol::ids::TerminalId>,
+    ) -> bool {
+        let Some(mark) = self.last_input.as_ref() else {
+            return false;
+        };
+        let (pane, at, sampled) = (mark.pane.clone(), mark.at, mark.sampled);
+        let elapsed = now.saturating_duration_since(at);
+        if !panes.into_iter().any(|id| *id == pane) {
+            // Not this pane. Drop a mark too old for its reply to still be
+            // coming, so a pane that never answers cannot strand one.
+            if elapsed > MAX_RTT_SAMPLE {
+                self.last_input = None;
+            }
+            return false;
+        }
+        // SAMPLE FIRST, then decide the grace. A reply that missed the current
+        // grace is precisely the evidence that the grace is too small, and
+        // discarding it unmeasured is what stops the estimate ever growing:
+        // on a cold estimator over a 60ms link the first reply arrives at
+        // 60ms, outside the 20ms floor, so an expiry check placed ahead of
+        // the sample drops it and the grace stays at 20ms forever. That is
+        // the whole failure this measurement exists to prevent.
+        if !sampled {
+            self.note_reply_latency(elapsed);
+            if let Some(mark) = self.last_input.as_mut() {
+                mark.sampled = true;
+            }
+        }
+        // Re-read the grace: the sample above may have just widened it, which
+        // makes the reply in hand a reply rather than the one that pays for
+        // the lesson.
+        let graced = elapsed < self.grace();
+        if !graced {
+            self.last_input = None;
+        }
+        graced
+    }
+
+    /// Note that the user just sent input to `pane`, so output from that pane
+    /// is a reply and must not be paced.
+    ///
+    /// `pane` is the focused pane AFTER dispatch, so a click that moves focus
+    /// marks the pane the user just selected rather than the one they left.
+    /// `None` (no focused pane) arms nothing: there is no pane whose output
+    /// could be the reply.
+    ///
+    /// The mark is cleared by TIME, never by a paint — a reply is often
+    /// several frames, and a mark consumed by the first leaves the frame
+    /// carrying the glyph to wait out the window.
+    pub(super) fn note_input(
+        &mut self,
+        pane: Option<&phux_protocol::ids::TerminalId>,
+        now: tokio::time::Instant,
+    ) {
+        let Some(pane) = pane else {
+            return;
+        };
+        self.last_input = Some(InputMark {
+            pane: pane.clone(),
+            at: now,
+            sampled: false,
+        });
+    }
+
+    /// How long output from the marked pane keeps counting as a reply.
+    ///
+    /// `max(20ms, 2 x measured round trip)`, capped at 250ms. The doubling is
+    /// headroom for jitter and for a reply the server splits across frames.
+    ///
+    /// Measured, because a fixed 20ms was sized for a unix socket and silently
+    /// stopped working the moment the link was not one: over QUIC to a
+    /// satellite, or any link past 20ms, every echo lands outside a fixed
+    /// grace and the whole exemption evaporates for exactly the sessions whose
+    /// latency is already worst.
+    fn grace(&self) -> Duration {
+        if let Some(pinned) = input_grace_override() {
+            return pinned;
+        }
+        self.reply_rtt
+            .saturating_mul(2)
+            .clamp(BASE_INPUT_GRACE, MAX_INPUT_GRACE)
+    }
+
+    /// Fold one input-to-output sample into the smoothed estimate.
+    ///
+    /// Fast attack, slow decay: a single slow reply widens the grace at once
+    /// (the alternative is a run of keystrokes each paying the tail the
+    /// estimate has not caught up to), while a run of fast ones narrows it
+    /// gradually. Samples past [`MAX_RTT_SAMPLE`] are a slow command rather
+    /// than a round trip and are ignored.
+    fn note_reply_latency(&mut self, sample: Duration) {
+        if sample > MAX_RTT_SAMPLE {
+            return;
+        }
+        self.reply_rtt = if sample > self.reply_rtt {
+            sample
+        } else {
+            // 7/8 old + 1/8 new, the usual smoothing constant for an RTT.
+            (self.reply_rtt.saturating_mul(7) + sample) / 8
+        };
     }
 
     /// Start the pacing window at `now`.
@@ -309,10 +446,10 @@ mod tests {
     fn the_first_frame_after_a_lull_paints_immediately() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
-        assert!(pacer.admit(t0), "nothing has painted; paint now");
+        assert!(pacer.admit(t0, false), "nothing has painted; paint now");
         // Well past the window: another lull, another immediate paint.
         assert!(
-            pacer.admit(t0 + Duration::from_secs(1)),
+            pacer.admit(t0 + Duration::from_secs(1), false),
             "a frame after the window paints immediately"
         );
     }
@@ -323,14 +460,14 @@ mod tests {
     fn frames_inside_the_window_are_refused_until_it_expires() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
-        assert!(pacer.admit(t0));
+        assert!(pacer.admit(t0, false));
         let interval = frame_interval();
         assert!(
-            !pacer.admit(t0 + interval / 2),
+            !pacer.admit(t0 + interval / 2, false),
             "half a window in, the paint is withheld"
         );
         assert!(
-            pacer.admit(t0 + interval),
+            pacer.admit(t0 + interval, false),
             "the window expiring re-admits exactly once"
         );
     }
@@ -341,7 +478,7 @@ mod tests {
     fn withheld_panes_deduplicate_and_drain_once() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
-        assert!(pacer.admit(t0));
+        assert!(pacer.admit(t0, false));
         for _ in 0..40 {
             pacer.withhold(&pane(1));
         }
@@ -358,7 +495,7 @@ mod tests {
         let mut pacer = PaintPacer::default();
         assert_eq!(pacer.deadline(), None, "nothing owed, nothing armed");
         let t0 = tokio::time::Instant::now();
-        assert!(pacer.admit(t0));
+        assert!(pacer.admit(t0, false));
         assert_eq!(
             pacer.deadline(),
             None,
@@ -375,85 +512,231 @@ mod tests {
     /// The felt-latency rule: a frame that answers the user is not paced.
     ///
     /// Measured regression this pins down — p50 echo improved (222us ->
-    /// 176us) while p99 went 711us -> 17.4ms and max 2.9ms -> 19.1ms, the
-    /// slow keystrokes clustered at one frame interval. A keypress whose echo
-    /// happened to arrive just after some unrelated paint opened a window was
-    /// treated as unsolicited output and made to wait for a deadline it
-    /// should never have been subject to.
+    /// 176us) while p99 went 711us -> 17.4ms, the slow keystrokes clustered
+    /// at one frame interval. A keypress whose echo arrived just after some
+    /// unrelated paint opened a window was treated as unsolicited output and
+    /// made to wait for a deadline it should never have been subject to.
     #[test]
-    fn input_in_flight_bypasses_a_window_that_would_otherwise_refuse() {
+    fn a_reply_bypasses_a_window_that_would_otherwise_refuse() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
         // Some unrelated output paints and opens a window.
-        assert!(pacer.admit(t0));
+        assert!(pacer.admit(t0, false));
         let mid = t0 + frame_interval() / 2;
         assert!(
-            !pacer.admit(mid),
+            !pacer.admit(mid, false),
             "unsolicited output inside the window is still paced"
         );
-        // The user types. The echo that follows is a REPLY, not a flood.
-        pacer.note_input(mid);
+        // The user types into pane 1. The echo that follows is a REPLY.
+        pacer.note_input(Some(&pane(1)), mid);
         assert!(
-            pacer.admit(mid),
+            pacer.observe_reply(mid, [&pane(1)]),
+            "output from the pane the user acted on is a reply"
+        );
+        assert!(
+            pacer.admit(mid, true),
             "a frame answering the user must not wait for the window"
         );
     }
 
+    /// The grace is PANE-KEYED: typing in one pane must not un-pace a flood
+    /// in another.
+    ///
+    /// The regression this closes. `input_until` was one global deadline and
+    /// `admit` took no pane, so any keystroke anywhere lifted pacing for every
+    /// pane at once — `yes` in pane A kept repainting at full rate for 20ms
+    /// after each character typed into pane B, which is exactly the
+    /// coalescing the pacer exists to do.
+    #[test]
+    fn typing_in_one_pane_does_not_unpace_a_flood_in_another() {
+        let flood = pane(1);
+        let typed = pane(2);
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        // A window is open (the flood just painted).
+        assert!(pacer.admit(t0, false));
+        let mid = t0 + frame_interval() / 2;
+
+        // The user types into the OTHER pane.
+        pacer.note_input(Some(&typed), mid);
+
+        // The flood's own burst is not a reply, and stays paced.
+        assert!(
+            !pacer.observe_reply(mid, [&flood]),
+            "the flooding pane's output is not an answer to anything"
+        );
+        assert!(
+            !pacer.admit(mid, false),
+            "a flood elsewhere must keep waiting for its window"
+        );
+
+        // The typed pane's echo is, and does not.
+        assert!(pacer.observe_reply(mid, [&typed]));
+        assert!(pacer.admit(mid, true), "the user's own echo paints now");
+    }
+
     /// The grace covers a reply that arrives as SEVERAL frames.
     ///
-    /// This is what the one-shot version got wrong, and it was worth 4.3% of
-    /// keystrokes landing in the 8-22ms band against 1.2% with pacing off: a
-    /// shell echo and the readline redraw behind it are two frames, and a
-    /// flag consumed by the first left the second — the one carrying the
-    /// glyph the user is waiting for — to wait out the window.
+    /// A shell echo and the readline redraw behind it are two frames, and a
+    /// mark consumed by the first would leave the second — the one carrying
+    /// the glyph the user is waiting for — to wait out the window.
     #[test]
     fn the_grace_covers_a_reply_split_across_frames() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
-        pacer.note_input(t0);
-        assert!(pacer.admit(t0), "the first frame of the reply paints");
-        assert!(
-            pacer.admit(t0 + Duration::from_millis(1)),
-            "and so does the second, 1ms later, still inside the grace"
-        );
-        assert!(pacer.admit(t0 + Duration::from_millis(5)), "and the third");
+        pacer.note_input(Some(&pane(1)), t0);
+        for delay in [0, 1, 5] {
+            let at = t0 + Duration::from_millis(delay);
+            assert!(
+                pacer.observe_reply(at, [&pane(1)]),
+                "frame at +{delay}ms is still part of the reply"
+            );
+            assert!(pacer.admit(at, true));
+        }
     }
 
     /// The grace EXPIRES, so a flood never gets a standing exemption from one
-    /// keystroke: past the window, unsolicited output is paced again.
+    /// keystroke.
     #[test]
     fn the_input_grace_expires_and_pacing_resumes() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
-        pacer.note_input(t0);
-        assert!(pacer.admit(t0), "the reply paints");
-        // Past the grace, admission is decided by the window again. The
-        // first frame out there opens a fresh one...
-        let after_grace = t0 + INPUT_GRACE;
+        pacer.note_input(Some(&pane(1)), t0);
+        assert!(pacer.observe_reply(t0, [&pane(1)]));
+        assert!(pacer.admit(t0, true), "the reply paints");
+
+        // Past the grace the mark is gone, whatever the pane.
+        let after = t0 + BASE_INPUT_GRACE + Duration::from_millis(1);
         assert!(
-            pacer.admit(after_grace),
-            "the grace has lapsed and so has the window opened by the reply"
+            !pacer.observe_reply(after, [&pane(1)]),
+            "an expired mark stops exempting its own pane"
         );
-        // ...and the next frame inside it is refused, which is pacing back in
-        // force. One keystroke buys a grace, never a standing exemption.
+        // Admission is decided by the window again: this frame opens one...
+        assert!(pacer.admit(after, false));
+        // ...and the next inside it is refused. Pacing is back in force.
         assert!(
-            !pacer.admit(after_grace + frame_interval() / 2),
-            "once the grace lapses the flood is paced again"
+            !pacer.admit(after + frame_interval() / 2, false),
+            "one keystroke buys a grace, never a standing exemption"
         );
     }
 
     /// `rearm` restarts the window but must NOT cancel the grace: a settle
-    /// that lands mid-reply would otherwise make the rest of that reply wait,
-    /// which is the exact shape of the bug the grace exists to close.
+    /// landing mid-reply would otherwise make the rest of that reply wait.
     #[test]
     fn rearm_restarts_the_window_without_cancelling_the_grace() {
         let mut pacer = PaintPacer::default();
         let t0 = tokio::time::Instant::now();
-        pacer.note_input(t0);
+        pacer.note_input(Some(&pane(1)), t0);
         pacer.rearm(t0);
+        let at = t0 + Duration::from_millis(1);
         assert!(
-            pacer.admit(t0 + Duration::from_millis(1)),
-            "the rest of the reply still bypasses the window"
+            pacer.observe_reply(at, [&pane(1)]),
+            "the rest of the reply still counts as one"
+        );
+        assert!(pacer.admit(at, true));
+    }
+
+    /// Input with no focused pane arms nothing — there is no pane whose
+    /// output could be the reply, and arming globally is the bug above.
+    #[test]
+    fn input_with_no_focused_pane_arms_no_grace() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        pacer.note_input(None, t0);
+        assert!(!pacer.observe_reply(t0, [&pane(1)]));
+    }
+
+    /// The grace SIZES ITSELF to the link.
+    ///
+    /// A fixed 20ms was sized for a unix socket and silently stopped working
+    /// the moment the link was not one: over QUIC to a distant server every
+    /// echo lands outside it, and the whole exemption evaporates for exactly
+    /// the sessions whose latency is already worst. The first reply on a slow
+    /// link is measured and every later keystroke is covered.
+    #[test]
+    fn the_grace_grows_to_a_measured_round_trip() {
+        let mut pacer = PaintPacer::default();
+        assert_eq!(
+            pacer.grace(),
+            BASE_INPUT_GRACE,
+            "a fresh pacer assumes a local socket"
+        );
+
+        // A 60ms link. The first reply lands outside the 20ms floor — and is
+        // measured anyway. Nothing hand-feeds the estimator here: if the
+        // sample were taken only for replies already inside the grace, a cold
+        // estimator on a slow link would never see one and the grace would
+        // stay at 20ms for the life of the session.
+        let t0 = tokio::time::Instant::now();
+        pacer.note_input(Some(&pane(1)), t0);
+        let late = t0 + Duration::from_millis(60);
+        assert!(
+            pacer.observe_reply(late, [&pane(1)]),
+            "the reply that taught us the link is slow is itself a reply"
+        );
+        assert_eq!(
+            pacer.grace(),
+            Duration::from_millis(120),
+            "2x the measured round trip, learned from one reply"
+        );
+
+        // And now a 60ms reply IS covered.
+        let t1 = late;
+        pacer.note_input(Some(&pane(1)), t1);
+        assert!(
+            pacer.observe_reply(t1 + Duration::from_millis(60), [&pane(1)]),
+            "on a calibrated 60ms link the echo is a reply, not a flood"
+        );
+    }
+
+    /// The measured grace is clamped at both ends: never below the local
+    /// floor, never past the ceiling that would switch pacing off entirely.
+    #[test]
+    fn the_measured_grace_is_clamped_at_both_ends() {
+        let mut pacer = PaintPacer::default();
+        pacer.note_reply_latency(Duration::from_micros(200));
+        assert_eq!(
+            pacer.grace(),
+            BASE_INPUT_GRACE,
+            "a fast local link still gets the floor"
+        );
+        pacer.note_reply_latency(Duration::from_millis(400));
+        assert_eq!(
+            pacer.grace(),
+            MAX_INPUT_GRACE,
+            "a very slow link is capped rather than disabling pacing"
+        );
+    }
+
+    /// A slow COMMAND is not a round trip. Folding it in would widen the
+    /// grace for a keystroke's echo on the strength of something that took
+    /// half a second to print.
+    #[test]
+    fn a_slow_command_does_not_count_as_a_round_trip() {
+        let mut pacer = PaintPacer::default();
+        pacer.note_reply_latency(Duration::from_millis(30));
+        let sized = pacer.grace();
+        pacer.note_reply_latency(MAX_RTT_SAMPLE + Duration::from_millis(1));
+        assert_eq!(pacer.grace(), sized, "the outlier is ignored");
+    }
+
+    /// Fast attack, slow decay: one slow reply widens the grace at once, so a
+    /// run of keystrokes does not each pay a tail the estimate has not caught
+    /// up to; a run of fast ones narrows it gradually.
+    #[test]
+    fn the_estimate_attacks_fast_and_decays_slowly() {
+        let mut pacer = PaintPacer::default();
+        pacer.note_reply_latency(Duration::from_millis(80));
+        assert_eq!(
+            pacer.grace(),
+            Duration::from_millis(160),
+            "attack is immediate"
+        );
+        pacer.note_reply_latency(Duration::from_millis(0));
+        assert!(
+            pacer.grace() > Duration::from_millis(120),
+            "one fast reply must not collapse the estimate; got {:?}",
+            pacer.grace()
         );
     }
 
@@ -462,7 +745,7 @@ mod tests {
     #[test]
     fn a_full_repaint_discharges_every_withheld_pane() {
         let mut pacer = PaintPacer::default();
-        assert!(pacer.admit(tokio::time::Instant::now()));
+        assert!(pacer.admit(tokio::time::Instant::now(), false));
         pacer.withhold(&pane(1));
         pacer.withhold(&pane(2));
         pacer.clear_pending();

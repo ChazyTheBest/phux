@@ -139,6 +139,9 @@ impl StdoutSink {
 
     /// Return `buf` to `pool` if there is room for it and it is not larger
     /// than `limit`. Both sides of the queue pool through the same rule.
+    /// `limit` is compared against CAPACITY — the memory the buffer actually
+    /// pins — and is itself derived from capacity in [`StdoutSink::flush`], so
+    /// the two cannot disagree about what a frame-sized buffer measures.
     fn pool(pool: &mut Vec<Vec<u8>>, mut buf: Vec<u8>, limit: usize) {
         if pool.len() >= SPARE_POOL || buf.capacity() > limit {
             return;
@@ -183,7 +186,15 @@ impl Write for StdoutSink {
             let chunk = std::mem::replace(&mut self.pending, recycled);
             // Grow the recycling limit to the frames this terminal actually
             // produces, bounded, and publish it for the writer side.
-            self.high_water = self.high_water.max(chunk.len());
+            //
+            // Sized from CAPACITY, not length, because capacity is what the
+            // pooling rule tests. `Vec` grows by doubling, so a 400 KB frame
+            // ends up in a 512 KiB allocation: a limit taken from `len` sat at
+            // 409600 while every buffer to be pooled measured 524288, so the
+            // rule rejected every one of them and the sink reallocated the
+            // frame buffer on every single frame — recycling that never
+            // engaged for exactly the frames it was widened to catch.
+            self.high_water = self.high_water.max(chunk.capacity());
             q.spare_limit = self.high_water.clamp(SPARE_MIN_BYTES, SPARE_MAX_BYTES);
             // The cap governs the EXISTING BACKLOG, never the frame in hand.
             //
@@ -669,6 +680,86 @@ mod tests {
             bytes <= CAP_BYTES + 8 * 1024,
             "the backlog must be bounded: {bytes} bytes"
         );
+    }
+
+    /// The recycling actually ENGAGES for a large frame: the sink cycles a
+    /// small set of allocations instead of minting one per frame.
+    ///
+    /// The gap the old test left. It asserted only that `spare_limit` grew,
+    /// which it did — but the limit was sized from `chunk.len()` while both
+    /// pooling sites gate on `buf.capacity()`. The frame is accumulated by
+    /// many small writes (the renderer emits per cell), so the `Vec` grows by
+    /// DOUBLING: a 300 KB frame lands in a 512 KiB allocation, measures
+    /// 524288 against a limit of 307200, and is rejected. The sink then
+    /// reallocated the frame buffer on every single frame while the pool sat
+    /// empty — recycling that never engaged for exactly the frames it was
+    /// widened to catch. Writing in pieces here is what reproduces that; one
+    /// big `write_all` reserves exactly and hides the bug.
+    #[test]
+    fn a_large_frames_buffer_is_reused_rather_than_reallocated() {
+        const FRAME: usize = 300 * 1024;
+        const PIECE: usize = 4 * 1024;
+        // A writer that discards, so buffers come straight back.
+        struct Sink;
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut sink, handle) = spawn_writer_into(Sink);
+
+        let piece = vec![b'#'; PIECE];
+        // Did a frame-sized allocation ever reach the pool? Asserting on
+        // POOL MEMBERSHIP, not on buffer addresses: freeing a 512 KiB block
+        // and immediately asking for another usually returns the same
+        // address, so pointer identity would pass even with recycling
+        // completely disabled.
+        let mut pooled_a_frame_sized_buffer = false;
+        for _ in 0..6 {
+            let mut written = 0;
+            while written < FRAME {
+                sink.write_all(&piece).expect("write");
+                written += PIECE;
+            }
+            sink.flush().expect("flush");
+            // Let the writer drain and hand the allocation back.
+            std::thread::sleep(Duration::from_millis(20));
+            let in_queue = {
+                let q = sink
+                    .shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                q.spare.iter().any(|b| b.capacity() >= FRAME)
+            };
+            pooled_a_frame_sized_buffer |= in_queue
+                || sink.recycled.iter().any(|b| b.capacity() >= FRAME)
+                || sink.pending.capacity() >= FRAME;
+        }
+
+        let limit = {
+            let q = sink
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            q.spare_limit
+        };
+        assert!(
+            pooled_a_frame_sized_buffer,
+            "a frame-sized buffer must survive in the pool; with the limit \
+             sized from `len` ({limit}) every candidate measured its doubled \
+             CAPACITY and was rejected, so the sink reallocated every frame"
+        );
+        assert!(
+            limit >= FRAME,
+            "the limit must cover the allocation a {FRAME}-byte frame really \
+             occupies, not just its length; limit={limit}"
+        );
+        handle.shutdown_and_join();
     }
 
     /// The recycling limit follows the frames the terminal actually produces.

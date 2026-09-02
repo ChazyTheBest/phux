@@ -398,6 +398,35 @@ fn drain_frame_batch(
     Ok(batch)
 }
 
+/// Whether an input event is the kind that expects output back, and so should
+/// arm the pacer's reply grace.
+///
+/// Pointer MOTION does not. The mouse is reported to the server under
+/// `?1002h` from attach (`driver::terminal`), so a divider drag, a selection
+/// sweep, or just crossing the window emits a continuous stream of ordinary
+/// `InputEvent`s — at well over 50 a second, each one refreshing a 20ms
+/// grace. That kept the grace permanently alive and pacing permanently off
+/// for the whole client. A drag's own feedback (the divider, the selection
+/// highlight) is chrome painted locally and never went through the pacer
+/// anyway; what motion does NOT do is make a pane echo something back.
+///
+/// Press and release do expect a reply — a click into a pane running a mouse
+/// aware program gets one — so only motion is excluded.
+pub(super) const fn input_expects_a_reply(event: &phux_protocol::input::InputEvent) -> bool {
+    match event {
+        phux_protocol::input::InputEvent::Mouse(mouse) => !matches!(
+            mouse.action,
+            phux_protocol::input::mouse::MouseAction::Motion
+        ),
+        // Keys, focus changes and pastes all expect output back. So does any
+        // future atom: `InputEvent` is `non_exhaustive`, and a new one is far
+        // likelier to be something the user did that expects a reply than
+        // another continuous pointer stream — so the default favours latency,
+        // and an atom that behaves like motion should be named above.
+        _ => true,
+    }
+}
+
 /// Whether an inbound burst must discharge the pacer's withheld debt before
 /// it parks, rather than leaving it to the `paint_deadline` select arm.
 ///
@@ -1553,14 +1582,12 @@ impl SessionLoop {
             self.input_events = events;
             return Ok(Step::Continue);
         }
-        // phux-l96p.3: the user just did something, so whatever output comes
-        // back is a REPLY and must not be paced. Set here rather than at the
-        // connection's send because this is the one funnel every input batch
-        // passes through (`on_stdin` and the bare-ESC flush both land here),
-        // and because a key consumed by a local keybinding counts too: the
-        // repaint it triggers is as much a response to the user as a pane
-        // echo. Cleared by the next paint (`PaintPacer::rearm`).
-        self.pacer.note_input(tokio::time::Instant::now());
+        // phux-l96p.3: whether this batch is the kind of input that expects
+        // output back. Computed BEFORE dispatch (which drains `events`) and
+        // armed after it, so the pane it is keyed to is the one focus landed
+        // on — a click that moves focus marks the pane the user just picked,
+        // not the one they left.
+        let expects_reply = events.iter().any(input_expects_a_reply);
         // Capture the pre-dispatch view so zoom and sidebar toggles can
         // diff against it and resize each changed pane's PTY. Taken
         // before dispatch mutates either piece of view geometry.
@@ -1587,6 +1614,16 @@ impl SessionLoop {
         self.input_events = events;
         let layout_changed = dispatched?;
         shipped?;
+        // Arm the pacer's reply grace now that dispatch has settled focus.
+        // Keyed to the focused pane: the output that must not wait is the
+        // reply from the pane the user acted on, and lifting pacing for every
+        // OTHER pane would un-pace a flood elsewhere on the screen — which is
+        // the coalescing the pacer exists to do. Cleared by TIME, never by a
+        // paint: a reply is often several frames.
+        if expects_reply {
+            self.pacer
+                .note_input(self.focused_pane.as_ref(), tokio::time::Instant::now());
+        }
         // phux-4h5a: a `toggle-sidebar` in this batch flipped
         // `sidebar_enabled`. Re-fold it into the reservation so the
         // reflow + repaint below tile into the NEW content rect this
@@ -1783,7 +1820,15 @@ impl SessionLoop {
         // `paint_deadline` arm settles them together when the window expires.
         // Deciding once per burst rather than once per frame is what makes the
         // settle a single composited frame.
-        let paint_now = self.pacer.admit(tokio::time::Instant::now());
+        let now = tokio::time::Instant::now();
+        // One pass over the burst answers both questions the pacer needs: does
+        // this carry output for the pane the user last acted on (so it is a
+        // reply, not a flood), and how long did that reply take (the sample
+        // the grace is sized from).
+        let is_reply = self
+            .pacer
+            .observe_reply(now, batch.iter().filter_map(frame_paint_target));
+        let paint_now = self.pacer.admit(now, is_reply);
         for (frame_idx, frame) in batch.into_iter().enumerate() {
             let Some(frame) = self.intercept_peer_reply(conn, frame, &mut repaint).await? else {
                 continue;
