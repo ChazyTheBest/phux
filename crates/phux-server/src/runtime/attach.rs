@@ -715,7 +715,15 @@ impl OutputPumpContext {
         // the same `forwards` gate every other live delta does.
         generation.republished_at(cut);
         *output_rx = publication.live;
+        // Through the same gate as any other live delta, not around it. A
+        // replay entry at or behind the new cut is already inside the
+        // checkpoint just published, and re-sending it under the replacement
+        // `bootstrap_id` is a `DuplicateSequence` to the client kernel — which
+        // detaches on it.
         for (seq, bytes) in publication.replay {
+            if !generation.forwards(seq) {
+                continue;
+            }
             let frame = self.output_frame(generation, seq, &bytes);
             if self.out_tx.send(Outbound::Frame(frame)).await.is_err() {
                 return Err(PumpFault::ReplayAbandoned);
@@ -815,6 +823,7 @@ impl OutputPumpContext {
                 self.lag_label,
             );
         }
+        generation.note_resync_requested();
         if enqueue_output_resync(&self.resize).await {
             return ControlFlow::Continue(());
         }
@@ -830,15 +839,37 @@ impl OutputPumpContext {
     /// being the one failure the old behaviour did not have. Re-asking costs
     /// one coalesced grid synthesis per retry and makes convergence
     /// unconditional rather than conditional on the actor's first answer.
-    async fn retry_gap_resync(&self) -> ControlFlow<Option<PumpFault>> {
-        warn!(
+    async fn retry_gap_resync(
+        &self,
+        generation: &mut PumpGeneration,
+    ) -> ControlFlow<Option<PumpFault>> {
+        // DEBUG, not WARN: the first gap already warned, and a retry loop that
+        // warns every time turns one wedged actor into a log flood.
+        debug!(
             terminal_id = ?self.wire_terminal_id,
+            attempt = generation.gap_attempts(),
             "{} is still waiting on its in-band resync; re-requesting",
             self.lag_label,
         );
+        generation.note_resync_requested();
         if enqueue_output_resync(&self.resize).await {
             return ControlFlow::Continue(());
         }
+        self.fail_unrecoverable_gap().await
+    }
+
+    /// The gap spent its whole request budget without the actor ever
+    /// broadcasting a replacement generation.
+    async fn abandon_unanswered_gap(
+        &self,
+        generation: &PumpGeneration,
+    ) -> ControlFlow<Option<PumpFault>> {
+        warn!(
+            terminal_id = ?self.wire_terminal_id,
+            attempts = generation.gap_attempts(),
+            "{} never received the in-band resync it asked for; failing the generation",
+            self.lag_label,
+        );
         self.fail_unrecoverable_gap().await
     }
 
@@ -871,15 +902,17 @@ enum PumpStep {
 /// fenced pump has waited [`pump::GAP_RESYNC_RETRY`] without seeing.
 async fn next_pump_event(
     ctx: &OutputPumpContext,
-    generation: &PumpGeneration,
+    generation: &mut PumpGeneration,
     output_rx: &mut tokio::sync::broadcast::Receiver<PaneOutput>,
 ) -> PumpStep {
-    match pump::next_event(generation, output_rx).await {
-        Some(received) => PumpStep::Event(received),
-        None => match ctx.retry_gap_resync().await {
-            ControlFlow::Continue(()) => PumpStep::Again,
-            ControlFlow::Break(fault) => PumpStep::Stop(fault),
-        },
+    let outcome = match pump::next_event(generation, output_rx).await {
+        pump::PumpWait::Event(received) => return PumpStep::Event(received),
+        pump::PumpWait::RetryResync => ctx.retry_gap_resync(generation).await,
+        pump::PumpWait::GapUnrecoverable => ctx.abandon_unanswered_gap(generation).await,
+    };
+    match outcome {
+        ControlFlow::Continue(()) => PumpStep::Again,
+        ControlFlow::Break(fault) => PumpStep::Stop(fault),
     }
 }
 
@@ -910,7 +943,7 @@ async fn run_output_pump(
         return Some(fault);
     }
     loop {
-        let received = match next_pump_event(ctx, &generation, &mut output_rx).await {
+        let received = match next_pump_event(ctx, &mut generation, &mut output_rx).await {
             PumpStep::Event(received) => received,
             PumpStep::Again => continue,
             PumpStep::Stop(fault) => return fault,

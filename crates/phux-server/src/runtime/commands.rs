@@ -1697,14 +1697,21 @@ impl AttachTerminalPumpCtx {
                 () = token.cancelled() => break,
                 next = pump::next_event(&stream.generation, &mut stream.output_rx) => next,
             };
-            let Some(msg) = next else {
+            let msg = match next {
+                pump::PumpWait::Event(msg) => msg,
                 // Fenced, and the replacement generation has not arrived
-                // within `pump::GAP_RESYNC_RETRY`. Ask again rather than sit
-                // on a screen that can never change.
-                if self.retry_resync_after_lag().await == PumpStep::Stop {
+                // within this attempt's backoff. Ask again rather than sit on
+                // a screen that can never change.
+                pump::PumpWait::RetryResync => {
+                    if self.retry_resync_after_lag(&mut stream).await == PumpStep::Stop {
+                        break;
+                    }
+                    continue;
+                }
+                pump::PumpWait::GapUnrecoverable => {
+                    self.abandon_unanswered_gap(&stream).await;
                     break;
                 }
-                continue;
             };
             if self.forward(&mut stream, msg).await == PumpStep::Stop {
                 break;
@@ -1860,22 +1867,40 @@ impl AttachTerminalPumpCtx {
                 "ATTACH_TERMINAL output pump lagged; requesting in-band resync",
             );
         }
+        stream.generation.note_resync_requested();
         self.request_resync().await
     }
 
-    /// The resync asked for at the last gap has not arrived within
-    /// [`pump::GAP_RESYNC_RETRY`]: ask again.
+    /// The resync asked for at the last gap has not arrived within its
+    /// backoff: ask again.
     ///
     /// A fenced pump forwards nothing, so a request the actor accepted but
     /// never answered would otherwise leave the consumer on a screen that can
     /// never change — silence being the one failure the unfenced behaviour did
-    /// not have.
-    async fn retry_resync_after_lag(&self) -> PumpStep {
-        warn!(
+    /// not have. `DEBUG`, not `WARN`: the first gap already warned, and a
+    /// retry loop that warns every time turns one wedged actor into a log
+    /// flood.
+    async fn retry_resync_after_lag(&self, stream: &mut AttachTerminalPumpStream) -> PumpStep {
+        debug!(
             terminal_id = ?self.wire_terminal_id,
+            attempt = stream.generation.gap_attempts(),
             "ATTACH_TERMINAL output pump is still waiting on its in-band resync; re-requesting",
         );
+        stream.generation.note_resync_requested();
         self.request_resync().await
+    }
+
+    /// The gap spent its whole request budget without the actor ever
+    /// broadcasting a replacement generation. Tell the consumer and stop,
+    /// rather than hold it on a screen that can never change.
+    async fn abandon_unanswered_gap(&self, stream: &AttachTerminalPumpStream) -> PumpStep {
+        warn!(
+            terminal_id = ?self.wire_terminal_id,
+            attempts = stream.generation.gap_attempts(),
+            "ATTACH_TERMINAL output pump never received the in-band resync it asked for; \
+             failing the generation",
+        );
+        self.fail_unrecoverable_gap().await
     }
 
     /// Queue the resync request, abandoning the connection if the actor will
@@ -1884,6 +1909,12 @@ impl AttachTerminalPumpCtx {
         if crate::runtime::attach::enqueue_output_resync(&self.resize).await {
             return PumpStep::Continue;
         }
+        self.fail_unrecoverable_gap().await
+    }
+
+    /// Send the terminal `ERROR` a consumer needs in order to know its stream
+    /// is over and reconnect, then end the pump.
+    async fn fail_unrecoverable_gap(&self) -> PumpStep {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             self.out_tx.send(Outbound::Frame(FrameKind::Error {
@@ -2051,7 +2082,14 @@ impl AttachTerminalPumpCtx {
         stream: &mut AttachTerminalPumpStream,
         replay: Vec<(u64, Bytes)>,
     ) -> PumpStep {
+        // Through the same gate as any other live delta, not around it. A
+        // replay entry at or behind the published cut is already inside the
+        // checkpoint, and re-sending it under this `bootstrap_id` is a
+        // `DuplicateSequence` to the client kernel — which detaches on it.
         for (seq, bytes) in replay {
+            if !stream.generation.forwards(seq) {
+                continue;
+            }
             if self
                 .out_tx
                 .send(Outbound::Frame(FrameKind::TerminalOutput {

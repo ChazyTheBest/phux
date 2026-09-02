@@ -113,9 +113,22 @@ impl ResyncDebounce {
     }
 
     /// Owe a resync for `reason` and (re)start the debounce, so a drag storm
-    /// — or a burst of lag-resync requests — coalesces into a single
-    /// snapshot rather than flooding the client.
+    /// coalesces into a single snapshot rather than flooding the client.
+    ///
+    /// A gap resync that is *already* owed deliberately does not push the
+    /// deadline out again. The two callers want opposite things: a resize
+    /// storm wants the last size, so every resize must re-arm, but every
+    /// fenced pump on a pane asks for the same single snapshot, and each of
+    /// those requests resetting the timer is a livelock. N pumps retrying
+    /// independently arrive at a mean interval of `retry / N`, which at around
+    /// ten consumers on one pane beats the 50 ms debounce every time: the
+    /// snapshot they are all waiting for would never fire, and none of them
+    /// would ever unfence. Coalescing onto the first deadline is what makes
+    /// the fleet converge instead of starve.
     fn arm(&mut self, reason: ResyncReason, deadline: std::pin::Pin<&mut tokio::time::Sleep>) {
+        if self.pending && reason == ResyncReason::OutboundGap {
+            return;
+        }
         self.pending = true;
         self.reason = reason;
         deadline.reset(tokio::time::Instant::now() + RESIZE_RESYNC_DEBOUNCE);
@@ -1317,5 +1330,99 @@ mod tick_rearm_tests {
             "re-arming a long-disarmed tick must yield one catch-up tick, not one per \
              missed period",
         );
+    }
+}
+
+#[cfg(test)]
+mod resync_debounce_tests {
+    use std::time::Duration;
+
+    use super::{RESIZE_RESYNC_DEBOUNCE, ResyncDebounce, ResyncReason};
+
+    fn idle() -> ResyncDebounce {
+        ResyncDebounce {
+            pending: false,
+            reason: ResyncReason::Resize,
+        }
+    }
+
+    /// A pane with many lagged consumers must still get its one snapshot.
+    ///
+    /// Every fenced output pump asks the actor for the same in-band resync,
+    /// and they retry independently. If each request restarted the 50 ms
+    /// debounce, N pumps arriving at a mean interval of `retry / N` would keep
+    /// pushing the deadline out faster than it could fire — the snapshot they
+    /// are all waiting for would never be broadcast and none of them would
+    /// ever unfence. That is a livelock, not a slowdown: it gets *worse* the
+    /// more consumers a pane has.
+    ///
+    /// Ten consumers, each asking twice, on a clock that only ever advances by
+    /// less than the debounce window. The deadline must not move after the
+    /// first request.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_gap_resync_is_not_pushed_out_by_more_lagged_consumers() {
+        let sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(sleep);
+        let mut debounce = idle();
+
+        debounce.arm(ResyncReason::OutboundGap, sleep.as_mut());
+        let first_deadline = sleep.deadline();
+        assert!(debounce.pending);
+
+        for _ in 0..20 {
+            // Faster than the debounce, which is exactly the starving case.
+            tokio::time::advance(RESIZE_RESYNC_DEBOUNCE / 4).await;
+            debounce.arm(ResyncReason::OutboundGap, sleep.as_mut());
+            assert_eq!(
+                sleep.deadline(),
+                first_deadline,
+                "a gap resync already owed must coalesce onto the pending deadline, \
+                 not restart it",
+            );
+        }
+
+        // And it really does come due: the deadline is in the past by now.
+        assert!(
+            sleep.deadline() <= tokio::time::Instant::now(),
+            "the coalesced snapshot must have become due despite the request storm",
+        );
+        assert_eq!(debounce.take_reason(), ResyncReason::OutboundGap);
+    }
+
+    /// The other half: a resize storm still re-arms every time, because there
+    /// the *last* size is the one worth synthesizing. Only the gap path
+    /// coalesces.
+    #[tokio::test(start_paused = true)]
+    async fn a_resize_still_restarts_the_debounce() {
+        let sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(sleep);
+        let mut debounce = idle();
+
+        debounce.arm(ResyncReason::Resize, sleep.as_mut());
+        let first_deadline = sleep.deadline();
+        tokio::time::advance(RESIZE_RESYNC_DEBOUNCE / 4).await;
+        debounce.arm(ResyncReason::Resize, sleep.as_mut());
+        assert!(
+            sleep.deadline() > first_deadline,
+            "a drag storm must settle on the last size",
+        );
+    }
+
+    /// A resize arriving while a gap resync is owed takes over: it re-arms and
+    /// carries the resize reason, and its snapshot unfences the gapped pumps
+    /// just as well.
+    #[tokio::test(start_paused = true)]
+    async fn a_resize_supersedes_a_pending_gap_resync() {
+        let sleep = tokio::time::sleep(Duration::from_secs(3600));
+        tokio::pin!(sleep);
+        let mut debounce = idle();
+
+        debounce.arm(ResyncReason::OutboundGap, sleep.as_mut());
+        let gap_deadline = sleep.deadline();
+        tokio::time::advance(RESIZE_RESYNC_DEBOUNCE / 4).await;
+        debounce.arm(ResyncReason::Resize, sleep.as_mut());
+
+        assert!(sleep.deadline() > gap_deadline);
+        assert_eq!(debounce.take_reason(), ResyncReason::Resize);
     }
 }

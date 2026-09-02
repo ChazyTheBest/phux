@@ -14,6 +14,17 @@
 //! The assertions mirror `lagged_consumer_resync.rs` frame for frame, because
 //! the guarantee is the same guarantee; only the subscription verb differs.
 //! Before the fix this fails on the first one, seconds into the drain.
+//!
+//! One trap this test fell into once, worth naming: the bootstrap arrives
+//! *interleaved ahead of* the `COMMAND_RESULT` that answers `ATTACH_TERMINAL`,
+//! so a helper that loops discarding everything but the result swallows the
+//! whole opening generation, and the stream then looks like it began with a
+//! bare `TERMINAL_OUTPUT`. It does not: ADR-0007 s4 requires the snapshot to
+//! precede every delta and the server honours it (`hub_relay_federation.rs`
+//! asserts the same ordering through a hub). [`attach_terminal_only`] returns
+//! the interleaved frames for exactly that reason, and the oracle below is
+//! strict — output for a generation no bootstrap opened is a failure, not a
+//! case to accommodate.
 
 #![allow(clippy::expect_used, reason = "tests")]
 #![allow(clippy::unwrap_used, reason = "tests")]
@@ -58,10 +69,10 @@ type Generation = (TerminalId, StreamId, BootstrapId);
 #[derive(Default)]
 struct SequenceOracle {
     next: HashMap<Generation, u64>,
-    /// Generations opened by an explicit `BOOTSTRAP_BEGIN`. A replacement
-    /// published in answer to a gap always arrives that way, so a non-zero
-    /// count is the proof that the resync actually landed.
-    published_generations: usize,
+    /// Generations opened by a `BOOTSTRAP_BEGIN`. The opening bootstrap makes
+    /// this 1, so a replacement published in answer to a gap is what takes it
+    /// past that — which is why the assertion at the end reads `> 1`.
+    generations: usize,
     /// Live frames seen, so the test knows the pump is running before it
     /// stalls.
     live_frames: usize,
@@ -70,27 +81,27 @@ struct SequenceOracle {
 impl SequenceOracle {
     fn open(&mut self, key: Generation, base_seq: u64) {
         self.next.insert(key, base_seq.saturating_add(1));
-        self.published_generations += 1;
+        self.generations += 1;
     }
 
-    /// The kernel's `expect_next_seq`, with one accommodation: an
-    /// `ATTACH_TERMINAL` subscription to a pane with nothing to replay starts
-    /// streaming live deltas with no `BOOTSTRAP_BEGIN` ahead of them, so the
-    /// first sequence seen for an unknown generation *anchors* it rather than
-    /// failing. Every sequence after that must be the exact next one — which
-    /// is where the gap this test exists for appears.
+    /// The client kernel's `expect_next_seq`, verbatim: a generation is opened
+    /// by its bootstrap, and every live frame on it must be the exact next
+    /// sequence. Output for a generation no bootstrap opened is not a case to
+    /// accommodate — it is the `UnknownGeneration` the kernel rejects.
     fn observe(&mut self, key: &Generation, seq: u64) {
         self.live_frames += 1;
-        if let Some(expected) = self.next.get_mut(key) {
-            assert_eq!(
-                seq, *expected,
-                "live sequence gap at {seq}; expected {expected} — the session kernel \
-                 rejects this frame and the consumer detaches with a protocol error",
-            );
-            *expected = seq.saturating_add(1);
-        } else {
-            self.next.insert(key.clone(), seq.saturating_add(1));
-        }
+        let expected = self.next.get_mut(key).unwrap_or_else(|| {
+            panic!(
+                "TERMINAL_OUTPUT seq={seq} names a generation no BOOTSTRAP_BEGIN opened; \
+                 ADR-0007 s4 requires the snapshot to precede every delta"
+            )
+        });
+        assert_eq!(
+            seq, *expected,
+            "live sequence gap at {seq}; expected {expected} — the session kernel \
+             rejects this frame and the consumer detaches with a protocol error",
+        );
+        *expected = seq.saturating_add(1);
     }
 }
 
@@ -181,7 +192,7 @@ async fn spawn_burst_pane(owner: &mut UnixStream) -> TerminalId {
 /// Subscribe `watcher` to `pane` with `ATTACH_TERMINAL` and nothing else — no
 /// session-scoped `ATTACH` on this connection, ever. That is the shape `phux
 /// rec` and the FFI consumers take.
-async fn attach_terminal_only(watcher: &mut UnixStream, pane: &TerminalId) {
+async fn attach_terminal_only(watcher: &mut UnixStream, pane: &TerminalId) -> Vec<FrameKind> {
     send_frame(
         watcher,
         &FrameKind::Command {
@@ -192,17 +203,24 @@ async fn attach_terminal_only(watcher: &mut UnixStream, pane: &TerminalId) {
         },
     )
     .await;
+    // Every frame the server interleaves ahead of the answer is *returned*,
+    // never dropped. The bootstrap arrives on this connection before the
+    // `COMMAND_RESULT` does, so a loop that discarded everything but the
+    // result would swallow the whole opening generation and leave the caller
+    // believing the stream started with a bare delta.
+    let mut interleaved = Vec::new();
     loop {
         let (_type_byte, frame) = recv_typed(watcher).await;
-        if let FrameKind::CommandResult { request_id, result } = frame
-            && request_id == 100
+        if let FrameKind::CommandResult { request_id, result } = &frame
+            && *request_id == 100
         {
             assert!(
                 matches!(result, CommandResult::Ok),
                 "ATTACH_TERMINAL must succeed, got {result:?}",
             );
-            return;
+            return interleaved;
         }
+        interleaved.push(frame);
     }
 }
 
@@ -220,15 +238,27 @@ fn lagged_attach_terminal_consumer_converges_on_a_replacement_generation() {
         let pane = spawn_burst_pane(&mut owner).await;
 
         let mut watcher = wait_for_socket(&socket, SOCKET_CONNECT_DEADLINE).await;
-        attach_terminal_only(&mut watcher, &pane).await;
+        let opening = attach_terminal_only(&mut watcher, &pane).await;
 
         let mut oracle = SequenceOracle::default();
         let mut screen = Screen::new(COLS, ROWS).expect("screen oracle");
 
+        // The opening generation arrives interleaved ahead of the
+        // `COMMAND_RESULT`, so it is folded in here rather than read off the
+        // socket below.
+        for frame in &opening {
+            if let Applied::Fatal(what) = apply(frame, &mut oracle, &mut screen) {
+                panic!("subscription failed while opening: {what}");
+            }
+        }
+        assert!(
+            oracle.generations >= 1,
+            "ATTACH_TERMINAL must deliver a bootstrap before any delta \
+             (ADR-0007 s4); got {opening:?}",
+        );
+
         // Drain until the pane is actually streaming, so the pump is live
-        // before the stall. An `ATTACH_TERMINAL` subscription to a pane with
-        // nothing to replay opens with live deltas and no bootstrap at all,
-        // so waiting on `BOOTSTRAP_READY` here would wait forever.
+        // before the stall.
         while oracle.live_frames == 0 {
             let (_type_byte, frame) = recv_typed(&mut watcher).await;
             if let Applied::Fatal(what) = apply(&frame, &mut oracle, &mut screen) {
@@ -256,7 +286,7 @@ fn lagged_attach_terminal_consumer_converges_on_a_replacement_generation() {
         }
 
         assert!(
-            oracle.published_generations > 0,
+            oracle.generations > 1,
             "consumer converged without a replacement generation ever being published, \
              so this run never actually lagged — the test proves nothing",
         );
