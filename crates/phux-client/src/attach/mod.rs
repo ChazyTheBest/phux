@@ -80,6 +80,10 @@ mod repaint;
 pub mod server_frame;
 mod stdout_writer;
 mod terminal_probe;
+// phux-l96p.4: the outer terminal's input handle. Split out of the driver
+// because "how stdin is read" is a transport concern with its own fallback
+// ladder, not part of the loop's state machine.
+mod tty_input;
 pub mod ws;
 
 pub use connection::{CertTrust, Dial, QuicDial, WsDial};

@@ -164,7 +164,7 @@ async fn overlay_active_prefix_key_reaches_overlay_not_resolver() {
     dispatch_input_events(
         &mut out,
         &mut conn,
-        vec![InputEvent::Key(leader), InputEvent::Key(letter)],
+        &mut vec![InputEvent::Key(leader), InputEvent::Key(letter)],
         &mut focused_pane,
         &mut detach_pending,
         &mut predict,
@@ -198,7 +198,7 @@ async fn overlay_active_prefix_key_reaches_overlay_not_resolver() {
     reason = "client-side libghostty Terminal is !Send; ADR-0003 binds us to current-thread"
 )]
 async fn dispatch_with_passthrough_popup(
-    events: Vec<InputEvent>,
+    mut events: Vec<InputEvent>,
     onboarding: bool,
 ) -> (bool, bool, bool) {
     let cfg = phux_config::parse_str(
@@ -296,7 +296,7 @@ async fn dispatch_with_passthrough_popup(
     dispatch_input_events(
         &mut out,
         &mut conn,
-        events,
+        &mut events,
         &mut focused_pane,
         &mut detach_pending,
         &mut predict,
@@ -482,7 +482,7 @@ async fn copy_mode_page_scroll_mutates_focused_terminal_viewport() {
     let changed = dispatch_input_events(
         &mut out,
         &mut conn,
-        vec![InputEvent::Key(page_up)],
+        &mut vec![InputEvent::Key(page_up)],
         &mut focused_pane,
         &mut detach_pending,
         &mut predict,
@@ -732,7 +732,7 @@ async fn dispatch_sidebar_click(ev: InputEvent) -> (usize, bool, usize) {
     dispatch_input_events(
         &mut out,
         &mut conn,
-        vec![ev],
+        &mut vec![ev],
         &mut focused_pane,
         &mut detach_pending,
         &mut predict,
@@ -955,7 +955,7 @@ async fn dispatch_bar_click(
         dispatch_input_events(
             &mut out,
             &mut conn,
-            vec![ev],
+            &mut vec![ev],
             &mut focused_pane,
             &mut detach_pending,
             &mut predict,
@@ -1192,7 +1192,7 @@ async fn dispatch_mouse_two_pane_with(
 )]
 async fn dispatch_mouse_two_pane_into(
     overlays: &mut OverlayState,
-    events: Vec<InputEvent>,
+    mut events: Vec<InputEvent>,
     seed_optout: &[TerminalId],
     seed_vt: &[(TerminalId, &[u8])],
     cell_px: (u16, u16),
@@ -1280,7 +1280,7 @@ async fn dispatch_mouse_two_pane_into(
         repainted = dispatch_input_events(
             &mut out,
             &mut conn,
-            events,
+            &mut events,
             &mut focused_pane,
             &mut detach_pending,
             &mut predict,
@@ -2013,7 +2013,7 @@ async fn predict_state_after_key_dispatch(alt_screen: bool) -> PredictionState {
     dispatch_input_events(
         &mut out,
         &mut conn,
-        vec![press(PhysicalKey::A, Some("a"))],
+        &mut vec![press(PhysicalKey::A, Some("a"))],
         &mut focused_pane,
         &mut detach_pending,
         &mut predict,

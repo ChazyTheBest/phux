@@ -195,12 +195,32 @@ impl StdinParser {
     }
 
     /// Returns `true` if the parser is currently inside an in-progress
-    /// sequence and a [`flush`](Self::flush) would change observable
-    /// behaviour. The driver uses this to decide whether to arm the
-    /// bare-ESC idle timer.
+    /// sequence, i.e. mid-decode of *something*.
+    ///
+    /// Note this is broader than "a flush would emit": see
+    /// [`esc_pending`](Self::esc_pending) for the predicate the idle timer
+    /// actually wants.
     #[must_use]
     pub const fn has_pending(&self) -> bool {
         !matches!(self.state, State::Ground)
+    }
+
+    /// Returns `true` only when a [`flush`](Self::flush) would emit an event —
+    /// that is, when a lone ESC is waiting to be disambiguated.
+    ///
+    /// This is the predicate the driver arms the bare-ESC idle timer from.
+    /// [`has_pending`](Self::has_pending) is true for every in-progress
+    /// sequence, and for all of them but `State::Escape` the flush is
+    /// documented to *keep* the state and emit nothing — so arming on it
+    /// bought a guaranteed-useless 10ms wake-up (plus a whole empty dispatch
+    /// batch) in the middle of every multi-byte key that happened to land
+    /// split across a read boundary. A complete `CSI`/`SS3` sequence already
+    /// emits the instant its final byte arrives and never waited; narrowing
+    /// the arming to the one state that *can* produce an event changes no
+    /// output, only how often the loop wakes up for nothing (phux-l96p.4).
+    #[must_use]
+    pub const fn esc_pending(&self) -> bool {
+        matches!(self.state, State::Escape)
     }
 
     /// Flush pending parser state on a timing boundary.
@@ -214,28 +234,46 @@ impl StdinParser {
     ///   next read is still expected to complete it. (Real terminals
     ///   never split CSI sequences across long idle windows.)
     pub fn flush(&mut self) -> Vec<InputEvent> {
-        match self.state {
-            State::Escape => {
-                self.state = State::Ground;
-                vec![InputEvent::Key(make_named_key(
-                    PhysicalKey::Escape,
-                    ModSet::empty(),
-                ))]
-            }
-            _ => Vec::new(),
+        let mut out = Vec::new();
+        self.flush_into(&mut out);
+        out
+    }
+
+    /// [`flush`](Self::flush), appending into a caller-owned buffer.
+    ///
+    /// The attach loop keeps one buffer for the life of the attach so the
+    /// keystroke path allocates nothing per event batch.
+    pub fn flush_into(&mut self, out: &mut Vec<InputEvent>) {
+        if matches!(self.state, State::Escape) {
+            self.state = State::Ground;
+            out.push(InputEvent::Key(make_named_key(
+                PhysicalKey::Escape,
+                ModSet::empty(),
+            )));
         }
     }
 
     /// Feed `bytes` and return any complete events.
     ///
     /// The parser does not allocate when no events come out beyond the
-    /// returned `Vec` itself.
+    /// returned `Vec` itself. Hot callers should prefer
+    /// [`feed_into`](Self::feed_into), which reuses the caller's buffer.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
         let mut out = Vec::new();
-        for &b in bytes {
-            self.feed_byte(b, &mut out);
-        }
+        self.feed_into(bytes, &mut out);
         out
+    }
+
+    /// [`feed`](Self::feed), appending into a caller-owned buffer.
+    ///
+    /// `feed` allocated a fresh `Vec` per stdin read; on the attach loop that
+    /// is one allocation per keystroke for a container that is emptied again
+    /// microseconds later. Feeding into a retained buffer makes the steady
+    /// state allocation-free (phux-l96p.4).
+    pub fn feed_into(&mut self, bytes: &[u8], out: &mut Vec<InputEvent>) {
+        for &b in bytes {
+            self.feed_byte(b, out);
+        }
     }
 
     fn feed_byte(&mut self, b: u8, out: &mut Vec<InputEvent>) {
@@ -1878,6 +1916,56 @@ mod tests {
         assert!(p.has_pending());
         let final_evs = p.feed(b"5A");
         assert_eq!(key_only(&final_evs).len(), 1);
+    }
+
+    /// phux-l96p.4. The idle timer exists to disambiguate a lone ESC, and
+    /// `flush` only ever emits from that one state — so `esc_pending` must be
+    /// true for a bare ESC and false for every other in-progress sequence,
+    /// even the ones `has_pending` still reports. Arming on the broader
+    /// predicate cost a guaranteed-useless 10ms wake-up whenever a multi-byte
+    /// key landed split across a read boundary.
+    #[test]
+    fn only_a_lone_esc_arms_the_idle_flush() {
+        let mut p = StdinParser::new();
+        assert!(!p.esc_pending(), "ground state waits for nothing");
+
+        let _ = p.feed(b"\x1b");
+        assert!(
+            p.esc_pending(),
+            "a bare ESC is exactly what the timer is for"
+        );
+
+        let _ = p.feed(b"[1;");
+        assert!(p.has_pending(), "the CSI is still in progress");
+        assert!(
+            !p.esc_pending(),
+            "a partial CSI cannot flush, so it must not arm the timer",
+        );
+
+        let evs = p.feed(b"5A");
+        assert_eq!(key_only(&evs).len(), 1, "the CSI completes on its own");
+        assert!(!p.esc_pending());
+    }
+
+    /// The attach loop feeds into one retained buffer. `feed_into` must append
+    /// to what is already there rather than replace it, or a batch would lose
+    /// every event decoded before the last read.
+    #[test]
+    fn feed_into_appends_to_the_callers_buffer() {
+        let mut p = StdinParser::new();
+        let mut out = Vec::new();
+        p.feed_into(b"ab", &mut out);
+        p.feed_into(b"c", &mut out);
+        assert_eq!(key_only(&out).len(), 3);
+
+        // ... and `flush_into` joins the same buffer.
+        p.feed_into(b"\x1b", &mut out);
+        assert!(p.esc_pending());
+        p.flush_into(&mut out);
+        let keys = key_only(&out);
+        assert_eq!(keys.len(), 4);
+        assert_eq!(keys[3].key, PhysicalKey::Escape);
+        assert!(!p.has_pending());
     }
 
     // ---- Misc -----------------------------------------------------------

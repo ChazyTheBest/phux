@@ -86,9 +86,10 @@ impl RawModeGuard {
             .remove(rustix::termios::ControlModes::CSIZE | rustix::termios::ControlModes::PARENB);
         raw.control_modes.insert(rustix::termios::ControlModes::CS8);
 
-        // Make `read` block until at least one byte is available, with
-        // no timeout. Tokio's stdin uses a blocking helper thread, so
-        // this matches its expectations.
+        // Make a read complete as soon as one byte is available, with no
+        // timeout. This is what makes the terminal readable-per-byte: the
+        // driver's reactor-driven handle (`crate::attach::tty_input`) wakes on
+        // the first byte, and the blocking-stdin fallback returns on it.
         raw.special_codes[rustix::termios::SpecialCodeIndex::VMIN] = 1;
         raw.special_codes[rustix::termios::SpecialCodeIndex::VTIME] = 0;
 

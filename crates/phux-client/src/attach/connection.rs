@@ -166,8 +166,20 @@ pub struct UdsReader {
 #[derive(Debug)]
 pub struct UdsWriter {
     inner: OwnedWriteHalf,
-    /// Reusable encode buffer.
+    /// Reusable encode buffer. Holds exactly one frame normally; holds the
+    /// whole corked batch while [`Self::corked`] is set.
     out: BytesMut,
+    /// phux-l96p.4: while set, [`Self::send`] appends the encoded frame to
+    /// `out` instead of writing it, and [`Self::uncork`] ships the batch in
+    /// one `write_all`.
+    ///
+    /// This is a *batching* cork, not a linger: it is only ever held across
+    /// the synchronous dispatch of events the client has ALREADY read, and it
+    /// is released before the loop parks again — so nothing is ever delayed
+    /// waiting for more input. One keystroke still costs exactly one write.
+    /// What it removes is the N writes and N `flush`es a multi-event read
+    /// (key auto-repeat, arrow spam, a mouse drag burst) used to pay.
+    corked: bool,
 }
 
 /// QUIC read half.
@@ -275,6 +287,7 @@ impl Connection {
             writer: FrameWriter::Uds(UdsWriter {
                 inner: write,
                 out: BytesMut::with_capacity(4096),
+                corked: false,
             }),
             peer_pid,
             negotiated_bootstrap: None,
@@ -446,6 +459,7 @@ impl Connection {
             writer: FrameWriter::Uds(UdsWriter {
                 inner: write,
                 out: BytesMut::with_capacity(4096),
+                corked: false,
             }),
             peer_pid,
             negotiated_bootstrap: None,
@@ -534,6 +548,23 @@ impl Connection {
     /// Encode `frame` and write it to the server.
     pub async fn send(&mut self, frame: &FrameKind) -> Result<(), AttachError> {
         self.writer.send(frame).await
+    }
+
+    /// Accumulate sends until [`Self::uncork`] instead of writing each one.
+    ///
+    /// The attach loop corks for the span of one input batch so a read that
+    /// decoded several events (auto-repeat, arrow spam, a drag burst) costs
+    /// one write instead of one per event. Callers MUST pair it with
+    /// [`Self::uncork`] on every exit path, including the error path — that is
+    /// what publishes the bytes.
+    pub fn cork(&mut self) {
+        self.writer.cork();
+    }
+
+    /// Ship everything corked since [`Self::cork`], in send order, in one
+    /// write. A no-op if nothing was sent or the transport does not cork.
+    pub async fn uncork(&mut self) -> Result<(), AttachError> {
+        self.writer.uncork().await
     }
 
     /// Read the next frame from the server.
@@ -1016,6 +1047,27 @@ impl FrameWriter {
             Self::Ws(w) => w.send(frame).await,
         }
     }
+
+    /// Batch sends until [`Self::uncork`] (phux-l96p.4).
+    ///
+    /// UDS only. QUIC already coalesces in its own send buffer, and the
+    /// WebSocket lane frames one binary message per phux frame, so
+    /// concatenating encodes there would be a protocol error rather than an
+    /// optimization. Both therefore keep writing per frame; corking is a
+    /// no-op for them and the driver needs no transport test.
+    fn cork(&mut self) {
+        if let Self::Uds(w) = self {
+            w.cork();
+        }
+    }
+
+    /// Ship a corked batch. See [`Self::cork`].
+    async fn uncork(&mut self) -> Result<(), AttachError> {
+        match self {
+            Self::Uds(w) => w.uncork().await,
+            Self::Quic(_) | Self::Ws(_) => Ok(()),
+        }
+    }
 }
 
 impl FrameReader {
@@ -1070,9 +1122,28 @@ fn write_failed(frame: &FrameKind, err: &io::Error) -> AttachError {
     ))
 }
 
+/// Sibling of [`write_failed`] for a corked batch, which has no single frame
+/// to name. The `ErrorKind` is carried through for the same reason:
+/// [`super::driver::peer_gone`] classifies on it.
+fn batch_write_failed(err: &io::Error) -> AttachError {
+    AttachError::Io(io::Error::new(
+        err.kind(),
+        format!("sending a batched input write: {err}"),
+    ))
+}
+
 impl UdsWriter {
     /// Encode `frame` into the internal buffer and flush it to the socket.
+    ///
+    /// While corked the frame is appended instead, and [`Self::uncork`] ships
+    /// the accumulated batch. Wire order is identical either way: the bytes
+    /// are concatenated in send order into one stream that is already a byte
+    /// stream, so the server decodes exactly the same frame sequence.
     async fn send(&mut self, frame: &FrameKind) -> Result<(), AttachError> {
+        if self.corked {
+            frame.encode(&mut self.out);
+            return Ok(());
+        }
         self.out.clear();
         frame.encode(&mut self.out);
         self.inner
@@ -1084,6 +1155,35 @@ impl UdsWriter {
             .flush()
             .await
             .map_err(|err| write_failed(frame, &err))?;
+        Ok(())
+    }
+
+    /// Start accumulating sends instead of writing them.
+    ///
+    /// Idempotent, and it clears the buffer, so an [`Self::uncork`] that was
+    /// skipped by an early return can never leak stale bytes into the next
+    /// batch.
+    fn cork(&mut self) {
+        self.out.clear();
+        self.corked = true;
+    }
+
+    /// Ship everything accumulated since [`Self::cork`] in one write.
+    ///
+    /// A no-op when nothing was sent, which is the common case: most batches
+    /// resolve to a keybinding and never reach the wire at all.
+    async fn uncork(&mut self) -> Result<(), AttachError> {
+        self.corked = false;
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        let batched = self.inner.write_all(&self.out).await;
+        self.out.clear();
+        batched.map_err(|err| batch_write_failed(&err))?;
+        self.inner
+            .flush()
+            .await
+            .map_err(|err| batch_write_failed(&err))?;
         Ok(())
     }
 }
@@ -1306,6 +1406,92 @@ mod tests {
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
         buf
+    }
+
+    /// A frame carrying `seq`, for ordering assertions.
+    fn seq_ack(seq: u64) -> FrameKind {
+        FrameKind::FrameAck {
+            terminal_id: phux_protocol::ids::TerminalId::Local { id: 1 },
+            stream_id: phux_protocol::StreamId::new(1).expect("stream"),
+            bootstrap_id: phux_protocol::BootstrapId::new(1).expect("bootstrap"),
+            seq,
+        }
+    }
+
+    /// Build a `UdsWriter` over one end of a socket pair, handing back the
+    /// other end to read what it wrote.
+    fn writer_pair() -> (UdsWriter, UnixStream) {
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        let (_read, write) = near.into_split();
+        (
+            UdsWriter {
+                inner: write,
+                out: BytesMut::with_capacity(64),
+                corked: false,
+            },
+            far,
+        )
+    }
+
+    /// phux-l96p.4. The cork's whole point is one write for a multi-event
+    /// input batch, so assert both halves: nothing reaches the peer while
+    /// corked, and everything reaches it in send order on the uncork. The
+    /// `try_read` between the sends is what proves the frames were withheld
+    /// rather than merely fast — `write_all` has already returned by then, so
+    /// an uncorked writer would have bytes waiting.
+    #[tokio::test]
+    async fn a_corked_batch_is_withheld_then_shipped_in_order() {
+        let (mut writer, peer) = writer_pair();
+        writer.cork();
+        for seq in 1..=3 {
+            writer.send(&seq_ack(seq)).await.expect("corked send");
+        }
+        let mut early = [0u8; 64];
+        assert!(
+            matches!(peer.try_read(&mut early), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+            "corked frames must not reach the peer before the uncork",
+        );
+
+        writer.uncork().await.expect("uncork");
+        let mut buf = BytesMut::new();
+        let mut chunk = [0u8; 256];
+        while buf.len() < 3 * framed(1).len() {
+            peer.readable().await.expect("readable");
+            match peer.try_read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("read: {err}"),
+            }
+        }
+        for seq in 1..=3 {
+            let decoded = decode_buffered(&mut buf, BootstrapLimits::default())
+                .expect("decode")
+                .expect("frame present");
+            assert_eq!(decoded, seq_ack(seq), "corked frames must keep send order");
+        }
+        assert!(buf.is_empty(), "the batch must be exactly what was corked");
+    }
+
+    /// The uncork must also *un*-cork: a writer left corked would silently
+    /// swallow every later frame, which is a far worse failure than the
+    /// latency the cork buys back.
+    #[tokio::test]
+    async fn a_send_after_uncork_writes_straight_through() {
+        let (mut writer, peer) = writer_pair();
+        writer.cork();
+        writer.uncork().await.expect("uncork with nothing corked");
+
+        writer.send(&seq_ack(9)).await.expect("send");
+        let mut buf = BytesMut::new();
+        let mut chunk = [0u8; 256];
+        peer.readable().await.expect("readable");
+        let n = peer.try_read(&mut chunk).expect("read");
+        buf.extend_from_slice(&chunk[..n]);
+        let decoded = decode_buffered(&mut buf, BootstrapLimits::default())
+            .expect("decode")
+            .expect("frame present");
+        assert_eq!(decoded, seq_ack(9));
     }
 
     #[test]

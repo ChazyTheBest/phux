@@ -17,6 +17,15 @@ use crate::layout::Workspace;
 /// The per-leaf rect map of the zoom- and sidebar-honoring view, used as the
 /// pre-toggle snapshot for the reflow handshake. Returns an empty map when
 /// there is no active window or its tree is unseeded (single-pane bootstrap).
+///
+/// phux-l96p.4: this runs on every input batch — the reflow handshake needs a
+/// *pre*-dispatch snapshot, so it cannot be deferred behind the "did zoom or
+/// the sidebar move?" test it feeds. It therefore goes through the paint
+/// path's memoized tiling rather than calling `compute_layout_in` directly:
+/// the tiling inputs (layout, content rect, viewport) are unchanged between
+/// keystrokes, so the steady state is a cache hit and the per-keystroke cost
+/// drops to cloning the rect map. Same tiling, same rects — the cache key is
+/// the complete input, so a hit is exact.
 pub(super) fn view_rects(
     workspace: &Workspace,
     zoomed: Option<&TerminalId>,
@@ -25,10 +34,10 @@ pub(super) fn view_rects(
 ) -> HashMap<TerminalId, crate::layout::Rect> {
     workspace
         .render_window(zoomed)
-        .and_then(|ls| {
-            ls.tree.as_ref().map(|_| {
-                crate::attach::multi_pane::compute_layout_in(ls.as_ref(), content, viewport_dims)
-                    .rects
+        .filter(|ls| ls.tree.is_some())
+        .map(|ls| {
+            crate::attach::paint::with_tiling(ls.as_ref(), content, viewport_dims, |tiling| {
+                tiling.rects.clone()
             })
         })
         .unwrap_or_default()

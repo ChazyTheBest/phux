@@ -133,7 +133,7 @@ struct EventEnv<'a, 'c, W: crate::attach::RenderSink> {
 pub(in crate::attach) async fn dispatch_input_events<W: crate::attach::RenderSink>(
     out: &mut W,
     conn: &mut Connection,
-    events: Vec<InputEvent>,
+    events: &mut Vec<InputEvent>,
     focused_pane: &mut Option<TerminalId>,
     detach_pending: &mut bool,
     predict: &mut PredictionState,
@@ -152,7 +152,9 @@ pub(in crate::attach) async fn dispatch_input_events<W: crate::attach::RenderSin
     };
     let mut predicted_any = false;
     let mut layout_changed = false;
-    for ev in events {
+    // Drained rather than consumed: the driver owns `events` for the life of
+    // the attach and reuses its allocation for every batch (phux-l96p.4).
+    for ev in events.drain(..) {
         let change = env.dispatch_event(ev).await?;
         layout_changed |= change.layout_changed;
         predicted_any |= change.predicted;

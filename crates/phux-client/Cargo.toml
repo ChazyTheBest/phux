@@ -101,7 +101,16 @@ bytes.workspace = true
 # `event` adds only `poll(2)` (no new crate): the OSC 10/11 palette probe waits
 # on its own deadline instead of the terminal's 100 ms `VTIME` timer, which sat
 # on the attach critical path.
-rustix = { version = "0.38", default-features = false, features = ["std", "termios", "fs", "event"] }
+# `alloc` + `procfs` are what gate `termios::ttyname` (rustix files it under
+# procfs because that is how it answers the question on Linux; on other targets
+# it is `ttyname_r(3)`). The attach loop needs the outer terminal's device path
+# so it can open its OWN non-blocking handle to it and read on reactor
+# readiness rather than on a blocking-pool thread (phux-l96p.4) — it must not
+# set `O_NONBLOCK` on fd 0, whose open file description belongs to the parent
+# shell. Both features' extra deps (`once_cell`, `itoa`) were already in the
+# workspace lock, so this enables code in a crate we already compile and adds
+# no new crate to the tree.
+rustix = { version = "0.38", default-features = false, features = ["std", "termios", "fs", "event", "alloc", "procfs"] }
 # `phux run` / `phux snapshot` deserialize the server's JSON contracts
 # (run result, `GET_SCREEN` screen state) via serde derives. The layout
 # CBOR envelope and the predict layer (which also needed serde, ciborium,

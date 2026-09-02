@@ -26,7 +26,6 @@ use phux_protocol::caps::BootstrapCapabilities;
 use phux_protocol::caps::ServerFeature;
 use phux_protocol::ids::{ClientId, SessionId, TerminalId};
 use phux_protocol::wire::frame::{AttachTarget, CONFIG_RELOAD_KEY, Command, FrameKind, Scope};
-use tokio::io::AsyncReadExt;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::agent_meta::AgentRecord;
@@ -50,6 +49,7 @@ use crate::attach::plugin_actions::{self, PluginActionEntry, PluginRunResult};
 use crate::attach::plugin_panes::{self, PluginPaneEntry};
 use crate::attach::repaint::{PaintPacer, RepaintAccumulator, RepaintLevel};
 use crate::attach::server_frame::{AgentMetaIndex, FrameOutcome, handle_server_frame};
+use crate::attach::tty_input::TtyInput;
 use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::{Overlay, PredictionState, PredictiveConfig};
@@ -581,10 +581,19 @@ pub(super) struct SessionLoop {
     predict: PredictionState,
     /// The predictive-echo overlay renderer.
     overlay: Overlay,
-    /// The outer terminal's stdin.
-    stdin: tokio::io::Stdin,
+    /// The outer terminal's stdin, read on reactor readiness when the
+    /// controlling tty can be opened privately (phux-l96p.4). See
+    /// [`crate::attach::tty_input`] for the fallback ladder.
+    stdin: TtyInput,
     /// One read's worth of stdin bytes.
     stdin_buf: [u8; 4096],
+    /// One batch's worth of decoded input events (phux-l96p.4).
+    ///
+    /// Retained across reads so the keystroke path reuses one allocation
+    /// instead of building a fresh `Vec` per read. Always drained by
+    /// [`Self::dispatch_batch`]; a non-empty buffer between iterations would
+    /// be a bug, not held state.
+    input_events: Vec<phux_protocol::input::InputEvent>,
     /// Terminal resize notifications.
     sigwinch: Signal,
     /// `phux-roz`: SIGINT/SIGTERM/SIGHUP handlers run terminal cleanup
@@ -731,8 +740,9 @@ impl SessionLoop {
             parser: StdinParser::new(),
             predict: PredictionState::new(predict_cfg, 80, 24),
             overlay: Overlay,
-            stdin: tokio::io::stdin(),
+            stdin: TtyInput::open(),
             stdin_buf: [0u8; 4096],
+            input_events: Vec::new(),
             sigwinch: signal(SignalKind::window_change()).map_err(AttachError::Io)?,
             sigint: signal(SignalKind::interrupt()).map_err(AttachError::Io)?,
             sigterm: signal(SignalKind::terminate()).map_err(AttachError::Io)?,
@@ -1315,10 +1325,14 @@ impl SessionLoop {
         out: &mut W,
         sidebar: Option<SidebarReservation>,
     ) -> Result<Step, AttachError> {
-        // Arm the bare-ESC idle timer only when the parser has pending
-        // state, anchored to the first iteration that saw it (the deadline
-        // survives other arms firing — see `esc_deadline`).
-        if self.parser.has_pending() {
+        // Arm the bare-ESC idle timer only when a lone ESC is actually
+        // waiting to be disambiguated, anchored to the first iteration that
+        // saw it (the deadline survives other arms firing — see
+        // `esc_deadline`). phux-l96p.4: this used to arm for ANY in-progress
+        // sequence, but `flush` only emits from `State::Escape`; every other
+        // state's timer fired, produced nothing, and cost the loop a wake-up
+        // and an empty dispatch batch.
+        if self.parser.esc_pending() {
             self.esc_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + ESC_FLUSH_IDLE);
         } else {
@@ -1478,7 +1492,11 @@ impl SessionLoop {
             }
             return Ok(Step::Continue);
         }
-        let events = self.parser.feed(&self.stdin_buf[..n]);
+        // Decode into the retained buffer, then hand it to the dispatcher by
+        // move so the borrow checker sees one owner; `dispatch_batch` returns
+        // it drained-but-allocated.
+        let mut events = std::mem::take(&mut self.input_events);
+        self.parser.feed_into(&self.stdin_buf[..n], &mut events);
         self.dispatch_batch(conn, out, sidebar, events).await
     }
 
@@ -1493,19 +1511,33 @@ impl SessionLoop {
         out: &mut W,
         sidebar: Option<SidebarReservation>,
     ) -> Result<Step, AttachError> {
-        let events = self.parser.flush();
+        let mut events = std::mem::take(&mut self.input_events);
+        self.parser.flush_into(&mut events);
         self.dispatch_batch(conn, out, sidebar, events).await
     }
 
     /// Dispatch one batch of decoded input events, then reflow and repaint
     /// whatever it moved.
+    ///
+    /// Takes the event buffer by move and hands it back drained, so the
+    /// keystroke path reuses one allocation (see `input_events`).
     async fn dispatch_batch<W: crate::attach::RenderSink>(
         &mut self,
         conn: &mut Connection,
         out: &mut W,
         sidebar: Option<SidebarReservation>,
-        events: Vec<phux_protocol::input::InputEvent>,
+        mut events: Vec<phux_protocol::input::InputEvent>,
     ) -> Result<Step, AttachError> {
+        // phux-l96p.4: an empty batch is common — a read that carries only the
+        // first bytes of a `CSI` sequence decodes to nothing, and so does an
+        // idle flush that finds no lone ESC. Nothing below can move any state
+        // without an event to move it, so everything below (a tiling diff, a
+        // `DispatchCtx` with its cloned focus history and sidebar targets, and
+        // an unconditional overlay repaint) was pure per-read waste.
+        if events.is_empty() {
+            self.input_events = events;
+            return Ok(Step::Continue);
+        }
         // Capture the pre-dispatch view so zoom and sidebar toggles can
         // diff against it and resize each changed pane's PTY. Taken
         // before dispatch mutates either piece of view geometry.
@@ -1517,7 +1549,21 @@ impl SessionLoop {
             self.content(sidebar),
             self.viewport_dims,
         );
-        let layout_changed = self.dispatch_input(conn, out, sidebar, events).await?;
+        // phux-l96p.4: batch this batch's wire writes. One keystroke still
+        // costs one write; a read that decoded several events (auto-repeat,
+        // arrow spam, a mouse drag burst) now costs one write rather than one
+        // per event. The cork spans only the synchronous dispatch of bytes we
+        // have already read and is released before the loop parks, so it is a
+        // batching cork and never a linger.
+        conn.cork();
+        let dispatched = self.dispatch_input(conn, out, sidebar, &mut events).await;
+        // Uncork on BOTH paths: a dispatch that errored half way through must
+        // not strand the frames it did emit in the cork buffer, and the next
+        // `send` must not find the writer still corked.
+        let shipped = conn.uncork().await;
+        self.input_events = events;
+        let layout_changed = dispatched?;
+        shipped?;
         // phux-4h5a: a `toggle-sidebar` in this batch flipped
         // `sidebar_enabled`. Re-fold it into the reservation so the
         // reflow + repaint below tile into the NEW content rect this
@@ -1578,12 +1624,24 @@ impl SessionLoop {
         conn: &mut Connection,
         out: &mut W,
         sidebar: Option<SidebarReservation>,
-        events: Vec<phux_protocol::input::InputEvent>,
+        events: &mut Vec<phux_protocol::input::InputEvent>,
     ) -> Result<bool, AttachError> {
         // phux-foz.9: the agents-section row -> window mapping,
         // snapshotted from the strip painter so a click on an
         // agent row hit-tests against exactly what was painted.
-        let sidebar_targets = self.sidebar_painter.click_targets();
+        //
+        // phux-l96p.4: `sidebar_targets` is read at exactly one site —
+        // `route_sidebar_click`, off a mouse event — and building it clones a
+        // String per roster row. A keyboard batch can never reach that site,
+        // so it gets the empty snapshot instead of paying for one.
+        let sidebar_targets = if events
+            .iter()
+            .any(|ev| matches!(ev, phux_protocol::input::InputEvent::Mouse(_)))
+        {
+            self.sidebar_painter.click_targets()
+        } else {
+            crate::render::chrome::sidebar::SidebarTargets::default()
+        };
         let mut ctx = DispatchCtx {
             engine_kernel: &mut self.engine_kernel,
             resolver: self.resolver.as_mut(),
