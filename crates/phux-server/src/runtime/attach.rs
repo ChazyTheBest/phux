@@ -22,6 +22,7 @@ use super::{
     SpawnOwnership, broadcast_event, prepare_attach, seed_session_with_actor,
     seed_session_with_pty_and_colors, send_error, spawn_pane_with_pty_and_colors,
 };
+use crate::runtime::pump::{self, PumpGeneration};
 use crate::state::{AttachSnapshotPane, ClientId, Outbound, SharedState};
 use crate::terminal_actor::{
     ConsumerAttachRequest, ConsumerDetachRequest, PaneOutput, PwdRequest, ResizeRequest,
@@ -433,50 +434,6 @@ enum PumpFault {
     ReplayAbandoned,
 }
 
-/// Where one output pump has got to inside the generation it is publishing.
-#[derive(Debug)]
-struct PumpGeneration {
-    /// Highest raw sequence already covered by the published bootstrap.
-    published_cut: u64,
-    /// Highest raw sequence actually forwarded to the client.
-    last_forwarded_seq: u64,
-    /// Generation every frame this pump emits is labelled with.
-    bootstrap_id: BootstrapId,
-    /// Cleared by a tombstone and set again once a replacement bootstrap is
-    /// published; nothing may be forwarded in between.
-    generation_active: bool,
-    /// Set the moment the broadcast drops a window under this pump, cleared
-    /// when the replacement generation is published.
-    ///
-    /// While it is set the pump forwards nothing (phux-l96p.10). Two things
-    /// depend on that. First, the client mirror is exactly sequenced: a
-    /// `TERMINAL_OUTPUT` whose `seq` skips the dropped window is a
-    /// `SequenceGap`, which the client treats as a protocol error and detaches
-    /// on — so forwarding "the rest" after a gap does not degrade the session,
-    /// it ends it. Second, a pump that keeps awaiting mailbox capacity for
-    /// frames the client cannot use consumes the broadcast at the *client's*
-    /// speed, and the in-band resync it just asked for is delivered on that
-    /// same broadcast: at PTY speed the resync is overwritten before the pump
-    /// reaches it, and the next lag re-arms the same trap. Dropping instead of
-    /// queueing lets the pump consume at memory speed, so the resync always
-    /// arrives. This is tmux's rule — a consumer far enough behind gets one
-    /// fresh screen, not a replay of everything it missed.
-    gap_pending: bool,
-}
-
-impl PumpGeneration {
-    /// Start at the cut the publication gate handed over.
-    const fn opened_at(published_cut: u64, bootstrap_id: BootstrapId) -> Self {
-        Self {
-            published_cut,
-            last_forwarded_seq: published_cut,
-            bootstrap_id,
-            generation_active: true,
-            gap_pending: false,
-        }
-    }
-}
-
 /// Whether a broadcast control frame belongs to a pump's current generation,
 /// and whether forwarding it ends that generation.
 #[derive(Debug, Clone, Copy)]
@@ -571,7 +528,7 @@ impl OutputPumpContext {
         FrameKind::TerminalOutput {
             terminal_id: self.wire_terminal_id.clone(),
             stream_id: self.stream_id,
-            bootstrap_id: generation.bootstrap_id,
+            bootstrap_id: generation.bootstrap_id(),
             seq,
             bytes: downsample_for_caps(bytes, self.client_caps),
         }
@@ -585,14 +542,14 @@ impl OutputPumpContext {
         replay: Vec<(u64, bytes::Bytes)>,
     ) -> Result<(), PumpFault> {
         for (seq, bytes) in replay {
-            if seq <= generation.published_cut {
+            if !generation.forwards(seq) {
                 continue;
             }
             let frame = self.output_frame(generation, seq, &bytes);
             if self.out_tx.send(Outbound::Frame(frame)).await.is_err() {
                 return Err(PumpFault::ReplayAbandoned);
             }
-            generation.last_forwarded_seq = seq;
+            generation.note_forwarded(seq);
         }
         Ok(())
     }
@@ -605,17 +562,14 @@ impl OutputPumpContext {
         seq: u64,
         bytes: &bytes::Bytes,
     ) -> ControlFlow<Option<PumpFault>> {
-        if !generation.generation_active
-            || generation.gap_pending
-            || seq <= generation.published_cut
-        {
+        if !generation.forwards(seq) {
             return ControlFlow::Continue(());
         }
         let frame = self.output_frame(generation, seq, bytes);
         if self.out_tx.send(Outbound::Frame(frame)).await.is_err() {
             return ControlFlow::Break(Some(PumpFault::OutboundClosed));
         }
-        generation.last_forwarded_seq = seq;
+        generation.note_forwarded(seq);
         ControlFlow::Continue(())
     }
 
@@ -660,7 +614,7 @@ impl OutputPumpContext {
         if owner != self.client_id.0 {
             return ControlFlow::Continue(());
         }
-        let disposition = self.classify_control(&frame, generation.bootstrap_id);
+        let disposition = self.classify_control(&frame, generation.bootstrap_id());
         if !disposition.targets_pump {
             return ControlFlow::Continue(());
         }
@@ -668,7 +622,7 @@ impl OutputPumpContext {
             return ControlFlow::Break(Some(PumpFault::OutboundClosed));
         }
         if disposition.ends_generation {
-            generation.generation_active = false;
+            generation.retire();
         }
         ControlFlow::Continue(())
     }
@@ -726,7 +680,7 @@ impl OutputPumpContext {
         prior_bootstrap_id: BootstrapId,
         reason: crate::terminal_actor::ResyncReason,
     ) -> Result<(), PumpFault> {
-        if generation.generation_active
+        if generation.is_active()
             && self
                 .out_tx
                 .send(Outbound::Frame(FrameKind::BootstrapTombstone {
@@ -734,7 +688,7 @@ impl OutputPumpContext {
                     stream_id: self.stream_id,
                     bootstrap_id: prior_bootstrap_id,
                     reason: tombstone_reason_for(reason),
-                    last_valid_seq: generation.last_forwarded_seq,
+                    last_valid_seq: generation.last_forwarded_seq(),
                 }))
                 .await
                 .is_err()
@@ -742,7 +696,7 @@ impl OutputPumpContext {
             return Err(PumpFault::TombstoneNotQueued);
         }
         let reply = self
-            .capture_native_checkpoint(generation.bootstrap_id)
+            .capture_native_checkpoint(generation.bootstrap_id())
             .await?;
         let (cut, cursor) = publish_native_bootstrap(&self.out_tx, reply)
             .await
@@ -752,23 +706,22 @@ impl OutputPumpContext {
             self.client_id.0,
             self.wire_terminal_id.clone(),
             self.stream_id,
-            generation.bootstrap_id,
+            generation.bootstrap_id(),
             cursor,
         )
         .await
         .map_err(|()| PumpFault::PublicationNotActivated)?;
-        generation.published_cut = cut;
-        generation.last_forwarded_seq = cut;
+        // Unfenced here, before the replay, so the replay's own frames pass
+        // the same `forwards` gate every other live delta does.
+        generation.republished_at(cut);
         *output_rx = publication.live;
         for (seq, bytes) in publication.replay {
             let frame = self.output_frame(generation, seq, &bytes);
             if self.out_tx.send(Outbound::Frame(frame)).await.is_err() {
                 return Err(PumpFault::ReplayAbandoned);
             }
-            generation.last_forwarded_seq = seq;
+            generation.note_forwarded(seq);
         }
-        generation.generation_active = true;
-        generation.gap_pending = false;
         Ok(())
     }
 
@@ -783,7 +736,7 @@ impl OutputPumpContext {
             &self.out_tx,
             self.wire_terminal_id.clone(),
             self.stream_id,
-            generation.bootstrap_id,
+            generation.bootstrap_id(),
             self.profile,
             self.limits,
             resync.cols,
@@ -796,10 +749,7 @@ impl OutputPumpContext {
         {
             return ControlFlow::Break(Some(PumpFault::OutboundClosed));
         }
-        generation.published_cut = resync.base_seq;
-        generation.last_forwarded_seq = resync.base_seq;
-        generation.generation_active = true;
-        generation.gap_pending = false;
+        generation.republished_at(resync.base_seq);
         ControlFlow::Continue(())
     }
 
@@ -816,8 +766,8 @@ impl OutputPumpContext {
         resync: &PaneResync,
     ) -> ControlFlow<Option<PumpFault>> {
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
-        let prior_bootstrap_id = generation.bootstrap_id;
-        generation.bootstrap_id = next_bootstrap_id(generation.bootstrap_id);
+        let prior_bootstrap_id = generation.bootstrap_id();
+        generation.set_bootstrap_id(next_bootstrap_id(generation.bootstrap_id()));
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
         if self.publishes_native_checkpoints() {
             return match self
@@ -841,18 +791,16 @@ impl OutputPumpContext {
     /// generation, ask the actor for an in-band resync, and lose the
     /// generation if it cannot deliver one.
     ///
-    /// The fence (`gap_pending`) is set *before* the request and is what makes
-    /// the resync land — see [`PumpGeneration::gap_pending`]. It is set even
-    /// when the request itself fails, so the frames between here and the
-    /// pump's exit are never the gapped ones that would detach the client.
+    /// The fence is set *before* the request and is what makes the resync
+    /// land — see [`PumpGeneration::forwards`]. It is set even when the
+    /// request itself fails, so the frames between here and the pump's exit
+    /// are never the gapped ones that would detach the client.
     async fn request_gap_resync(
         &self,
         generation: &mut PumpGeneration,
         dropped: u64,
     ) -> ControlFlow<Option<PumpFault>> {
-        let already_pending = generation.gap_pending;
-        generation.gap_pending = true;
-        if already_pending {
+        if generation.fence_for_gap() {
             debug!(
                 terminal_id = ?self.wire_terminal_id,
                 dropped,
@@ -874,7 +822,7 @@ impl OutputPumpContext {
     }
 
     /// The resync asked for at the last gap has not arrived within
-    /// [`GAP_RESYNC_RETRY`]: ask again.
+    /// [`pump::GAP_RESYNC_RETRY`]: ask again.
     ///
     /// A pump waiting on a resync forwards nothing, so a request the actor
     /// accepted but never answered (its snapshot synthesis failed, say) would
@@ -909,13 +857,6 @@ impl OutputPumpContext {
     }
 }
 
-/// How long a fenced pump waits for the replacement generation before asking
-/// for it again.
-///
-/// An order of magnitude above the actor's `RESIZE_RESYNC_DEBOUNCE`, so a
-/// resync that is merely coalescing is never mistaken for one that was lost.
-const GAP_RESYNC_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// What one turn of [`next_pump_event`] produced.
 enum PumpStep {
     /// Dispatch this broadcast result.
@@ -926,23 +867,16 @@ enum PumpStep {
     Stop(Option<PumpFault>),
 }
 
-/// The next broadcast event for a pump.
-///
-/// A pump that is not fenced simply awaits the broadcast. A fenced one bounds
-/// that wait: it is forwarding nothing until the replacement generation lands,
-/// so without a bound a resync that never arrived would be indistinguishable
-/// from a pane with nothing to say.
+/// The next broadcast event for this pump, re-asking for a resync that a
+/// fenced pump has waited [`pump::GAP_RESYNC_RETRY`] without seeing.
 async fn next_pump_event(
     ctx: &OutputPumpContext,
     generation: &PumpGeneration,
     output_rx: &mut tokio::sync::broadcast::Receiver<PaneOutput>,
 ) -> PumpStep {
-    if !generation.gap_pending {
-        return PumpStep::Event(output_rx.recv().await);
-    }
-    match tokio::time::timeout(GAP_RESYNC_RETRY, output_rx.recv()).await {
-        Ok(received) => PumpStep::Event(received),
-        Err(_) => match ctx.retry_gap_resync().await {
+    match pump::next_event(generation, output_rx).await {
+        Some(received) => PumpStep::Event(received),
+        None => match ctx.retry_gap_resync().await {
             ControlFlow::Continue(()) => PumpStep::Again,
             ControlFlow::Break(fault) => PumpStep::Stop(fault),
         },
@@ -3135,6 +3069,13 @@ impl PaneCaptureContext<'_> {
             );
             return Err("state-sync consumer registration failed".to_owned());
         }
+        // A tick-managed (state-sync) consumer gets NO broadcast output pump:
+        // the actor's 33 Hz tick emits its deltas directly, in that consumer's
+        // own per-consumer sequence space, with its own resync. That is what
+        // keeps the pump's gap fence (`PumpGeneration::forwards`) and the
+        // state-sync path disjoint rather than merely non-interfering — there
+        // is no pump here to fence, and no broadcast sequence for a fence to
+        // hold back. `state_sync_consumer_gets_no_broadcast_pump` pins it.
         if !registration.tick_managed {
             self.spawn_pane_pump(staging, terminal_id, &wire_terminal_id, &handle);
         }

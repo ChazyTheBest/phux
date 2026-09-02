@@ -47,6 +47,8 @@ pub mod attach;
 pub mod client;
 pub mod commands;
 pub mod input_lane;
+/// Shared per-generation state both pane output pumps enforce.
+mod pump;
 mod resume;
 mod upgrade;
 mod upload;

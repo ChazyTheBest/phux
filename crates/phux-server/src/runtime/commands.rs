@@ -17,6 +17,7 @@ use super::{
     spawn_terminal_exit_watcher,
 };
 use crate::agent_asked::{AskedPayload, AskedSource};
+use crate::runtime::pump::{self, PumpGeneration};
 use crate::state::{ClientId, Outbound, SharedState, TerminalInput};
 use crate::terminal_actor::{
     ConsumerAckRequest, ControlRequest, EncodedInputRequest, ResizeRequest, ScreenRequest,
@@ -1578,16 +1579,15 @@ struct AttachTerminalPumpCtx {
 
 /// Where the pump currently sits in one terminal's output: the receiver it is
 /// draining and how far the published generation has reached.
+///
+/// The generation state itself is [`PumpGeneration`], shared verbatim with the
+/// ATTACH pump in [`crate::runtime::attach`]. It was duplicated here once, and
+/// the copy silently missed the gap fence (phux-l96p.10) — so this consumer
+/// kept detaching on a sequence gap after interactive attach was fixed. There
+/// is one copy of the rules now.
 struct AttachTerminalPumpStream {
     output_rx: tokio::sync::broadcast::Receiver<crate::terminal_actor::PaneOutput>,
-    /// Highest sequence already covered by the published bootstrap.
-    published_cut: u64,
-    /// Highest sequence this generation has put on the wire.
-    last_forwarded_seq: u64,
-    /// Replica generation currently stamped on forwarded frames.
-    bootstrap_id: phux_protocol::ids::BootstrapId,
-    /// False once a tombstone retired the published generation.
-    generation_active: bool,
+    generation: PumpGeneration,
 }
 
 /// Whether the pump keeps running after handling one output message.
@@ -1641,10 +1641,7 @@ impl AttachTerminalPumpCtx {
         };
         let mut stream = AttachTerminalPumpStream {
             output_rx,
-            published_cut,
-            last_forwarded_seq: published_cut,
-            bootstrap_id,
-            generation_active: true,
+            generation: PumpGeneration::opened_at(published_cut, bootstrap_id),
         };
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
         if native_checkpoint_profile(self.stream_profile) {
@@ -1661,13 +1658,22 @@ impl AttachTerminalPumpCtx {
             }
         }
         self.generation_last_seq.store(
-            stream.last_forwarded_seq,
+            stream.generation.last_forwarded_seq(),
             std::sync::atomic::Ordering::Release,
         );
         loop {
-            let msg = tokio::select! {
+            let next = tokio::select! {
                 () = token.cancelled() => break,
-                msg = stream.output_rx.recv() => msg,
+                next = pump::next_event(&stream.generation, &mut stream.output_rx) => next,
+            };
+            let Some(msg) = next else {
+                // Fenced, and the replacement generation has not arrived
+                // within `pump::GAP_RESYNC_RETRY`. Ask again rather than sit
+                // on a screen that can never change.
+                if self.retry_resync_after_lag().await == PumpStep::Stop {
+                    break;
+                }
+                continue;
             };
             if self.forward(&mut stream, msg).await == PumpStep::Stop {
                 break;
@@ -1705,7 +1711,7 @@ impl AttachTerminalPumpCtx {
                 self.republish_generation(stream, &resync).await
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
-                self.resync_after_lag(dropped).await
+                self.resync_after_lag(stream, dropped).await
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => PumpStep::Stop,
         }
@@ -1718,20 +1724,20 @@ impl AttachTerminalPumpCtx {
         seq: u64,
         bytes: &Bytes,
     ) -> PumpStep {
-        if !stream.generation_active || seq <= stream.published_cut {
+        if !stream.generation.forwards(seq) {
             return PumpStep::Continue;
         }
         let frame = FrameKind::TerminalOutput {
             terminal_id: self.wire_terminal_id.clone(),
             stream_id: self.stream_id,
-            bootstrap_id: stream.bootstrap_id,
+            bootstrap_id: stream.generation.bootstrap_id(),
             seq,
             bytes: crate::runtime::attach::downsample_for_caps(bytes, self.client_caps),
         };
         if self.out_tx.send(Outbound::Frame(frame)).await.is_err() {
             return PumpStep::Stop;
         }
-        stream.last_forwarded_seq = seq;
+        stream.generation.note_forwarded(seq);
         self.generation_last_seq
             .store(seq, std::sync::atomic::Ordering::Release);
         PumpStep::Continue
@@ -1781,7 +1787,8 @@ impl AttachTerminalPumpCtx {
         if owner != self.client_id.0 {
             return PumpStep::Continue;
         }
-        let (targets_pump, ends_generation) = self.classify_control(&frame, stream.bootstrap_id);
+        let (targets_pump, ends_generation) =
+            self.classify_control(&frame, stream.generation.bootstrap_id());
         if !targets_pump {
             return PumpStep::Continue;
         }
@@ -1789,19 +1796,60 @@ impl AttachTerminalPumpCtx {
             return PumpStep::Stop;
         }
         if ends_generation {
-            stream.generation_active = false;
+            stream.generation.retire();
         }
         PumpStep::Continue
     }
 
-    /// Ask the actor for an in-band resync after the broadcast ring dropped
-    /// deltas out from under this pump.
-    async fn resync_after_lag(&self, dropped: u64) -> PumpStep {
+    /// Fence the generation and ask the actor for an in-band resync after the
+    /// broadcast ring dropped deltas out from under this pump.
+    ///
+    /// The fence is the whole point and is set *before* the request: resuming
+    /// live deltas across the dropped window puts a `TERMINAL_OUTPUT` whose
+    /// `seq` skips it on the wire, and the consumer's session kernel rejects
+    /// that as a protocol error rather than tolerating it — so the consumer
+    /// dies before the resync it just asked for can arrive. See
+    /// [`PumpGeneration::forwards`].
+    async fn resync_after_lag(
+        &self,
+        stream: &mut AttachTerminalPumpStream,
+        dropped: u64,
+    ) -> PumpStep {
+        if stream.generation.fence_for_gap() {
+            debug!(
+                terminal_id = ?self.wire_terminal_id,
+                dropped,
+                "ATTACH_TERMINAL output pump lagged again while a resync was \
+                 already in flight; re-requesting",
+            );
+        } else {
+            warn!(
+                terminal_id = ?self.wire_terminal_id,
+                dropped,
+                "ATTACH_TERMINAL output pump lagged; requesting in-band resync",
+            );
+        }
+        self.request_resync().await
+    }
+
+    /// The resync asked for at the last gap has not arrived within
+    /// [`pump::GAP_RESYNC_RETRY`]: ask again.
+    ///
+    /// A fenced pump forwards nothing, so a request the actor accepted but
+    /// never answered would otherwise leave the consumer on a screen that can
+    /// never change — silence being the one failure the unfenced behaviour did
+    /// not have.
+    async fn retry_resync_after_lag(&self) -> PumpStep {
         warn!(
             terminal_id = ?self.wire_terminal_id,
-            dropped,
-            "ATTACH_TERMINAL output pump lagged; requesting in-band resync",
+            "ATTACH_TERMINAL output pump is still waiting on its in-band resync; re-requesting",
         );
+        self.request_resync().await
+    }
+
+    /// Queue the resync request, abandoning the connection if the actor will
+    /// not take it.
+    async fn request_resync(&self) -> PumpStep {
         if crate::runtime::attach::enqueue_output_resync(&self.resize).await {
             return PumpStep::Continue;
         }
@@ -1834,8 +1882,12 @@ impl AttachTerminalPumpCtx {
         // Resync is control, so an unchanged cut still tombstones and
         // replaces the published generation.
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
-        let prior_bootstrap_id = stream.bootstrap_id;
-        stream.bootstrap_id = crate::runtime::attach::next_bootstrap_id(stream.bootstrap_id);
+        let prior_bootstrap_id = stream.generation.bootstrap_id();
+        stream
+            .generation
+            .set_bootstrap_id(crate::runtime::attach::next_bootstrap_id(
+                stream.generation.bootstrap_id(),
+            ));
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
         if native_checkpoint_profile(self.stream_profile) {
             return self
@@ -1856,7 +1908,7 @@ impl AttachTerminalPumpCtx {
             &self.out_tx,
             self.wire_terminal_id.clone(),
             self.stream_id,
-            stream.bootstrap_id,
+            stream.generation.bootstrap_id(),
             self.stream_profile,
             self.bootstrap_limits,
             resync.cols,
@@ -1869,11 +1921,9 @@ impl AttachTerminalPumpCtx {
         {
             return PumpStep::Stop;
         }
-        stream.published_cut = resync.base_seq;
-        stream.last_forwarded_seq = resync.base_seq;
+        stream.generation.republished_at(resync.base_seq);
         self.generation_last_seq
             .store(resync.base_seq, std::sync::atomic::Ordering::Release);
-        stream.generation_active = true;
         PumpStep::Continue
     }
 
@@ -1886,7 +1936,7 @@ impl AttachTerminalPumpCtx {
         prior_bootstrap_id: phux_protocol::ids::BootstrapId,
         resync: &PumpResync,
     ) -> PumpStep {
-        if stream.generation_active
+        if stream.generation.is_active()
             && self
                 .out_tx
                 .send(Outbound::Frame(FrameKind::BootstrapTombstone {
@@ -1894,7 +1944,7 @@ impl AttachTerminalPumpCtx {
                     stream_id: self.stream_id,
                     bootstrap_id: prior_bootstrap_id,
                     reason: tombstone_reason(resync.reason),
-                    last_valid_seq: stream.last_forwarded_seq,
+                    last_valid_seq: stream.generation.last_forwarded_seq(),
                 }))
                 .await
                 .is_err()
@@ -1908,7 +1958,7 @@ impl AttachTerminalPumpCtx {
                 owner: self.client_id.0,
                 terminal_id: self.wire_terminal_id.clone(),
                 stream_id: self.stream_id,
-                bootstrap_id: stream.bootstrap_id,
+                bootstrap_id: stream.generation.bootstrap_id(),
                 limits: self.bootstrap_limits,
                 max_bytes: crate::native_state::MAX_NATIVE_PREFIX_BYTES,
                 max_frames: crate::native_state::MAX_NATIVE_PREFIX_CHUNKS + 2,
@@ -1940,7 +1990,7 @@ impl AttachTerminalPumpCtx {
             self.client_id.0,
             self.wire_terminal_id.clone(),
             self.stream_id,
-            stream.bootstrap_id,
+            stream.generation.bootstrap_id(),
             cursor,
         )
         .await
@@ -1948,17 +1998,17 @@ impl AttachTerminalPumpCtx {
             self.connection_token.cancel();
             return PumpStep::Stop;
         };
-        stream.published_cut = cut;
-        stream.last_forwarded_seq = cut;
+        // Unfenced here, before the replay, so the replay's own frames pass
+        // the same `forwards` gate every other live delta does.
+        stream.generation.republished_at(cut);
         stream.output_rx = publication.live;
         if self.forward_native_replay(stream, publication.replay).await == PumpStep::Stop {
             return PumpStep::Stop;
         }
         self.generation_last_seq.store(
-            stream.last_forwarded_seq,
+            stream.generation.last_forwarded_seq(),
             std::sync::atomic::Ordering::Release,
         );
-        stream.generation_active = true;
         PumpStep::Continue
     }
 
@@ -1976,7 +2026,7 @@ impl AttachTerminalPumpCtx {
                 .send(Outbound::Frame(FrameKind::TerminalOutput {
                     terminal_id: self.wire_terminal_id.clone(),
                     stream_id: self.stream_id,
-                    bootstrap_id: stream.bootstrap_id,
+                    bootstrap_id: stream.generation.bootstrap_id(),
                     seq,
                     bytes: crate::runtime::attach::downsample_for_caps(&bytes, self.client_caps),
                 }))
@@ -1985,7 +2035,7 @@ impl AttachTerminalPumpCtx {
             {
                 return PumpStep::Stop;
             }
-            stream.last_forwarded_seq = seq;
+            stream.generation.note_forwarded(seq);
         }
         PumpStep::Continue
     }

@@ -3359,6 +3359,125 @@ mod writer_close_tests {
         );
     }
 
+    /// A transport that keeps the bytes it was handed, so a test can check
+    /// what the batch boundaries actually carve out of them.
+    struct SlicingWriter {
+        /// One entry per frame, as the transport would put it on the wire.
+        frames: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl FrameWriter for SlicingWriter {
+        async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+            self.frames.borrow_mut().push(frame.to_vec());
+            Ok(())
+        }
+
+        async fn close(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Batching coalesces *writes*, never frames.
+    ///
+    /// The default `write_frames` slices the batch on the recorded boundaries,
+    /// which is what a message-oriented transport (WebSocket, WebTransport)
+    /// depends on: one binary message must be exactly one phux frame, and the
+    /// peer enforces that with `framing::check_frame`. So every slice must be
+    /// a complete, self-consistent frame — never a split one, never two run
+    /// together, and never one whose declared length disagrees with the bytes
+    /// handed over. Frames of deliberately mixed sizes, because a uniform
+    /// payload would hide an off-by-one in the boundary arithmetic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_slices_back_into_exactly_the_frames_that_went_in() {
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let writer = SlicingWriter {
+            frames: Rc::clone(&frames),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let sent: Vec<FrameKind> = (0..8_u64)
+            .map(|i| FrameKind::Error {
+                request_id: None,
+                code: ErrorCode::InternalError,
+                // Lengths from 1 to ~4 KiB, so no two frames are alike.
+                message: "x".repeat(1 << i),
+            })
+            .collect();
+        for frame in sent.clone() {
+            tx.send(Outbound::Frame(frame)).await.expect("queue frame");
+        }
+        drop(tx);
+
+        let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
+        writer_task(writer, rx, close_rx, ClientId(13)).await;
+
+        let written = frames.borrow();
+        assert_eq!(written.len(), sent.len(), "one slice per queued frame");
+        for (slice, original) in written.iter().zip(&sent) {
+            // The peer's own check: size must agree with the declared length.
+            phux_protocol::wire::framing::check_frame(slice)
+                .expect("each slice must be one well-formed frame");
+            let (decoded, rest) = FrameKind::decode(slice).expect("slice decodes");
+            assert!(rest.is_empty(), "a slice must not carry a second frame");
+            assert_eq!(
+                format!("{decoded:?}"),
+                format!("{original:?}"),
+                "a slice must be the frame that went in, unaltered",
+            );
+        }
+    }
+
+    /// A frame near the wire ceiling still rides the batch intact.
+    ///
+    /// `MAX_FRAME_LEN` bounds one *frame*, not one write, so batching a large
+    /// frame with small ones must neither split it nor push it over: the
+    /// length prefix each frame carries is written by `FrameKind::encode`
+    /// before batching and is untouched by it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_near_maximum_frame_survives_batching_beside_small_ones() {
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let writer = SlicingWriter {
+            frames: Rc::clone(&frames),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        // Comfortably the largest thing a real pane emits, and far past any
+        // single socket write.
+        let big = "y".repeat(1 << 20);
+        tx.send(Outbound::Frame(FrameKind::Pong { nonce: 1 }))
+            .await
+            .expect("queue frame");
+        tx.send(Outbound::Frame(FrameKind::Error {
+            request_id: None,
+            code: ErrorCode::InternalError,
+            message: big.clone(),
+        }))
+        .await
+        .expect("queue frame");
+        tx.send(Outbound::Frame(FrameKind::Pong { nonce: 2 }))
+            .await
+            .expect("queue frame");
+        drop(tx);
+
+        let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
+        writer_task(writer, rx, close_rx, ClientId(14)).await;
+
+        let written = frames.borrow();
+        assert_eq!(written.len(), 3);
+        for slice in written.iter() {
+            phux_protocol::wire::framing::check_frame(slice)
+                .expect("a large frame beside small ones stays well-formed");
+            let length = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+            assert!(
+                (1..=phux_protocol::wire::frame::MAX_FRAME_LEN).contains(&length),
+                "batching must not produce a frame outside the wire bound",
+            );
+        }
+        let (decoded, _) = FrameKind::decode(&written[1]).expect("decode the big frame");
+        let FrameKind::Error { message, .. } = decoded else {
+            panic!("expected the ERROR frame in the middle slot");
+        };
+        assert_eq!(message, big, "a megabyte payload crossed the batch intact");
+    }
+
     /// The other half of the contract: a lone frame still leaves immediately,
     /// on its own write. Nothing lingers waiting for a second frame.
     #[tokio::test(flavor = "current_thread")]
