@@ -66,6 +66,20 @@ pub mod vcs;
 pub mod wait;
 pub mod watch;
 
+/// The shared benchmark corpora (`benchmarks/support.rs`), compiled into the
+/// test build so a gate can assert against the same grids the benches
+/// measure instead of a private copy that drifts.
+///
+/// Declared HERE rather than beside its only consumer
+/// (`attach::render::tests`) because `#[path]` on a module nested inside
+/// inline modules resolves against a directory that does not exist on disk
+/// (`src/attach/render/tests/`), and a relative path cannot traverse `..`
+/// through a directory that is not there. `src/` is real, so the path
+/// resolves.
+#[cfg(test)]
+#[path = "../../../benchmarks/support.rs"]
+pub(crate) mod bench_support;
+
 // Pane-interior substrate, re-exported from `phux-client-core` so the
 // `ratatui`-free boundary is compiler-enforced (ADR-0020) while consumers
 // keep stable `phux_client::{layout, multi_pane, predict}` paths.

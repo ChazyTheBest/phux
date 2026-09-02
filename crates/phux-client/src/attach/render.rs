@@ -68,6 +68,17 @@ pub enum RenderError {
     /// Kitty graphics replay failed while projecting libghostty image state.
     #[error("kitty replay: {0}")]
     KittyReplay(#[from] kitty_replay::KittyReplayError),
+    /// A batched row read produced a column the renderer could not decode.
+    ///
+    /// libghostty encodes each cluster into the row's text buffer itself, so
+    /// this means the buffer disagreed with the offsets describing it. It is
+    /// surfaced rather than skipped because a skipped column would slide
+    /// every later cell in the row one place left (see `walk_row_cells`).
+    #[error("row cell at column {col} could not be read from the batched row")]
+    UnreadableCell {
+        /// The pane-local column whose cell could not be decoded.
+        col: u16,
+    },
 }
 
 /// The copy-mode selection rectangle the renderer reverse-videos while painting.
@@ -729,21 +740,86 @@ fn paint_row<'alloc>(
     let mut state = RowState {
         emitted: None,
         prev_pen: None,
-        styling: RowStyling::of(row)?,
     };
 
     // One crossing into libghostty for the whole row. Every cell consumes
-    // one column, including a wide glyph's spacer tail (which emits
-    // nothing), so zipping against the column range clips at `cols_total`
+    // one column, including a wide glyph's spacer tail (which emits nothing),
+    // so walking the columns in step with the cells clips at `cols_total`
     // exactly as the old per-cell walk did.
     let batch = cells.update(row)?.read_row(rowbuf)?;
-    for (col, cell) in (0..cols_total).zip(batch.iter()) {
-        emit_cell(buf, &batch, &cell, &mut state, selection, (row_index, col))?;
-    }
+    walk_row_cells(&batch, cols_total, |col, cell| {
+        emit_cell(buf, &batch, cell, &mut state, selection, (row_index, col))
+    })?;
     out.write_all(buf)?;
     // Reset per-row dirty bit after drawing, per the libghostty
     // contract.
     row.set_dirty(false)?;
+    Ok(())
+}
+
+/// The per-column cell source a row walk reads.
+///
+/// [`RowCells`] — one row, read from libghostty in a single crossing — is the
+/// only production implementation. The trait exists so that
+/// [`walk_row_cells`]'s refusal to SKIP a column can be tested: a `None` from
+/// `RowCells::get` needs a text slice that does not land on a UTF-8 boundary,
+/// which no live terminal produces and no test can stage against the real
+/// type.
+trait RowCellSource<'buf> {
+    /// How many cells the row holds.
+    fn cell_count(&self) -> usize;
+    /// The cell at `col`, or `None` if the read cannot produce one.
+    fn cell_at(&self, col: usize) -> Option<RowCell<'buf>>;
+}
+
+impl<'buf> RowCellSource<'buf> for RowCells<'buf> {
+    #[inline]
+    fn cell_count(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn cell_at(&self, col: usize) -> Option<RowCell<'buf>> {
+        self.get(col)
+    }
+}
+
+/// Hand every column of a row to `visit`, in order, refusing to skip one.
+///
+/// The obvious spelling — `(0..cols_total).zip(source.iter())` — is a trap.
+/// [`RowCells::iter`] is a `filter_map` over `get`, so ONE unreadable cell
+/// mid-row would silently vanish from the iterator and pair every later cell
+/// with the column to its left: the row paints a column short with its whole
+/// tail shifted, and nothing reports it. The per-cell walk this batched read
+/// replaced could not do that, because it advanced the column and the cell
+/// together.
+///
+/// So the columns are indexed explicitly, and a column the source cannot
+/// produce is a [`RenderError::UnreadableCell`] rather than a hole. The walk
+/// still stops at the shorter of the row and the clip, which is the ordinary
+/// end-of-row case and not an error.
+///
+/// The `let ... else` rather than `cell_at(..).ok_or(..)?` is load-bearing at
+/// this size. `ok_or` builds a `Result<RowCell, RenderError>` for EVERY cell,
+/// and `RenderError` carries an `io::Error`, so the happy path pays a wide
+/// move plus a discriminant test 12 000 times a frame; measured on
+/// `render_frame`, spelling it that way cost ~20% of the full-dirty frame.
+/// The `else` arm keeps the error construction on the cold path where it
+/// belongs.
+#[inline]
+fn walk_row_cells<'buf, S, F>(source: &S, cols_total: u16, mut visit: F) -> Result<(), RenderError>
+where
+    S: RowCellSource<'buf>,
+    F: FnMut(u16, &RowCell<'buf>) -> Result<(), RenderError>,
+{
+    let painted = u16::try_from(source.cell_count())
+        .unwrap_or(u16::MAX)
+        .min(cols_total);
+    for col in 0..painted {
+        let Some(cell) = source.cell_at(usize::from(col)) else {
+            return Err(RenderError::UnreadableCell { col });
+        };
+        visit(col, &cell)?;
+    }
     Ok(())
 }
 
@@ -756,10 +832,20 @@ fn paint_row<'alloc>(
 /// row in a single call (see [`CellScratch::rowbuf`]). What is left to avoid
 /// is materialising a [`Style`] per cell — it is 72 bytes, and the run
 /// coalescing in [`emit_sgr_if_changed`] has to compare one against the
-/// active state. A cell whose pen IDENTITY ([`PenKey`]: the row's style-run
+/// active state. A cell whose pen IDENTITY ([`PenKey`]: this row's style-run
 /// index plus the resolved colours and the selection flip) matches its
-/// predecessor's cannot change the emitted SGR, so it skips straight to its
-/// glyphs and the `Style` is built once per run instead.
+/// predecessor's is by construction another member of the same run, so it
+/// cannot change the emitted SGR: it skips straight to its glyphs, and the
+/// `Style` is built once per run instead.
+///
+/// The per-cell walk this replaced also consulted the ROW's `styled` flag to
+/// skip the style and foreground reads wholesale on an unstyled row — worth
+/// 24 000 crossings a frame back when those reads were crossings. It is dead
+/// weight now and has been dropped: the batched read resolves an unstyled
+/// row to a single default style-table entry anyway, so the flag bought
+/// nothing and cost two crossings per row to read. The byte-identity gate
+/// (`batched_row_read_emits_the_same_bytes_as_the_per_cell_walk`) holds this
+/// path to the old one, flag and all.
 fn emit_cell(
     out: &mut Vec<u8>,
     batch: &RowCells<'_>,
@@ -784,32 +870,13 @@ fn emit_cell(
         inverted,
     };
     if state.prev_pen != Some(pen) {
-        let (mut style, fg, bg) = read_cell_pen(batch, cell, state.styling)?;
+        let mut style = batch.style(cell.style_index)?;
         style.inverse ^= inverted;
-        emit_sgr_if_changed(out, &mut state.emitted, style, fg, bg);
+        emit_sgr_if_changed(out, &mut state.emitted, style, cell.fg, cell.bg);
         state.prev_pen = Some(pen);
     }
     emit_cell_glyphs(out, cell.text);
     Ok(())
-}
-
-/// The pen `(style, resolved fg, resolved bg)` a cell paints with.
-///
-/// The colours come straight out of the batched row read. Only the [`Style`]
-/// costs anything, and on an unstyled row not even that: libghostty's own
-/// resolution makes every cell's style the default there (see
-/// [`RowStyling`]), so the row's style table need not be consulted at all.
-fn read_cell_pen(
-    batch: &RowCells<'_>,
-    cell: &RowCell<'_>,
-    styling: RowStyling,
-) -> Result<(Style, Option<RgbColor>, Option<RgbColor>), RenderError> {
-    let style = if matches!(styling, RowStyling::Styled) {
-        batch.style(cell.style_index)?
-    } else {
-        Style::default()
-    };
-    Ok((style, cell.fg, cell.bg))
 }
 
 /// Write one cell's glyphs, after [`emit_cell`] has settled the style.
@@ -870,16 +937,15 @@ fn project_row_into_frame<'alloc>(
 ) -> Result<(), RenderError> {
     let (ox, oy) = origin;
     let batch = cells.update(row)?.read_row(rowbuf)?;
-    for (col, cell) in (0..cols_total).zip(batch.iter()) {
+    walk_row_cells(&batch, cols_total, |col, cell| {
         project_cell_into_frame(
             frame,
             &batch,
-            &cell,
+            cell,
             row_index.saturating_add(oy),
             col.saturating_add(ox),
-        )?;
-    }
-    Ok(())
+        )
+    })
 }
 
 /// Write one cell's grapheme + resolved style into `frame` at `(row, col)`,
@@ -1336,39 +1402,6 @@ fn write_blank_run(out: &mut impl Write, n: u16) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether a row holds any styled cell, decided once per row.
-///
-/// libghostty keeps a deliberately conservative `styled` flag per row: it is
-/// set the first time a styled cell is written to the row and never cleared
-/// again, because re-checking would cost more than it saves. So the flag can
-/// be a false POSITIVE, never a false negative — a styled cell in a row the
-/// flag calls unstyled is a page-integrity violation ghostty's own checker
-/// rejects (`UnmarkedStyleRow`).
-///
-/// That makes the flag safe to lead with: on an unstyled row every cell's
-/// `style()` resolves to the default and every cell's `fg_color()` to `None`,
-/// so both reads can be skipped for the whole row at the cost of reading one
-/// flag. On a full 200x60 frame that is 24 000 crossings into libghostty
-/// traded for 60.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RowStyling {
-    /// No cell in this row carries a style entry.
-    Unstyled,
-    /// At least one cell may carry a style entry; read the pen per cell.
-    Styled,
-}
-
-impl RowStyling {
-    /// Read the row's flag.
-    fn of(row: &RowIteration<'_, '_>) -> Result<Self, RenderError> {
-        Ok(if row.raw_row()?.is_styled()? {
-            Self::Styled
-        } else {
-            Self::Unstyled
-        })
-    }
-}
-
 /// The state [`paint_row`] threads across one row's cells.
 #[derive(Debug)]
 struct RowState {
@@ -1381,8 +1414,6 @@ struct RowState {
     /// sequence, which is what lets [`emit_cell`] skip building a [`Style`]
     /// for every cell in a run.
     prev_pen: Option<PenKey>,
-    /// How this row's cells resolve their pen.
-    styling: RowStyling,
 }
 
 /// The cell style currently active on the outer terminal, as a comparable
@@ -1392,18 +1423,26 @@ struct RowState {
 /// rather than from `Style`'s palette-indexed color fields.
 type EmittedStyle = (Style, Option<RgbColor>, Option<RgbColor>);
 
-/// A cell's pen identity within one row — everything that decides the SGR it
-/// would emit, in 20 bytes rather than [`EmittedStyle`]'s ~100.
+/// A cell's pen identity within ONE row read — everything that decides the
+/// SGR it would emit, in 20 bytes rather than [`EmittedStyle`]'s ~100.
 ///
-/// `style_index` is the row's style-RUN index from the batched read, and
-/// libghostty interns styles, so two cells share an index exactly when they
-/// share a style. Equal keys therefore guarantee an equal `(Style, fg, bg)`,
-/// which makes this a pure fast path: it can only skip work
-/// [`emit_sgr_if_changed`] would have found redundant, never change what
-/// reaches the terminal.
+/// `style_index` is a style-RUN index, not a style identity: the batched read
+/// appends a style-table entry only where a cell's style differs from the
+/// preceding cell's, so the index rises monotonically across the row and a
+/// style the row RETURNS to is given a fresh index. That makes equal indices
+/// a strictly stronger statement than "equal style" — two cells sharing one
+/// are adjacent members of a single run — so the fast path is sound: it can
+/// only skip work [`emit_sgr_if_changed`] would have found redundant, never
+/// change what reaches the terminal. A DIFFERENT index proves nothing, which
+/// is why the miss path still does the real `(Style, fg, bg)` comparison.
+///
+/// The indices belong to one `read_row` and are never reused across rows, so
+/// [`RowState::prev_pen`] is reset at every row start and no key from one row
+/// is ever compared against a key from another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PenKey {
-    /// Index into the row's deduplicated style table.
+    /// This cell's run within the row's style table — valid only within the
+    /// `read_row` that produced it.
     style_index: u32,
     /// The cell's resolved foreground.
     fg: Option<RgbColor>,
@@ -2133,14 +2172,71 @@ mod tests {
     /// (no grapheme) and a single space are the same visible verdict, so
     /// both collapse to `None`. Colors are kept even on blanks because a
     /// colored gap (e.g. a bg run) is visually distinct.
-    type VisCell = (Option<char>, Option<RgbColor>, Option<RgbColor>);
+    ///
+    /// The ATTRIBUTES are kept for the same reason the colors are, and
+    /// because dropping them made the round-trip assertions much weaker than
+    /// they looked: a renderer that emitted the right glyph in the right
+    /// colour but lost every bold/italic/underline/inverse would have
+    /// satisfied a colour-and-char comparison exactly.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct VisCell {
+        ch: Option<char>,
+        fg: Option<RgbColor>,
+        bg: Option<RgbColor>,
+        attrs: VisAttrs,
+    }
 
-    fn vis_cell(graphemes: &[char], fg: Option<RgbColor>, bg: Option<RgbColor>) -> VisCell {
+    /// The text attributes a cell carries, all of which
+    /// [`write_reset_and_sgr`] emits and a terminal re-parses.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "a faithful projection of libghostty's own eight independent Style flags; folding them into enums would stop this mirroring the thing it compares against"
+    )]
+    struct VisAttrs {
+        bold: bool,
+        faint: bool,
+        italic: bool,
+        underline: Underline,
+        blink: bool,
+        inverse: bool,
+        invisible: bool,
+        strikethrough: bool,
+        overline: bool,
+    }
+
+    impl VisAttrs {
+        fn of(style: &Style) -> Self {
+            Self {
+                bold: style.bold,
+                faint: style.faint,
+                italic: style.italic,
+                underline: style.underline,
+                blink: style.blink,
+                inverse: style.inverse,
+                invisible: style.invisible,
+                strikethrough: style.strikethrough,
+                overline: style.overline,
+            }
+        }
+    }
+
+    fn vis_cell(
+        graphemes: &[char],
+        fg: Option<RgbColor>,
+        bg: Option<RgbColor>,
+        style: &Style,
+    ) -> VisCell {
         let ch = match graphemes {
             [] | [' '] => None,
             [c, ..] => Some(*c),
         };
-        (ch, fg, bg)
+        VisCell {
+            ch,
+            fg,
+            bg,
+            attrs: VisAttrs::of(style),
+        }
     }
 
     /// Read the visible grid of a live terminal, normalized via [`vis_cell`].
@@ -2166,6 +2262,7 @@ mod tests {
                     &cell.graphemes().expect("graphemes"),
                     cell.fg_color().expect("fg"),
                     cell.bg_color().expect("bg"),
+                    &cell.style().expect("style"),
                 ));
                 ci += 1;
             }
@@ -2618,7 +2715,7 @@ mod tests {
 
         // Decode into an 8x4 grid: content centred at cols 2..6, rows 1..3.
         let grid = decode_grid(&out, 8, 4);
-        let at = |r: usize, c: usize| grid[r * 8 + c].0;
+        let at = |r: usize, c: usize| grid[r * 8 + c].ch;
         // Top + bottom margin rows are entirely blank.
         for c in 0..8 {
             assert_eq!(at(0, c), None, "top margin row must be blank at col {c}");
@@ -2815,5 +2912,435 @@ mod tests {
         let inverse = output.find("\x1b[7").expect("tail selection is visible");
         let glyph = output.find('世').expect("wide glyph is rendered");
         assert!(inverse < glyph, "inverse style must precede the wide glyph");
+    }
+
+    // ---------------------------------------------------------------
+    // The batched row read, held to the per-cell walk it replaced
+    // ---------------------------------------------------------------
+
+    /// The benchmark corpora, so the byte-identity gate below runs over the
+    /// same grids the render bench measures rather than a hand-picked few.
+    /// Compiled in at the crate root — see [`crate::bench_support`].
+    use crate::bench_support as support;
+
+    /// A cell source that reports `len` columns but refuses one of them —
+    /// the shape `RowCells::get` takes when a cluster's byte range does not
+    /// land on a UTF-8 boundary.
+    struct HolySource {
+        len: usize,
+        hole: usize,
+    }
+
+    impl<'buf> RowCellSource<'buf> for HolySource {
+        fn cell_count(&self) -> usize {
+            self.len
+        }
+        fn cell_at(&self, col: usize) -> Option<RowCell<'buf>> {
+            if col == self.hole {
+                return None;
+            }
+            Some(RowCell {
+                text: "x",
+                style_index: 0,
+                fg: None,
+                bg: None,
+                has_styling: false,
+                selected: false,
+                wide: CellWide::Narrow,
+            })
+        }
+    }
+
+    /// A column the row read cannot produce must STOP the walk with an error,
+    /// never be skipped.
+    ///
+    /// `RowCells::iter` is a `filter_map`, so the natural
+    /// `(0..cols).zip(batch.iter())` would drop the bad column and hand every
+    /// later cell the column to its left: the row paints one short with its
+    /// whole tail shifted, silently. The per-cell walk this replaced advanced
+    /// the column and the cell together and could not do that, so neither may
+    /// the batched one.
+    #[test]
+    fn an_unreadable_cell_errors_instead_of_shifting_the_row() {
+        let mut visited: Vec<u16> = Vec::new();
+        let err = walk_row_cells(&HolySource { len: 8, hole: 3 }, 8, |col, _| {
+            visited.push(col);
+            Ok(())
+        })
+        .expect_err("an unreadable column must be reported");
+
+        assert!(
+            matches!(err, RenderError::UnreadableCell { col: 3 }),
+            "the failing column must be named, got {err:?}"
+        );
+        assert_eq!(
+            visited,
+            vec![0, 1, 2],
+            "the walk stops at the hole; it must not carry on with shifted columns"
+        );
+    }
+
+    /// A readable row visits every column exactly once, in order, and stops
+    /// at the shorter of the row and the clip.
+    #[test]
+    fn a_readable_row_visits_every_column_in_order() {
+        let mut visited: Vec<u16> = Vec::new();
+        walk_row_cells(&HolySource { len: 8, hole: 99 }, 5, |col, _| {
+            visited.push(col);
+            Ok(())
+        })
+        .expect("no hole");
+        assert_eq!(visited, vec![0, 1, 2, 3, 4], "clip wins when it is shorter");
+
+        visited.clear();
+        walk_row_cells(&HolySource { len: 3, hole: 99 }, 40, |col, _| {
+            visited.push(col);
+            Ok(())
+        })
+        .expect("no hole");
+        assert_eq!(visited, vec![0, 1, 2], "the row wins when it is shorter");
+    }
+
+    /// The pre-`8a49759d` cell-emission path, preserved so the batched read
+    /// can be held to BYTE identity against it rather than to a
+    /// visible-grid round trip.
+    ///
+    /// This is the old code, not a paraphrase: one crossing into libghostty
+    /// per value per cell, the `prev_had_text` shortcut that let `wide` go
+    /// unread across a run of blanks, and the unstyled-row shortcut that
+    /// skipped the style and foreground reads. It shares
+    /// [`emit_sgr_if_changed`] and [`write_cup`] with the production path on
+    /// purpose: the only thing that may differ between the two is HOW a
+    /// cell's values are read, so any byte difference is attributable to the
+    /// batched read.
+    ///
+    /// [`RefRowStyling`] is a copy of the row-level `styled` shortcut the
+    /// production path no longer needs, kept here so the reference stays the
+    /// code that actually shipped rather than a simplification of it.
+    struct RefRowState {
+        emitted: Option<EmittedStyle>,
+        prev_had_text: bool,
+        styling: RefRowStyling,
+    }
+
+    /// Whether a row holds any styled cell, decided once per row.
+    ///
+    /// libghostty keeps a deliberately conservative `styled` flag per row: it
+    /// is set the first time a styled cell is written to the row and never
+    /// cleared again. So it can be a false POSITIVE, never a false negative,
+    /// which is what made it safe for the per-cell walk to lead with: on an
+    /// unstyled row every cell's `style()` resolved to the default and every
+    /// `fg_color()` to `None`, so both reads could be skipped for the whole
+    /// row at the cost of one flag.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RefRowStyling {
+        Unstyled,
+        Styled,
+    }
+
+    impl RefRowStyling {
+        fn of(row: &RowIteration<'_, '_>) -> Result<Self, RenderError> {
+            Ok(if row.raw_row()?.is_styled()? {
+                Self::Styled
+            } else {
+                Self::Unstyled
+            })
+        }
+    }
+
+    fn reference_paint_rows<'alloc>(
+        out: &mut Vec<u8>,
+        cluster: &mut String,
+        row_iter: &mut RowIteration<'alloc, '_>,
+        cells: &mut CellIterator<'alloc>,
+        origin: (u16, u16),
+        extent: (u16, u16),
+        selection: Option<SelectionRect>,
+    ) -> Result<(), RenderError> {
+        let (cols_total, rows_total) = extent;
+        let (ox, oy) = origin;
+        let mut row_index: u16 = 0;
+        while let Some(row) = row_iter.next() {
+            if row_index >= rows_total {
+                break;
+            }
+            write_cup(out, row_index.saturating_add(oy), ox)?;
+            out.extend_from_slice(b"\x1b[0m");
+            let mut state = RefRowState {
+                emitted: None,
+                prev_had_text: false,
+                styling: RefRowStyling::of(row)?,
+            };
+            let mut col: u16 = 0;
+            let mut cell_iter = cells.update(row)?;
+            while let Some(cell) = cell_iter.next() {
+                if col >= cols_total {
+                    break;
+                }
+                reference_emit_cell(out, cluster, cell, &mut state, selection, (row_index, col))?;
+                col = col.saturating_add(1);
+            }
+            row.set_dirty(false)?;
+            row_index = row_index.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn reference_emit_cell(
+        out: &mut Vec<u8>,
+        cluster: &mut String,
+        cell: &libghostty_vt::render::CellIteration<'_, '_>,
+        state: &mut RefRowState,
+        selection: Option<SelectionRect>,
+        at: (u16, u16),
+    ) -> Result<(), RenderError> {
+        let (row, col) = at;
+        cluster.clear();
+        cell.graphemes_utf8(cluster)?;
+        let has_text = !cluster.is_empty();
+        let wide = reference_read_wide(cell, state, has_text, selection)?;
+        state.prev_had_text = has_text;
+        if matches!(wide, CellWide::SpacerTail) {
+            return Ok(());
+        }
+        let (mut style, fg, bg) = reference_read_cell_pen(cell, state.styling, has_text)?;
+        if selection_covers_cell(selection, row, col, wide) {
+            style.inverse = !style.inverse;
+        }
+        emit_sgr_if_changed(out, &mut state.emitted, style, fg, bg);
+        if cluster.is_empty() {
+            out.push(b' ');
+        } else {
+            out.extend_from_slice(cluster.as_bytes());
+        }
+        Ok(())
+    }
+
+    fn reference_read_wide(
+        cell: &libghostty_vt::render::CellIteration<'_, '_>,
+        state: &RefRowState,
+        has_text: bool,
+        selection: Option<SelectionRect>,
+    ) -> Result<CellWide, RenderError> {
+        let could_be_tail = !has_text && state.prev_had_text;
+        if could_be_tail || selection.is_some() {
+            return Ok(cell.raw_cell()?.wide()?);
+        }
+        Ok(CellWide::Narrow)
+    }
+
+    fn reference_read_cell_pen(
+        cell: &libghostty_vt::render::CellIteration<'_, '_>,
+        styling: RefRowStyling,
+        has_text: bool,
+    ) -> Result<(Style, Option<RgbColor>, Option<RgbColor>), RenderError> {
+        if matches!(styling, RefRowStyling::Styled) {
+            return Ok((cell.style()?, cell.fg_color()?, cell.bg_color()?));
+        }
+        let bg = if has_text { None } else { cell.bg_color()? };
+        Ok((Style::default(), None, bg))
+    }
+
+    /// The row payload the PRODUCTION path emits for a full-dirty frame —
+    /// `paint_dirty_rows` alone, with no prologue, cursor or epilogue, so the
+    /// comparison isolates the cell loop.
+    fn production_row_bytes(
+        terminal: &GhosttyTerminal<'_, '_>,
+        extent: (u16, u16),
+        selection: Option<SelectionRect>,
+    ) -> Vec<u8> {
+        let mut state = RenderState::new().expect("RenderState");
+        let mut rows_it = RowIterator::new().expect("RowIterator");
+        let mut cells_it = CellIterator::new().expect("CellIterator");
+        let snap = state.update(terminal).expect("snapshot");
+        let mut scratch = CellScratch::default();
+        let mut out = Vec::new();
+        let mut row_iter = rows_it.update(&snap).expect("rows");
+        paint_dirty_rows(
+            &mut out,
+            &mut scratch,
+            &mut row_iter,
+            &mut cells_it,
+            Dirty::Full,
+            (0, 0),
+            extent,
+            selection,
+        )
+        .expect("paint");
+        out
+    }
+
+    /// The same payload as the pre-batch per-cell walk would have emitted.
+    fn reference_row_bytes(
+        terminal: &GhosttyTerminal<'_, '_>,
+        extent: (u16, u16),
+        selection: Option<SelectionRect>,
+    ) -> Vec<u8> {
+        let mut state = RenderState::new().expect("RenderState");
+        let mut rows_it = RowIterator::new().expect("RowIterator");
+        let mut cells_it = CellIterator::new().expect("CellIterator");
+        let snap = state.update(terminal).expect("snapshot");
+        let mut out = Vec::new();
+        let mut cluster = String::new();
+        let mut row_iter = rows_it.update(&snap).expect("rows");
+        reference_paint_rows(
+            &mut out,
+            &mut cluster,
+            &mut row_iter,
+            &mut cells_it,
+            (0, 0),
+            extent,
+            selection,
+        )
+        .expect("reference paint");
+        out
+    }
+
+    /// Report the first differing byte with a readable window rather than
+    /// dumping two 15 KB buffers.
+    fn assert_same_bytes(label: &str, actual: &[u8], expected: &[u8]) {
+        if actual == expected {
+            return;
+        }
+        let at = actual
+            .iter()
+            .zip(expected)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| actual.len().min(expected.len()));
+        let from = at.saturating_sub(40);
+        panic!(
+            "{label}: batched and per-cell emission diverge at byte {at} \
+             (lengths {} vs {})\n  batched:  {:?}\n  per-cell: {:?}",
+            actual.len(),
+            expected.len(),
+            String::from_utf8_lossy(&actual[from..(at + 40).min(actual.len())]),
+            String::from_utf8_lossy(&expected[from..(at + 40).min(expected.len())]),
+        );
+    }
+
+    /// Build one of the shared benchmark corpora, mirroring
+    /// `phux-client/benches/render_frame.rs::build_terminal` so the gate and
+    /// the bench walk the same cells.
+    fn corpus_terminal(corpus: support::Corpus) -> GhosttyTerminal<'static, 'static> {
+        let (cols, rows) = corpus.geometry();
+        let mut terminal = GhosttyTerminal::new(TerminalOptions {
+            cols,
+            rows,
+            max_scrollback: corpus.history_lines().max(1_000),
+        })
+        .expect("corpus terminal");
+
+        match corpus {
+            support::Corpus::Shell80x24 => {
+                terminal.vt_write(b"$ printf 'ready\\n'\r\nready\r\n$ ");
+                terminal.vt_write(b"\x1b[1;32mbranch\x1b[0m feat/negotiated-libghostty-codec\r\n");
+                terminal.vt_write(
+                    "wide: \u{6771}\u{4eac} \u{1f980} combining: e\u{301}\r\n".as_bytes(),
+                );
+            }
+            support::Corpus::Tui200x60 | support::Corpus::Unicode50k => {
+                terminal.vt_write(b"\x1b[?1049h\x1b[2J\x1b[H");
+                for row in 0..rows {
+                    let color = 16 + (u32::from(row) * 37 % 216);
+                    let line = format!(
+                        "\x1b[{};1H\x1b[38;5;{}m{:03} {:<170}\x1b[0m",
+                        row + 1,
+                        color,
+                        row,
+                        support::deterministic_line(usize::from(row)).trim_end(),
+                    );
+                    terminal.vt_write(line.as_bytes());
+                }
+                terminal.vt_write(b"\x1b[30;70H\x1b[7m ACTIVE \x1b[0m");
+            }
+        }
+        terminal
+    }
+
+    /// A grid built for the cases the corpora do not reliably contain: a row
+    /// that ENDS on a wide glyph's spacer tail, a background-only cell (a
+    /// cell whose colour comes from its own content tag rather than a style
+    /// entry), and a style the row returns to after leaving it.
+    fn edge_case_terminal() -> GhosttyTerminal<'static, 'static> {
+        // 8 columns: "abcdef" then a wide glyph occupying cols 6-7, so the
+        // row's LAST column is the glyph's spacer tail.
+        let mut terminal = GhosttyTerminal::new(TerminalOptions {
+            cols: 8,
+            rows: 4,
+            max_scrollback: 100,
+        })
+        .expect("edge terminal");
+        terminal.vt_write("abcdef\u{6771}".as_bytes());
+        terminal.vt_write(b"\r\n");
+        // Background-only cells: erase a run with a bg set, so the cells carry
+        // a content-tag background and no style entry.
+        terminal.vt_write(b"\x1b[48;2;0;0;90m\x1b[K\x1b[0m");
+        terminal.vt_write(b"\r\n");
+        // A style the row leaves and returns to, plus a combining cluster.
+        terminal.vt_write("\x1b[1;4;38;2;9;9;9mAA\x1b[0mB\x1b[1;4;38;2;9;9;9mCe\u{301}".as_bytes());
+        terminal.vt_write(b"\r\n");
+        // A fully blank row, so the all-default fast path is covered too.
+        terminal
+    }
+
+    /// The batched row read must emit the SAME BYTES as the per-cell walk it
+    /// replaced, over every benchmark corpus and over the edge cases the
+    /// corpora do not cover, with and without a copy-mode selection.
+    ///
+    /// The visible-grid round trips elsewhere in this module prove the output
+    /// RECONSTRUCTS correctly; this proves the change was a pure speedup,
+    /// which is the claim `8a49759d` actually made.
+    #[test]
+    fn batched_row_read_emits_the_same_bytes_as_the_per_cell_walk() {
+        for corpus in support::Corpus::ALL {
+            let extent = corpus.geometry();
+            let actual = production_row_bytes(&corpus_terminal(corpus), extent, None);
+            let expected = reference_row_bytes(&corpus_terminal(corpus), extent, None);
+            assert!(!actual.is_empty(), "{} emitted nothing", corpus.label());
+            assert_same_bytes(corpus.label(), &actual, &expected);
+        }
+    }
+
+    /// The same identity over a row ending in a wide glyph's spacer tail, a
+    /// background-only cell, and a repeated style — the three shapes whose
+    /// per-cell shortcuts (`prev_had_text`, the unstyled-row pen, the
+    /// style-run index) the batched read had to reproduce rather than
+    /// approximate.
+    #[test]
+    fn batched_row_read_matches_the_per_cell_walk_on_the_edge_cases() {
+        let extent = (8u16, 4u16);
+        assert_same_bytes(
+            "edge cases",
+            &production_row_bytes(&edge_case_terminal(), extent, None),
+            &reference_row_bytes(&edge_case_terminal(), extent, None),
+        );
+    }
+
+    /// And with a live copy-mode selection, whose edges are where the two
+    /// paths' `wide` handling could most easily disagree: the per-cell walk
+    /// read `wide` for real only under a selection, and a selection that
+    /// covers a wide glyph's BASE must also invert its tail column.
+    #[test]
+    fn batched_row_read_matches_the_per_cell_walk_under_a_selection() {
+        let extent = (8u16, 4u16);
+        // Row 0 ends `...\u{6771}` across cols 6-7. Select up to col 6 (the
+        // base) so the selection edge lands exactly on the wide pair, and
+        // again up to col 5 so it stops one short of it.
+        for end_col in [5u16, 6, 7] {
+            for rectangle in [false, true] {
+                let selection = Some(SelectionRect {
+                    start_row: 0,
+                    start_col: 1,
+                    end_row: 2,
+                    end_col,
+                    rectangle,
+                });
+                assert_same_bytes(
+                    &format!("selection end_col={end_col} rectangle={rectangle}"),
+                    &production_row_bytes(&edge_case_terminal(), extent, selection),
+                    &reference_row_bytes(&edge_case_terminal(), extent, selection),
+                );
+            }
+        }
     }
 }

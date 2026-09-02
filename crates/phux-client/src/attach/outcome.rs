@@ -127,6 +127,12 @@ impl From<super::render::RenderError> for AttachError {
             super::render::RenderError::Io(e) => Self::Io(e),
             super::render::RenderError::Ghostty(e) => Self::Ghostty(e),
             super::render::RenderError::KittyReplay(e) => Self::Protocol(e.to_string()),
+            // A row the batched read could not decode is a mirror-integrity
+            // failure, not an I/O or emulator fault; it reaches the user as a
+            // protocol-level complaint rather than a silently short row.
+            other @ super::render::RenderError::UnreadableCell { .. } => {
+                Self::Protocol(other.to_string())
+            }
         }
     }
 }
