@@ -9,6 +9,7 @@ mod client;
 mod error;
 mod types;
 
+use std::collections::HashSet;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -928,6 +929,22 @@ fn apply_attached(
 ) -> Result<(), BridgeError> {
     ensure_expected_attach(client, attach_id, "ATTACHED")?;
     let focused_session = snapshot.focused_session;
+    // ATTACHED describes the whole workspace so native clients can project a
+    // session switcher, but the server bootstraps only the focused session.
+    // Counting panes from other sessions leaves the attach barrier waiting for
+    // bootstrap frames the server will never send.
+    let focused_windows: HashSet<_> = snapshot
+        .windows
+        .iter()
+        .filter(|window| window.session_id == focused_session)
+        .map(|window| window.id)
+        .collect();
+    let terminals: Vec<_> = snapshot
+        .panes
+        .iter()
+        .filter(|pane| focused_windows.contains(&pane.window_id))
+        .map(|pane| pane.id.clone())
+        .collect();
     client.sessions = snapshot
         .sessions
         .into_iter()
@@ -940,7 +957,6 @@ fn apply_attached(
             focused: session.id == focused_session,
         })
         .collect();
-    let terminals: Vec<_> = snapshot.panes.into_iter().map(|pane| pane.id).collect();
     apply_kernel_input(
         client,
         KernelInput::AttachStarted {
@@ -2259,6 +2275,85 @@ mod tests {
         );
         assert!(frame.data.is_null());
         assert_eq!(frame.len, 0);
+        unsafe { phux_client_free(client) };
+    }
+
+    #[test]
+    fn attached_snapshot_scopes_participants_to_the_focused_session() {
+        let client = boxed_client();
+        unsafe {
+            (*client).inner.protocol_ready = true;
+            (*client).inner.attach_queued = true;
+            (*client).inner.expected_attach_id = Some(7);
+        }
+        let focused_session = SessionId::new(2);
+        let other_session = SessionId::new(1);
+        let focused_window = phux_protocol::WindowId::new(20);
+        let other_window = phux_protocol::WindowId::new(10);
+        let focused_terminal = phux_protocol::TerminalId::local(30);
+        let other_terminal = phux_protocol::TerminalId::local(40);
+        let snapshot = phux_protocol::wire::info::SessionSnapshot::new(
+            focused_session,
+            focused_window,
+            focused_terminal.clone(),
+        )
+        .with_sessions(vec![
+            phux_protocol::wire::info::SessionInfo::new(other_session, "other"),
+            phux_protocol::wire::info::SessionInfo::new(focused_session, "focused"),
+        ])
+        .with_windows(vec![
+            phux_protocol::wire::info::WindowInfo::new(
+                other_window,
+                other_session,
+                "other".to_owned(),
+            ),
+            phux_protocol::wire::info::WindowInfo::new(
+                focused_window,
+                focused_session,
+                "focused".to_owned(),
+            ),
+        ])
+        .with_panes(vec![
+            phux_protocol::wire::info::TerminalInfo::new(
+                other_terminal.clone(),
+                other_window,
+                80,
+                24,
+            ),
+            phux_protocol::wire::info::TerminalInfo::new(
+                focused_terminal.clone(),
+                focused_window,
+                80,
+                24,
+            ),
+        ]);
+
+        assert_eq!(
+            feed_kind(
+                client,
+                &FrameKind::Attached {
+                    attach_id: 7,
+                    snapshot,
+                    initial_client_id: phux_protocol::ClientId::new(9),
+                },
+            ),
+            PhuxClientResult::Ok
+        );
+        assert!(unsafe {
+            (*client)
+                .inner
+                .session
+                .active_attach_contains(&focused_terminal)
+        });
+        assert!(
+            !unsafe {
+                (*client)
+                    .inner
+                    .session
+                    .active_attach_contains(&other_terminal)
+            },
+            "a terminal in another session is never bootstrapped by this attach"
+        );
         unsafe { phux_client_free(client) };
     }
 
