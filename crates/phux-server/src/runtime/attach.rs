@@ -3132,7 +3132,19 @@ impl PaneCaptureContext<'_> {
         // keeps the pump's gap fence (`PumpGeneration::forwards`) and the
         // state-sync path disjoint rather than merely non-interfering — there
         // is no pump here to fence, and no broadcast sequence for a fence to
-        // hold back. `state_sync_consumer_gets_no_broadcast_pump` pins it.
+        // hold back.
+        //
+        // The invariant is enforced in two places and they must agree: here,
+        // for ATTACH, and in `commands.rs` for the `SPAWN_TERMINAL` path,
+        // which additionally drops its `pump_done_guard` because there is no
+        // pump task for a replacement to wait on. What covers it today is
+        // indirect — `statesync_convergence` would diverge if a pump were also
+        // feeding raw broadcast bytes into a state-sync consumer's stream —
+        // and no test pins the two call sites against each other directly.
+        // (A citation here previously named a test called
+        // `state_sync_consumer_gets_no_broadcast_pump`; no such test has ever
+        // existed. Writing the real two-path version is its own piece of work
+        // and its own bead, not a comment.)
         if !registration.tick_managed {
             self.spawn_pane_pump(staging, terminal_id, &wire_terminal_id, &handle);
         }

@@ -469,20 +469,17 @@ impl TerminalActor {
         // every pane on this current-thread runtime (ADR-0003), not just this
         // one. Signalling a child that turns out to be dead is harmless
         // (`ESRCH`); failing to signal one that is alive is unbounded.
-        match pty.child.try_wait() {
-            Ok(Some(_status)) => {
-                trace!("pty child already exited");
-            }
-            Ok(None) => {
-                Self::terminate_child_group(&mut pty).await;
-            }
-            Err(err) => {
+        let observed = pty.child.try_wait();
+        if needs_termination(&observed) {
+            if let Err(err) = &observed {
                 debug!(
                     ?err,
                     "pty child try_wait failed; assuming alive and terminating"
                 );
-                Self::terminate_child_group(&mut pty).await;
             }
+            Self::terminate_child_group(&mut pty).await;
+        } else {
+            trace!("pty child already exited");
         }
         // Drop the master so the reader thread sees EOF and exits.
         // We drop pty_tx so the writer thread sees a closed channel
@@ -491,22 +488,37 @@ impl TerminalActor {
         // here makes the thread joins below predictable.
         drop(self.pty_tx.take());
         // Reap the child so the OS releases its slot — without ever blocking
-        // this task. See `reap_child_bounded`.
-        reap_child_bounded(&mut pty).await;
-        // We can't drop `pty.master` separately because it's behind an
-        // Arc<Mutex<_>> — the Arc strong count drops when `pty` falls
-        // out of scope at the end of this function.
-        if let Some(handle) = pty.reader_thread.take() {
-            // Safe to join unconditionally: the receiver was dropped at the
-            // top of this function, so the reader can never be parked in
-            // `blocking_send` waiting for a permit that will never come, and
-            // its post-actor drain is bounded by `spawn::ORPHAN_DRAIN_BUDGET`.
-            let _ = handle.join();
+        // this task. See `reap_bounded`.
+        let child_pid = pty.child.process_id();
+        if matches!(
+            reap_bounded(|| pty.child.try_wait()).await,
+            ReapOutcome::Expired
+        ) {
+            warn!("pty child did not exit within the reap budget; handing it to a reaper thread");
+            spawn_detached_reaper(child_pid);
         }
-        if let Some(handle) = pty.writer_thread.take() {
-            let _ = handle.join();
-        }
+        // ORDER IS LOAD-BEARING: drop the PTY before joining the bridge
+        // threads.
+        //
+        // Dropping `pty` closes this side's master handle and releases the
+        // child, which is what lets the reader's `read(2)` return. Joining
+        // first — as this did — deadlocks the whole server whenever the
+        // reader is inside `spawn::drain_master_to_eof`, because that
+        // function's budget is only observed BETWEEN reads: a `read(2)`
+        // already blocked on a slave someone else still holds open never
+        // returns to check it. Any process that escaped the snapshotted
+        // groups is such a holder, and on a shared current-thread runtime
+        // (ADR-0003) one of those freezes every pane on the server, forever.
+        //
+        // Dropping first is necessary but NOT sufficient — the reader holds
+        // its own `dup`ed descriptor, so our close does not by itself end its
+        // read — which is why the joins below are bounded rather than
+        // unconditional.
+        let reader_thread = pty.reader_thread.take();
+        let writer_thread = pty.writer_thread.take();
         drop(pty);
+        join_thread_bounded(reader_thread, "pty reader").await;
+        join_thread_bounded(writer_thread, "pty writer").await;
     }
 
     /// Gracefully stop a still-running PTY child on pane teardown (phux-sw1).
@@ -531,11 +543,11 @@ impl TerminalActor {
     pub(super) async fn terminate_child_group(pty: &mut PtyOwned) {
         let groups = pane_signal_groups(pty);
         if groups.is_empty() {
-            let _ = pty.child.kill();
+            hard_kill_child(pty);
             return;
         }
         if !hangup_pane_groups(&groups) {
-            let _ = pty.child.kill();
+            hard_kill_child(pty);
             return;
         }
         if await_pane_group_exit(pty, &groups).await {
@@ -625,46 +637,147 @@ async fn await_pane_group_exit(pty: &mut PtyOwned, groups: &[nix::unistd::Pid]) 
     false
 }
 
-/// Reap the pane's child without ever blocking the actor task.
+/// Does this `try_wait` result leave the child needing termination?
+///
+/// Only a confirmed exit says no. `Ok(None)` is "still running", and an `Err`
+/// is "we do not know" — for which the safe reading is "alive". Signalling a
+/// child that turns out to be dead is harmless (`ESRCH`); failing to signal a
+/// live one used to strand it unsignalled and then block the reap on it
+/// forever.
+const fn needs_termination(observed: &std::io::Result<Option<portable_pty::ExitStatus>>) -> bool {
+    !matches!(observed, Ok(Some(_)))
+}
+
+/// What [`reap_bounded`] concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapOutcome {
+    /// The child was collected; nothing is left behind.
+    Reaped,
+    /// `try_wait` itself failed. Nothing more to try here.
+    Failed,
+    /// The budget ran out with the child still running.
+    Expired,
+}
+
+/// Poll `poll` until the child is collected or [`PANE_KILL_REAP_BUDGET`]
+/// expires, without ever blocking the calling task.
 ///
 /// `Child::wait` is a blocking `waitpid`. Calling it from the actor is only
 /// sound if the child is guaranteed dead, and it is not: every path into this
-/// function has *asked* the child to exit, but a child can ignore `SIGHUP`,
-/// and `hard_kill_pane_groups` only reaches the process groups snapshotted
-/// before signalling. One that slips through blocks `waitpid` forever — and
-/// because every pane actor shares one current-thread runtime (ADR-0003),
-/// that is not one stuck pane, it is a frozen server.
+/// function has *asked* the child to exit, but `hard_kill_pane_groups` only
+/// reaches the process groups snapshotted before signalling. One that slips
+/// through blocks `waitpid` forever — and because every pane actor shares one
+/// current-thread runtime (ADR-0003), that is a frozen server, not a stuck
+/// pane.
 ///
-/// So poll `try_wait` on the same cadence the grace window uses and give up
-/// after a bounded budget. Giving up leaks a zombie until the server exits,
-/// which is a strictly better failure than deadlocking every pane.
-#[allow(
-    clippy::future_not_send,
-    reason = "ADR-0014: TerminalActor owns !Send Terminal; lives on LocalSet"
-)]
-async fn reap_child_bounded(pty: &mut PtyOwned) {
+/// Takes a closure rather than the child so the policy can be tested without
+/// a real PTY; see `reap_bounded_tests`.
+async fn reap_bounded<F>(mut poll: F) -> ReapOutcome
+where
+    F: FnMut() -> std::io::Result<Option<portable_pty::ExitStatus>>,
+{
     let deadline = tokio::time::Instant::now() + PANE_KILL_REAP_BUDGET;
     loop {
-        match pty.child.try_wait() {
+        match poll() {
             Ok(Some(status)) => {
                 debug!(?status, "pty child reaped");
-                return;
+                return ReapOutcome::Reaped;
             }
             Ok(None) => {}
             Err(err) => {
                 debug!(?err, "pty child wait failed");
-                return;
+                return ReapOutcome::Failed;
             }
         }
         if tokio::time::Instant::now() >= deadline {
+            return ReapOutcome::Expired;
+        }
+        tokio::time::sleep(PANE_KILL_POLL).await;
+    }
+}
+
+/// Hand a child that outlived the reap budget to a detached thread that will
+/// block in `waitpid` for as long as it takes.
+///
+/// Abandoning it outright — which is what this path used to do — leaks a
+/// zombie for the lifetime of the server, and nothing else ever collects it:
+/// phux installs no `SIGCHLD` handler and has no central reaper, and the
+/// adopted-PTY child only reaps on an explicit poll. One thread parked in
+/// `waitpid` is far cheaper than an entry in the process table that never
+/// goes away, and unlike the actor task this thread is allowed to block.
+fn spawn_detached_reaper(pid: Option<u32>) {
+    let Some(pid) = pid.and_then(|raw| i32::try_from(raw).ok()) else {
+        warn!("pty child outlived the reap budget and has no pid; it will stay a zombie");
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("phux-pty-reaper".to_owned())
+        .spawn(move || {
+            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+        });
+    if let Err(err) = spawned {
+        warn!(
+            ?err,
+            pid, "could not spawn a reaper thread; the child will stay a zombie"
+        );
+    }
+}
+
+/// Join a bridge thread, but give up and detach it if it does not exit inside
+/// [`PANE_KILL_REAP_BUDGET`].
+///
+/// A bare `join()` here is a whole-server deadlock waiting to happen: the
+/// reader can be blocked in `read(2)` on a slave that a process outside the
+/// snapshotted groups still holds open, and the writer can be blocked writing
+/// to a full one. A thread cannot be cancelled in Rust, so the bound is
+/// "stop waiting", not "stop the thread" — we drop the handle and let it
+/// finish on its own when its descriptor finally closes. That leaks at worst
+/// one parked thread per abandoned pane, against freezing every pane on the
+/// runtime.
+async fn join_thread_bounded(handle: Option<std::thread::JoinHandle<()>>, what: &'static str) {
+    let Some(handle) = handle else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + PANE_KILL_REAP_BUDGET;
+    while !handle.is_finished() {
+        if tokio::time::Instant::now() >= deadline {
             warn!(
-                "pty child did not exit within the reap budget; abandoning it \
-                 rather than blocking the runtime"
+                thread = what,
+                "pty bridge thread did not exit within the budget; detaching it"
             );
             return;
         }
         tokio::time::sleep(PANE_KILL_POLL).await;
     }
+    let _ = handle.join();
+}
+
+/// `SIGKILL` the pane's child directly, bypassing `portable_pty`'s killer.
+///
+/// `ChildKiller::kill` is the wrong tool on two counts. It sends `SIGHUP`,
+/// not `SIGKILL` — so the "fall back to killing the child" paths in
+/// [`TerminalActor::terminate_child_group`] were only hanging it up again,
+/// which is exactly what had already failed. And having sent it, the
+/// implementation calls `std::thread::sleep` up to four times at 50 ms while
+/// it polls, so a fallback that is supposed to be immediate blocked the actor
+/// task — and with it every pane on the runtime — for up to 200 ms.
+///
+/// `nix` is already a dependency for the group signalling next door, so the
+/// direct call costs nothing and says what it means.
+fn hard_kill_child(pty: &mut PtyOwned) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if let Some(pid) = pty
+        .child
+        .process_id()
+        .and_then(|raw| i32::try_from(raw).ok())
+    {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        return;
+    }
+    // No pid to aim at: the library killer is all that is left.
+    let _ = pty.child.kill();
 }
 
 /// Backstop: a group ignored the hangup (or is mid-flush past the
@@ -677,5 +790,133 @@ fn hard_kill_pane_groups(groups: &[nix::unistd::Pid]) {
         if !matches!(killpg(group, None), Err(Errno::ESRCH)) {
             let _ = killpg(group, Signal::SIGKILL);
         }
+    }
+}
+
+#[cfg(test)]
+mod teardown_policy_tests {
+    use super::{ReapOutcome, join_thread_bounded, needs_termination, reap_bounded};
+    use crate::terminal_actor::{PANE_KILL_POLL, PANE_KILL_REAP_BUDGET};
+
+    /// The portable gate on the join hang.
+    ///
+    /// The integration fixture for this (a detached process holding the slave
+    /// open) cannot demonstrate the bug on a BSD-family kernel — see
+    /// `pane_kill_is_bounded_when_a_detached_process_holds_the_slave_open` —
+    /// so the property is pinned here instead, where it depends on nothing but
+    /// our own code: a thread that will not exit must cost us the budget and
+    /// then be abandoned, never an unbounded `join()`.
+    #[tokio::test(start_paused = true)]
+    async fn a_thread_that_never_exits_is_detached_rather_than_joined() {
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Parks until the test lets it go — the in-process stand-in for a
+            // reader blocked in `read(2)` on a slave nobody will close.
+            let _ = parked.recv();
+        });
+
+        let started = tokio::time::Instant::now();
+        join_thread_bounded(Some(handle), "never-exits").await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= PANE_KILL_REAP_BUDGET,
+            "the join must serve its whole budget before detaching; gave up after {waited:?}",
+        );
+        // Let the thread finish so the test leaves nothing parked behind.
+        let _ = release.send(());
+    }
+
+    /// The other half: a thread that does exit must be joined promptly, not
+    /// sat out for the full budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_thread_that_exits_is_joined_without_serving_the_budget() {
+        let handle = std::thread::spawn(|| {});
+        // Let it finish before we start waiting, so this asserts the fast
+        // path rather than racing it.
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+
+        let started = tokio::time::Instant::now();
+        join_thread_bounded(Some(handle), "exits").await;
+
+        assert!(
+            started.elapsed() < PANE_KILL_REAP_BUDGET,
+            "a bridge thread that has already exited must not cost a budget",
+        );
+    }
+
+    /// The `Err` arm is the one that used to strand a live child unsignalled
+    /// and then block the reap on it forever, so it is the one worth pinning:
+    /// "we could not tell" must mean "terminate it", not "assume it is gone".
+    #[test]
+    fn only_a_confirmed_exit_skips_termination() {
+        assert!(
+            !needs_termination(&Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))),
+            "a reaped child needs nothing"
+        );
+        assert!(needs_termination(&Ok(None)), "still running");
+        assert!(
+            needs_termination(&Err(std::io::Error::other("try_wait blew up"))),
+            "an unreadable status must be read as alive: signalling a dead child is \
+             harmless, stranding a live one is not",
+        );
+    }
+
+    /// The whole point of the bounded reap: a child that never exits must not
+    /// hold the actor. Virtual time, so this asserts the policy rather than
+    /// the wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_child_that_never_exits_expires_the_budget_instead_of_blocking() {
+        let started = tokio::time::Instant::now();
+        let mut polls = 0_u32;
+        let outcome = reap_bounded(|| {
+            polls += 1;
+            Ok(None)
+        })
+        .await;
+
+        assert_eq!(outcome, ReapOutcome::Expired);
+        assert!(
+            started.elapsed() >= PANE_KILL_REAP_BUDGET,
+            "the reap must serve its whole budget before abandoning the child",
+        );
+        // It has to actually poll, not just sleep out the budget once.
+        let expected = PANE_KILL_REAP_BUDGET.as_millis() / PANE_KILL_POLL.as_millis();
+        assert!(
+            u128::from(polls) >= expected,
+            "expected ~{expected} polls across the budget, got {polls}",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_child_that_exits_is_reaped_without_serving_the_budget() {
+        let started = tokio::time::Instant::now();
+        let mut remaining = 2_u32;
+        let outcome = reap_bounded(|| {
+            if remaining == 0 {
+                return Ok(Some(portable_pty::ExitStatus::with_exit_code(0)));
+            }
+            remaining -= 1;
+            Ok(None)
+        })
+        .await;
+
+        assert_eq!(outcome, ReapOutcome::Reaped);
+        assert!(
+            started.elapsed() < PANE_KILL_REAP_BUDGET,
+            "a child that exits early must not cost the whole budget",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_try_wait_gives_up_rather_than_spinning_out_the_budget() {
+        let outcome = reap_bounded(|| Err(std::io::Error::other("no such child"))).await;
+        assert_eq!(
+            outcome,
+            ReapOutcome::Failed,
+            "there is nothing to retry when the status itself is unreadable",
+        );
     }
 }

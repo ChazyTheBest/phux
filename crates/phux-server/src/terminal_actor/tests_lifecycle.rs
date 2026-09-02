@@ -830,49 +830,182 @@ async fn pane_kill_lets_a_terminal_flush_finish_inside_the_grace() {
         .await;
 }
 
-/// phux-l96p.12: a child that refuses to die must not be able to hang the
-/// server.
+/// Kill a fixture's deliberately-detached holder process.
 ///
-/// The companion hazard to the test above, and the more dangerous one. Every
-/// pane actor shares a single current-thread runtime (ADR-0003), so a
-/// teardown that blocks does not stall one pane, it freezes all of them. Two
-/// ways that used to be reachable: `shutdown_pty` reaped with a blocking
-/// `waitpid`, and its `try_wait` error branch fell through to that reap
-/// having sent no signal at all — so a child nobody had asked to exit was
-/// waited on forever.
+/// These two tests exist because a process escaped every group phux signals,
+/// which means nothing in the production path will ever clean it up — the
+/// test has to. `pkill -P <shell>` does not work here and quietly leaks: the
+/// holder is reparented to init the moment its shell dies, so by the time
+/// teardown finishes it has no parent to match on. A leaked `sleep 3600` is
+/// merely untidy, but a leaked spewing `cat` loop burns a core for the rest
+/// of the suite and starves every load-sensitive test after it — which is
+/// exactly what it did before this existed.
 ///
-/// The fixture is the adversary those paths assume cannot exist: a shell that
-/// ignores `SIGHUP` outright and writes to the terminal without pause, so it
-/// can only be stopped by `SIGKILL` at the grace deadline. What is asserted
-/// is not a latency number but a bound — that teardown finishes at all, and
-/// on roughly the schedule the grace defines.
+/// The fixtures therefore record the job's pid, and `set -m` guarantees it is
+/// also its own process group id, so one `killpg` takes the whole job.
+fn kill_detached_holder(holder_pid_file: &std::path::Path) {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::Pid;
+
+    let Ok(text) = std::fs::read_to_string(holder_pid_file) else {
+        return;
+    };
+    let Ok(raw) = text.trim().parse::<i32>() else {
+        return;
+    };
+    let pid = Pid::from_raw(raw);
+    let _ = killpg(pid, Signal::SIGKILL);
+    let _ = kill(pid, Signal::SIGKILL);
+}
+
+/// A process that escaped the snapshotted groups and still holds the slave
+/// open must not be able to hang the server (wave-two review, item 1).
+///
+/// This is the shape that made the previous revision of `shutdown_pty` a
+/// permanent whole-server deadlock. The reader thread, once its channel
+/// closes, keeps reading the master so a dying child can finish flushing —
+/// but that drain's budget is only observed BETWEEN reads, and a `read(2)`
+/// blocked on a slave someone else holds open never returns to check it. The
+/// old code then joined that thread unconditionally, and dropped the PTY only
+/// afterwards, so the join waited on a read that nothing would ever end. On a
+/// shared current-thread runtime (ADR-0003) that is every pane on the server,
+/// forever.
+///
+/// `sleep` under `set -m` is the portable stand-in for the reviewer's
+/// `setsid`, which macOS does not ship: job control gives a background job its
+/// own process group, so it is outside both groups `pane_signal_groups`
+/// snapshots and survives the hangup and the hard kill. It inherits the slave
+/// as its stdio and holds it open silently.
+///
+/// What is asserted is a bound, not a duration. The bug is an UNBOUNDED wait,
+/// so any finite ceiling catches it, and a loose one keeps this test out of
+/// the load-sensitivity that the flush tests have to live with.
+///
+/// **Honest limitation: this test passes against the unfixed code on macOS.**
+/// Measured — it does, in 0.27s. BSD-family kernels revoke the controlling
+/// terminal when the session leader exits, and `exec cat` makes the pane's own
+/// child that leader, so its death hands the reader `EIO` and the old
+/// unconditional join returned after all. Linux has no such revocation, so
+/// there the holder really does keep `read(2)` blocked and the old code
+/// deadlocks the server. This test is therefore a real gate on CI and a
+/// documented shape here, not a local reproduction; the property that holds
+/// everywhere is pinned by
+/// `teardown_policy_tests::a_thread_that_never_exits_is_detached_rather_than_joined`,
+/// which depends on no kernel behaviour at all.
 #[tokio::test(flavor = "current_thread")]
-async fn pane_kill_hard_kills_a_child_that_ignores_the_hangup() {
+async fn pane_kill_is_bounded_when_a_detached_process_holds_the_slave_open() {
     use portable_pty::CommandBuilder;
 
-    // Loose on purpose. The bug this guards against is an UNBOUNDED hang, so
-    // any finite bound catches it, and a tight one would just re-import the
-    // sibling test's load sensitivity for no extra detection. Six times the
-    // grace is comfortably beyond scheduling noise and still nowhere near
-    // "hung".
-    let ceiling = PANE_KILL_GRACE * 6;
+    let ceiling = PANE_KILL_GRACE * 8;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let holder = dir.path().join("holder");
+
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.arg("-c");
+            // `exec cat` so the pane's own child is an ordinary foreground
+            // job that dies to the hangup, leaving only the detached holder.
+            // The holder's pid is recorded so the test can clean up what it
+            // deliberately made unreachable — see `kill_detached_holder`.
+            cmd.arg("set -m; sleep 3600 & printf %s \"$!\" > \"$PHUX_TEST_HOLDER\"; exec cat");
+            cmd.env("PHUX_TEST_HOLDER", &holder);
+
+            let token = CancellationToken::new();
+            let bundle = TerminalActor::build_with_token(
+                80,
+                24,
+                Some(cmd),
+                test_scrollback(1000),
+                token.clone(),
+            )
+            .expect("build actor");
+            let actor = bundle.actor;
+            let run = tokio::task::spawn_local(actor.run());
+
+            // Wait for the holder to exist rather than sleeping a fixed
+            // second: the fixture is only set up once its pid is on disk.
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !holder.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "the fixture never forked its detached holder: an environment problem \
+                     (machine load), not a failure of the path this test covers",
+            );
+
+            let killed_at = std::time::Instant::now();
+            token.cancel();
+            tokio::time::timeout(ceiling, run)
+                .await
+                .expect(
+                    "pane teardown never completed while a detached process held the slave \
+                     open: the actor is blocked joining a reader parked in read(2), and on a \
+                     shared current-thread runtime that is every pane on the server",
+                )
+                .expect("actor task failed");
+            let shutdown_took = killed_at.elapsed();
+
+            kill_detached_holder(&holder);
+
+            assert!(
+                shutdown_took < ceiling,
+                "teardown must be bounded by our own budgets, not by whether some process \
+                     we never signalled decides to close the slave; took {shutdown_took:?}",
+            );
+        })
+        .await;
+}
+
+/// phux-l96p.12 / wave-two review item 2: a child that refuses to die must not
+/// be able to hang the server, and the fixture has to make our BOUND the thing
+/// that saves us.
+///
+/// The first version of this test kept its spewing `cat` inside the pane's
+/// foreground group, so `hard_kill_pane_groups` reached it, `try_wait`
+/// succeeded on the first poll, and every budget under test went unexercised —
+/// it passed just as happily against the unbounded code. The spewer now
+/// escapes into its own process group under `set -m`, which is what the
+/// signalling path cannot reach, so the teardown finishes because it is
+/// bounded rather than because the child cooperated.
+///
+/// The reap budget itself still cannot be driven from here: the pane's own
+/// child is always reachable by `SIGKILL`, so `try_wait` always succeeds
+/// eventually. That path is covered directly by `teardown_policy_tests`, which
+/// can force the expiry this fixture cannot.
+#[tokio::test(flavor = "current_thread")]
+async fn pane_kill_is_bounded_when_an_escaped_child_ignores_the_hangup_and_spews() {
+    use portable_pty::CommandBuilder;
+
+    let ceiling = PANE_KILL_GRACE * 8;
 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let armed = dir.path().join("armed");
+            let holder = dir.path().join("holder");
             let payload = dir.path().join("payload");
             std::fs::write(&payload, vec![b'.'; 256 * 1024]).expect("write payload");
 
-            // `trap '' HUP` sets SIG_IGN, which every `cat` below inherits
-            // across `exec`. Nothing short of SIGKILL stops this pane.
+            // `trap '' HUP` sets SIG_IGN, inherited across `exec`; `set -m`
+            // puts the background loop in its own process group, outside
+            // everything `pane_signal_groups` snapshots. So it ignores the
+            // hangup AND never sees the hard kill, and it writes without
+            // pause the whole time.
             let script = dir.path().join("foreground.sh");
             std::fs::write(
                 &script,
                 "trap '' HUP\n\
+                     set -m\n\
+                     while :; do cat \"$PHUX_TEST_PAYLOAD\"; done &\n\
+                     printf %s \"$!\" > \"$PHUX_TEST_HOLDER\"\n\
                      printf armed > \"$PHUX_TEST_ARMED\"\n\
-                     while :; do cat \"$PHUX_TEST_PAYLOAD\"; done\n",
+                     wait\n",
             )
             .expect("write foreground script");
 
@@ -910,16 +1043,19 @@ async fn pane_kill_hard_kills_a_child_that_ignores_the_hangup() {
             tokio::time::timeout(ceiling, run)
                 .await
                 .expect(
-                    "pane teardown never completed for a child that ignores SIGHUP and keeps \
-                     writing: the actor is blocked, and on a shared current-thread runtime \
-                     that means every pane on the server is blocked with it",
+                    "pane teardown never completed for a child that escaped the signalled \
+                     groups and keeps writing: the actor is blocked, and on a shared \
+                     current-thread runtime every pane is blocked with it",
                 )
                 .expect("actor task failed");
             let shutdown_took = killed_at.elapsed();
+
+            kill_detached_holder(&holder);
+
             assert!(
                 shutdown_took < ceiling,
-                "teardown must be bounded by the hangup grace plus the reap budget, not by \
-                     the child's willingness to exit; took {shutdown_took:?}",
+                "teardown must be bounded by the grace, reap and join budgets, not by the \
+                     child's willingness to exit; took {shutdown_took:?}",
             );
         })
         .await;

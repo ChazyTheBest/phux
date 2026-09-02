@@ -69,7 +69,14 @@ threads-required = 'num-cpus'
 # which is exactly the kind of load that makes every other test in this file
 # miss its own 500ms product budget.
 [[profile.default.overrides]]
-filter = 'package(phux-server) & test(pane_kill_hard_kills_a_child_that_ignores_the_hangup)'
+filter = 'package(phux-server) & test(pane_kill_is_bounded_when_an_escaped_child_ignores_the_hangup_and_spews)'
+threads-required = 'num-cpus'
+
+# Its quiet twin: same teardown bound, a silent detached holder of the slave
+# instead of a noisy one. It spends a second waiting for a shell to fork, so
+# it is here to stop it soaking up a runner slot rather than to protect it.
+[[profile.default.overrides]]
+filter = 'package(phux-server) & test(pane_kill_is_bounded_when_a_detached_process_holds_the_slave_open)'
 threads-required = 'num-cpus'
 
 # `agent_detect` needs the same treatment, for the same reason, and the

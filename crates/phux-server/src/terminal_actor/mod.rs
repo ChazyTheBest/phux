@@ -342,14 +342,32 @@ const PANE_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 const PANE_KILL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Ceiling on how long the pane-kill path will wait to reap the child after
-/// it has been signalled (phux-l96p.12).
+/// it has been signalled, and on how long it will wait for either bridge
+/// thread to exit (phux-l96p.12).
 ///
 /// Reached only when something has already gone wrong: by this point the
 /// child has been sent `SIGHUP` and then `SIGKILL`, so it should be a zombie
 /// within a poll or two. The budget exists because the alternative — a
-/// blocking `waitpid` — turns "one child we failed to kill" into "every pane
-/// on the runtime is frozen" (ADR-0003). Generous relative to
-/// [`PANE_KILL_POLL`] so ordinary scheduling delay never trips it.
+/// blocking `waitpid`, or a bare `JoinHandle::join` — turns "one child we
+/// failed to kill" into "every pane on the runtime is frozen" (ADR-0003).
+/// Generous relative to [`PANE_KILL_POLL`] so ordinary scheduling delay never
+/// trips it.
+///
+/// **What expiry costs, stated honestly.** Giving up here is not free, and
+/// nothing downstream cleans up after it:
+///
+/// * The child is handed to a detached thread that blocks in `waitpid`
+///   (`io::spawn_detached_reaper`). phux installs no `SIGCHLD` handler and has
+///   no central reaper — the adopted-PTY child collects only on an explicit
+///   poll — so without that thread the process would stay a zombie for the
+///   lifetime of the server. One parked thread is the cheaper leak.
+/// * A bridge thread that misses the budget is detached, not stopped. Rust
+///   cannot cancel a thread, so it lives until its descriptor closes. That is
+///   at worst one parked thread per abandoned pane.
+///
+/// Both are bounded leaks traded against an unbounded stall, which is the
+/// right trade on a shared current-thread runtime; neither is a leak we would
+/// accept if the deadlock were avoidable some other way.
 const PANE_KILL_REAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
 const NATIVE_HISTORY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
