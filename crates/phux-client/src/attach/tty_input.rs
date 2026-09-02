@@ -49,6 +49,20 @@ pub(super) enum TtyInput {
     /// Blocking-pool-backed stdin. Correct everywhere, slower by one
     /// cross-thread wake-up per read.
     Blocking(Box<tokio::io::Stdin>),
+    /// EOF has been reported once. Reads never complete again.
+    ///
+    /// A terminal that reached EOF stays at EOF, so a `read` on it returns
+    /// `Ok(0)` immediately, forever. The attach loop's `select!` is `biased`
+    /// with stdin first, so an arm that completes on every poll starves every
+    /// arm below it — inbound frames, the paint deadline, and the
+    /// SIGINT/SIGTERM/SIGHUP handlers that restore the terminal. The observed
+    /// failure was a client spinning a core at 100% and ignoring `kill`,
+    /// because the signal arms were never polled to see it.
+    ///
+    /// Latching here rather than in the driver keeps the invariant with the
+    /// thing that owns it: whatever the loop does with the `Ok(0)` it is
+    /// handed, it cannot re-arm an exhausted terminal by forgetting a flag.
+    Closed,
 }
 
 impl TtyInput {
@@ -83,17 +97,26 @@ impl TtyInput {
 
     /// Read one burst of input.
     ///
-    /// Cancel-safe on both variants, which is what lets it sit in the attach
+    /// Cancel-safe on every variant, which is what lets it sit in the attach
     /// loop's `select!`: the readiness path only awaits readiness (dropping
-    /// the future loses no bytes, the fd stays readable), and tokio's stdin
-    /// buffers a blocking read that outlives its future.
+    /// the future loses no bytes, the fd stays readable), tokio's stdin
+    /// buffers a blocking read that outlives its future, and a pending future
+    /// carries no state at all.
     ///
-    /// `Ok(0)` is EOF, exactly as for `Read::read`.
+    /// `Ok(0)` is EOF, exactly as for `Read::read` — reported EXACTLY ONCE.
+    /// The caller still gets its one chance to detach cleanly; every later
+    /// call parks forever so the exhausted terminal cannot spin the loop (see
+    /// [`Self::Closed`]).
     pub(super) async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
+        let result = match self {
             Self::Ready(fd) => read_when_ready(fd, buf).await,
             Self::Blocking(stdin) => stdin.read(buf).await,
+            Self::Closed => std::future::pending().await,
+        };
+        if matches!(result, Ok(0)) {
+            *self = Self::Closed;
         }
+        result
     }
 }
 
@@ -185,6 +208,43 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_blocking_stdin_without_a_tty() {
         assert!(matches!(TtyInput::open(), TtyInput::Blocking(_)));
+    }
+
+    /// The regression that motivated [`TtyInput::Closed`]: a terminal at EOF
+    /// answers `Ok(0)` instantly and forever, and the attach loop's `select!`
+    /// polls stdin FIRST (`biased`), so an arm that keeps completing starves
+    /// the inbound-frame, paint-deadline and signal arms below it. A real
+    /// client was found spinning a core at 100% and deaf to `kill` for an
+    /// hour, because the SIGTERM arm was never reached.
+    ///
+    /// EOF must therefore be reported exactly once — the caller needs that one
+    /// `Ok(0)` to send its `Detach` — and every read after it must park. The
+    /// timeout is the assertion: before the latch this call returned `Ok(0)`
+    /// immediately, which is precisely the spin.
+    #[tokio::test]
+    async fn eof_is_reported_once_and_then_parks_forever() {
+        // A closed pipe is a fd that is readable and at EOF, which is exactly
+        // the shape a hung-up terminal presents.
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(writer);
+        let mut input = TtyInput::Ready(Box::new(
+            AsyncFd::with_interest(OwnedFd::from(reader), Interest::READABLE).expect("register"),
+        ));
+
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            input.read(&mut buf).await.expect("first read"),
+            0,
+            "EOF must be reported once so the caller can detach",
+        );
+        assert!(matches!(input, TtyInput::Closed), "EOF must latch");
+
+        let again =
+            tokio::time::timeout(std::time::Duration::from_millis(200), input.read(&mut buf)).await;
+        assert!(
+            again.is_err(),
+            "a read after EOF must never complete; it completed with {again:?}",
+        );
     }
 
     /// The device-identity guard is what makes a fresh `/dev/tty` open safe to
