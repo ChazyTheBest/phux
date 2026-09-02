@@ -3095,6 +3095,67 @@ pub(crate) fn broadcast_event(
     }
 }
 
+/// Upper bound on outbound messages coalesced into one transport write.
+///
+/// The drain is non-blocking, so this only caps how much of an *already
+/// queued* backlog one turn absorbs; the cap exists so a saturated mailbox
+/// cannot hold the writer inside a single encode loop long enough to starve
+/// the close-control arm. It is comfortably above
+/// [`crate::mailbox::DEFAULT_CLIENT_MAILBOX`], which is the real ceiling in
+/// practice.
+const MAX_WRITE_COALESCE: usize = 32;
+
+/// Encode one outbound message onto the end of `batch`, recording its frame
+/// boundary in `ends`.
+///
+/// Returns the terminal-sentinel message when this was an
+/// [`Outbound::TerminalError`]: the caller must stop draining there, because
+/// everything after the sentinel is discarded by contract.
+fn encode_into_batch(
+    message: Outbound,
+    batch: &mut BytesMut,
+    ends: &mut Vec<usize>,
+) -> Option<String> {
+    let (frame, terminal_message) = match message {
+        Outbound::Frame(frame) => (frame, None),
+        Outbound::TerminalError {
+            request_id,
+            code,
+            message,
+        } => (
+            FrameKind::Error {
+                request_id,
+                code,
+                message: message.clone(),
+            },
+            Some(message),
+        ),
+    };
+    frame.encode(batch);
+    ends.push(batch.len());
+    terminal_message
+}
+
+/// Absorb up to [`MAX_WRITE_COALESCE`] further messages that are *already*
+/// queued into the same batch. Stops on an empty or closed mailbox, and on a
+/// terminal-error sentinel (returned so the caller can finish the shutdown
+/// handshake).
+fn drain_ready_into_batch(
+    rx: &mut tokio::sync::mpsc::Receiver<Outbound>,
+    batch: &mut BytesMut,
+    ends: &mut Vec<usize>,
+) -> Option<String> {
+    for _ in 1..MAX_WRITE_COALESCE {
+        let Ok(next) = rx.try_recv() else {
+            return None;
+        };
+        if let Some(message) = encode_into_batch(next, batch, ends) {
+            return Some(message);
+        }
+    }
+    None
+}
+
 /// Writer task: drain the per-client outbound channel and write each
 /// message to the socket. Encodes [`Outbound::Frame`] via
 /// `FrameKind::encode`.
@@ -3108,6 +3169,9 @@ pub(crate) async fn writer_task<W: FrameWriter>(
     client_id: ClientId,
 ) {
     let mut buf = BytesMut::with_capacity(1024);
+    // Exclusive end offset of each frame encoded into `buf` this turn, so a
+    // message-oriented transport can still write them one message at a time.
+    let mut ends: Vec<usize> = Vec::new();
     let mut close_control_open = true;
     loop {
         let message = if close_control_open {
@@ -3131,24 +3195,21 @@ pub(crate) async fn writer_task<W: FrameWriter>(
         let Some(message) = message else {
             break;
         };
-        let (frame, terminal_message) = match message {
-            Outbound::Frame(frame) => (frame, None),
-            Outbound::TerminalError {
-                request_id,
-                code,
-                message,
-            } => (
-                FrameKind::Error {
-                    request_id,
-                    code,
-                    message: message.clone(),
-                },
-                Some(message),
-            ),
-        };
+        // Encode this message plus everything already queued behind it into
+        // one buffer, then hand the whole batch to the transport. A PTY burst
+        // fans out as many small `TERMINAL_OUTPUT` frames that arrive faster
+        // than the socket drains, and writing each one separately paid a
+        // syscall per frame for bytes that were going down the same stream
+        // anyway. Nothing waits: the drain is `try_recv`, so a lone keystroke
+        // echo still leaves on its own write with no added latency, and no
+        // linger timer is introduced.
         buf.clear();
-        frame.encode(&mut buf);
-        if let Err(err) = writer.write_frame(&buf).await {
+        ends.clear();
+        let mut terminal_message = encode_into_batch(message, &mut buf, &mut ends);
+        if terminal_message.is_none() {
+            terminal_message = drain_ready_into_batch(&mut rx, &mut buf, &mut ends);
+        }
+        if let Err(err) = writer.write_frames(&buf, &ends).await {
             debug!(?client_id, error = %err, "writer error on frame; client task ending");
             let _ = writer.close().await;
             return;
@@ -3213,6 +3274,93 @@ mod writer_close_tests {
             self.0.borrow_mut().push(WriterEvent::Close);
             Ok(())
         }
+    }
+
+    /// A transport that records batches instead of frames, so a test can see
+    /// how many transport writes a queue of frames actually costs.
+    struct BatchRecordingWriter {
+        /// One entry per `write_frames` call: how many frames it carried.
+        batches: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl FrameWriter for BatchRecordingWriter {
+        async fn write_frame(&mut self, _frame: &[u8]) -> io::Result<()> {
+            self.batches.borrow_mut().push(1);
+            Ok(())
+        }
+
+        async fn write_frames(&mut self, _batch: &[u8], ends: &[usize]) -> io::Result<()> {
+            self.batches.borrow_mut().push(ends.len());
+            Ok(())
+        }
+
+        async fn close(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A burst that lands in the mailbox faster than the socket drains must
+    /// cost ONE transport write, not one per frame. The drain is `try_recv`,
+    /// so this is pure backlog absorption with no added latency.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_burst_costs_one_transport_write() {
+        let batches = Rc::new(RefCell::new(Vec::new()));
+        let writer = BatchRecordingWriter {
+            batches: Rc::clone(&batches),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for nonce in 0..8_u64 {
+            tx.send(Outbound::Frame(FrameKind::Pong { nonce }))
+                .await
+                .expect("queue frame");
+        }
+        drop(tx);
+
+        let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
+        writer_task(writer, rx, close_rx, ClientId(11)).await;
+        assert_eq!(
+            batches.borrow().as_slice(),
+            [8],
+            "eight already-queued frames must leave as one batched write",
+        );
+    }
+
+    /// The other half of the contract: a lone frame still leaves immediately,
+    /// on its own write. Nothing lingers waiting for a second frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lone_frame_is_written_without_waiting_for_company() {
+        let batches = Rc::new(RefCell::new(Vec::new()));
+        let writer = BatchRecordingWriter {
+            batches: Rc::clone(&batches),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (_close_tx, close_rx) = tokio::sync::watch::channel(false);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let task =
+                    tokio::task::spawn_local(writer_task(writer, rx, close_rx, ClientId(12)));
+                tx.send(Outbound::Frame(FrameKind::Pong { nonce: 1 }))
+                    .await
+                    .expect("queue frame");
+                // Yield until the writer has drained it. The frame lands with
+                // the channel still open and no timer pending, because no
+                // linger exists to wait on.
+                for _ in 0..16 {
+                    if !batches.borrow().is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    [1],
+                    "one queued frame leaves on its own write",
+                );
+                drop(tx);
+                task.await.expect("writer task");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

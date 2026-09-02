@@ -82,6 +82,31 @@ impl Osc133Scanner {
     /// in stream order.
     pub(super) fn feed(&mut self, chunk: &[u8]) -> Vec<OscMark> {
         let mut marks = Vec::new();
+        // Ground-state fast skip. In `Ground` the machine reacts to exactly
+        // one byte, `ESC`; every other byte is a no-op that still costs a
+        // match arm and a loop iteration. A `cat` of a plain-text file is
+        // 100% such bytes, so stepping them one at a time made this scanner
+        // one of the most expensive things the actor did per chunk —
+        // ~0.5 ms/MB, comparable to libghostty's whole VT parse of the same
+        // bytes. `memchr` is the SIMD form of the identical search; the state
+        // machine below is entered unchanged from wherever it lands.
+        //
+        // The skip applies from `Ground` only. A scan resumed mid-OSC still
+        // walks every byte, because those bytes are the OSC payload and a
+        // control-free chunk can be the middle of a mark.
+        if matches!(self.state, State::Ground) {
+            let Some(escape) = memchr::memchr(0x1b, chunk) else {
+                return marks;
+            };
+            self.feed_bytes(&chunk[escape..], &mut marks);
+            return marks;
+        }
+        self.feed_bytes(chunk, &mut marks);
+        marks
+    }
+
+    /// The state machine proper: one pass over `chunk` from the current state.
+    fn feed_bytes(&mut self, chunk: &[u8], marks: &mut Vec<OscMark>) {
         for &byte in chunk {
             // A byte may need re-processing after an aborted OSC (the
             // aborting byte is itself the start of something new), hence
@@ -139,7 +164,6 @@ impl Osc133Scanner {
                 break;
             }
         }
-        marks
     }
 
     /// Terminate the in-flight OSC: parse a 133 prompt mark out of the
@@ -261,6 +285,32 @@ mod tests {
                 exit_code: Some(42)
             }]
         );
+    }
+
+    /// The ground-state fast skip must not change what the machine sees. A
+    /// mark whose payload chunk contains no `ESC` at all is exactly the case
+    /// the skip would wrongly discard if it applied outside `Ground`.
+    #[test]
+    fn a_control_free_middle_chunk_is_still_scanned_as_osc_payload() {
+        assert_eq!(
+            scan(&[b"plain text\x1b]133;", b"D;7", b"\x07 more plain text"]),
+            vec![OscMark::CommandEnd { exit_code: Some(7) }]
+        );
+        // ... and a long run of plain bytes before the mark is skipped
+        // without losing it.
+        let mut chunk = vec![b'x'; 100_000];
+        chunk.extend_from_slice(b"\x1b]133;C\x07");
+        assert_eq!(scan(&[&chunk]), vec![OscMark::CommandStart]);
+    }
+
+    /// A chunk with no `ESC` while in `Ground` yields nothing and leaves the
+    /// scanner in `Ground` — the fast skip's contract.
+    #[test]
+    fn a_control_free_chunk_in_ground_is_a_no_op() {
+        let mut scanner = Osc133Scanner::new();
+        assert_eq!(scanner.feed(&vec![b'a'; 8192]), Vec::new());
+        assert_eq!(scanner.state, State::Ground);
+        assert_eq!(scanner.feed(b"\x1b]133;C\x07"), vec![OscMark::CommandStart]);
     }
 
     #[test]

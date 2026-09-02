@@ -77,9 +77,16 @@ impl TerminalActor {
         self.agent_dirty_since_detect = true;
     }
 
+    /// Test-only: run one state-sync tick exactly as the `run` loop's tick
+    /// arm would, without driving real time.
+    #[cfg(test)]
+    pub(crate) fn service_state_tick_for_test(&mut self) {
+        self.service_state_tick();
+    }
+
     /// Test-only: install in-memory PTY channels on a no-PTY actor so a
     /// test can inject a PTY-output burst (the returned
-    /// [`mpsc::UnboundedSender<PtyEvent>`]) and observe the encoded input
+    /// [`mpsc::Sender<PtyEvent>`]) and observe the encoded input
     /// the actor forwards toward the PTY writer thread (the returned
     /// [`mpsc::Receiver<EncodedInputRequest>`]). Faithful to production
     /// wiring: queued output is consumed by `vt_write`; serviced input
@@ -89,17 +96,26 @@ impl TerminalActor {
     #[cfg(test)]
     pub(crate) fn install_test_pty_channels(
         &mut self,
-    ) -> (
-        mpsc::UnboundedSender<PtyEvent>,
-        mpsc::Receiver<EncodedInputRequest>,
-    ) {
-        let (evt_tx, evt_rx) = mpsc::unbounded_channel::<PtyEvent>();
+    ) -> (mpsc::Sender<PtyEvent>, mpsc::Receiver<EncodedInputRequest>) {
+        let (evt_tx, evt_rx) = mpsc::channel::<PtyEvent>(TEST_PTY_CHANNEL_DEPTH);
         let (writer_tx, writer_rx) = mpsc::channel::<EncodedInputRequest>(DEFAULT_INPUT_MAILBOX);
         self.pty_rx = Some(evt_rx);
         self.pty_tx = Some(writer_tx);
         (evt_tx, writer_rx)
     }
 }
+
+/// Depth of the in-memory PTY channel [`TerminalActor::install_test_pty_channels`]
+/// installs.
+///
+/// Production uses `spawn::PTY_CHANNEL_DEPTH` (small, so a runaway child
+/// meets backpressure). Tests are the opposite shape: several pre-queue a
+/// whole burst *before* spawning the actor, which is only possible with a
+/// queue deep enough to hold it. The depth is not what those tests measure —
+/// they measure the actor's `select!` ordering — so giving the seam its own
+/// generous bound keeps them honest about the thing they assert while
+/// production keeps the bound that matters.
+pub(super) const TEST_PTY_CHANNEL_DEPTH: usize = 512;
 
 /// Ceiling for "this task has already been told to stop, so joining it
 /// should return immediately" waits.

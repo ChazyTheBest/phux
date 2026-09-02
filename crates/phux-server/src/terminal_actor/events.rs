@@ -200,7 +200,9 @@ impl TerminalActor {
         // watching, which left `last_title` stale forever for exactly the
         // panes the sidebar most wants to describe. Refreshing here keeps one
         // title parser (libghostty's) and one mirror. Costs one FFI read plus
-        // one compare per chunk, and allocates only when the title changes.
+        // one compare per chunk, and allocates only when the title changes;
+        // measured at under 0.01 ms/MB, which is why no attempt is made to
+        // skip it (see `ingest_pty_payload`).
         let title_changed = self.refresh_title();
         let marks = self.osc133.feed(chunk);
         for mark in &marks {
@@ -232,7 +234,7 @@ impl TerminalActor {
                 osc133::OscMark::Progress(_) => {}
             }
         }
-        if chunk.contains(&0x07) {
+        if memchr::memchr(0x07, chunk).is_some() {
             self.emit_event(AgentEvent::Bell);
         }
         // Title: `refresh_title` (above) already synced the mirror; emit on a
@@ -255,27 +257,14 @@ impl TerminalActor {
         // appearing or changing as `Some`, retitling away as `None` — because
         // the detector cannot infer a cleared marker, and without the clear
         // the same question asked twice would coalesce into silence.
-        let current_ask = AskMarker::parse(&self.last_title);
-        if current_ask != self.last_ask {
-            let ask = current_ask.as_ref().map(|marker| AskedPayload {
-                id: marker.id.clone(),
-                question: marker.question.clone(),
-                suggestions: marker.suggestions.clone(),
-                // Elapsed-since-ask is not tracked server-side in v1; the
-                // consumer renders a live waiting counter from receipt.
-                elapsed_seconds: None,
-            });
-            // Advance the mirror only once the edge is actually in flight. An
-            // ask is edge-triggered — unlike the level-triggered detector,
-            // nothing re-derives it — so a full sink would otherwise swallow
-            // it outright; leaving the mirror stale re-attempts on the next
-            // chunk. With no sink wired at all there is nothing to deliver
-            // and nothing to retry.
-            if self.try_emit_agent_state(AgentDetectEvent::AskSentinel(ask))
-                || self.agent_state_sink.is_none()
-            {
-                self.last_ask = current_ask;
-            }
+        //
+        // The marker is a function of `last_title` alone, so it can only move
+        // when the title moved — or when a previous chunk's emission was
+        // refused and the retry is still owed (`ask_retry_owed`). Re-parsing
+        // on every chunk of a pane whose title has not changed in an hour
+        // re-derives an answer that provably cannot differ.
+        if title_changed || self.ask_retry_owed {
+            self.source_ask_marker();
         }
         // Dirty: a chunk arrived, so the grid mutated. Coalesce to one
         // `dirty` per burst; `idle` (from the tick arm) closes the burst.
@@ -286,6 +275,41 @@ impl TerminalActor {
                 self.broadcast_agent_event(&AgentEvent::Dirty);
                 self.dirty_event_emitted_this_burst = true;
             }
+        }
+    }
+
+    /// Re-derive the in-pane ask marker from the current title and ship the
+    /// edge (phux-2sl6).
+    ///
+    /// Split out of [`Self::source_events_from_chunk`] so the caller can gate
+    /// it on the two conditions under which the answer can differ from last
+    /// time: the title changed, or a previous emission was refused.
+    fn source_ask_marker(&mut self) {
+        let current_ask = AskMarker::parse(&self.last_title);
+        if current_ask == self.last_ask {
+            self.ask_retry_owed = false;
+            return;
+        }
+        let ask = current_ask.as_ref().map(|marker| AskedPayload {
+            id: marker.id.clone(),
+            question: marker.question.clone(),
+            suggestions: marker.suggestions.clone(),
+            // Elapsed-since-ask is not tracked server-side in v1; the
+            // consumer renders a live waiting counter from receipt.
+            elapsed_seconds: None,
+        });
+        // Advance the mirror only once the edge is actually in flight. An ask
+        // is edge-triggered — unlike the level-triggered detector, nothing
+        // re-derives it — so a full sink would otherwise swallow it outright;
+        // leaving the mirror stale re-attempts on the next chunk. With no
+        // sink wired at all there is nothing to deliver and nothing to retry.
+        if self.try_emit_agent_state(AgentDetectEvent::AskSentinel(ask))
+            || self.agent_state_sink.is_none()
+        {
+            self.last_ask = current_ask;
+            self.ask_retry_owed = false;
+        } else {
+            self.ask_retry_owed = true;
         }
     }
 

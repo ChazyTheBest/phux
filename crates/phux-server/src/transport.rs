@@ -73,6 +73,27 @@ pub(crate) trait FrameReader {
 pub(crate) trait FrameWriter {
     async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()>;
 
+    /// Write several already-encoded frames that sit back-to-back in `batch`,
+    /// where `ends` holds each frame's exclusive end offset (so frame `i` is
+    /// `batch[ends[i - 1]..ends[i]]`, with an implicit `0` before the first).
+    ///
+    /// The default is one [`Self::write_frame`] per frame, which is what a
+    /// message-oriented transport (WebSocket, WebTransport, QUIC) requires:
+    /// there, a frame boundary IS a transport message boundary and merging
+    /// two frames into one write would corrupt the stream. A byte-stream
+    /// transport has no such constraint — its frames are self-delimiting via
+    /// the length prefix `FrameKind::encode` already wrote — so it can and
+    /// should override this with a single write of the whole batch. See
+    /// `UdsWriter`.
+    async fn write_frames(&mut self, batch: &[u8], ends: &[usize]) -> io::Result<()> {
+        let mut start = 0;
+        for &end in ends {
+            self.write_frame(&batch[start..end]).await?;
+            start = end;
+        }
+        Ok(())
+    }
+
     /// Finish the server-to-client stream after its final frame.
     async fn close(&mut self) -> io::Result<()>;
 }
@@ -150,6 +171,16 @@ pub(crate) struct UdsWriter {
 impl FrameWriter for UdsWriter {
     async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         self.writer.write_all(frame).await
+    }
+
+    /// One `write_all` for the whole batch. UDS is a byte stream and every
+    /// frame in `batch` already carries its own length prefix, so the bytes
+    /// on the wire are identical to writing them one at a time — the client's
+    /// reassembler cannot tell the difference. What changes is the syscall
+    /// count: a burst that queued N frames behind a busy writer now costs one
+    /// `write(2)` instead of N. `ends` is unused for exactly that reason.
+    async fn write_frames(&mut self, batch: &[u8], _ends: &[usize]) -> io::Result<()> {
+        self.writer.write_all(batch).await
     }
 
     async fn close(&mut self) -> io::Result<()> {

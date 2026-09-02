@@ -292,7 +292,18 @@ impl TerminalActor {
                 // and the signal deliverer (it owns the PTY child pid).
                 Some(req) = self.control_rx.recv() => self.handle_control_request(req),
 
-                _ = tick.tick(), if !bootstrap_pending => self.service_state_tick(),
+                // Disarmed while there is nothing for a tick to do (see
+                // `state_tick_armed`). A `select!` arm whose precondition is
+                // false is never polled, so a disarmed tick registers no
+                // timer and produces no wakeup at all — an idle pane with no
+                // state-sync consumer costs zero, where it used to wake the
+                // whole actor 33 times a second to discover that. The guard
+                // is re-evaluated every loop turn, and every event that can
+                // make the tick relevant (a consumer attaching, a PTY chunk
+                // opening an output burst, a native cursor binding) is itself
+                // a loop turn, so re-arming is immediate.
+                _ = tick.tick(), if !bootstrap_pending && self.state_tick_armed() =>
+                    self.service_state_tick(),
 
                 // Agent-state detector (ADR-0046). This interval is the SOLE
                 // driver: PTY bytes deliberately do NOT wake it. A chatty
@@ -417,7 +428,7 @@ impl TerminalActor {
     /// reference grid, and push a `TerminalOutput` frame onto its outbound
     /// mailbox whenever `synthesize_against_reference` returns non-empty
     /// bytes.
-    fn service_state_tick(&mut self) {
+    pub(super) fn service_state_tick(&mut self) {
         // phux-y2t: close an output burst with an `idle` event
         // when no PTY output arrived since the previous tick.
         // This bookkeeping is independent of the state-sync
@@ -426,6 +437,34 @@ impl TerminalActor {
         self.tick_emit();
         #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
         self.expire_native_cursors();
+    }
+
+    /// Whether the state-sync tick arm has any work to do this turn.
+    ///
+    /// [`Self::service_state_tick`] does exactly three things, and all three
+    /// are conditional:
+    ///
+    /// * `maybe_emit_idle` closes an output burst — only relevant while one
+    ///   is open (`in_output_burst`).
+    /// * `tick_emit` returns immediately unless some consumer is
+    ///   tick-managed, which is the same gate spelled out here.
+    /// * `expire_native_cursors` expires history bindings — only relevant
+    ///   while at least one exists.
+    ///
+    /// With none of those true the tick was a pure wakeup: a timer fire, a
+    /// `debug_span!` construction, and two early returns, repeated 33 times a
+    /// second for every pane on the server whether or not anyone was
+    /// attached. Naming the precondition lets the `select!` skip arming the
+    /// timer entirely.
+    pub(super) fn state_tick_armed(&self) -> bool {
+        if self.in_output_burst {
+            return true;
+        }
+        #[cfg(all(feature = "native-engine", not(target_arch = "wasm32")))]
+        if !self.native_cursor_owners.is_empty() {
+            return true;
+        }
+        self.consumer_tick_emits || self.consumer_states.values().any(|s| s.wants_state_sync)
     }
 
     /// Whether the agent-state detector arm may run this turn: a detector was
@@ -555,7 +594,7 @@ impl TerminalActor {
     /// the byte-cap case the crossing chunk is left
     /// queued for the next turn (mpsc has no peek, so the
     /// length is checked before `try_recv`).
-    fn coalesce_pty_burst(&mut self, first: Vec<u8>) -> PtyBurst {
+    fn coalesce_pty_burst(&mut self, first: Bytes) -> PtyBurst {
         let mut coalesced: Vec<u8> = Vec::new();
         let mut saw_eof = false;
         let mut hit_byte_cap = false;
@@ -575,7 +614,7 @@ impl TerminalActor {
                 hit_byte_cap = true;
                 break;
             }
-            match self.pty_rx.as_mut().map(mpsc::UnboundedReceiver::try_recv) {
+            match self.pty_rx.as_mut().map(mpsc::Receiver::try_recv) {
                 Some(Ok(PtyEvent::Bytes(more))) => {
                     if coalesced.is_empty() {
                         coalesced.reserve(first.len() + more.len());
@@ -595,8 +634,14 @@ impl TerminalActor {
                 _ => break,
             }
         }
+        // The lone-chunk path is now genuinely copy-free: the reader thread
+        // already hands over a refcounted `Bytes`, so a single chunk moves
+        // through with no re-buffering at all. The join buffer, and its
+        // copy, remains for the short-read bursts it was written for —
+        // which on macOS is every burst, because the line discipline caps a
+        // PTY read at 1024 bytes (see `spawn::PTY_READ_CHUNK`).
         let payload: Bytes = if coalesced.is_empty() {
-            Bytes::from(first)
+            first
         } else {
             Bytes::from(coalesced)
         };
@@ -610,6 +655,29 @@ impl TerminalActor {
     /// Write one coalesced PTY payload into the canonical `Terminal` and fan
     /// out everything derived from it (color queries, encoder snapshot, dirty
     /// bits, semantic events, native bootstrap advance).
+    ///
+    /// Every step here was measured before being kept or dropped. Over 4 KiB
+    /// plain-text chunks, in milliseconds of CPU per MB ingested (release
+    /// build, macOS, `TerminalActor::new(200, 50)`):
+    ///
+    /// | step | before | after |
+    /// |---|---|---|
+    /// | libghostty `vt_write` | 0.71 – 0.76 | unchanged |
+    /// | OSC scanners (`answer_color_queries` + `osc133`) | 1.36 – 1.39 | **0.03** |
+    /// | `publish_input_snapshot` (≈10 FFI reads + a `watch` send) | 0.02 | unchanged |
+    /// | `refresh_title` (FFI read + string compare) | 0.00 | unchanged |
+    ///
+    /// The two FFI-shaped steps that look expensive are not — libghostty's
+    /// mode and title reads disappear into the noise — so they stay
+    /// unconditional. An earlier revision gated them behind a "did this
+    /// payload contain an escape byte" scan; that scan cost ~0.5 ms/MB, as
+    /// much as the whole VT parse, to avoid 0.02, and was removed.
+    ///
+    /// The scanners were where the money was: two byte-at-a-time state
+    /// machines walking every byte of output to find an introducer that plain
+    /// text never contains. The fix that survived therefore lives inside them
+    /// (a ground-state `memchr` skip), not around them, and takes the actor's
+    /// whole per-chunk ingest cost on plain output from ~2.1 to ~0.6 ms/MB.
     fn ingest_pty_payload(&mut self, payload: &Bytes) {
         self.terminal.borrow_mut().vt_write(payload);
         self.answer_color_queries(payload);

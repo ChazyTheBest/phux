@@ -58,6 +58,10 @@ chrono.workspace = true
 # JSON codec is `serde_json`, already in the dep graph.
 serde.workspace = true
 serde_json.workspace = true
+# SIMD byte search for the PTY ingest hot path; see the workspace dep for the
+# full justification and the measurement that motivated it. Already in the
+# graph via `serde_json`, so it costs no additional compilation.
+memchr.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

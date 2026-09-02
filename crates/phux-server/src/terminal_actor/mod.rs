@@ -164,6 +164,20 @@ enum ColorQueryState {
 
 impl ColorQueryScanner {
     fn feed(&mut self, bytes: &[u8], mut on_query: impl FnMut(u8)) {
+        // Ground-state fast skip, for the same reason as
+        // [`osc133::Osc133Scanner::feed`]: in `Ground` the machine reacts to
+        // exactly two bytes (`ESC` and 8-bit `OSC`), so a chunk of plain
+        // output is a long run of no-ops that used to be stepped one match
+        // arm at a time. Resuming mid-OSC still walks every byte, because
+        // those bytes are the OSC payload.
+        let bytes = if matches!(self.state, ColorQueryState::Ground) {
+            let Some(start) = memchr::memchr2(b'\x1b', 0x9d, bytes) else {
+                return;
+            };
+            &bytes[start..]
+        } else {
+            bytes
+        };
         for byte in bytes {
             match self.state {
                 ColorQueryState::Ground => match *byte {
@@ -583,7 +597,7 @@ enum NativeOrPty {
 
 async fn recv_native_or_pty(
     native: &mut NativeRequestReceivers,
-    pty: Option<&mut mpsc::UnboundedReceiver<PtyEvent>>,
+    pty: Option<&mut mpsc::Receiver<PtyEvent>>,
     prefer_native: bool,
 ) -> NativeOrPty {
     if prefer_native {
@@ -723,7 +737,7 @@ pub struct TerminalActor {
     /// Bytes streaming in from the PTY reader thread. `None` when this
     /// actor is the no-PTY test variant (`TerminalActor::new`); the select!
     /// branch becomes a no-op via `Option::as_mut`.
-    pty_rx: Option<mpsc::UnboundedReceiver<PtyEvent>>,
+    pty_rx: Option<mpsc::Receiver<PtyEvent>>,
     /// Outbound bytes destined for the PTY writer thread. `None` for
     /// the no-PTY test variant.
     pty_tx: Option<mpsc::Sender<EncodedInputRequest>>,
@@ -817,6 +831,15 @@ pub struct TerminalActor {
     /// generic OSC 9 / OSC 777 desktop notifications as asks. The title
     /// sentinel remains the explicit v1 ask signal.
     last_ask: Option<AskMarker>,
+    /// Whether an ask edge was derived but refused by a full agent-state
+    /// sink, so the next PTY chunk must re-derive and retry it.
+    ///
+    /// The retry used to be implicit: the marker was re-parsed on every
+    /// chunk, so a stale `last_ask` simply re-attempted next time. Parsing is
+    /// now gated on a title change (the only thing that can move the answer),
+    /// which makes the owed retry something the actor has to remember rather
+    /// than rediscover.
+    ask_retry_owed: bool,
     /// Whether the pane is currently in an active output "burst": a
     /// `dirty` event has been emitted and no settling `idle` has followed.
     /// Drives the dirty/idle coalescing — at most one `dirty` per burst,

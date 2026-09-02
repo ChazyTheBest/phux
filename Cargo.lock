@@ -2369,6 +2369,7 @@ dependencies = [
  "insta",
  "libc",
  "libghostty-vt",
+ "memchr",
  "nix 0.29.0",
  "phux-config",
  "phux-core",

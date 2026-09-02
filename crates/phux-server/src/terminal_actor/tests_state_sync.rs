@@ -446,6 +446,78 @@ fn atomic_state_sync_bootstrap_primes_exact_cut_and_sequence() {
     );
 }
 
+/// The 33 Hz state-sync timer is armed only when a tick would actually do
+/// something. A pane with no consumer at all — the resting state of every
+/// detached session on the server — must not arm it, because every one of
+/// those wakeups used to construct a span and take two early returns for
+/// nothing.
+#[test]
+fn the_state_tick_is_disarmed_with_nothing_to_emit() {
+    let bundle = TerminalActor::new(20, 5).expect("new");
+    let mut actor = bundle.actor;
+    assert!(
+        !actor.state_tick_armed(),
+        "no consumer, no burst, no native cursor: nothing to tick for",
+    );
+
+    // A raw consumer is served by the broadcast pump, not the tick.
+    let (raw_outbound, _raw_rx) = dummy_outbound();
+    actor
+        .register_consumer(ClientId(1), raw_outbound, 11, false)
+        .expect("register raw consumer");
+    assert!(
+        !actor.state_tick_armed(),
+        "a raw consumer is pumped, not ticked",
+    );
+
+    // A state-sync consumer is exactly what the tick exists for.
+    let (sync_outbound, _sync_rx) = dummy_outbound();
+    actor
+        .register_consumer(ClientId(2), sync_outbound, 12, true)
+        .expect("register state-sync consumer");
+    assert!(
+        actor.state_tick_armed(),
+        "a state-sync consumer must re-arm the tick",
+    );
+}
+
+/// The other re-arming edge: an open output burst owes a settling `idle`,
+/// which only the tick can emit. Disarming while a burst is open would strand
+/// the pane in `dirty` forever.
+#[test]
+fn an_open_output_burst_arms_the_state_tick() {
+    let bundle = TerminalActor::new(20, 5).expect("new");
+    let mut actor = bundle.actor;
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    actor.set_event_sink(event_tx);
+    assert!(!actor.state_tick_armed(), "quiet pane, disarmed");
+
+    actor.vt_write_for_test(b"hello");
+    actor.source_events_from_chunk(b"hello");
+    assert!(
+        matches!(event_rx.try_recv(), Ok(AgentEvent::Dirty)),
+        "the burst opened",
+    );
+    assert!(
+        actor.state_tick_armed(),
+        "an open burst owes an idle, so the tick must be armed",
+    );
+
+    // First tick sees the output flag and holds; the second settles the burst
+    // and disarms again.
+    actor.service_state_tick_for_test();
+    assert!(actor.state_tick_armed(), "burst still open");
+    actor.service_state_tick_for_test();
+    assert!(
+        matches!(event_rx.try_recv(), Ok(AgentEvent::Idle)),
+        "the settling idle still fires",
+    );
+    assert!(
+        !actor.state_tick_armed(),
+        "a settled pane disarms the tick again",
+    );
+}
+
 /// phux-bowo: dirty/idle settling is independent of the state-sync
 /// emitter gate. A raw-only pane must produce a fresh pair for each
 /// output burst even though `tick_emit` stays gated and therefore leaves

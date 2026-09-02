@@ -146,6 +146,18 @@ serde = { version = "1", features = ["derive"] }
 # `crates/phux-server/src/upgrade/blob.rs` for why the default 128-level cap is
 # wrong for that one parse.
 serde_json = { version = "1", features = ["unbounded_depth"] }
+# SIMD byte search for the PTY ingest hot path. The pane actor scans every
+# PTY byte twice (the OSC-133 prompt-mark scanner and the OSC 10/11 colour
+# query scanner), and both spend nearly all of that time in their ground
+# state looking for a single introducer byte. Measured on a 4 KiB plain-text
+# chunk, the hand-written `iter().position()` skip costs ~0.5 ms/MB per
+# scanner — comparable to libghostty's entire VT parse of the same bytes —
+# because an early-exiting search does not vectorize. `memchr` is the
+# standard, thoroughly tested SIMD implementation of exactly this primitive.
+# It adds nothing to the build: 2.8.1 is already compiled into every phux
+# binary through `serde_json` (and `regex`, `nom`, `axum`), so this only
+# names a dependency the graph already carries.
+memchr = "2"
 toml = "1"
 # Comment-preserving edits for user-owned config.toml. The plugin lifecycle
 # commands need to toggle/add/remove `[[plugins]]` entries without flattening a

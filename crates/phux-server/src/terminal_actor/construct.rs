@@ -308,6 +308,7 @@ impl TerminalActor {
             agent_state_sink: None,
             agent_dirty_since_detect: false,
             last_ask: None,
+            ask_retry_owed: false,
             in_output_burst: false,
             output_since_idle_tick: false,
             event_subscribers: RefCell::new(Vec::new()),

@@ -10,10 +10,45 @@ use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-/// Default PTY read chunk size. Mirrors the example. Sized comfortably
-/// above the typical libghostty escape-sequence span so a single read
-/// rarely splits a sequence boundary.
-const PTY_READ_CHUNK: usize = 4096;
+/// Default PTY read chunk size.
+///
+/// Every read that returns is one channel message, one actor wakeup, and one
+/// pass through the per-chunk fixed costs the actor pays regardless of
+/// payload size. Raising the ceiling lets a platform whose line discipline
+/// has more queued hand it over in one go.
+///
+/// It is a ceiling, not a target, and measurement says the kernel is the
+/// binding constraint, not this number: on macOS a PTY master read returns at
+/// most 1024 bytes however large the buffer is (measured over a 1.5 MB
+/// `seq` burst — 2215 reads, mean 672 B, max 1024 B, identical at a 64 KiB
+/// buffer). So this is sized for the platforms that *can* fill it while
+/// staying small enough that `PTY_READ_CHUNK * PTY_CHANNEL_DEPTH` is a
+/// defensible per-pane memory bound; a 64 KiB buffer bought nothing
+/// measurable and multiplied that bound by four.
+const PTY_READ_CHUNK: usize = 16 * 1024;
+
+/// Depth of the reader-thread -> actor PTY channel.
+///
+/// The channel used to be unbounded, so a runaway producer (`cat` of a huge
+/// file, `yes`) could grow the queue without limit while the actor was busy:
+/// memory tracked the producer's speed rather than the consumer's. Bounding
+/// it turns that into backpressure — the reader thread blocks in
+/// `blocking_send`, stops draining the PTY, and the kernel line discipline
+/// stalls the child, exactly as tmux does.
+///
+/// Blocking the reader is safe because the actor never waits on it: the
+/// `select!` loop polls the PTY receiver every turn and `shutdown_pty` drops
+/// the receiver before joining the reader thread, which fails the pending
+/// `blocking_send` and releases it.
+///
+/// The depth is bounded *below* by coalescing, not by memory. The actor
+/// batches up to `MAX_PTY_COALESCE` queued chunks into one `vt_write` +
+/// broadcast frame, so a queue shallower than that cap silently throttles the
+/// batcher: at depth 8 the same 1.5 MB burst went from 84 `vt_write`s
+/// averaging 17.7 KB to 520 averaging 2.9 KB, and paid every per-chunk fixed
+/// cost six times over. 128 keeps the batcher supplied with headroom to
+/// spare while capping one pane at `PTY_READ_CHUNK * 128` = 2 MiB.
+pub(super) const PTY_CHANNEL_DEPTH: usize = 128;
 
 /// `EIO` on a PTY master write means the slave side is gone — the child
 /// exited or closed its end. Every Unix spells it 5; `std::io::ErrorKind`
@@ -419,7 +454,12 @@ impl std::fmt::Debug for PtyOwned {
 #[derive(Debug)]
 pub(crate) enum PtyEvent {
     /// A chunk of bytes read from the PTY master.
-    Bytes(Vec<u8>),
+    ///
+    /// `Bytes`, not `Vec<u8>`: the chunk is broadcast to every attached
+    /// consumer as a refcounted payload, so handing the actor a `Bytes`
+    /// removes the `Vec -> Bytes` conversion the broadcast path used to make
+    /// on every chunk.
+    Bytes(bytes::Bytes),
     /// The PTY hit EOF or errored. Either way: the child is going away.
     Eof,
 }
@@ -740,7 +780,7 @@ pub fn shell_command(shell: &str, command: &str, login: bool) -> CommandBuilder 
     cmd
 }
 type SpawnedPty = (
-    mpsc::UnboundedReceiver<PtyEvent>,
+    mpsc::Receiver<PtyEvent>,
     mpsc::Sender<EncodedInputRequest>,
     PtyOwned,
 );
@@ -748,9 +788,7 @@ type SpawnedPty = (
 /// Receive from `rx` when `Some`; otherwise park forever. Used as a
 /// select! arm so the actor's loop can run with or without a PTY
 /// without an `expect()` or branching `if`.
-pub(crate) async fn recv_or_pending(
-    rx: Option<&mut mpsc::UnboundedReceiver<PtyEvent>>,
-) -> Option<PtyEvent> {
+pub(crate) async fn recv_or_pending(rx: Option<&mut mpsc::Receiver<PtyEvent>>) -> Option<PtyEvent> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -810,6 +848,35 @@ pub(crate) fn adopt_pty(
     start_pty_bridge(master, child)
 }
 
+/// Hand one PTY chunk to the actor, blocking the reader thread only when the
+/// queue is genuinely full.
+///
+/// `try_send` first, `blocking_send` on the rebound. The distinction is worth
+/// the four extra lines: the reader makes one of these calls per `read(2)` —
+/// on macOS the line discipline caps a read at 1024 bytes, so a 6.9 MB burst
+/// is ~9700 of them — and `blocking_send` pays a `block_on` park setup every
+/// time, which measured as roughly 20-70 ms of extra wall clock per burst
+/// even though the queue was never actually full. `try_send` is a semaphore
+/// `try_acquire` plus a push. The blocking path still exists, and is still
+/// the whole point of bounding the channel: when a runaway producer really
+/// does outrun the actor, the reader parks here, stops draining the PTY, and
+/// the child stalls on `write(2)`.
+///
+/// Returns `Break` when the receive half is gone and the reader must exit.
+fn send_pty_chunk(tx: &mpsc::Sender<PtyEvent>, chunk: bytes::Bytes) -> std::ops::ControlFlow<()> {
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(PtyEvent::Bytes(chunk)) {
+        Ok(()) => std::ops::ControlFlow::Continue(()),
+        Err(TrySendError::Full(event)) => {
+            if tx.blocking_send(event).is_err() {
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+        Err(TrySendError::Closed(_)) => std::ops::ControlFlow::Break(()),
+    }
+}
+
 /// Shared tail of [`spawn_pty`] / [`adopt_pty`]: take the master's reader +
 /// writer halves, start the reader / writer bridge threads, and assemble the
 /// [`PtyOwned`] bundle + actor-side channel endpoints.
@@ -829,33 +896,36 @@ fn start_pty_bridge(
     // other clone alive for resize ioctls.
     let master_for_writer = Arc::clone(&master);
 
-    let (pty_tx_to_actor, pty_rx_for_actor) = mpsc::unbounded_channel::<PtyEvent>();
+    let (pty_tx_to_actor, pty_rx_for_actor) = mpsc::channel::<PtyEvent>(PTY_CHANNEL_DEPTH);
     let (input_tx_to_writer, mut input_rx_for_writer) =
         mpsc::channel::<EncodedInputRequest>(super::DEFAULT_INPUT_MAILBOX);
 
     let reader_thread = std::thread::Builder::new()
         .name("phux-pty-reader".to_owned())
         .spawn(move || {
-            let mut buf = [0u8; PTY_READ_CHUNK];
+            // Heap, not stack: the buffer is `PTY_READ_CHUNK` wide and lives
+            // for the whole thread.
+            let mut buf = vec![0_u8; PTY_READ_CHUNK];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let _ = pty_tx_to_actor.send(PtyEvent::Eof);
+                        let _ = pty_tx_to_actor.blocking_send(PtyEvent::Eof);
                         break;
                     }
                     Ok(n) => {
                         debug!(n, "pty read");
-                        if pty_tx_to_actor
-                            .send(PtyEvent::Bytes(buf[..n].to_vec()))
-                            .is_err()
-                        {
+                        // One exact-size allocation per read, as before, but
+                        // now already in the refcounted shape the broadcast
+                        // path wants.
+                        let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                        if send_pty_chunk(&pty_tx_to_actor, chunk).is_break() {
                             // Actor went away.
                             break;
                         }
                     }
                     Err(err) => {
                         debug!(?err, "pty reader thread: read error");
-                        let _ = pty_tx_to_actor.send(PtyEvent::Eof);
+                        let _ = pty_tx_to_actor.blocking_send(PtyEvent::Eof);
                         break;
                     }
                 }

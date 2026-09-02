@@ -463,6 +463,13 @@ impl TerminalActor {
             Ok(status) => debug!(?status, "pty child reaped"),
             Err(err) => debug!(?err, "pty child wait failed"),
         }
+        // Close the PTY receiver before joining the reader. The channel is
+        // bounded (`spawn::PTY_CHANNEL_DEPTH`), so a reader parked in
+        // `blocking_send` behind a full queue only wakes when the receive
+        // half goes away; joining first would deadlock teardown. Nothing
+        // reads `pty_rx` after this point — both `shutdown_pty` callers
+        // return from `run` immediately afterwards.
+        self.pty_rx = None;
         // We can't drop `pty.master` separately because it's behind an
         // Arc<Mutex<_>> — the Arc strong count drops when `pty` falls
         // out of scope at the end of this function.
