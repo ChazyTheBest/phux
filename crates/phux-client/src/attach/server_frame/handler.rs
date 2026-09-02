@@ -15,9 +15,7 @@ use crate::attach::actions::{
     self, PendingSplit, PendingWindow, apply_spawned_ok, apply_terminal_closed,
 };
 use crate::attach::outcome::{AttachEnd, AttachError, describe_exit};
-use crate::attach::paint::{
-    SidebarReservation, StatusBarPaint, content_rect, paint_bar_after_pane, paint_focused_pane,
-};
+use crate::attach::paint::{SidebarReservation, StatusBarPaint, content_rect, paint_focused_pane};
 use crate::attach::pane_state::{
     AttachKernel, PaneSlot, published_replica, published_terminal, reanchor_predict_to_pane,
 };
@@ -107,27 +105,6 @@ struct FrameCtx<'a, W: crate::attach::RenderSink> {
     /// The per-inbound-frame dispatch span. The heavy content arms record
     /// their identifiers and payload sizes onto it.
     frame_span: &'a tracing::Span,
-}
-
-/// Everything a `TERMINAL_OUTPUT` paint touches: the sink it writes to, the
-/// pane mirrors it renders from, the layout it tiles against, and the chrome
-/// that follows the pane render.
-///
-/// Built by reborrowing disjoint [`FrameCtx`] fields at the paint site, so the
-/// two paint policies below (focused pane, background pane) share one context
-/// instead of a dozen positional arguments.
-struct OutputPaint<'a, W> {
-    out: &'a mut W,
-    panes: &'a mut HashMap<TerminalId, PaneSlot>,
-    kernel: &'a AttachKernel,
-    /// The zoom-honoring view to tile against (phux-x2hm).
-    active_ls: &'a LayoutState,
-    status_bar: Option<&'a mut StatusBarPainter>,
-    session_name: &'a str,
-    sidebar: Option<SidebarReservation>,
-    viewport_dims: (u16, u16),
-    /// The pooled walk over the pane's published libghostty replica.
-    walk: ReplicaWalk<'a, 'static, 'static>,
 }
 
 /// Process one server-to-client frame. Returns a [`FrameOutcome`]
@@ -539,6 +516,10 @@ const fn paint_permitted(
 /// phux-x2hm: read through the zoom-honoring view, so a zoomed pane is sized
 /// against the whole window. Falls back to the content rect when the pane has
 /// no tile (single-pane bootstrap, or a pane in a non-active window).
+///
+/// Reached ONLY the first time a pane is seen. Its caller used to run this on
+/// every output frame — before the damage check and before the coalescing
+/// gate — to size a mirror that, on all but the first frame, already existed.
 fn initial_pane_dims<W: crate::attach::RenderSink>(
     ctx: &FrameCtx<'_, W>,
     terminal_id: &TerminalId,
@@ -547,9 +528,7 @@ fn initial_pane_dims<W: crate::attach::RenderSink>(
     ctx.workspace
         .render_window(ctx.zoomed.as_ref())
         .and_then(|ls| {
-            crate::attach::multi_pane::compute_layout_in(ls.as_ref(), content, ctx.viewport_dims)
-                .rects
-                .get(terminal_id)
+            crate::attach::paint::tiled_rect(ls.as_ref(), content, ctx.viewport_dims, terminal_id)
                 .map(|r| (r.w, r.h))
         })
         .unwrap_or((content.w, content.h))
@@ -563,6 +542,13 @@ fn initial_pane_dims<W: crate::attach::RenderSink>(
 /// attach barrier permits paint damage: a pre-barrier OSC title must update
 /// chrome caches even though its visible repaint remains suppressed until
 /// `ATTACH_READY`.
+///
+/// Everything a suppressed frame does NOT do is as load-bearing as what a
+/// painted one does. A frame whose paint is withheld — by the coalescing
+/// mask, a modal overlay, an open synchronized-output transaction, or the
+/// driver's frame pacer — applies its bytes (that already happened in the
+/// kernel), refreshes the pane's title and sync-output bookkeeping, and
+/// returns. It tiles no layout, allocates no mirror, and composes no chrome.
 fn handle_terminal_output<W: crate::attach::RenderSink>(
     ctx: &mut FrameCtx<'_, W>,
     terminal_id: &TerminalId,
@@ -578,7 +564,6 @@ fn handle_terminal_output<W: crate::attach::RenderSink>(
     // carries the resulting notice; the branches are exclusive, so
     // only one of them moves it.
     let notices = route.notices;
-    let mut status_bar_painted = StatusBarPaint::NotPublished;
     // Correlate this apply: which pane, which seq, how many bytes.
     // The span's CLOSE duration is the per-frame client paint cost
     // (vt_write + render_at for the focused pane) — the headline
@@ -588,6 +573,7 @@ fn handle_terminal_output<W: crate::attach::RenderSink>(
         .record("terminal_id", tracing::field::debug(terminal_id));
     ctx.frame_span.record("seq", seq);
     ctx.frame_span.record("bytes", bytes.len());
+    crate::attach::render_prof::note_frames(1);
     let walk = published_replica(ctx.engine_kernel, terminal_id).ok_or_else(|| {
         AttachError::Protocol(format!(
             "TERMINAL_OUTPUT targeted unpublished {terminal_id:?}"
@@ -596,13 +582,18 @@ fn handle_terminal_output<W: crate::attach::RenderSink>(
     let terminal = walk.terminal;
     let bar = ctx.status_bar.as_ref().map(|p| p.position());
     let content = content_rect(ctx.viewport_dims, bar, ctx.sidebar);
-    let initial_dims = initial_pane_dims(ctx, terminal_id, content);
-    let is_focused = ctx.focused_pane.as_ref() == Some(terminal_id);
-    let slot = match ctx.panes.entry(terminal_id.clone()) {
-        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-        std::collections::hash_map::Entry::Vacant(v) => {
-            v.insert(PaneSlot::new_with_size(initial_dims.0, initial_dims.1)?)
-        }
+    // Seed a mirror only for a pane we have never seen. The tiling that sizes
+    // it is computed inside this branch, so the steady-state frame pays one
+    // hash lookup instead of a full `compute_layout_in`.
+    if !ctx.panes.contains_key(terminal_id) {
+        let (cols, rows) = initial_pane_dims(ctx, terminal_id, content);
+        ctx.panes
+            .insert(terminal_id.clone(), PaneSlot::new_with_size(cols, rows)?);
+    }
+    let Some(slot) = ctx.panes.get_mut(terminal_id) else {
+        return Err(AttachError::Protocol(format!(
+            "pane slot missing for {terminal_id:?} after seeding"
+        )));
     };
     let title_changed = slot.title_changed(terminal);
     let sync_output_active = slot.update_sync_output(terminal, tokio::time::Instant::now());
@@ -614,44 +605,33 @@ fn handle_terminal_output<W: crate::attach::RenderSink>(
             ..FrameOutcome::default()
         });
     }
-    // The libghostty mirror is now warm even for panes in a
-    // non-active window (off-screen invariant). Rendering only
-    // applies to the active window's composition; if there's no
-    // active window there's nothing on-screen to repaint.
-    // phux-x2hm: render against the zoom-honoring view so a zoomed
-    // pane paints to the whole window and the others (absent from the
-    // synthetic single-leaf layout) get no rect and so do not paint.
-    let Some(active_ls) = ctx.workspace.render_window(ctx.zoomed.as_ref()) else {
+    if !paint_permitted(ctx.overlay_active, ctx.defer_paint, sync_output_active) {
+        crate::attach::render_prof::note_skipped(1);
         return Ok(FrameOutcome {
             ack,
-            pty_writes,
             chrome_dirty: title_changed,
+            pty_writes,
             notices,
             ..FrameOutcome::default()
         });
-    };
-    let active_ls = active_ls.as_ref();
-    if paint_permitted(ctx.overlay_active, ctx.defer_paint, sync_output_active) {
-        let paint = OutputPaint {
+    }
+    let status_bar_painted = paint_output_frame(
+        OutputFrame {
             out: ctx.out,
-            panes: ctx.panes,
             kernel: ctx.engine_kernel,
-            active_ls,
+            panes: ctx.panes,
+            workspace: ctx.workspace,
+            zoomed: ctx.zoomed.as_ref(),
+            focused_pane: ctx.focused_pane.as_ref(),
             status_bar: ctx.status_bar.as_deref_mut(),
-            session_name: ctx.session_name.as_str(),
             sidebar: ctx.sidebar,
             viewport_dims: ctx.viewport_dims,
-            walk,
-        };
-        // A focused pane is by construction the one `focused_pane` names, so
-        // the `let` below never fails when `is_focused` holds.
-        let painted = if is_focused && let Some(fid) = ctx.focused_pane.as_ref() {
-            paint_focused_output(paint, fid, ctx.predict, ctx.overlay)
-        } else {
-            paint_background_output(paint, terminal_id, ctx.focused_pane.as_ref())
-        };
-        status_bar_painted = status_bar_painted.or(painted);
-    }
+            session_name: ctx.session_name.as_str(),
+            predict: ctx.predict,
+            overlay: ctx.overlay,
+        },
+        std::slice::from_ref(terminal_id),
+    );
     Ok(FrameOutcome {
         ack,
         chrome_dirty: title_changed,
@@ -662,53 +642,185 @@ fn handle_terminal_output<W: crate::attach::RenderSink>(
     })
 }
 
-/// phux-flywheel: the paint trigger — render the focused pane (this enters
-/// `paint_full_frame`'s span inside `paint_focused_pane`), reconcile
-/// predictions, repaint the bar. Its OWN child span isolates paint cost from
-/// the `vt_apply` above so a trace shows apply-ms vs paint-ms separately.
-/// Debug-level + lazy `rows` field ⇒ free at the default filter.
-fn paint_focused_output<W: crate::attach::RenderSink>(
-    paint: OutputPaint<'_, W>,
+/// Everything one composited output frame paints from.
+///
+/// Gathered as a struct rather than a positional list because there are two
+/// callers with unrelated shapes: this module's `TERMINAL_OUTPUT` arm, which
+/// reborrows disjoint [`FrameCtx`] fields, and the driver's frame pacer,
+/// which builds it from [`crate::attach::driver`]-owned state when a withheld
+/// paint's deadline expires.
+pub(in crate::attach) struct OutputFrame<'a, W> {
+    pub(in crate::attach) out: &'a mut W,
+    pub(in crate::attach) kernel: &'a AttachKernel,
+    pub(in crate::attach) panes: &'a mut HashMap<TerminalId, PaneSlot>,
+    pub(in crate::attach) workspace: &'a Workspace,
+    /// phux-x2hm: the pane zoomed to fill the window, if any.
+    pub(in crate::attach) zoomed: Option<&'a TerminalId>,
+    pub(in crate::attach) focused_pane: Option<&'a TerminalId>,
+    pub(in crate::attach) status_bar: Option<&'a mut StatusBarPainter>,
+    pub(in crate::attach) sidebar: Option<SidebarReservation>,
+    pub(in crate::attach) viewport_dims: (u16, u16),
+    pub(in crate::attach) session_name: &'a str,
+    pub(in crate::attach) predict: &'a mut PredictionState,
+    pub(in crate::attach) overlay: &'a Overlay,
+}
+
+/// Composite and ship ONE frame covering every pane in `targets`.
+///
+/// The frame is a single DEC 2026 synchronized-output block containing, in
+/// order: each target pane's interior, the predictive-echo overlay, the status
+/// bar, and the end-of-frame cursor — then one flush. Before this, the
+/// incremental path emitted the pane and the bar as separate visible states
+/// with a flush apiece, so a terminal could present a frame with new cells and
+/// last frame's chrome, and the off-loop stdout writer was woken twice per
+/// frame.
+///
+/// `targets` is a slice rather than one id because a paced frame settles every
+/// pane whose paint was withheld during the window, and they must land in the
+/// same block: two panes settling in two blocks is the tearing this function
+/// exists to remove, just at a coarser grain.
+pub(in crate::attach) fn paint_output_frame<W: crate::attach::RenderSink>(
+    paint: OutputFrame<'_, W>,
+    targets: &[TerminalId],
+) -> StatusBarPaint {
+    let OutputFrame {
+        out,
+        kernel,
+        panes,
+        workspace,
+        zoomed,
+        focused_pane,
+        status_bar,
+        sidebar,
+        viewport_dims,
+        session_name,
+        predict,
+        overlay,
+    } = paint;
+    // The libghostty mirrors are warm even for panes in a non-active window
+    // (off-screen invariant). Rendering only applies to the active window's
+    // composition; with no active window there is nothing on-screen to
+    // repaint. phux-x2hm: tile against the zoom-honoring view, so a zoomed
+    // pane paints to the whole window and the others — absent from the
+    // synthetic single-leaf layout — get no rect and so do not paint.
+    let Some(active_ls) = workspace.render_window(zoomed) else {
+        return StatusBarPaint::NotPublished;
+    };
+    let active_ls = active_ls.as_ref();
+    let bar = status_bar.as_ref().map(|p| p.position());
+    let content = content_rect(viewport_dims, bar, sidebar);
+    // phux-flywheel: the paint trigger. Its OWN child span isolates paint cost
+    // from the `vt_apply` above, so a trace shows apply-ms vs paint-ms
+    // separately. Debug-level + lazy `rows` field => free at the default filter.
+    let _paint_trigger = tracing::debug_span!("paint_trigger", rows = viewport_dims.1).entered();
+    let mut block = crate::attach::paint::FrameBlock::begin(out);
+    for terminal_id in targets {
+        let rect = crate::attach::paint::tiled_rect(active_ls, content, viewport_dims, terminal_id);
+        let Some(walk) = published_replica(kernel, terminal_id) else {
+            continue;
+        };
+        if focused_pane == Some(terminal_id) {
+            paint_focused_interior(
+                &mut block,
+                rect.unwrap_or(content),
+                panes,
+                kernel,
+                terminal_id,
+                walk,
+                predict,
+                overlay,
+            );
+        } else if let Some(rect) = rect {
+            // phux-2x9: a non-focused pane repaints on its own output so it is
+            // not visually frozen. A pane with no rect is off-screen (another
+            // window) and paints nothing.
+            paint_background_interior(&mut block, rect, panes, terminal_id, walk);
+        }
+    }
+    finish_output_frame(
+        block,
+        status_bar,
+        &FrameTail {
+            focused_pane,
+            panes,
+            active_ls,
+            content,
+            viewport_dims,
+            sidebar,
+            session_name,
+        },
+    )
+}
+
+/// The chrome-and-cursor tail of a composited frame.
+struct FrameTail<'a> {
+    focused_pane: Option<&'a TerminalId>,
+    panes: &'a HashMap<TerminalId, PaneSlot>,
+    active_ls: &'a LayoutState,
+    content: Rect,
+    viewport_dims: (u16, u16),
+    sidebar: Option<SidebarReservation>,
+    session_name: &'a str,
+}
+
+/// Close a composited frame: status bar, then the one cursor placement, then
+/// the block epilogue and its single flush.
+fn finish_output_frame<W: crate::attach::RenderSink>(
+    block: crate::attach::paint::FrameBlock<'_, W>,
+    status_bar: Option<&mut StatusBarPainter>,
+    tail: &FrameTail<'_>,
+) -> StatusBarPaint {
+    let focused_cursor = tail
+        .focused_pane
+        .and_then(|fid| tail.panes.get(fid))
+        .and_then(|slot| slot.renderer.last_cursor());
+    // phux-9xn: the focused pane's Rect origin parks (and hides) the cursor
+    // when `last_cursor` is None, so a frame never strands it at the bar's
+    // tail — bottom-right of the host terminal.
+    let fallback_origin = tail
+        .focused_pane
+        .and_then(|fid| {
+            crate::attach::paint::tiled_rect(tail.active_ls, tail.content, tail.viewport_dims, fid)
+        })
+        .map_or(Some((0, 0)), |r| Some((r.x, r.y)));
+    crate::attach::paint::close_frame_with_chrome(
+        block,
+        status_bar,
+        tail.viewport_dims,
+        tail.sidebar,
+        tail.session_name,
+        focused_cursor,
+        fallback_origin,
+        // A pane-output frame changes no bar input, so the widget pipeline
+        // runs only if a setter already marked the strip dirty.
+        crate::render::chrome::status_bar::ComposePolicy::WhenDirty,
+    )
+}
+
+/// Render the focused pane's interior and reconcile predictions against the
+/// cells that just landed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the focused-pane paint context: sink, geometry, mirrors, kernel, predictor, overlay; same arg-list refactor follow-up as paint_full_frame"
+)]
+fn paint_focused_interior<W: crate::attach::RenderSink>(
+    out: &mut W,
+    rect: Rect,
+    panes: &mut HashMap<TerminalId, PaneSlot>,
+    kernel: &AttachKernel,
     fid: &TerminalId,
+    walk: ReplicaWalk<'_, 'static, 'static>,
     predict: &mut PredictionState,
     overlay: &Overlay,
-) -> StatusBarPaint {
-    let OutputPaint {
-        out,
-        panes,
-        kernel,
-        active_ls,
-        status_bar,
-        session_name,
-        sidebar,
-        viewport_dims,
-        walk,
-    } = paint;
-    let _paint_trigger = tracing::debug_span!("paint_trigger", rows = viewport_dims.1).entered();
-    let bar = status_bar.as_ref().map(|p| p.position());
-    let _ = paint_focused_pane(
-        out,
-        active_ls,
-        panes,
-        kernel,
-        fid,
-        viewport_dims,
-        bar,
-        sidebar,
-        false,
-    );
+) {
+    let _ = paint_focused_pane(out, rect, panes, kernel, fid, false);
     // The reconcile + overlay work entirely in PANE-LOCAL
     // coordinates (predictions are pane-local; the cell reader
-    // indexes the pane's own grid). `focused_cursor` (outer) is
-    // kept only for the host-cursor restore in the bar paint.
-    let (focused_cursor, focused_cursor_local, pane_origin) =
-        panes.get(fid).map_or((None, None, (0, 0)), |s| {
-            (
-                s.renderer.last_cursor(),
-                s.renderer.last_cursor_local(),
-                s.renderer.last_origin(),
-            )
-        });
+    // indexes the pane's own grid). The outer `last_cursor` is
+    // kept only for the frame's cursor tail.
+    let (focused_cursor_local, pane_origin) = panes.get(fid).map_or((None, (0, 0)), |s| {
+        (s.renderer.last_cursor_local(), s.renderer.last_origin())
+    });
     // ADR-0090: sync the screen mode before reconciling — the
     // frame just applied may have switched screens (vim
     // starting or exiting), and predictions anchored to the
@@ -753,112 +865,40 @@ fn paint_focused_output<W: crate::attach::RenderSink>(
     if predict.should_display(crate::attach::input_dispatch::predict_now_ms()) {
         let _ = overlay.render(predict, pane_origin, out);
     }
-    // phux-9xn: compute the focused pane's Rect origin so
-    // the bar paint can park the cursor there if
-    // `last_cursor` is None. Without this fallback the
-    // bar's final write leaves the host terminal cursor
-    // at bottom-right.
-    let content = content_rect(viewport_dims, bar, sidebar);
-    let fallback_origin =
-        crate::attach::multi_pane::compute_layout_in(active_ls, content, viewport_dims)
-            .rects
-            .get(fid)
-            .map(|r| (r.x, r.y))
-            .or(Some((0, 0)));
-    paint_bar_after_pane(
-        status_bar,
-        out,
-        viewport_dims,
-        sidebar,
-        session_name,
-        focused_cursor,
-        fallback_origin,
-        // Hot path: pane render stays above the bar row, so the
-        // painter's cache makes an unchanged bar a zero-byte
-        // no-op (incremental-paint win).
-        false,
-    )
 }
 
 /// phux-2x9: repaint a NON-focused pane on its own output so it isn't
 /// visually frozen — output (and the post-split/resize resync snapshot) must
 /// show without the user focusing the pane. `render_at` is dirty-tracked, so
-/// steady-state output only repaints changed rows. After painting into this
-/// pane's rect we restore the focused pane's cursor so the host cursor stays
-/// where the user is typing.
-fn paint_background_output<W: crate::attach::RenderSink>(
-    paint: OutputPaint<'_, W>,
+/// steady-state output only repaints changed rows. The frame's shared tail
+/// then restores the focused pane's cursor, so the host cursor ends where the
+/// user is typing.
+fn paint_background_interior<W: crate::attach::RenderSink>(
+    out: &mut W,
+    rect: Rect,
+    panes: &mut HashMap<TerminalId, PaneSlot>,
     terminal_id: &TerminalId,
-    focused_pane: Option<&TerminalId>,
-) -> StatusBarPaint {
-    let OutputPaint {
-        out,
-        panes,
-        kernel: _,
-        active_ls,
-        status_bar,
-        session_name,
-        sidebar,
-        viewport_dims,
-        walk,
-    } = paint;
-    let bar = status_bar.as_ref().map(|p| p.position());
-    let content = content_rect(viewport_dims, bar, sidebar);
-    let rects =
-        crate::attach::multi_pane::compute_layout_in(active_ls, content, viewport_dims).rects;
-    let Some(rect) = rects.get(terminal_id).copied() else {
-        return StatusBarPaint::NotPublished;
+    walk: ReplicaWalk<'_, 'static, 'static>,
+) {
+    let Some(slot) = panes.get_mut(terminal_id) else {
+        return;
     };
-    if let Some(slot) = panes.get_mut(terminal_id) {
-        // phux-foz.11: letterbox like every other paint path.
-        // An undersized mirror (resize handshake in flight)
-        // painted incrementally at the rect origin here, while
-        // `paint_full_frame` centres the same mirror — dirty
-        // rows then land offset from the full-frame rows and
-        // the pane shows doubled text until a full repaint.
-        // Mirror >= rect degrades to the prior `render_at`.
-        let mirror = crate::attach::paint::mirror_dims(walk.terminal, rect);
-        let _ = slot.renderer.render_at_letterboxed(
-            walk,
-            out,
-            (rect.x, rect.y),
-            (rect.w, rect.h),
-            mirror,
-            false,
-        );
-    }
-    // Restore the focused pane's cursor: the render above
-    // left the host cursor inside the non-focused pane.
-    let focused_cursor = focused_pane
-        .and_then(|fid| panes.get(fid))
-        .and_then(|s| s.renderer.last_cursor());
-    if status_bar.is_some() {
-        let fallback = focused_pane
-            .and_then(|fid| rects.get(fid))
-            .map(|r| (r.x, r.y));
-        return paint_bar_after_pane(
-            status_bar,
-            out,
-            viewport_dims,
-            sidebar,
-            session_name,
-            focused_cursor,
-            fallback,
-            // Non-focused pane render stays above the bar
-            // row; cache decides whether to re-emit.
-            false,
-        );
-    }
-    if let Some((row, col)) = focused_cursor {
-        let _ = write!(
-            out,
-            "\x1b[{};{}H\x1b[?25h",
-            row.saturating_add(1),
-            col.saturating_add(1)
-        );
-    }
-    let _ = out.flush();
-    StatusBarPaint::NotPublished
+    // phux-foz.11: letterbox like every other paint path.
+    // An undersized mirror (resize handshake in flight)
+    // painted incrementally at the rect origin here, while
+    // `paint_full_frame` centres the same mirror — dirty
+    // rows then land offset from the full-frame rows and
+    // the pane shows doubled text until a full repaint.
+    // Mirror >= rect degrades to the prior `render_at`.
+    let mirror = crate::attach::paint::mirror_dims(walk.terminal, rect);
+    let _ = slot.renderer.render_at_letterboxed(
+        walk,
+        out,
+        (rect.x, rect.y),
+        (rect.w, rect.h),
+        mirror,
+        false,
+    );
 }
 
 /// The reason is the whole point of the frame (phux-l83x): with `ERROR`

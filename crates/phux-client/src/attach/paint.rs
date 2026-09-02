@@ -19,13 +19,308 @@ use phux_protocol::ids::TerminalId;
 
 use super::pane_state::{AttachKernel, PaneSlot, published_replica};
 use crate::layout::LayoutState;
-use crate::render::chrome::status_bar::{BarInset, Position, StatusBarPainter, make_context};
+use crate::render::chrome::status_bar::{
+    BarInset, ComposePolicy, Position, StatusBarPainter, make_context,
+};
 
 // phux-l96p.2: the DEC 2026 constants and the nestable guard that owns them
 // moved to `super::render` so the per-pane paint can open its own block
 // without truncating the frame-level one opened here. `SyncOutput::begin`
 // emits the mode bytes only for the outermost block.
 use super::render::SyncOutput;
+
+/// Hide the cursor for the duration of a composited frame. Emitted just
+/// inside the synchronized-output block so a terminal that ignores mode 2026
+/// still never shows the cursor skating across a half-painted grid; the
+/// frame's own [`end_of_frame_cursor`] shows it again at the authoritative
+/// position.
+const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
+
+/// One composited frame: a DEC 2026 synchronized-output block that swallows
+/// the flushes of everything painted inside it and ships exactly once at the
+/// end.
+///
+/// Two problems solved together, both of which are per-frame costs on the
+/// hottest path in the client:
+///
+/// * **One block, not none.** Before this, only the destructive full-frame
+///   paint was wrapped in mode 2026. The incremental path — the one that runs
+///   on every `TERMINAL_OUTPUT` — emitted pane cells, then the status bar,
+///   then the cursor, each visible to the outer terminal as it landed. A
+///   conforming terminal presented up to three intermediate states per frame.
+/// * **One flush, not two.** [`end_of_frame_cursor`] flushes, and before
+///   phux-l96p.2 the pane renderer's epilogue flushed too. Against the
+///   off-loop [`super::stdout_writer::StdoutSink`] each flush is a queue push
+///   plus a condvar wake of the writer thread.
+///
+/// The wrapper is deliberately a `Write` rather than a change to the painters:
+/// each painter keeps whatever `flush()` calls it needs to be correct
+/// standalone (in tests, or the headless renderer), and this type makes them
+/// no-ops for the duration of a composed frame.
+///
+/// # Why the body is buffered
+///
+/// The block's DEPTH is taken in [`Self::begin`], before any painter runs,
+/// and released in [`Self::end`]. That ordering is load-bearing: the pane
+/// renderer opens its own [`SyncOutput`] around a dirty repaint, and it must
+/// see a non-zero depth so it nests instead of closing the frame's block half
+/// way through — leaving the status bar and the cursor outside the
+/// transaction, which is exactly the tearing this type exists to remove.
+///
+/// Taking the depth eagerly means [`SyncOutput::begin`] emits `?2026h`
+/// eagerly too. So it emits into a scratch buffer rather than to the sink,
+/// and [`Self::end`] ships the buffer only if a painter actually wrote
+/// something. A frame that emits nothing — every pane clean, the bar cached,
+/// the cursor already where it belongs — therefore still costs zero bytes,
+/// zero writes, and no writer-thread wake, which is what makes an idle attach
+/// silent between status ticks.
+///
+/// The buffer is borrowed from a thread-local pool and returned on `end`, so
+/// the steady state allocates nothing.
+pub(super) struct FrameBlock<'a, W: Write> {
+    inner: &'a mut W,
+    /// The frame's bytes, including the block prologue and epilogue.
+    /// `mem::take`n from the thread-local pool at `begin` and returned at
+    /// `end`.
+    body: Vec<u8>,
+    /// The nestable DEC 2026 guard. Held for the frame's whole life so the
+    /// per-pane renderer's own guard nests inside it. `None` only if the
+    /// scratch buffer somehow refused a write, which a `Vec` cannot.
+    sync: Option<SyncOutput>,
+    /// Whether any painter has emitted through the `Write` impl. The
+    /// prologue and epilogue are written directly to `body`, so this counts
+    /// painter output only.
+    painted: bool,
+}
+
+thread_local! {
+    /// Scratch buffer reused across composited frames.
+    ///
+    /// Per-thread because the client's paint path is one tokio current-thread
+    /// runtime (ADR-0003) and libghostty's `Terminal` is `!Send`. A nested or
+    /// concurrent frame simply takes a fresh buffer, which is correct — it
+    /// just does not get the reuse.
+    static FRAME_BODY: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl<'a, W: Write> FrameBlock<'a, W> {
+    /// Begin a composited frame on `inner`.
+    ///
+    /// Opens the synchronized-output block immediately (see the type docs for
+    /// why the depth cannot wait for the first write) but writes nothing to
+    /// `inner` until [`Self::end`].
+    pub(super) fn begin(inner: &'a mut W) -> Self {
+        let mut body = FRAME_BODY.with(|pool| {
+            pool.try_borrow_mut()
+                .map(|mut pool| std::mem::take(&mut *pool))
+                .unwrap_or_default()
+        });
+        body.clear();
+        // Infallible: the sink is a `Vec`. `ok()` keeps the guard optional so
+        // a future fallible sink degrades to "no block" rather than panicking.
+        let sync = SyncOutput::begin(&mut body).ok();
+        let _ = body.write_all(CURSOR_HIDE);
+        Self {
+            inner,
+            body,
+            sync,
+            painted: false,
+        }
+    }
+
+    /// Whether any painter inside this frame has emitted a byte.
+    ///
+    /// The end-of-frame cursor tail keys on this: a frame in which every pane
+    /// was clean and the bar was cached has moved nothing on screen, so the
+    /// host cursor is already where the last frame left it and re-placing it
+    /// would be pure cost.
+    pub(super) const fn opened(&self) -> bool {
+        self.painted
+    }
+
+    /// Close the block and ship it: `?2026l`, then the frame's one write and
+    /// its one flush.
+    ///
+    /// A frame in which no painter wrote closes to a no-op — the buffered
+    /// prologue is discarded, nothing reaches the sink, and the writer thread
+    /// is never woken.
+    pub(super) fn end(mut self) -> std::io::Result<()> {
+        if let Some(sync) = self.sync.take() {
+            let _ = sync.end(&mut self.body);
+        }
+        let shipped = if self.painted {
+            super::render_prof::note_paints(1);
+            self.inner
+                .write_all(&self.body)
+                .and_then(|()| self.inner.flush())
+        } else {
+            Ok(())
+        };
+        // Return the buffer to the pool whatever the sink did.
+        let body = std::mem::take(&mut self.body);
+        FRAME_BODY.with(|pool| {
+            if let Ok(mut pool) = pool.try_borrow_mut() {
+                *pool = body;
+            }
+        });
+        shipped
+    }
+}
+
+impl<W: Write> Drop for FrameBlock<'_, W> {
+    /// Release the synchronized-output depth if `end` was never reached (an
+    /// early return, or a panic between the two). `SyncOutput`'s own `Drop`
+    /// does the release; this exists so the guard is dropped rather than
+    /// leaked through the buffer.
+    fn drop(&mut self) {
+        self.sync = None;
+    }
+}
+
+impl<W: Write> Write for FrameBlock<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.painted = true;
+        self.body.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.painted = true;
+        self.body.extend_from_slice(buf);
+        Ok(())
+    }
+
+    /// Swallowed. The whole point: painters inside a composited frame must
+    /// not each ship their partial work to the terminal.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Memoized pane tiling for the attach loop's hot path.
+///
+/// [`crate::multi_pane::compute_layout_in`] is not free: it walks the split
+/// tree, allocates a `HashMap` of rects, rasterizes every divider cell into a
+/// `Vec`, and builds the drag hit-map. The `TERMINAL_OUTPUT` path used to run
+/// it up to three times per frame (mirror sizing, the focused pane's rect,
+/// the cursor-fallback origin) for a layout that changes only when the user
+/// splits, resizes, zooms, or switches windows — i.e. essentially never,
+/// relative to output frames.
+///
+/// The key is the whole tiling input: the rendered [`LayoutState`] (which
+/// carries the split tree AND the focus that divider weights key on), the
+/// content rect the panes tile into, and the outer viewport (so a SIGWINCH
+/// misses). The content rect is the load-bearing one: it is whatever
+/// [`content_rect`] currently reserves, so a sidebar toggle, a bar moving to
+/// the top, and the phux-l96p.8 pane-grid RAIL row all land in the key
+/// without this cache having to know they exist. Validation
+/// is a structural equality check against the cached state rather than a
+/// hash, so a hit is exact — there is no collision class that could paint a
+/// pane at a stale rect.
+///
+/// A miss stores a clone of the layout; hits are compare-only and allocate
+/// nothing.
+#[derive(Debug, Default)]
+struct LayoutCache {
+    /// The inputs the cached tiling was computed from.
+    key: Option<(LayoutState, crate::layout::Rect, (u16, u16))>,
+    /// The tiling itself, dropped whenever the key moves.
+    tiling: Option<crate::multi_pane::PaneLayout>,
+    /// How many times the tiling was actually computed. Incremented on the
+    /// cold path only; the memoization tests assert against it, because
+    /// "returns the right rect" is true of an implementation that memoizes
+    /// nothing.
+    misses: u64,
+}
+
+impl LayoutCache {
+    /// The tiling for `layout` inside `content`, computed only on a miss.
+    fn get(
+        &mut self,
+        layout: &LayoutState,
+        content: crate::layout::Rect,
+        viewport_dims: (u16, u16),
+    ) -> &crate::multi_pane::PaneLayout {
+        let hit = self.key.as_ref().is_some_and(|(cached, rect, viewport)| {
+            *rect == content && *viewport == viewport_dims && cached == layout
+        });
+        if !hit {
+            self.key = Some((layout.clone(), content, viewport_dims));
+            self.tiling = None;
+        }
+        // The `None` arm runs exactly on a miss; a hit never re-tiles.
+        let misses = &mut self.misses;
+        self.tiling.get_or_insert_with(|| {
+            *misses = misses.saturating_add(1);
+            super::render_prof::note_layouts(1);
+            crate::multi_pane::compute_layout_in(layout, content, viewport_dims)
+        })
+    }
+}
+
+thread_local! {
+    /// One cache per attach thread.
+    ///
+    /// Thread-local rather than a [`super::driver`] field because the key is
+    /// the COMPLETE tiling input — a hit is a structural match on the layout,
+    /// the content rect, and the viewport, so a cache shared between two
+    /// session loops (or an attach and its re-attach) can only ever miss, never
+    /// answer wrongly. That buys the memoization without threading a
+    /// twenty-third parameter through `handle_server_frame`'s driver boundary
+    /// and its thirteen call sites. ADR-0003 pins the client to one
+    /// current-thread runtime and libghostty's `Terminal` is `!Send`, so
+    /// "per thread" is "per attach loop" in practice.
+    static LAYOUT_CACHE: std::cell::RefCell<LayoutCache> =
+        std::cell::RefCell::new(LayoutCache::default());
+}
+
+/// Run `read` against the memoized tiling of `layout` inside `content`.
+///
+/// The hot path's single entry point for pane geometry. `read` sees the same
+/// [`crate::multi_pane::PaneLayout`] a direct
+/// [`crate::multi_pane::compute_layout_in`] would produce and should copy out
+/// what it needs (rects are `Copy`) rather than borrow past the call.
+///
+/// Falls back to computing in place if the cache is already borrowed — a
+/// re-entrant read cannot happen today, and correctness must not depend on
+/// that staying true.
+pub(super) fn with_tiling<R>(
+    layout: &LayoutState,
+    content: crate::layout::Rect,
+    viewport_dims: (u16, u16),
+    read: impl FnOnce(&crate::multi_pane::PaneLayout) -> R,
+) -> R {
+    LAYOUT_CACHE.with(|cache| {
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            return read(cache.get(layout, content, viewport_dims));
+        }
+        super::render_prof::note_layouts(1);
+        read(&crate::multi_pane::compute_layout_in(
+            layout,
+            content,
+            viewport_dims,
+        ))
+    })
+}
+
+/// One pane's rect in the memoized tiling.
+pub(super) fn tiled_rect(
+    layout: &LayoutState,
+    content: crate::layout::Rect,
+    viewport_dims: (u16, u16),
+    terminal_id: &TerminalId,
+) -> Option<crate::layout::Rect> {
+    with_tiling(layout, content, viewport_dims, |tiling| {
+        tiling.rects.get(terminal_id).copied()
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum StatusBarPaint {
@@ -37,13 +332,6 @@ pub(super) enum StatusBarPaint {
 }
 
 impl StatusBarPaint {
-    pub(super) const fn or(self, other: Self) -> Self {
-        match other {
-            Self::NotPublished => self,
-            Self::Published { .. } => other,
-        }
-    }
-
     pub(super) fn delivered(self, painter: Option<&StatusBarPainter>, expected: &str) -> bool {
         matches!(self, Self::Published { cols } if usize::from(cols) >= expected.chars().count())
             && painter.is_some_and(|painter| painter.notice_is(expected))
@@ -74,37 +362,29 @@ pub(super) fn mirror_dims(
     (cols, rows)
 }
 
-/// Render one pane into its outer-viewport sub-Rect.
+/// Render one pane into `rect`, its outer-viewport sub-Rect.
 ///
-/// Looks up the pane's Rect in the layout, resizes its libghostty
-/// Terminal to match (so the renderer's CUP math lines up), and calls
-/// `render_at` with the Rect's origin. Falls back to `(0,0)` + full
-/// pane viewport when the layout has no entry (single-pane bootstrap).
+/// The rect is the CALLER's, not re-derived here: both call sites already
+/// hold the frame's tiling (`paint_full_frame` computed it, the
+/// `TERMINAL_OUTPUT` path reads it from the [`LayoutCache`]), and re-tiling
+/// inside this function made the incremental path compute the same layout
+/// three times per frame. Callers pass the content rect itself when the
+/// layout has no entry for the pane (single-pane bootstrap).
+///
+/// Resizes nothing: the mirror's grid is server-authoritative, and `rect`
+/// only clips and positions the paint.
 ///
 /// Returns the renderer's cached `last_cursor` (outer-viewport coords),
 /// or `None` if the pane has no slot or its libghostty cursor is hidden.
 /// Callers use this to restore the cursor after a status-bar paint.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "phux-4h5a adds the sidebar reservation to the pane paint context; same arg-list refactor follow-up as paint_full_frame / handle_server_frame"
-)]
 pub(super) fn paint_focused_pane<W: Write>(
     out: &mut W,
-    layout_state: &LayoutState,
+    rect: crate::layout::Rect,
     panes: &mut HashMap<TerminalId, PaneSlot>,
     kernel: &AttachKernel,
     focused: &TerminalId,
-    viewport_dims: (u16, u16),
-    bar: Option<Position>,
-    sidebar: Option<SidebarReservation>,
     force_full: bool,
 ) -> Option<(u16, u16)> {
-    let content = content_rect(viewport_dims, bar, sidebar);
-    let rect = super::multi_pane::compute_layout_in(layout_state, content, viewport_dims)
-        .rects
-        .get(focused)
-        .copied()
-        .unwrap_or(content);
     let slot = panes.get_mut(focused)?;
     let walk = published_replica(kernel, focused)?;
     // The mirror grid size is server-authoritative (set only at the
@@ -267,17 +547,8 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
     // frame ends with a deterministic cursor position regardless of
     // whether render_at touched the cursor. See phux-gxy.
     let final_cursor = focused_pane.and_then(|fid| {
-        paint_focused_pane(
-            out,
-            layout_state,
-            panes,
-            kernel,
-            fid,
-            viewport_dims,
-            bar,
-            sidebar,
-            true,
-        )
+        let rect = multi.rects.get(fid).copied().unwrap_or(content);
+        paint_focused_pane(out, rect, panes, kernel, fid, true)
     });
     // The focused pane's Rect origin is the fallback cursor parking spot when
     // `final_cursor` is None (phux-gxy/9xn). All cursor placement + the flush
@@ -391,11 +662,20 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
     }
     // `bar_row_clobbered = false`: nothing cleared the bar row, so the
     // painter's cache decides. Skipped entirely when the config has no bar.
-    let status_bar_painted = status_bar
-        .as_deref_mut()
-        .map_or(StatusBarPaint::NotPublished, |painter| {
-            paint_bar_row(painter, out, viewport_dims, sidebar, session_name, false)
-        });
+    let status_bar_painted =
+        status_bar
+            .as_deref_mut()
+            .map_or(StatusBarPaint::NotPublished, |painter| {
+                paint_bar_row(
+                    painter,
+                    out,
+                    viewport_dims,
+                    sidebar,
+                    session_name,
+                    false,
+                    ComposePolicy::Always,
+                )
+            });
     // The sole CUP + DECTCEM + flush authority for this paint, reached on EVERY
     // path — bar or no bar. The sidebar's own emit parks the host cursor at the
     // end of the last strip row, so an early return here leaves the user's
@@ -476,6 +756,7 @@ pub(super) fn paint_bar_after_pane<W: Write>(
         sidebar,
         session_name,
         bar_row_clobbered,
+        ComposePolicy::Always,
     );
     // After the bar repaints, the cursor sits on the bar row. Put it
     // back at the focused pane's known position when we have one;
@@ -502,13 +783,14 @@ pub(super) fn paint_bar_after_pane<W: Write>(
 /// optional, and a caller whose earlier emits moved the host cursor (the
 /// sidebar strip) must own its `end_of_frame_cursor` whether or not a bar
 /// exists. See [`paint_bar_after_pane`] for `bar_row_clobbered`.
-fn paint_bar_row<W: Write>(
+pub(super) fn paint_bar_row<W: Write>(
     painter: &mut StatusBarPainter,
     out: &mut W,
     viewport_dims: (u16, u16),
     sidebar: Option<SidebarReservation>,
     session_name: &str,
     bar_row_clobbered: bool,
+    compose: ComposePolicy,
 ) -> StatusBarPaint {
     let inset = bar_inset(viewport_dims, sidebar);
     if viewport_dims.1 == 0 || inset.span(viewport_dims.0).1 == 0 {
@@ -531,12 +813,75 @@ fn paint_bar_row<W: Write>(
         // The window list is owned by the painter and injected inside
         // `paint`; this context carries none.
         &make_context(session_name, SystemTime::now()),
+        compose,
     ) {
         Ok(true) => StatusBarPaint::Published {
             cols: inset.span(viewport_dims.0).1,
         },
         Ok(false) | Err(_) => StatusBarPaint::NotPublished,
     }
+}
+
+/// Close a composited frame with its chrome tail: the status-bar row, then the
+/// ONE cursor placement, then the block epilogue and its single flush.
+///
+/// The counterpart to [`FrameBlock::begin`], and the reason the bar is emitted
+/// through [`paint_bar_row`] rather than [`paint_bar_after_pane`]: the latter
+/// owns a cursor tail of its own, which would place the cursor before the
+/// frame is finished and, on a frame where nothing changed, force bytes onto
+/// the wire to say so.
+///
+/// A frame in which nothing was emitted closes to nothing at all — no cursor
+/// tail, no `?2026l`, no flush, no writer-thread wake. That is the idle path:
+/// the host cursor is already where the previous frame left it.
+///
+/// On a failed close the painter's cache is invalidated and the frame reports
+/// `NotPublished`, so the bar re-emits next time rather than trusting a cache
+/// that describes bytes the terminal may never have received.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the frame tail's context: block, painter, geometry, sidebar, session, cursor, compose policy; same arg-list refactor follow-up as paint_full_frame"
+)]
+pub(super) fn close_frame_with_chrome<W: Write>(
+    mut block: FrameBlock<'_, W>,
+    mut status_bar: Option<&mut StatusBarPainter>,
+    viewport_dims: (u16, u16),
+    sidebar: Option<SidebarReservation>,
+    session_name: &str,
+    cursor: Option<(u16, u16)>,
+    fallback_origin: Option<(u16, u16)>,
+    compose: ComposePolicy,
+) -> StatusBarPaint {
+    let painted = status_bar
+        .as_deref_mut()
+        .map_or(StatusBarPaint::NotPublished, |painter| {
+            // `bar_row_clobbered = false`: pane rendering is confined to the
+            // rows above the reserved bar row, so the painter's own content
+            // cache decides whether anything is owed.
+            paint_bar_row(
+                painter,
+                &mut block,
+                viewport_dims,
+                sidebar,
+                session_name,
+                false,
+                compose,
+            )
+        });
+    let cursor_placed = if block.opened() {
+        end_of_frame_cursor(&mut block, cursor, fallback_origin).is_ok()
+    } else {
+        true
+    };
+    if cursor_placed && block.end().is_ok() {
+        return painted;
+    }
+    if !matches!(painted, StatusBarPaint::NotPublished)
+        && let Some(painter) = status_bar
+    {
+        painter.invalidate();
+    }
+    StatusBarPaint::NotPublished
 }
 
 /// Effective viewport available to pane rendering: outer dims with the
@@ -728,6 +1073,90 @@ mod tests {
     use super::*;
     use crate::attach::render::SYNC_OUTPUT_END;
     use crate::render::ChromeBreakpoints;
+
+    fn leaf_layout(id: &TerminalId) -> LayoutState {
+        LayoutState {
+            tree: Some(crate::layout::LayoutNode::Leaf(id.clone())),
+            focus: Some(id.clone()),
+        }
+    }
+
+    /// The whole point of the cache: an unchanged layout tiles ONCE, however
+    /// many times the frame asks for a rect. The `TERMINAL_OUTPUT` path used
+    /// to run `compute_layout_in` three times per frame — mirror sizing, the
+    /// focused pane's rect, the cursor-fallback origin — for a layout that
+    /// only moves when the user splits, resizes, zooms, or switches windows.
+    #[test]
+    fn an_unchanged_layout_tiles_once_however_often_it_is_read() {
+        let id = TerminalId::Local { id: 1 };
+        let layout = leaf_layout(&id);
+        let content = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 23,
+        };
+        let mut cache = LayoutCache::default();
+        for _ in 0..16 {
+            let rect = cache
+                .get(&layout, content, (80, 24))
+                .rects
+                .get(&id)
+                .copied();
+            assert_eq!(rect, Some(content), "the single leaf fills the content");
+        }
+        assert_eq!(cache.misses, 1, "sixteen reads, one tiling");
+    }
+
+    /// Every part of the key must invalidate: the layout tree (a split), the
+    /// content rect (a sidebar toggle or a bar moving), and the viewport (a
+    /// SIGWINCH). Validation is structural equality, so a hit is exact —
+    /// there is no collision that could paint a pane at a stale rect.
+    #[test]
+    fn every_component_of_the_key_forces_a_retile() {
+        let id = TerminalId::Local { id: 1 };
+        let other = TerminalId::Local { id: 2 };
+        let layout = leaf_layout(&id);
+        let content = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 23,
+        };
+        let mut cache = LayoutCache::default();
+        let _ = cache.get(&layout, content, (80, 24));
+        assert_eq!(cache.misses, 1);
+
+        // A different tree.
+        let _ = cache.get(&leaf_layout(&other), content, (80, 24));
+        assert_eq!(cache.misses, 2, "a changed layout retiles");
+
+        // A different content rect. Every reservation `content_rect` makes
+        // shows up here — a sidebar appearing, a top-docked bar, the
+        // pane-grid rail — so none of them can leave a stale tiling behind.
+        let inset = crate::layout::Rect {
+            x: 20,
+            y: 0,
+            w: 60,
+            h: 23,
+        };
+        let _ = cache.get(&leaf_layout(&other), inset, (80, 24));
+        assert_eq!(cache.misses, 3, "a changed content rect retiles");
+
+        // A different viewport (SIGWINCH).
+        let _ = cache.get(&leaf_layout(&other), inset, (100, 30));
+        assert_eq!(cache.misses, 4, "a changed viewport retiles");
+
+        // Back to an already-seen key: still a miss, because the cache holds
+        // exactly one entry — but the rect is correct, which is what matters.
+        let rect = cache
+            .get(&leaf_layout(&other), inset, (100, 30))
+            .rects
+            .get(&other)
+            .copied();
+        assert_eq!(cache.misses, 4, "re-reading the current key is free");
+        assert_eq!(rect, Some(inset));
+    }
 
     fn published_kernel(
         terminals: &[TerminalId],
@@ -1706,17 +2135,12 @@ mod tests {
         // (M) disagrees with the mirror (N). With a bar, pane_dims = (80, 23).
         let viewport = (80u16, 24u16);
         let mut out: Vec<u8> = Vec::new();
-        let _ = paint_focused_pane(
-            &mut out,
-            &layout,
-            &mut panes,
-            &kernel,
-            &id,
-            viewport,
-            Some(Position::Bottom),
-            None,
-            false,
-        );
+        // The caller now owns the tiling: with no tree there is no rect, so
+        // the content rect is what the pane paints into — exactly the
+        // fallback `paint_focused_pane` used to compute for itself.
+        let content = content_rect(viewport, Some(Position::Bottom), None);
+        let rect = tiled_rect(&layout, content, viewport, &id).unwrap_or(content);
+        let _ = paint_focused_pane(&mut out, rect, &mut panes, &kernel, &id, false);
 
         // The mirror grid size is unchanged — the layout rect did not resize it.
         let slot = panes.get(&id).expect("slot");

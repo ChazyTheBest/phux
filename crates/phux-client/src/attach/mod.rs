@@ -66,7 +66,11 @@ mod sidebar_zones;
 pub mod record;
 pub mod reflow;
 mod reload;
+// `PHUX_RENDER_PROF=1`: per-second paint/flush/compose counters, so a change
+// to the paint scheduler is arguable from numbers rather than a screen
+// recording. Free (one predicted branch per call site) when unset.
 pub mod render;
+pub(crate) mod render_prof;
 pub mod rendered;
 // ADR-0029 §2: the monotone repaint accumulator. Loop-level triggers raise a
 // level; the driver drains it once per iteration, so a burst of chrome

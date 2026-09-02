@@ -18,6 +18,12 @@
 //! [`RepaintLevel`] derives `Ord` in DECLARATION order, which is what makes
 //! [`RepaintAccumulator::raise_chrome`] / [`RepaintAccumulator::raise_full`] a
 //! monotone `max`: idempotent, order-independent, and impossible to lower.
+//!
+//! [`PaintPacer`] is the same idea one level up: the accumulator collapses the
+//! triggers WITHIN one loop iteration, the pacer collapses paints ACROSS
+//! iterations that land inside one frame interval.
+
+use std::time::Duration;
 
 /// How much of the frame a drained repaint must redraw. Ordered least- to
 /// most-expensive; `Ord` follows declaration order so a raise is a `max`.
@@ -113,9 +119,206 @@ impl RepaintAccumulator {
     }
 }
 
+/// The default cap on composited frames per second, as a minimum interval
+/// between them.
+///
+/// 16ms is one frame at 60Hz: fast enough that no human perceives the delay,
+/// slow enough that a producer emitting a thousand lines a second stops
+/// costing a thousand full repaints. It is a FLOOR on the gap between paints,
+/// never a delay added to a quiet screen — the first frame after any lull
+/// paints immediately (see [`PaintPacer::admit`]), so first-byte latency for
+/// a keystroke echo is unchanged.
+const DEFAULT_FRAME_INTERVAL_MS: u64 = 16;
+
+/// `PHUX_FRAME_INTERVAL_MS` overrides the pacing floor; `0` disables pacing
+/// entirely (every burst paints, the pre-pacer behaviour).
+fn frame_interval() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let ms = std::env::var("PHUX_FRAME_INTERVAL_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_FRAME_INTERVAL_MS);
+        Duration::from_millis(ms)
+    })
+}
+
+/// The frame-rate governor for pane output (phux-l96p.3).
+///
+/// The coalescing drain that preceded this collapses frames that are ALREADY
+/// QUEUED on one socket read. It cannot help a producer whose lines arrive one
+/// wake-up apart — a program printing progress a thousand times a second hands
+/// the driver a thousand separate bursts, and every one of them used to paint.
+/// On a scrolling viewport each of those paints is a full-screen repaint, so
+/// the client burned tens of megabytes a second redrawing frames no eye could
+/// resolve.
+///
+/// The policy has two halves, and the first is what keeps it honest:
+///
+/// * **The first frame after a lull paints immediately.** Pacing never delays
+///   the byte a user is waiting for. Typing into a quiet shell, a keystroke's
+///   echo is on the glass exactly as fast as before.
+/// * **Frames inside the window accumulate.** Their bytes still reach the
+///   libghostty mirror (the mirror is the truth; only the paint is withheld),
+///   the panes they touched are remembered, and the driver settles all of them
+///   in ONE composited frame when the window expires.
+///
+/// The accumulated set is per-pane and unordered-but-deduplicated: settling
+/// twice for the same pane in one frame would paint the same rows twice.
+#[derive(Debug, Default)]
+pub(super) struct PaintPacer {
+    /// Earliest instant the next composited frame may be emitted. `None` ⇒
+    /// nothing has painted yet, so the next request paints.
+    next_allowed: Option<tokio::time::Instant>,
+    /// Panes whose paint was withheld and still owe a settle. Small by
+    /// construction (one entry per visible pane), so a linear dedup beats a
+    /// hash set.
+    pending: Vec<phux_protocol::ids::TerminalId>,
+}
+
+impl PaintPacer {
+    /// Whether a composited frame may be emitted at `now`, arming the next
+    /// window if so.
+    ///
+    /// The single decision point: callers that are admitted paint inline,
+    /// callers that are refused [`Self::withhold`] every pane they touched.
+    pub(super) fn admit(&mut self, now: tokio::time::Instant) -> bool {
+        let interval = frame_interval();
+        if interval.is_zero() {
+            return true;
+        }
+        if self.next_allowed.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.next_allowed = Some(now + interval);
+        true
+    }
+
+    /// Remember that `terminal_id` owes a settle paint.
+    pub(super) fn withhold(&mut self, terminal_id: &phux_protocol::ids::TerminalId) {
+        if !self.pending.iter().any(|id| id == terminal_id) {
+            self.pending.push(terminal_id.clone());
+        }
+    }
+
+    /// When the driver must wake to settle withheld panes, or `None` when
+    /// nothing is owed.
+    ///
+    /// `None` on an idle screen is what keeps the pacer free: the driver arms
+    /// no timer, so a quiet attach parks on its wake-up sources exactly as it
+    /// did before.
+    pub(super) const fn deadline(&self) -> Option<tokio::time::Instant> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            self.next_allowed
+        }
+    }
+
+    /// Take the panes owed a settle paint, clearing the debt.
+    pub(super) fn take_pending(&mut self) -> Vec<phux_protocol::ids::TerminalId> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Forget every withheld pane: a full-viewport repaint has just redrawn
+    /// them all, so settling them again would repaint what is already correct.
+    pub(super) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use phux_protocol::ids::TerminalId;
+
+    fn pane(id: u32) -> TerminalId {
+        TerminalId::Local { id }
+    }
+
+    /// The pacer's central promise: latency is never added to a quiet screen.
+    /// The first frame after any lull paints immediately, so a keystroke's
+    /// echo reaches the glass exactly as fast as it did before pacing.
+    #[test]
+    fn the_first_frame_after_a_lull_paints_immediately() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        assert!(pacer.admit(t0), "nothing has painted; paint now");
+        // Well past the window: another lull, another immediate paint.
+        assert!(
+            pacer.admit(t0 + Duration::from_secs(1)),
+            "a frame after the window paints immediately"
+        );
+    }
+
+    /// A frame arriving inside the window is refused, and refusing it is what
+    /// makes the settle a SINGLE composited frame rather than one per burst.
+    #[test]
+    fn frames_inside_the_window_are_refused_until_it_expires() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        assert!(pacer.admit(t0));
+        let interval = frame_interval();
+        assert!(
+            !pacer.admit(t0 + interval / 2),
+            "half a window in, the paint is withheld"
+        );
+        assert!(
+            pacer.admit(t0 + interval),
+            "the window expiring re-admits exactly once"
+        );
+    }
+
+    /// Withheld panes deduplicate: a burst that touches the same pane forty
+    /// times owes ONE settle for it, not forty repaints of the same rows.
+    #[test]
+    fn withheld_panes_deduplicate_and_drain_once() {
+        let mut pacer = PaintPacer::default();
+        let t0 = tokio::time::Instant::now();
+        assert!(pacer.admit(t0));
+        for _ in 0..40 {
+            pacer.withhold(&pane(1));
+        }
+        pacer.withhold(&pane(2));
+        let owed = pacer.take_pending();
+        assert_eq!(owed, vec![pane(1), pane(2)]);
+        assert!(pacer.take_pending().is_empty(), "taking the debt clears it");
+    }
+
+    /// An idle screen arms no timer at all: with nothing owed the driver's
+    /// select loop parks on exactly the wake-up sources it did before.
+    #[test]
+    fn an_idle_pacer_arms_no_deadline() {
+        let mut pacer = PaintPacer::default();
+        assert_eq!(pacer.deadline(), None, "nothing owed, nothing armed");
+        let t0 = tokio::time::Instant::now();
+        assert!(pacer.admit(t0));
+        assert_eq!(
+            pacer.deadline(),
+            None,
+            "a frame that painted owes no settle"
+        );
+        pacer.withhold(&pane(1));
+        assert_eq!(
+            pacer.deadline(),
+            Some(t0 + frame_interval()),
+            "a withheld pane arms the window's end"
+        );
+    }
+
+    /// A full-viewport repaint force-redraws every pane, so it discharges the
+    /// debt. Settling afterwards would repaint rows that are already correct.
+    #[test]
+    fn a_full_repaint_discharges_every_withheld_pane() {
+        let mut pacer = PaintPacer::default();
+        assert!(pacer.admit(tokio::time::Instant::now()));
+        pacer.withhold(&pane(1));
+        pacer.withhold(&pane(2));
+        pacer.clear_pending();
+        assert!(pacer.take_pending().is_empty());
+        assert_eq!(pacer.deadline(), None);
+    }
 
     /// The drained work for a level-only raise: no fleet re-projection.
     fn painted(level: RepaintLevel, viewport_was_cleared: bool) -> Repaint {

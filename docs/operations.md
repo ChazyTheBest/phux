@@ -74,6 +74,8 @@ Both fmt layers emit span-close timing (`FmtSpan::CLOSE`), so any `#[instrument]
 | `RUST_LOG` | Filter directives. Default `phux=info,warn`. |
 | `PHUX_LOG=<path>` | Write logs to `<path>` via non-blocking file writer. Server tees to this file *in addition to* stderr; client writes here *instead of* its per-pid default. Parent directory created if missing. |
 | `PHUX_LOG_FORMAT=text\|json` | `text` (default): human single-line layer. `json`: one JSON object per line for `jq`/`grep`. Applies to both stderr and file sinks. |
+| `PHUX_RENDER_PROF=1` | Client only. Emits one `render_prof` INFO line per second carrying the attach loop's paint counters: `frames` (inbound `TERMINAL_OUTPUT` frames applied), `paints` (composited frames emitted), `skipped` (paints withheld by coalescing or the frame pacer), `bar_composes` (runs of the status-bar widget pipeline), `layouts` (pane tilings that missed the layout cache), `flushes` and `bytes` (what reached the off-loop stdout writer). Free when unset. |
+| `PHUX_FRAME_INTERVAL_MS=<ms>` | Client only. Minimum interval between composited frames; default `16` (one frame at 60Hz). The first frame after any lull always paints immediately, so this never adds latency to a quiet screen — it only bounds how often a sustained output stream repaints. `0` disables pacing entirely. |
 
 The **canonical server log** is `$XDG_STATE_HOME/phux/server.log` (falls back
 to `$HOME/.local/state/phux/`). Every spawn path writes the same file: the

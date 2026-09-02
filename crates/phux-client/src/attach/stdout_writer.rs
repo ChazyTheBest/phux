@@ -41,12 +41,35 @@ const CAP_BYTES: usize = 256 * 1024;
 struct QueueState {
     /// Complete-`flush()` byte buffers, written to the tty in order.
     chunks: VecDeque<Vec<u8>>,
+    /// Buffers the writer thread has finished with, returned here for the
+    /// sink to refill.
+    ///
+    /// Without this, every `flush()` handed its `Vec` to the writer and
+    /// started a fresh allocation for the next frame — one malloc plus one
+    /// free per frame forever, and the fresh buffer had to grow back to
+    /// frame size from zero. Recycling makes the steady state allocation-free
+    /// (both sides converge on buffers already large enough) while keeping
+    /// the queue's ownership story unchanged: a buffer is either in `chunks`
+    /// (owed to the terminal), in `spare` (owned by nobody), or in the sink's
+    /// `pending`.
+    spare: Vec<Vec<u8>>,
     /// Running total of `chunks` byte lengths (cheap cap check).
     bytes: usize,
     /// Set by [`WriterHandle::shutdown_and_join`]; tells the writer to drain
     /// and exit.
     shutdown: bool,
 }
+
+/// Upper bound on recycled buffers held between the two sides.
+///
+/// One in flight and one being filled is the steady state; a small pool
+/// absorbs a burst without letting a pathological run pin memory that the
+/// [`CAP_BYTES`] backlog check would otherwise have bounded.
+const SPARE_POOL: usize = 4;
+
+/// Largest recycled buffer kept. A one-off giant frame (a full-screen repaint
+/// at a huge viewport) must not permanently pin its capacity.
+const SPARE_MAX_BYTES: usize = 64 * 1024;
 
 struct Shared {
     queue: Mutex<QueueState>,
@@ -65,6 +88,30 @@ pub(super) struct StdoutSink {
     /// can hold a reader independent of the `&mut StdoutSink` borrow.
     pub(super) needs_resync: Arc<AtomicBool>,
     pending: Vec<u8>,
+    /// Buffers reclaimed from the writer thread, ready to be refilled.
+    recycled: Vec<Vec<u8>>,
+}
+
+impl StdoutSink {
+    /// Take back buffers the writer thread has finished with.
+    ///
+    /// Called with the queue lock already held (the flush path takes it
+    /// anyway), so recycling costs no extra synchronization. An associated
+    /// function rather than a method so the caller can hold the lock guard —
+    /// which borrows `self.shared` — while handing over `self.recycled`.
+    fn reclaim(recycled: &mut Vec<Vec<u8>>, q: &mut QueueState) {
+        while recycled.len() < SPARE_POOL {
+            let Some(mut buf) = q.spare.pop() else { break };
+            if buf.capacity() > SPARE_MAX_BYTES {
+                continue;
+            }
+            buf.clear();
+            recycled.push(buf);
+        }
+        // Anything left in `spare` beyond what we want is dropped here rather
+        // than accumulating.
+        q.spare.clear();
+    }
 }
 
 impl Write for StdoutSink {
@@ -82,13 +129,24 @@ impl Write for StdoutSink {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let chunk = std::mem::take(&mut self.pending);
+        crate::attach::render_prof::note_flushes(1);
+        crate::attach::render_prof::note_bytes(
+            u64::try_from(self.pending.len()).unwrap_or(u64::MAX),
+        );
         {
             let mut q = self
                 .shared
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Reclaim first, under the lock we had to take anyway, so THIS
+            // flush can refill a returned buffer rather than waiting a frame.
+            Self::reclaim(&mut self.recycled, &mut q);
+            // Swap the filled buffer out for a recycled one, so the steady
+            // state neither allocates nor frees. `mem::replace` keeps
+            // `pending` a valid empty buffer at all times.
+            let recycled = self.recycled.pop().unwrap_or_default();
+            let chunk = std::mem::replace(&mut self.pending, recycled);
             if q.bytes.saturating_add(chunk.len()) > CAP_BYTES {
                 // Writer is behind. Drop the stale backlog AND this chunk (a
                 // diff that would corrupt the screen if applied after the gap)
@@ -96,6 +154,14 @@ impl Write for StdoutSink {
                 q.chunks.clear();
                 q.bytes = 0;
                 self.needs_resync.store(true, Ordering::Release);
+                // The dropped chunk's allocation is still useful; keep it
+                // rather than freeing it on the very path where the sink is
+                // under the most pressure.
+                if self.recycled.len() < SPARE_POOL && chunk.capacity() <= SPARE_MAX_BYTES {
+                    let mut chunk = chunk;
+                    chunk.clear();
+                    self.recycled.push(chunk);
+                }
             } else {
                 q.bytes += chunk.len();
                 q.chunks.push_back(chunk);
@@ -155,6 +221,7 @@ fn spawn_writer_into<W: Write + Send + 'static>(inner: W) -> (StdoutSink, Writer
     let shared = Arc::new(Shared {
         queue: Mutex::new(QueueState {
             chunks: VecDeque::new(),
+            spare: Vec::new(),
             bytes: 0,
             shutdown: false,
         }),
@@ -169,6 +236,7 @@ fn spawn_writer_into<W: Write + Send + 'static>(inner: W) -> (StdoutSink, Writer
         shared: Arc::clone(&shared),
         needs_resync: Arc::new(AtomicBool::new(false)),
         pending: Vec::with_capacity(8192),
+        recycled: Vec::with_capacity(SPARE_POOL),
     };
     (
         sink,
@@ -184,8 +252,11 @@ fn spawn_writer_into<W: Write + Send + 'static>(inner: W) -> (StdoutSink, Writer
 /// flushes every queued chunk first; `shutdown_and_join` clears the backlog so
 /// this exits promptly).
 fn writer_loop<W: Write>(shared: &Shared, mut out: W) {
+    // Reused across iterations so the drain itself stops allocating a fresh
+    // `Vec<Vec<u8>>` per wake-up.
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
     loop {
-        let chunks: Vec<Vec<u8>> = {
+        {
             let mut q = shared
                 .queue
                 .lock()
@@ -200,14 +271,32 @@ fn writer_loop<W: Write>(shared: &Shared, mut out: W) {
                 break;
             }
             q.bytes = 0;
-            q.chunks.drain(..).collect()
-        };
+            chunks.extend(q.chunks.drain(..));
+        }
         for chunk in &chunks {
             if out.write_all(chunk).is_err() {
                 return;
             }
         }
         let _ = out.flush();
+        // Hand the emptied buffers back for the sink to refill.
+        {
+            let mut q = shared
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[allow(
+                clippy::iter_with_drain,
+                reason = "`chunks` is reused across loop iterations; `into_iter` would consume the allocation this loop exists to keep"
+            )]
+            for mut buf in chunks.drain(..) {
+                if q.spare.len() >= SPARE_POOL || buf.capacity() > SPARE_MAX_BYTES {
+                    continue;
+                }
+                buf.clear();
+                q.spare.push(buf);
+            }
+        }
     }
 }
 
@@ -280,6 +369,7 @@ mod tests {
         let shared = Arc::new(Shared {
             queue: Mutex::new(QueueState {
                 chunks: VecDeque::new(),
+                spare: Vec::new(),
                 bytes: 0,
                 shutdown: false,
             }),
@@ -289,6 +379,7 @@ mod tests {
             shared: Arc::clone(&shared),
             needs_resync: Arc::new(AtomicBool::new(false)),
             pending: Vec::new(),
+            recycled: Vec::new(),
         };
         // Queue just under the cap.
         sink.write_all(&vec![0u8; CAP_BYTES - 1]).expect("write");
@@ -305,6 +396,71 @@ mod tests {
         };
         assert!(chunks_empty, "stale backlog dropped on overflow");
         assert_eq!(bytes, 0);
+    }
+
+    /// The steady state must stop allocating: once the writer has returned a
+    /// buffer, the next `flush()` refills that same allocation instead of
+    /// handing the writer a fresh `Vec` and freeing the old one.
+    #[test]
+    fn flush_reuses_the_writers_returned_buffers() {
+        let (mut sink, handle) = spawn_stdout_writer();
+        // Prime the pool: one frame out, drained and returned by the writer.
+        sink.write_all(&vec![b'x'; 4096]).expect("write");
+        sink.flush().expect("flush");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let returned = {
+                let q = sink
+                    .shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !q.spare.is_empty()
+            };
+            if returned {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The next flush reclaims it: the sink ends up holding a warm buffer
+        // rather than a freshly-allocated empty one.
+        sink.write_all(b"second frame").expect("write");
+        sink.flush().expect("flush");
+        assert!(
+            sink.pending.capacity() >= 4096,
+            "flush must refill a recycled buffer, not allocate a new one \
+             (capacity {})",
+            sink.pending.capacity()
+        );
+        handle.shutdown_and_join();
+    }
+
+    /// A one-off giant frame must not pin its capacity in the pool forever.
+    #[test]
+    fn oversized_buffers_are_not_recycled() {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(QueueState {
+                chunks: VecDeque::new(),
+                spare: vec![Vec::with_capacity(SPARE_MAX_BYTES + 1)],
+                bytes: 0,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let mut sink = StdoutSink {
+            shared: Arc::clone(&shared),
+            needs_resync: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            recycled: Vec::new(),
+        };
+        {
+            let mut q = shared.queue.lock().expect("lock");
+            StdoutSink::reclaim(&mut sink.recycled, &mut q);
+        }
+        assert!(
+            sink.recycled.is_empty(),
+            "an oversized buffer must be dropped, not pooled"
+        );
     }
 
     #[test]

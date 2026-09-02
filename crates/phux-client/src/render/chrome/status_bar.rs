@@ -520,6 +520,27 @@ impl Notice {
     }
 }
 
+/// Whether a bar paint is allowed to reuse the strip it composed last time.
+///
+/// The painter can see every input it owns — the window list, prefix, cwd,
+/// exit code, notice, badge, attention hint, theme — because each arrives
+/// through a setter that invalidates the cache. It CANNOT see the wall clock
+/// the `time` widget reads, an `exec` widget's asynchronously-refreshed cache,
+/// or the session name the caller threads in. So the decision belongs to the
+/// caller, who knows what its paint was triggered by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposePolicy {
+    /// Run the widget pipeline. Every trigger that can have moved an input the
+    /// painter does not own uses this: the 1 s poll tick, a chrome repaint, a
+    /// full-frame redraw, and every standalone caller.
+    Always,
+    /// Reuse the cached strip unless a setter invalidated it. Only the
+    /// pane-output path, which by construction changes no bar input — so
+    /// recomposing on it produces bytes identical to the last frame's at the
+    /// cost of the whole pipeline.
+    WhenDirty,
+}
+
 /// VT painter for a composed [`StatusBar`].
 ///
 /// Thin stateful wrapper over [`render_status_bar`]: caches the last
@@ -878,7 +899,8 @@ impl StatusBarPainter {
         rows: u16,
         ctx: &StatusBarContext<'_>,
     ) -> io::Result<()> {
-        self.paint_outcome(out, inset, cols, rows, ctx).map(drop)
+        self.paint_outcome(out, inset, cols, rows, ctx, ComposePolicy::Always)
+            .map(drop)
     }
 
     /// Paint the bar and report whether this call emitted the row rather than
@@ -890,6 +912,7 @@ impl StatusBarPainter {
         cols: u16,
         rows: u16,
         ctx: &StatusBarContext<'_>,
+        compose: ComposePolicy,
     ) -> io::Result<bool> {
         if cols == 0 || rows == 0 {
             return Ok(false);
@@ -911,17 +934,31 @@ impl StatusBarPainter {
         if self.bar.is_empty() && self.windows.is_empty() {
             return Ok(false);
         }
+        // The widget pipeline is the expensive half of a bar paint, and on
+        // the client's hot path almost every call to it was wasted: a
+        // `TERMINAL_OUTPUT` frame changes pane cells, never the bar. Under a
+        // burst that meant composing the whole strip — every widget, into a
+        // fresh ratatui buffer — hundreds of times a second to produce bytes
+        // identical to last frame's.
+        if self.cached_compose_stands_in(compose, x, cols, rows) {
+            return Ok(false);
+        }
         let ctx = self.ctx_with_window_list(ctx);
+        crate::attach::render_prof::note_bar_composes(1);
         let new_row = self.bar.render(&ctx.as_widget(), cols);
         if !self.needs_repaint(x, cols, rows, &new_row) {
             return Ok(false);
         }
         let row_index = self.row_index(rows);
-        // Delegate to the ratatui-backed renderer. We pre-composed
-        // `new_row` for cache-keying; the renderer recomposes — cheap
-        // (same inputs, deterministic) and keeps `render_status_bar`
-        // usable standalone in tests.
-        render_status_bar(out, &self.bar, &ctx, row_index, x, cols)?;
+        // Emit the strip we just composed rather than delegating to
+        // `render_status_bar`, which would run the whole widget pipeline a
+        // SECOND time for the same inputs. Same two steps it performs (lay
+        // the cells into a `cols x 1` buffer, write it), so the bytes are
+        // identical; `render_status_bar` stays as the standalone entry point
+        // for callers that have no painter.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, cols, 1));
+        fill_buffer(&mut buffer, &new_row, cols);
+        write_buffer(out, &buffer, row_index, x, cols)?;
         self.paint_row_overlays(out, row_index, x, cols)?;
         self.last_row = Some((x, cols, new_row));
         self.last_viewport = Some((cols, rows));
@@ -971,6 +1008,29 @@ impl StatusBarPainter {
             last_exit: self.last_exit,
             ..*ctx
         }
+    }
+
+    /// Whether the cached strip can stand in for a fresh compose.
+    ///
+    /// True only when the caller declared this a pane-output paint AND a
+    /// cached row exists for exactly this span and viewport. Every setter the
+    /// painter owns calls [`Self::invalidate`], which clears `last_row`, so an
+    /// intact cache means nothing the painter owns has moved — and a pane
+    /// output frame cannot move anything else.
+    fn cached_compose_stands_in(
+        &self,
+        compose: ComposePolicy,
+        x: u16,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
+        if matches!(compose, ComposePolicy::Always) {
+            return false;
+        }
+        let Some((prev_x, prev_cols, _)) = self.last_row.as_ref() else {
+            return false;
+        };
+        *prev_x == x && *prev_cols == cols && self.last_viewport == Some((cols, rows))
     }
 
     /// Whether the freshly composed row differs from the cached paint, in

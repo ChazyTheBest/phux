@@ -1494,6 +1494,59 @@ fn drive_output(
     let _ = drive_output_seq(engine, out, layout, focused, panes, terminal_id, bytes, seq);
 }
 
+/// Like [`drive_output_seq`] but with `defer_paint` set: the frame applies to
+/// the mirror and reports its outcome without painting.
+#[allow(clippy::too_many_arguments)]
+fn drive_output_deferred(
+    engine: &mut EngineFixture,
+    out: &mut Vec<u8>,
+    layout: &mut Workspace,
+    focused: &mut Option<TerminalId>,
+    panes: &mut HashMap<TerminalId, PaneSlot>,
+    terminal_id: &TerminalId,
+    bytes: &[u8],
+    seq: u64,
+) -> FrameOutcome {
+    let mut session_name = String::new();
+    let mut zoomed: Option<TerminalId> = None;
+    let mut predict = PredictionState::new(PredictiveConfig::disabled(), 80, 24);
+    let overlay = Overlay;
+    let mut pending_splits = HashMap::new();
+    let mut pending_windows = HashMap::new();
+    handle_server_frame_with_kernel(
+        &mut engine.kernel,
+        &mut engine.effects,
+        out,
+        FrameKind::TerminalOutput {
+            terminal_id: terminal_id.clone(),
+            stream_id: phux_protocol::StreamId::new(1).expect("stream"),
+            bootstrap_id: phux_protocol::BootstrapId::new(1).expect("bootstrap"),
+            seq,
+            bytes: bytes::Bytes::copy_from_slice(bytes),
+        },
+        panes,
+        layout,
+        focused,
+        &mut zoomed,
+        &mut session_name,
+        None,
+        None,
+        None,
+        (80, 24),
+        &mut predict,
+        &overlay,
+        None,
+        &mut pending_splits,
+        &mut pending_windows,
+        &mut HashSet::new(),
+        &mut AgentMetaIndex::default(),
+        false,
+        // defer_paint
+        true,
+    )
+    .expect("handle_server_frame")
+}
+
 /// Like [`drive_output`] but stamps an explicit `seq` and returns the
 /// [`FrameOutcome`] so ack-emission tests can inspect `outcome.ack`.
 #[allow(clippy::too_many_arguments)]
@@ -1646,6 +1699,155 @@ fn synchronized_output_paints_only_after_end_across_frames() {
     assert!(panes[&pane].sync_output_since.is_none());
     let printable = strip_csi(&String::from_utf8_lossy(&out));
     assert!(printable.contains("half-drawn frame"));
+}
+
+/// phux-l96p.3: an incremental output paint is ONE synchronized-output block.
+///
+/// Before this, only the destructive full-frame path wrapped itself in DEC
+/// 2026; the incremental path — the one that runs on every `TERMINAL_OUTPUT` —
+/// emitted pane cells, then chrome, then the cursor, each visible to the outer
+/// terminal as it landed. The invariants asserted here are the frame contract:
+/// exactly one open and one close, the open first, the close last, and the
+/// cursor hidden for the duration of the paint.
+///
+/// It is also the seam against phux-l96p.2: the pane renderer opens its OWN
+/// `render::SyncOutput` around a dirty repaint, and the frame block holds the
+/// nesting depth for its whole life so that guard nests instead of closing
+/// the frame's block half way through. A regression there shows up here as
+/// two opens and two closes — with the status bar and the cursor stranded
+/// outside the transaction, which is precisely the tearing being removed.
+#[test]
+fn an_incremental_output_paint_is_one_synchronized_block() {
+    let pane = tid(1);
+    let mut layout = Workspace::single(pane.clone());
+    let mut focused = Some(pane.clone());
+    let (mut engine, mut panes) = published_fixture(&[(&pane, 80, 24, b"")]);
+    let mut out: Vec<u8> = Vec::new();
+
+    drive_output(
+        &mut engine,
+        &mut out,
+        &mut layout,
+        &mut focused,
+        &mut panes,
+        &pane,
+        b"hello frame",
+    );
+
+    let s = String::from_utf8_lossy(&out);
+    assert_eq!(
+        s.matches("\x1b[?2026h").count(),
+        1,
+        "exactly one block opens per frame: {s:?}"
+    );
+    assert_eq!(
+        s.matches("\x1b[?2026l").count(),
+        1,
+        "exactly one block closes per frame: {s:?}"
+    );
+    assert!(
+        s.starts_with("\x1b[?2026h\x1b[?25l"),
+        "the block opens before any cell, cursor hidden: {s:?}"
+    );
+    assert!(
+        s.ends_with("\x1b[?2026l"),
+        "the block closes after the cursor placement: {s:?}"
+    );
+    // The cursor placement is the LAST thing in the frame, so proving it sits
+    // before the single close proves the whole composite is inside the block.
+    let close = s.rfind("\x1b[?2026l").expect("block closes");
+    let cursor = s
+        .rfind("\x1b[?25h")
+        .expect("frame ends by showing the cursor");
+    assert!(
+        cursor < close,
+        "the cursor is placed inside the block, not after it: {s:?}"
+    );
+}
+
+/// phux-l96p.3: a suppressed frame paints nothing at all.
+///
+/// The coalescing mask, a modal overlay, an open synchronized-output
+/// transaction and the driver's frame pacer all route through the same
+/// `defer_paint` gate. A deferred frame must still apply its bytes to the
+/// mirror (that is the whole point of deferring the PAINT rather than the
+/// frame), but must not open a block, tile a layout, or touch the chrome.
+#[test]
+fn a_deferred_output_frame_emits_nothing_but_still_applies() {
+    let pane = tid(1);
+    let mut layout = Workspace::single(pane.clone());
+    let mut focused = Some(pane.clone());
+    let (mut engine, mut panes) = published_fixture(&[(&pane, 80, 24, b"")]);
+    let mut out: Vec<u8> = Vec::new();
+    let seq = engine
+        .kernel
+        .published(&pane)
+        .expect("published terminal")
+        .last_seq()
+        .checked_add(1)
+        .expect("live sequence");
+
+    let outcome = drive_output_deferred(
+        &mut engine,
+        &mut out,
+        &mut layout,
+        &mut focused,
+        &mut panes,
+        &pane,
+        b"deferred glyphs",
+        seq,
+    );
+
+    assert!(out.is_empty(), "a deferred frame writes no bytes: {out:?}");
+    assert!(!outcome.chrome_dirty, "no title moved");
+    let terminal = super::super::pane_state::published_terminal(&engine.kernel, &pane)
+        .expect("published terminal");
+    let slot = panes.get_mut(&pane).expect("slot");
+    let cell = slot
+        .renderer
+        .read_grapheme_at(ReplicaWalk::for_test(terminal), 0, 0)
+        .expect("read cell");
+    assert_eq!(cell, Some('d'), "the mirror still ingested the bytes");
+}
+
+/// phux-l96p.3: a frame that changes nothing on screen costs nothing.
+///
+/// Re-applying identical bytes leaves the mirror's dirty tracking clean and
+/// the bar's cache intact, so the frame block never opens — no `?2026h`, no
+/// cursor placement, and (against the real sink) no writer-thread wake.
+#[test]
+fn a_frame_that_changes_nothing_writes_nothing() {
+    let pane = tid(1);
+    let mut layout = Workspace::single(pane.clone());
+    let mut focused = Some(pane.clone());
+    let (mut engine, mut panes) = published_fixture(&[(&pane, 80, 24, b"")]);
+    let mut warm: Vec<u8> = Vec::new();
+    drive_output(
+        &mut engine,
+        &mut warm,
+        &mut layout,
+        &mut focused,
+        &mut panes,
+        &pane,
+        b"steady",
+    );
+    assert!(!warm.is_empty(), "the first paint emits the row");
+
+    // A zero-byte payload changes no cell and moves no cursor.
+    let mut quiet: Vec<u8> = Vec::new();
+    drive_output(
+        &mut engine,
+        &mut quiet,
+        &mut layout,
+        &mut focused,
+        &mut panes,
+        &pane,
+        b"",
+    );
+    assert!(
+        quiet.is_empty(),
+        "an output frame that changes nothing must emit nothing: {quiet:?}"
+    );
 }
 
 /// phux-foz.9: an OSC 0/2 title riding in ordinary `TERMINAL_OUTPUT`

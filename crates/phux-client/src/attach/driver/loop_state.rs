@@ -40,15 +40,15 @@ use crate::attach::input_dispatch::{
 use crate::attach::onboarding::{AttachClaim, AttachMoment};
 use crate::attach::outcome::{AttachEnd, AttachError};
 use crate::attach::paint::{
-    SidebarEdge, SidebarReservation, StatusBarPaint, content_rect, paint_bar_after_pane,
-    paint_chrome_in_place, paint_full_frame, sidebar_reservation,
+    SidebarEdge, SidebarReservation, StatusBarPaint, content_rect, paint_chrome_in_place,
+    paint_full_frame, sidebar_reservation,
 };
 use crate::attach::pane_state::{
     AttentionNavigation, PaneSlot, VcsIndex, reanchor_predict_to_pane,
 };
 use crate::attach::plugin_actions::{self, PluginActionEntry, PluginRunResult};
 use crate::attach::plugin_panes::{self, PluginPaneEntry};
-use crate::attach::repaint::{RepaintAccumulator, RepaintLevel};
+use crate::attach::repaint::{PaintPacer, RepaintAccumulator, RepaintLevel};
 use crate::attach::server_frame::{AgentMetaIndex, FrameOutcome, handle_server_frame};
 use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
@@ -605,6 +605,14 @@ pub(super) struct SessionLoop {
     /// highlight repaints) a lone Escape could be deferred far past the
     /// intended window. `None` ⇔ nothing pending.
     esc_deadline: Option<tokio::time::Instant>,
+    /// phux-l96p.3: the frame-rate governor for pane output.
+    ///
+    /// A burst that lands inside the previous frame's window applies its bytes
+    /// to the mirrors but withholds the paint, recording the panes it touched;
+    /// the `paint_deadline` arm below settles all of them in one composited
+    /// frame when the window expires. See [`PaintPacer`] for why the coalescing
+    /// drain alone was not enough.
+    pacer: PaintPacer,
     /// phux-foz.2: whether the which-key popup is armed at all.
     which_key_enabled: bool,
     /// How long the resolver may sit at a prefix before the popup shows.
@@ -731,6 +739,7 @@ impl SessionLoop {
             sighup: signal(SignalKind::hangup()).map_err(AttachError::Io)?,
             detach_pending: false,
             esc_deadline: None,
+            pacer: PaintPacer::default(),
             which_key_enabled: cfg.which_key_enabled,
             which_key_delay: cfg.which_key_delay,
             which_key_deadline: None,
@@ -1231,6 +1240,7 @@ impl SessionLoop {
         // the pointer with no button held, dropped as soon as it closes.
         sync_hover_tracking(out, self.overlays.wants_pointer_hover()).map_err(AttachError::Io)?;
         self.repaint_after_resync(out, sidebar, needs_resync);
+        crate::attach::render_prof::tick();
         Ok(())
     }
 
@@ -1344,6 +1354,9 @@ impl SessionLoop {
         // socket reads, so their deadline is pane state rather than a
         // per-batch timer. A stuck producer gets one bounded recovery paint;
         // later bytes re-arm suppression if mode 2026 is still set.
+        // phux-l96p.3: the frame pacer's settle deadline. Armed only while
+        // some pane's paint is owed, so an idle attach adds no timer at all.
+        let paint_sleep = sleep_until_or_pending(self.pacer.deadline());
         let sync_output_sleep = sleep_until_or_pending(
             self.panes
                 .values()
@@ -1361,6 +1374,15 @@ impl SessionLoop {
             // batch so a redraw burst paints once; bounded so it cannot
             // starve the stdin arm polled above it.
             frame = conn.recv() => self.on_server_frame(conn, out, sidebar, frame).await,
+
+            // phux-l96p.3: the withheld frames' window expired. Settle every
+            // pane whose paint was held back, in ONE composited frame. Polled
+            // above the other timers (but below stdin and inbound frames) so a
+            // settle cannot be starved by a chatty widget tick.
+            () = paint_sleep => {
+                self.on_paint_deadline(out, sidebar);
+                Ok(Step::Continue)
+            }
 
             // Bound the failure mode of an application that omits `?2026l`.
             // Expose the latest complete mirror once, then let subsequent
@@ -1673,11 +1695,22 @@ impl SessionLoop {
         // outside the `select!` would capture the stale outer
         // one. This path does not shadow it.
         let mut repaint = RepaintAccumulator::default();
+        // phux-l96p.3: one pacing decision for the whole burst. Admitted, the
+        // burst behaves exactly as before (per-pane last-wins coalescing, then
+        // one paint). Refused, EVERY output frame in it defers: the bytes still
+        // reach the mirrors, the panes they touched are recorded, and the
+        // `paint_deadline` arm settles them together when the window expires.
+        // Deciding once per burst rather than once per frame is what makes the
+        // settle a single composited frame.
+        let paint_now = self.pacer.admit(tokio::time::Instant::now());
         for (frame_idx, frame) in batch.into_iter().enumerate() {
             let Some(frame) = self.intercept_peer_reply(conn, frame, &mut repaint).await? else {
                 continue;
             };
-            let defer_paint = frame_defers_paint(defer_flags[frame_idx], &frame);
+            let defer_paint = !paint_now || frame_defers_paint(defer_flags[frame_idx], &frame);
+            if !paint_now && let Some(target) = frame_paint_target(&frame) {
+                self.pacer.withhold(target);
+            }
             match self
                 .apply_server_frame(conn, out, sidebar, frame, defer_paint, &mut repaint)
                 .await?
@@ -1687,6 +1720,20 @@ impl SessionLoop {
             }
         }
         self.drain_repaint(out, sidebar, &mut repaint);
+        // phux-l96p.3: if handling this burst outran the pacing window,
+        // settle here instead of waiting for the `paint_deadline` arm. The
+        // inbound arm is `biased` ahead of that timer, so a socket that is
+        // continuously readable would keep winning the race and the screen
+        // would freeze while the mirrors raced ahead. In practice the drain
+        // empties the socket and the timer gets its turn; this closes the case
+        // where it does not, and costs one `Instant` comparison otherwise.
+        if self
+            .pacer
+            .deadline()
+            .is_some_and(|at| at <= tokio::time::Instant::now())
+        {
+            self.on_paint_deadline(out, sidebar);
+        }
         // phux-k0cw.10: the first paint is behind us, so the
         // peer sweep can go out now. Placed after the drain,
         // not before it, so the frames it sends never sit
@@ -2367,7 +2414,68 @@ impl SessionLoop {
         if drained.fleet_dirty {
             self.refresh_fleet(out, sidebar);
         }
+        // A full repaint force-redraws every pane, so it discharges every
+        // paint the pacer was still holding. Settling them afterwards would
+        // repaint rows that are already correct.
+        if matches!(drained.level, RepaintLevel::Full) {
+            self.pacer.clear_pending();
+        }
         self.repaint_view(out, sidebar, drained.level);
+    }
+
+    /// phux-l96p.3: the frame pacer's window expired — settle every pane whose
+    /// paint was withheld, as ONE composited frame.
+    ///
+    /// Suppression is re-evaluated here rather than inherited from the frames
+    /// that were withheld: an overlay may have opened, or a pane may have
+    /// entered a synchronized-output transaction, since. Both have their own
+    /// recovery (the overlay repaints the view on dismiss; the sync-output
+    /// watchdog exposes a stuck transaction), so a pane suppressed at settle
+    /// time is dropped rather than held indefinitely.
+    fn on_paint_deadline<W: crate::attach::RenderSink>(
+        &mut self,
+        out: &mut W,
+        sidebar: Option<SidebarReservation>,
+    ) {
+        let owed = self.pacer.take_pending();
+        if owed.is_empty() {
+            return;
+        }
+        // Arm the next window from the settle, not from the burst that filled
+        // it, so a sustained producer paints on a steady cadence.
+        self.pacer.admit(tokio::time::Instant::now());
+        if self.overlays.is_active() {
+            return;
+        }
+        let live: Vec<TerminalId> = owed
+            .into_iter()
+            .filter(|id| {
+                self.panes
+                    .get(id)
+                    .is_some_and(|slot| slot.sync_output_since.is_none())
+            })
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        let painted = crate::attach::server_frame::paint_output_frame(
+            crate::attach::server_frame::OutputFrame {
+                out,
+                kernel: &self.engine_kernel,
+                panes: &mut self.panes,
+                workspace: &self.workspace,
+                zoomed: self.zoomed.as_ref(),
+                focused_pane: self.focused_pane.as_ref(),
+                status_bar: self.status_bar.as_mut(),
+                sidebar,
+                viewport_dims: self.viewport_dims,
+                session_name: &self.session_name,
+                predict: &mut self.predict,
+                overlay: &self.overlay,
+            },
+            &live,
+        );
+        self.finish_paint(painted);
     }
 
     /// Rebuild and repaint the agent-fleet dashboard, if it is open.
@@ -2602,18 +2710,26 @@ impl SessionLoop {
             "status_tick: repaint bar"
         );
         let fallback_origin = Some(self.bar_fallback_origin(sidebar));
-        let painted = paint_bar_after_pane(
+        // The tick used to end in an unconditional cursor placement and flush
+        // even when the composed row was byte-identical — every second, for
+        // the life of the attach, a wake of the stdout writer thread to say
+        // that nothing changed. Wrapping the tick in a frame block makes the
+        // no-change case emit literally nothing: the block only opens if the
+        // bar actually writes, and a block that never opened performs no
+        // cursor tail, no epilogue, and no flush.
+        let painted = crate::attach::paint::close_frame_with_chrome(
+            crate::attach::paint::FrameBlock::begin(out),
             self.status_bar.as_mut(),
-            out,
             self.viewport_dims,
             sidebar,
             &self.session_name,
             focused_cursor,
             fallback_origin,
-            // Idle tick: nothing clobbered the bar row. The
-            // painter's content cache repaints only when a
-            // widget (e.g. the clock) actually changed.
-            false,
+            // The tick exists precisely to refresh what the painter cannot
+            // observe (the clock, an `exec` widget's cache), so it always
+            // composes. Unchanged output still emits nothing: the row cache
+            // suppresses the write and the frame block never opens.
+            crate::render::chrome::status_bar::ComposePolicy::Always,
         );
         self.finish_paint(painted);
     }
@@ -2630,14 +2746,15 @@ impl SessionLoop {
                 self.workspace
                     .render_window(self.zoomed.as_ref())
                     .and_then(|ls| {
-                        crate::attach::multi_pane::compute_layout_in(
+                        // Through the memoized tiling: this runs on every 1 s
+                        // status tick, and the layout it asks about is the
+                        // same one the last paint tiled.
+                        crate::attach::paint::tiled_rect(
                             ls.as_ref(),
                             content,
                             self.viewport_dims,
+                            fid,
                         )
-                        .rects
-                        .get(fid)
-                        .copied()
                     })
             })
             .map_or((0, 0), |r| (r.x, r.y))
