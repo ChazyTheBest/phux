@@ -23,7 +23,7 @@ set -euo pipefail
 
 tag="${1:?usage: gen-formula.sh <tag> <dist-dir> [out-file]}"
 dist="${2:?usage: gen-formula.sh <tag> <dist-dir> [out-file]}"
-base="https://github.com/phall1/phux/releases/download/${tag}"
+base="https://github.com/no-phux/phux/releases/download/${tag}"
 
 # sha <target> -> prints the checksum, or empty string if the artifact is absent.
 sha() {
@@ -75,7 +75,7 @@ emit() {
 # Do not edit by hand.
 class Phux < Formula
   desc "Libghostty-backed terminal control plane (not tmux)"
-  homepage "https://github.com/phall1/phux"
+  homepage "https://github.com/no-phux/phux"
   url "${base}/phux-${tag}-${primary_target}.tar.gz"
   sha256 "${primary_sha}"
   license any_of: ["MIT", "Apache-2.0"]

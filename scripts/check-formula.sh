@@ -95,7 +95,7 @@ write_sha "$tag" aarch64-apple-darwin "$arm_mac_sha"
 write_sha "$tag" x86_64-unknown-linux-gnu "$x86_linux_sha"
 write_sha "$tag" aarch64-unknown-linux-gnu "$arm_linux_sha"
 gen "$tag" "${TMP}/phux-full.rb"
-assert_contains "${TMP}/phux-full.rb" 'url "https://github.com/phall1/phux/releases/download/v9.9.9/phux-v9.9.9-aarch64-apple-darwin.tar.gz"'
+assert_contains "${TMP}/phux-full.rb" 'url "https://github.com/no-phux/phux/releases/download/v9.9.9/phux-v9.9.9-aarch64-apple-darwin.tar.gz"'
 assert_contains "${TMP}/phux-full.rb" "sha256 \"${arm_mac_sha}\""
 assert_contains "${TMP}/phux-full.rb" 'on_macos do'
 assert_contains "${TMP}/phux-full.rb" 'depends_on arch: :arm64'
