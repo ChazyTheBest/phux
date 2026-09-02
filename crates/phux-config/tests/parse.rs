@@ -115,10 +115,10 @@ shell = "/bin/bash"
 /// values themselves are pinned per field so a change to any schema
 /// default cannot slip through the two-way equality:
 /// - which-key on with a 400 ms hesitation delay (phux-foz.2);
-/// - predictive-echo UNSET, i.e. the dial decides (ADR-0090's RTT-adaptive
-///   gate in its coarse form: on for a remote attach, off over UDS, where
-///   the round trip is not worth hiding). An explicit `predictive-echo`
-///   still wins in either direction;
+/// - predictive-echo UNSET, i.e. the dial decides: on when the dial leaves
+///   the machine, off otherwise (including a loopback QUIC/WebSocket dial),
+///   because a round trip that does not exist is not worth hiding. An
+///   explicit `predictive-echo` still wins in either direction;
 /// - sidebar ENABLED, width 28, on the left (phux-4h5a, on by default
 ///   per phux-k0cw);
 /// - status bar at the bottom (phux-foz.8);

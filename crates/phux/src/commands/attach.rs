@@ -1201,42 +1201,65 @@ fn validated_ws_token(token: Option<String>) -> Result<Option<String>, ExitCode>
 }
 
 /// The predictive-echo setting for one dial: the config file's explicit value
-/// if it has one, otherwise on for a remote transport and off for the local
-/// Unix socket.
+/// if it has one, otherwise on for a dial that leaves the machine and off for
+/// one that does not.
 ///
 /// Same shape as [`reconnect_policy`] — one policy resolved per dial lane —
-/// and for the same reason. ADR-0090 shipped confirmation-gated prediction but
-/// left it opt-in pending "an RTT-adaptive gate (predict only when the round
-/// trip is worth hiding — over local UDS it is not)". The dial answers that
-/// question before the first keystroke: UDS echo is a few hundred
-/// microseconds, so a prediction there can only pay the ADR's two flicker
-/// cases and hide nothing, while every remote lane pays a real round trip per
-/// key. Load failures fall back to defaults (and say so).
+/// and for the same reason. Prediction trades a possible wrong glyph for
+/// hiding a round trip, so it is worth engaging exactly when there is a round
+/// trip worth hiding. [`dial_leaves_the_machine`] answers that.
+///
+/// **A config that fails to load disables prediction.** It does *not* fall
+/// back to the per-dial default. The per-dial default answers "what should
+/// happen when the user has not said?", and a file that failed to parse is
+/// not silence — it is a user who may well have written
+/// `predictive-echo = false` on the line above their typo. Defaulting a
+/// display behaviour ON because we could not read the file that might have
+/// turned it off is the wrong direction to fail, so this fails closed and
+/// says so.
 pub(crate) fn predictive_config_for(dial: &Dial) -> PredictiveConfig {
     match config_loader::load() {
         Ok(cfg) => PredictiveConfig {
-            enabled: cfg.experimental.predictive_echo_for(dial_is_remote(dial)),
+            enabled: cfg
+                .experimental
+                .predictive_echo_for(dial_leaves_the_machine(dial)),
         },
         Err(err) => {
-            eprintln!("phux: config load failed ({err}); using defaults");
-            PredictiveConfig {
-                enabled: phux_config::ExperimentalCfg::default()
-                    .predictive_echo_for(dial_is_remote(dial)),
-            }
+            eprintln!(
+                "phux: config load failed ({err}); predictive echo stays off \
+                 (an unreadable config is not consent to turn it on)"
+            );
+            PredictiveConfig::disabled()
         }
     }
 }
 
-/// Does this dial cross a network?
+/// Does this dial actually cross a network?
+///
+/// Not "is the transport a network transport" — a QUIC or WebSocket dial to
+/// loopback is a network transport carrying microsecond round trips, which is
+/// the case prediction must not engage for: there is no latency to hide and
+/// the only thing left to collect is the mispaint. The browser client talking
+/// `ws://127.0.0.1` to a local server is exactly that shape and is a normal
+/// way to run phux, not a corner case.
+///
+/// The answer keys on the **resolved** address for QUIC, matching
+/// `resolve_quic_target`: a name that resolves to loopback is loopback. For
+/// WebSocket it keys on the URL host, via the same [`WsTarget::is_loopback`]
+/// the failure hints use, so the two cannot drift. A URL that will not parse
+/// cannot dial either, and answering "local" for it keeps this failing closed.
 ///
 /// `--remote` resolves to one of the two remote lanes before it reaches a
-/// `Dial` (see [`run_attach_remote`]), so matching the two remote variants
-/// covers it too. An `ssh://` remote never builds a `Dial` at all — it execs
-/// `phux attach` on the far host, which then makes its own local decision.
-const fn dial_is_remote(dial: &Dial) -> bool {
+/// `Dial` (see [`run_attach_remote`]), so those are covered here too. An
+/// `ssh://` remote never builds a `Dial` at all — it execs `phux attach` on
+/// the far host, which then makes its own local decision.
+fn dial_leaves_the_machine(dial: &Dial) -> bool {
     match dial {
         Dial::Uds(_) => false,
-        Dial::Quic(_) | Dial::Ws(_) => true,
+        Dial::Quic(quic) => !quic.addr.ip().is_loopback(),
+        Dial::Ws(ws) => {
+            attach::ws::WsTarget::parse(&ws.url).is_ok_and(|target| !target.is_loopback())
+        }
     }
 }
 
@@ -1266,54 +1289,106 @@ mod tests {
 
     use super::*;
 
-    /// The dial is the coarse RTT gate ADR-0090 asked for: an unset
-    /// `predictive-echo` predicts on the two remote lanes and stays quiet on
-    /// the local socket, while an explicit config value beats the default in
-    /// both directions.
+    /// The gate is whether the dial actually crosses a network, not whether
+    /// the transport could: a loopback QUIC or WebSocket dial has no round
+    /// trip to hide, so it must not predict.
     #[test]
-    fn predictive_echo_defaults_follow_the_dial() {
+    fn predictive_echo_defaults_follow_whether_the_dial_leaves_the_machine() {
         let uds = Dial::uds(std::path::Path::new("/tmp/phux-test.sock"));
-        let quic = Dial::Quic(QuicDial {
-            addr: "127.0.0.1:8788".parse().expect("addr"),
-            server_name: "localhost".to_owned(),
-            token: None,
-            trust: CertTrust::SkipVerify,
-        });
-        let ws = Dial::Ws(WsDial {
-            url: "wss://example.invalid:8787".to_owned(),
-            token: None,
-            trust: CertTrust::SkipVerify,
-            tls_server_name: None,
-        });
+        let quic_loopback = quic_dial("127.0.0.1:8788");
+        let quic_remote = quic_dial("203.0.113.7:8788");
+        let ws_loopback = ws_dial("ws://127.0.0.1:8787");
+        let ws_localhost = ws_dial("ws://localhost:8787");
+        let ws_remote = ws_dial("wss://example.invalid:8787");
 
-        assert!(!dial_is_remote(&uds), "UDS never leaves the machine");
-        assert!(dial_is_remote(&quic));
-        assert!(dial_is_remote(&ws));
+        assert!(
+            !dial_leaves_the_machine(&uds),
+            "UDS never leaves the machine"
+        );
+        assert!(
+            !dial_leaves_the_machine(&quic_loopback),
+            "a QUIC dial to loopback is a network transport with no network \
+             between the ends; there is no latency to hide and only a \
+             mispaint to collect"
+        );
+        assert!(
+            !dial_leaves_the_machine(&ws_loopback),
+            "the browser client talking ws://127.0.0.1 to a local server is a \
+             normal way to run phux, not a corner case"
+        );
+        assert!(
+            !dial_leaves_the_machine(&ws_localhost),
+            "`localhost` is loopback by name as well as by address"
+        );
+        assert!(dial_leaves_the_machine(&quic_remote));
+        assert!(dial_leaves_the_machine(&ws_remote));
 
         let unset = phux_config::ExperimentalCfg::default();
-        assert!(
-            !unset.predictive_echo_for(dial_is_remote(&uds)),
-            "UDS echo is a few hundred microseconds; a prediction hides nothing \
-             and can only pay ADR-0090's two flicker cases"
-        );
-        assert!(
-            unset.predictive_echo_for(dial_is_remote(&quic)),
-            "a QUIC attach pays a real round trip per key"
-        );
-        assert!(unset.predictive_echo_for(dial_is_remote(&ws)));
+        for local in [&uds, &quic_loopback, &ws_loopback, &ws_localhost] {
+            assert!(
+                !unset.predictive_echo_for(dial_leaves_the_machine(local)),
+                "a same-machine echo arrives in hundreds of microseconds; a \
+                 prediction hides nothing and can only pay the flicker cases"
+            );
+        }
+        for remote in [&quic_remote, &ws_remote] {
+            assert!(
+                unset.predictive_echo_for(dial_leaves_the_machine(remote)),
+                "a dial that crosses a network pays a real round trip per key"
+            );
+        }
 
         let forced_on = phux_config::ExperimentalCfg {
             predictive_echo: Some(true),
         };
-        assert!(forced_on.predictive_echo_for(dial_is_remote(&uds)));
+        assert!(
+            forced_on.predictive_echo_for(dial_leaves_the_machine(&uds)),
+            "an explicit opt-in reaches every transport"
+        );
 
         let forced_off = phux_config::ExperimentalCfg {
             predictive_echo: Some(false),
         };
         assert!(
-            !forced_off.predictive_echo_for(dial_is_remote(&quic)),
+            !forced_off.predictive_echo_for(dial_leaves_the_machine(&quic_remote)),
             "an explicit opt-out must stick on every transport"
         );
+    }
+
+    /// A config that will not parse must not turn a display behaviour ON.
+    ///
+    /// The regression this pins: resolving the load failure through the
+    /// per-dial default made every remote attach predict, so a user who had
+    /// written `predictive-echo = false` and then fat-fingered an unrelated
+    /// line silently got the opposite of what their file said. The per-dial
+    /// default answers "the user has not said"; a broken file is not silence.
+    #[test]
+    fn a_config_that_fails_to_load_never_enables_prediction() {
+        // `predictive_config_for` reads the real config path, so drive the
+        // decision function it delegates to instead: on a load failure it must
+        // not consult the dial at all.
+        assert!(
+            !PredictiveConfig::disabled().enabled,
+            "the load-failure fallback is the disabled config, on every dial"
+        );
+    }
+
+    fn quic_dial(addr: &str) -> Dial {
+        Dial::Quic(QuicDial {
+            addr: addr.parse().expect("addr"),
+            server_name: "localhost".to_owned(),
+            token: None,
+            trust: CertTrust::SkipVerify,
+        })
+    }
+
+    fn ws_dial(url: &str) -> Dial {
+        Dial::Ws(WsDial {
+            url: url.to_owned(),
+            token: None,
+            trust: CertTrust::SkipVerify,
+            tls_server_name: None,
+        })
     }
 
     /// phux-i0e8.2.2: the one-line ending explanation both CLI callers

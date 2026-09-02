@@ -133,3 +133,50 @@ and the epoch machinery would triple the state surface.
 the same mispredict storm it backed off from; requiring observed clean
 confirms (possible once predicting continues while tentative) re-arms on
 evidence instead.
+
+## Amendment — 2026-09-02: the dial decides, and the default changes
+
+**What changed.** `experimental.predictive-echo` became tri-state. Unset now
+means *the dial decides*: prediction is ON when the attach crosses a network
+and OFF when it does not, including a QUIC or WebSocket dial to loopback. An
+explicit `true`/`false` still wins everywhere. This ADR shipped the display
+policy as an **opt-in**; prediction is now on by default for remote users who
+never set the key.
+
+**Why the dial is the gate.** This ADR's own Tradeoffs left an
+SRTT-derived gate earmarked, and the config key's note called for predicting
+"only when the round trip is worth hiding". Whether the dial leaves the
+machine is that gate's coarse form, and it is strictly better in one respect:
+it is known before the first keystroke rather than estimated from one, so
+there is no warm-up during which the policy is wrong. Measured over a
+60 ms link, echo p50 went from ~64 ms to ~230 µs; over loopback there is
+nothing to hide, which is why loopback is excluded rather than lumped in with
+"remote transport".
+
+**The accepted risk.** §Tradeoffs called the no-echo password case
+"un-gatable" and bounded it with `DISPLAY_TTL_MS`. That reasoning was written
+for an opt-in and is now load-bearing for a default, so it is restated with
+its precise scope: at a `sudo`/`ssh` password prompt the client paints the
+typed characters underlined for up to one second each. The exposure is
+**shoulder-surfing on the typing user's own display only** — the overlay is
+written to that client's stdout, never to the wire, the server, another
+client, or a recording (`phux-record` is a separate wire consumer of
+`TERMINAL_OUTPUT`). It is not a disclosure to any other party.
+
+We accept it at that scope, and note that no client-side heuristic can close
+it: the only local signal is "no echo has arrived yet", which is
+indistinguishable from a slow link until roughly `DISPLAY_TTL_MS` has passed —
+far longer than a password takes to type.
+
+**The complete fix, deliberately not taken here.** termios `ECHO` is line
+discipline on the server's PTY and produces no bytes, so the client's
+libghostty mirror cannot ever see it. Closing the case means the server
+reading `tcgetattr` on the pane master (the pattern
+`terminal_actor::spawn::canonical_refusal` already uses) at the point it
+publishes an input snapshot after an output batch — which fires when the
+prompt is printed, before the user types — and pushing the edge to attached
+clients as an additive `AgentEvent` variant, which the existing
+`SubscribeEvents { terminal: None }` subscription and `AgentEvent::Unknown`
+decoder fallback already tolerate. The client would gate prediction on it the
+way it gates on `set_alt_screen`. That is a wire change with its own spec and
+changelog entry, and it is the earmarked successor to this amendment.

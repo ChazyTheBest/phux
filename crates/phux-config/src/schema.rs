@@ -737,14 +737,20 @@ pub struct ExperimentalCfg {
     ///    momentarily renders the typed characters locally, bounded by the
     ///    display timeout.
     ///
-    /// ADR-0090 named the missing piece: "an RTT-adaptive gate (predict only
-    /// when the round trip is worth hiding — over local UDS it is not)". The
-    /// dial *is* that gate's coarse form, and it is known before the first
-    /// keystroke rather than estimated from one: a UDS attach echoes in
-    /// hundreds of microseconds, where a prediction can only cost the two
-    /// flicker cases above and buy nothing, while a `--remote` / `--quic` /
-    /// `--ws` attach pays a full network round trip per key, which is exactly
-    /// the latency the predictor exists to hide.
+    /// This key's own earlier note called for "an RTT-adaptive gate (predict
+    /// only when the round trip is worth hiding — over local UDS it is not)"
+    /// before prediction could be on by default. Whether the dial leaves the
+    /// machine is that gate's coarse form, and it has the advantage of being
+    /// known before the first keystroke rather than estimated from one: a
+    /// same-machine attach echoes in hundreds of microseconds, where a
+    /// prediction can only cost the two flicker cases above and buy nothing,
+    /// while a dial that crosses a network pays a full round trip per key,
+    /// which is exactly the latency the predictor exists to hide. A dial to
+    /// loopback over QUIC or WebSocket counts as same-machine: the transport
+    /// is a network transport but the round trip is not.
+    ///
+    /// See ADR-0090 for the display policy this rides on, and its Amendment
+    /// section for why default-on over a network is an acceptable trade.
     ///
     /// Set the key explicitly to override that in either direction — `true`
     /// engages Mosh-class local echo everywhere including UDS, `false`

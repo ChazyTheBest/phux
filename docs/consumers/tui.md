@@ -808,21 +808,40 @@ passwords), where echo is suppressed by the server PTY's termios —
 invisible to the client — so a predicted insert momentarily renders the
 typed characters, bounded by the one-second display timeout.
 
-[ADR-0090](../../ADR/0090-confirmation-gated-predictive-echo.md) named the
-missing piece as "an RTT-adaptive gate (predict only when the round trip
-is worth hiding — over local UDS it is not)". The dial is that gate in its
-coarse form, and it has the advantage of being known before the first
-keystroke rather than estimated from one: a UDS attach echoes in hundreds
-of microseconds, where a prediction can only cost the two cases above and
-buy nothing, while every remote lane pays a full network round trip per
-key — exactly the latency the predictor exists to hide. A finer
-SRTT-derived gate can refine this later without changing the key's
-meaning.
+The gate is an RTT gate in coarse form — predict only when there is a
+round trip worth hiding — and it has the advantage of being known before
+the first keystroke rather than estimated from one. A same-machine attach
+echoes in hundreds of microseconds, where a prediction can only cost the
+two cases above and buy nothing; a dial that crosses a network pays a full
+round trip per key, which is exactly the latency the predictor exists to
+hide. A finer SRTT-derived gate can refine this later without changing the
+key's meaning.
+
+**"Remote" means the dial actually leaves the machine, not that the
+transport could.** A `--quic` or `--ws` dial to `127.0.0.1` or `localhost`
+— the shape the browser client uses against a local server — counts as
+local and does not predict: the transport is a network transport but the
+round trip is not. For QUIC the test is the *resolved* address, so a name
+that resolves to loopback is loopback.
+
+A `config.toml` that fails to load leaves prediction **off**, on every
+transport, rather than falling back to the per-transport default. The
+default answers "the user has not said"; a file that will not parse is not
+silence, and may well be a file that said `false` one line above a typo.
+
+The password case above is the risk this default accepts, and its scope is
+worth stating exactly: the guessed characters are painted on **your own
+screen only**. The overlay never reaches the wire, the server, another
+client, or a `phux rec` recording — it is a local paint, so the exposure
+is someone reading over your shoulder, not a disclosure to anyone else.
+See ADR-0090's Amendment for why no client-side heuristic closes it and
+what would.
 
 ```toml
 [experimental]
-# Unset: predict on --remote/--quic/--ws, not on the local socket.
-# true:  predict on every transport, UDS included.
+# Unset: predict when the dial leaves the machine; not on the local
+#        socket, and not on a loopback --quic / --ws dial.
+# true:  predict on every transport.
 # false: never predict.
 predictive-echo = false
 ```

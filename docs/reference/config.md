@@ -35,7 +35,7 @@ The configuration surface of `~/.config/phux/config.toml`. The loader layers you
 
 ## Scalar keys
 
-Every scalar knob with its shipped default, serialized from the schema itself. Keys that are unset by default (`defaults.shell`, `defaults.spawn-on-attach`) and composite keys — widget lists, binding tables, hook and registry arrays — do not appear here; the annotated config below documents them in place.
+Every scalar knob with its shipped default, serialized from the schema itself, plus the tri-state knobs whose shipped state is *unset* and whose unset meaning is spelled out in place of a value. Keys that are simply absent by default (`defaults.shell`, `defaults.spawn-on-attach`) and composite keys — widget lists, binding tables, hook and registry arrays — do not appear here; the annotated config below documents them in place.
 
 | Key | Default |
 |---|---|
@@ -49,6 +49,7 @@ Every scalar knob with its shipped default, serialized from the schema itself. K
 | `defaults.session-name-template` | `"${cwd-basename}"` |
 | `defaults.term` | `"xterm-256color"` |
 | `defaults.window-size` | `"smallest"` |
+| `experimental.predictive-echo` | unset — the dial decides: on when the attach leaves the machine, off otherwise. `true` / `false` force it on every transport |
 | `keybindings.prefix` | `"C-a"` |
 | `keybindings.which-key` | `true` |
 | `keybindings.which-key-delay-ms` | `400` |

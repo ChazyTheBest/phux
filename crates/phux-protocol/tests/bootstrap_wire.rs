@@ -1259,3 +1259,67 @@ fn nested_envelopes_are_rejected() {
         DecodeError::CompressedFrameInvalid,
     );
 }
+
+/// A tiny payload may not declare a huge inflated length: the receiver sizes
+/// its allocation from the handshake, not from a number the sender picked.
+///
+/// The bound is the larger negotiated payload limit plus an envelope
+/// allowance, so a declaration above that is refused before anything is
+/// allocated or inflated. Bounding by the 16 MiB frame cap instead would let a
+/// few hundred bytes on the wire cost the receiver 16 MiB of memory per frame.
+#[test]
+fn an_envelope_may_not_declare_more_than_the_negotiated_bounds() {
+    use phux_protocol::wire::encode::Encoder;
+    use phux_protocol::wire::field;
+    use phux_protocol::wire::frame::TYPE_FRAME_COMPRESSED;
+
+    // A real inner frame body (everything past the length prefix), so the
+    // payload is above suspicion in both shape and size and only the declared
+    // length lies. A body of raw zeros would fail as an unknown frame type
+    // before the bound was ever reached, and would prove nothing.
+    let mut framed = BytesMut::new();
+    FrameKind::BootstrapChunk {
+        terminal_id: TerminalId::local(1),
+        stream_id: stream(1),
+        bootstrap_id: bootstrap(1),
+        chunk_seq: 0,
+        payload: Bytes::from(vec![0_u8; 64 * 1024]),
+    }
+    .encode(&mut framed);
+    let body = framed[4..].to_vec();
+    let deflated = phux_protocol::wire::compress::deflate(&body).expect("compresses");
+
+    let envelope = |declared: u32| {
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&[0_u8; 4]);
+        let body_start = out.len();
+        {
+            let mut enc = Encoder::new(&mut out);
+            enc.write_u8(TYPE_FRAME_COMPRESSED);
+            enc.write_field_with(field::frame_compressed::ALGORITHM, |e| e.write_u8(1));
+            enc.write_field_with(field::frame_compressed::UNCOMPRESSED_LEN, |e| {
+                e.write_u32_be(declared);
+            });
+            enc.write_field(field::frame_compressed::PAYLOAD, &deflated);
+        }
+        let len = u32::try_from(out.len() - body_start).unwrap();
+        out[0..4].copy_from_slice(&len.to_be_bytes());
+        out
+    };
+
+    // Just under the 16 MiB frame cap: legal under the old bound, refused now.
+    let greedy = envelope(15 * 1024 * 1024);
+    assert_eq!(
+        FrameKind::decode(&greedy).expect_err("a greedy declaration is refused"),
+        DecodeError::LengthOverflow,
+        "an envelope must not be able to name an allocation the connection \
+         never negotiated"
+    );
+
+    // The honest declaration still decodes, so the bound rejects only liars.
+    let honest = envelope(u32::try_from(body.len()).unwrap());
+    assert!(
+        FrameKind::decode(&honest).is_ok(),
+        "a truthful envelope within the negotiated bounds must still decode"
+    );
+}

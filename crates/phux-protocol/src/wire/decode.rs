@@ -543,6 +543,35 @@ impl<'a> Decoder<'a> {
     /// cannot ask the receiver for more memory than a legal frame; and a
     /// nested envelope is rejected, so a hostile sender cannot drive
     /// unbounded recursion or amplification through repeated wrapping.
+    /// The largest inflated frame body this connection will allocate for a
+    /// `FRAME_COMPRESSED` envelope (`docs/spec/proto.md` §6.4).
+    ///
+    /// The envelope's `uncompressed_len` is a number the *sender* picked, and
+    /// the receiver allocates it before inflating anything. Bounding it by the
+    /// §5 frame cap alone would let a peer spend a few hundred bytes to make
+    /// this side allocate 16 MiB, over and over. The bound is therefore the
+    /// larger of the two payload limits **this connection actually
+    /// negotiated**, plus one chunk of envelope allowance for the inner
+    /// frame's own ids, cursors and length prefixes — because wrapping is only
+    /// specified for the two payload-bearing frames whose sizes those limits
+    /// govern. With the reference advertisements that is ~1 MiB rather than
+    /// 16 MiB, and it shrinks further for a peer that negotiated smaller
+    /// bounds, which is exactly the peer least able to absorb the allocation.
+    ///
+    /// It is a ceiling, not a shape check: a legal wrapped frame is always
+    /// under it, so this rejects only senders outside the contract.
+    fn max_compressed_frame_bytes(&self) -> u32 {
+        /// Room for the inner frame's type byte, field ids, ids, and opaque
+        /// cursors sitting alongside its payload. `HISTORY_PAGE` carries the
+        /// most: two cursors at `MAX_HISTORY_CURSOR_BYTES` each, plus ids.
+        const ENVELOPE_ALLOWANCE: u32 = 64 * 1024;
+
+        self.max_bootstrap_chunk_bytes
+            .max(self.max_history_page_bytes)
+            .saturating_add(ENVELOPE_ALLOWANCE)
+            .min(MAX_FRAME_LEN)
+    }
+
     fn decode_frame_compressed(&mut self) -> Result<FrameKind, DecodeError> {
         let mut algorithm = None;
         let mut uncompressed_len = None;
@@ -566,7 +595,7 @@ impl<'a> Decoder<'a> {
             return Err(DecodeError::CompressedFrameInvalid);
         }
         let declared = uncompressed_len.ok_or(DecodeError::UnexpectedEof)?;
-        if declared == 0 || declared > MAX_FRAME_LEN {
+        if declared == 0 || declared > self.max_compressed_frame_bytes() {
             return Err(DecodeError::LengthOverflow);
         }
         let declared = usize::try_from(declared).map_err(|_| DecodeError::LengthOverflow)?;

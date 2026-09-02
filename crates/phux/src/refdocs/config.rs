@@ -142,6 +142,25 @@ fn scalar_rows(value: &toml::Value, path: &str, rows: &mut Vec<(String, String)>
     }
 }
 
+/// Keys whose shipped state is **unset**, where "unset" is a documented
+/// behaviour rather than an absence.
+///
+/// [`default_scalar_rows`] serializes `Config::default()`, and serde omits a
+/// `None`, so an `Option` knob leaves no row — correct for `defaults.shell`
+/// (unset means "ask the OS") and wrong for a tri-state knob, where a reader
+/// scanning this table for the key finds nothing at all and concludes it does
+/// not exist. These rows put the key back with its unset meaning in the
+/// `Default` column.
+///
+/// Hand-written, and guarded: `tristate_keys_are_really_unset_in_the_schema`
+/// fails if one of these ever acquires a concrete serialized default, which is
+/// the moment the hand-written text would start lying.
+const TRISTATE_ROWS: &[(&str, &str)] = &[(
+    "experimental.predictive-echo",
+    "unset — the dial decides: on when the attach leaves the machine, \
+     off otherwise. `true` / `false` force it on every transport",
+)];
+
 /// The scalar knobs of the schema defaults, as rendered in the table.
 ///
 /// Walked from `Config::default()` rather than the parsed `default.toml`
@@ -160,6 +179,35 @@ fn default_scalar_rows() -> Vec<(String, String)> {
         .expect("Config::default() serializes to TOML");
     let mut rows = Vec::new();
     scalar_rows(&defaults, "", &mut rows);
+    rows
+}
+
+/// The rendered `| Key | Default |` cells, presentation applied.
+///
+/// Deliberately separate from [`default_scalar_rows`], which stays the
+/// serialized truth and nothing else: `the_embedded_defaults_agree_with_the_schema_defaults`
+/// compares those raw values against `default.toml`, and it would have to
+/// strip formatting and special-case the unset rows if the two jobs shared one
+/// function. One function answers "what does the schema default to", the other
+/// "what does the table say".
+fn rendered_scalar_rows() -> Vec<(String, String)> {
+    // A serialized default is a literal, so it renders as one; a tri-state
+    // row's cell is prose carrying its own inline code spans. Formatting here
+    // rather than at the write site is what lets the two coexist in one column
+    // without nesting backticks.
+    let mut rows: Vec<(String, String)> = default_scalar_rows()
+        .into_iter()
+        .map(|(key, value)| (key, format!("`{value}`")))
+        .collect();
+    rows.extend(
+        TRISTATE_ROWS
+            .iter()
+            .map(|(key, meaning)| ((*key).to_owned(), (*meaning).to_owned())),
+    );
+    // `scalar_rows` walks a `toml::Value::Table`, which is already sorted, so
+    // the appended rows are the only ones out of place. Sorting the whole list
+    // keeps the page's one ordering rule ("alphabetical by key") true.
+    rows.sort_by(|(a, _), (b, _)| a.cmp(b));
     rows
 }
 
@@ -189,15 +237,17 @@ pub(crate) fn page() -> Page {
     body.push_str(
         "\n## Scalar keys\n\n\
          Every scalar knob with its shipped default, serialized from the \
-         schema itself. Keys that are unset by default (`defaults.shell`, \
+         schema itself, plus the tri-state knobs whose shipped state is \
+         *unset* and whose unset meaning is spelled out in place of a \
+         value. Keys that are simply absent by default (`defaults.shell`, \
          `defaults.spawn-on-attach`) and composite keys — widget lists, \
          binding tables, hook and registry arrays — do not appear here; \
          the annotated config below documents them in place.\n\n\
          | Key | Default |\n\
          |---|---|\n",
     );
-    for (key, value) in default_scalar_rows() {
-        let _ = writeln!(body, "| `{key}` | `{value}` |");
+    for (key, value) in rendered_scalar_rows() {
+        let _ = writeln!(body, "| `{key}` | {value} |");
     }
 
     debug_assert!(
@@ -293,6 +343,31 @@ mod tests {
             .insert("fg".to_owned(), "#cdd6f4".to_owned());
         config.experimental.predictive_echo = Some(true);
         config
+    }
+
+    /// The guard on [`TRISTATE_ROWS`]: every key listed there must really be
+    /// absent from the serialized defaults.
+    ///
+    /// The rows exist because serde omits a `None` and the table would
+    /// otherwise lose the key entirely. The moment one of them acquires a
+    /// concrete default, serde emits a row of its own, the page grows a
+    /// duplicate, and the hand-written "unset — ..." text becomes a lie. This
+    /// fails then, at the schema change, rather than in review of the rendered
+    /// page.
+    #[test]
+    fn tristate_keys_are_really_unset_in_the_schema() {
+        let defaults =
+            toml::Value::try_from(Config::default()).expect("Config::default() serializes to TOML");
+        let mut serialized = Vec::new();
+        scalar_rows(&defaults, "", &mut serialized);
+        for (key, _) in super::TRISTATE_ROWS {
+            assert!(
+                !serialized.iter().any(|(got, _)| got == key),
+                "{key} is listed in TRISTATE_ROWS but the schema now \
+                 serializes a default for it; drop the hand-written row and \
+                 let the generated table carry it"
+            );
+        }
     }
 
     /// THE coverage gate: `SECTIONS` and the schema's serde key set must

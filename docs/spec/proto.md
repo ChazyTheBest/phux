@@ -507,10 +507,21 @@ type byte followed by its payload, i.e. everything a frame carries after the
 length prefix. The receiver inflates it and dispatches the result exactly as
 if those bytes had arrived unwrapped.
 
+A sender MUST NOT wrap a frame whose body exceeds the larger of the two
+negotiated payload bounds (`max_chunk_bytes`, `max_history_page_bytes`) plus a
+64 KiB allowance for the inner frame's own ids, cursors and field headers. The
+envelope is specified for the payload-bearing frames those bounds govern, and
+the limit is what lets a receiver size its allocation from the handshake
+rather than from a number the sender chose.
+
 A receiver MUST:
 
-- reject `uncompressed_len` of zero or above the §5 frame cap **before**
-  allocating, so an envelope can never ask for more memory than a legal frame;
+- reject `uncompressed_len` of zero or above that bound **before** allocating.
+  Bounding by the §5 frame cap alone would let a peer spend a few hundred
+  bytes of payload to make the receiver allocate 16 MiB, repeatedly; bounding
+  by the negotiated limits makes the worst case proportional to what the
+  connection agreed to carry, and smallest for the peer that asked for the
+  smallest bounds;
 - inflate to **exactly** `uncompressed_len` bytes, rejecting both a stream
   that ends short and one that would run long — a decoder that accepted a
   short inflate would dispatch a truncated body, which can decode as a
