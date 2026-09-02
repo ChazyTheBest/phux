@@ -155,3 +155,14 @@ insta.workspace = true
 # new external surface.
 tracing-subscriber = { workspace = true }
 tracing-core = { workspace = true }
+
+# Cell-emission gate for `attach::render` (phux-l96p.2). `harness = false`:
+# a plain `main` that prints ns/frame, bytes/frame, allocs/frame and
+# flushes/frame — no criterion, no new dependency row. `required-features`
+# gates it on `testkit` because it builds a `ReplicaWalk` through
+# `ReplicaWalk::for_test`, so `cargo clippy --all-targets` on the default
+# feature set skips it rather than failing to compile.
+[[bench]]
+name = "render_frame"
+harness = false
+required-features = ["testkit"]

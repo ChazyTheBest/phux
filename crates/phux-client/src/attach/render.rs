@@ -14,6 +14,24 @@
 //! bits are reset after the row is drawn so subsequent renders skip clean
 //! rows.
 //!
+//! Two frame-level contracts hold across everything below (`phux-l96p.2`):
+//!
+//! * **A painted frame is a transaction.** The dirty-row paint opens a DEC
+//!   2026 synchronized-output block (`SyncOutput`) and closes it after the
+//!   cursor is placed, so a terminal that composites mid-sequence never shows
+//!   a half-repainted pane. The guard nests, so the frame-level block
+//!   `paint::paint_full_frame` opens around several panes plus the chrome is
+//!   not truncated by the per-pane one. A CLEAN frame opens no block and
+//!   emits nothing at all.
+//! * **The renderer never flushes.** ADR-0029 already makes
+//!   `paint::end_of_frame_cursor` the one cursor authority per frame; it is
+//!   the one FLUSH authority too, so a composite frame reaches the outer
+//!   terminal in a single write-out rather than one per component painter.
+//!
+//! The cell loop itself allocates nothing: the grapheme cluster and the row's
+//! bytes are read into buffers the pane's renderer owns for its whole life
+//! (see `CellScratch`).
+//!
 //! No raw-mode or alt-screen toggling happens here; the [`super::driver`]
 //! owns those transitions via an RAII guard so they survive panics and
 //! early returns.
@@ -156,6 +174,30 @@ pub struct TerminalRenderer<'alloc> {
     /// ordinary renders are unaffected and no other paint path needs to know
     /// copy-mode exists.
     selection: Option<SelectionRect>,
+    /// Per-frame emission buffers, reused for the life of the pane
+    /// (`phux-l96p.2`). See [`CellScratch`].
+    scratch: CellScratch,
+}
+
+/// The renderer's reusable per-frame emission buffers.
+///
+/// These live on the pane's [`TerminalRenderer`] rather than on the stack of
+/// a paint call because the cell loop is the tightest loop in the product: a
+/// full-dirty 200x60 frame walks 12 000 cells, and the pre-`phux-l96p.2` loop
+/// bought a fresh `Vec<char>` from the allocator for every non-empty one —
+/// ~10 000 malloc/free pairs before a single byte reached the terminal, over
+/// half the frame's wall time. Hoisting the two buffers here makes the steady
+/// state allocation-free: the first frame grows them to a row's width and
+/// every later frame reuses that capacity.
+#[derive(Debug, Default)]
+struct CellScratch {
+    /// One painted row's VT bytes, handed to the sink in a single
+    /// `write_all` instead of one call per cell.
+    row: Vec<u8>,
+    /// The current cell's grapheme cluster, UTF-8 encoded in place by
+    /// [`CellIteration::graphemes_utf8`] — the allocation-free counterpart
+    /// to `CellIteration::graphemes`, which allocates a `Vec<char>` per call.
+    cluster: String,
 }
 
 impl<'alloc> TerminalRenderer<'alloc> {
@@ -169,6 +211,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
             last_cursor_local: None,
             last_origin: (0, 0),
             selection: None,
+            scratch: CellScratch::default(),
         })
     }
 
@@ -226,9 +269,10 @@ impl<'alloc> TerminalRenderer<'alloc> {
         row: u16,
         col: u16,
     ) -> Result<Option<char>, RenderError> {
-        Ok(self
-            .read_cell_graphemes(walk, row, col)?
-            .and_then(|g| g.first().copied()))
+        if !self.read_cell_cluster(walk, row, col)? {
+            return Ok(None);
+        }
+        Ok(self.scratch.cluster.chars().next())
     }
 
     /// Read the full grapheme cluster of the cell at `(row, col)` as a
@@ -252,24 +296,36 @@ impl<'alloc> TerminalRenderer<'alloc> {
         row: u16,
         col: u16,
     ) -> Result<Option<String>, RenderError> {
-        Ok(self.read_cell_graphemes(walk, row, col)?.and_then(|g| {
-            if g.is_empty() {
-                None
-            } else {
-                Some(g.into_iter().collect())
-            }
-        }))
+        if !self.read_cell_cluster(walk, row, col)? {
+            return Ok(None);
+        }
+        if self.scratch.cluster.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.scratch.cluster.clone()))
     }
 
     /// Shared cell-grapheme lookup backing [`Self::read_grapheme_at`] and
-    /// [`Self::read_grapheme_string_at`]. Returns the cell's scalar vec,
-    /// or `None` when `(row, col)` is out of range.
-    fn read_cell_graphemes(
+    /// [`Self::read_grapheme_string_at`].
+    ///
+    /// Loads the cell's grapheme cluster into [`CellScratch::cluster`] and
+    /// returns whether `(row, col)` was in range; an in-range blank cell
+    /// leaves the buffer empty. Reading through the shared scratch is what
+    /// makes the predictive-echo reconcile allocation-free — it runs once per
+    /// pending prediction on every server frame, and used to buy (and throw
+    /// away) a `Vec<char>` on each call.
+    ///
+    /// Row seeking is still linear: libghostty's `RowIterator` exposes only
+    /// `next()`, with no counterpart to `CellIterator::select`, so reaching
+    /// row *n* costs *n* iterator steps. `select` on the *cell* iterator does
+    /// make the column O(1). A `row_iterator_select(y)` in libghostty-vt
+    /// would close the remaining gap.
+    fn read_cell_cluster(
         &mut self,
         walk: ReplicaWalk<'_, 'alloc, '_>,
         row: u16,
         col: u16,
-    ) -> Result<Option<Vec<char>>, RenderError> {
+    ) -> Result<bool, RenderError> {
         let RenderWalk {
             snapshot,
             rows,
@@ -277,8 +333,9 @@ impl<'alloc> TerminalRenderer<'alloc> {
         } = self.pool.begin(walk.terminal, walk.generation)?;
         let rows_total = snapshot.rows()?;
         let cols_total = snapshot.cols()?;
+        self.scratch.cluster.clear();
         if row >= rows_total || col >= cols_total {
-            return Ok(None);
+            return Ok(false);
         }
         let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
@@ -286,14 +343,15 @@ impl<'alloc> TerminalRenderer<'alloc> {
             if row_index == row {
                 let mut cell_iter = cells.update(this_row)?;
                 cell_iter.select(col)?;
-                return Ok(Some(cell_iter.graphemes()?));
+                cell_iter.graphemes_utf8(&mut self.scratch.cluster)?;
+                return Ok(true);
             }
             row_index = row_index.saturating_add(1);
             if row_index >= rows_total {
                 break;
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     /// Render dirty rows of `terminal` to `out`. Returns the dirty
@@ -410,13 +468,14 @@ impl<'alloc> TerminalRenderer<'alloc> {
         let extent = clipped_extent(&snapshot, clip)?;
         let (cols_total, rows_total) = extent;
 
+        let cluster = &mut self.scratch.cluster;
         let mut row_iter = rows.update(&snapshot)?;
         let mut row_index: u16 = 0;
         while let Some(row) = row_iter.next() {
             if row_index >= rows_total {
                 break;
             }
-            project_row_into_frame(frame, cells, row, row_index, origin, cols_total)?;
+            project_row_into_frame(frame, cluster, cells, row, row_index, origin, cols_total)?;
             row_index = row_index.saturating_add(1);
         }
 
@@ -457,12 +516,22 @@ impl<'alloc> TerminalRenderer<'alloc> {
         force_full: bool,
     ) -> Result<Dirty, RenderError> {
         let lb = letterbox_rect(rect_origin, rect_clip, mirror);
+        // Bars and content are ONE transaction when there are bars: otherwise
+        // an undersized mirror shows its blanked margins a beat before the
+        // content lands inside them. Opened only in the pad case so the
+        // clamp path (and every clean frame through it) stays byte-identical;
+        // the guard nests with the one `render_at_inner` opens.
+        let sync = lb.has_pad().then(|| SyncOutput::begin(out)).transpose()?;
         // Blank the four margin bars first so an undersized mirror's
         // surrounding cells are cleared before the centred content paints
         // over the interior. Skipped entirely when there is no pad (the
         // mirror-fills-the-rect / clamp case), keeping that path byte-identical.
         emit_letterbox_margins(out, lb)?;
-        self.render_at_inner(walk, out, lb.inner_origin, lb.inner_clip, force_full)
+        let dirty = self.render_at_inner(walk, out, lb.inner_origin, lb.inner_clip, force_full)?;
+        if let Some(sync) = sync {
+            sync.end(out)?;
+        }
+        Ok(dirty)
     }
 
     fn render_at_inner(
@@ -503,12 +572,20 @@ impl<'alloc> TerminalRenderer<'alloc> {
             )?;
             return Ok(dirty);
         }
+        // Every incremental paint is a transaction, not just the full-frame
+        // one: a dirty-row repaint moves the cursor, rewrites rows, and
+        // re-places the cursor, and a terminal that composites mid-sequence
+        // shows the intermediate states as tearing. The guard nests, so this
+        // costs nothing extra when the frame-level paint already opened a
+        // block around several panes plus the chrome.
+        let sync = SyncOutput::begin(out)?;
         out.write_all(b"\x1b[?25l")?;
 
         let extent = clipped_extent(&snapshot, clip)?;
         let mut row_iter = rows.update(&snapshot)?;
         paint_dirty_rows(
             out,
+            &mut self.scratch,
             &mut row_iter,
             cells,
             dirty,
@@ -532,6 +609,7 @@ impl<'alloc> TerminalRenderer<'alloc> {
             &mut self.last_cursor,
             &mut self.last_cursor_local,
         )?;
+        sync.end(out)?;
         Ok(dirty)
     }
 }
@@ -567,8 +645,13 @@ fn clipped_extent(
 ///
 /// Under `Dirty::Full` paint every row; under `Dirty::Partial` skip rows whose
 /// per-row dirty bit is clear.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row-walk context: sink, scratch, the libghostty trio, and the clip/selection policy"
+)]
 fn paint_dirty_rows<'alloc>(
     out: &mut impl Write,
+    scratch: &mut CellScratch,
     row_iter: &mut RowIteration<'alloc, '_>,
     cells: &mut CellIterator<'alloc>,
     dirty: Dirty,
@@ -583,7 +666,9 @@ fn paint_dirty_rows<'alloc>(
             break;
         }
         if matches!(dirty, Dirty::Full) || row.dirty()? {
-            paint_row(out, row, cells, row_index, origin, cols_total, selection)?;
+            paint_row(
+                out, scratch, row, cells, row_index, origin, cols_total, selection,
+            )?;
         }
         row_index += 1;
     }
@@ -592,8 +677,18 @@ fn paint_dirty_rows<'alloc>(
 
 /// Paint one row: position the cursor at its start, emit every cell up to
 /// `cols_total`, then clear the row's dirty bit.
+///
+/// The row is composed into [`CellScratch::row`] and handed to `out` in a
+/// single `write_all`. The bytes are identical to the previous
+/// write-per-cell emission; what changes is that a 200-column row costs the
+/// sink one call instead of ~200.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row-paint context: sink, scratch, the libghostty trio, and the clip/selection policy"
+)]
 fn paint_row<'alloc>(
     out: &mut impl Write,
+    scratch: &mut CellScratch,
     row: &RowIteration<'alloc, '_>,
     cells: &mut CellIterator<'alloc>,
     row_index: u16,
@@ -601,14 +696,20 @@ fn paint_row<'alloc>(
     cols_total: u16,
     selection: Option<SelectionRect>,
 ) -> Result<(), RenderError> {
+    let CellScratch { row: buf, cluster } = scratch;
+    buf.clear();
     let (ox, oy) = origin;
-    write_cup(out, row_index.saturating_add(oy), ox)?;
+    write_cup(buf, row_index.saturating_add(oy), ox)?;
     // Force a reset at row start so the previous row's tail
     // style can't leak into the current row. After this the
     // active outer-terminal SGR state is the default style,
     // which `emitted = None` represents.
-    out.write_all(b"\x1b[0m")?;
-    let mut emitted: Option<EmittedStyle> = None;
+    buf.extend_from_slice(b"\x1b[0m");
+    let mut state = RowState {
+        emitted: None,
+        prev_had_text: false,
+        styling: RowStyling::of(row)?,
+    };
 
     let mut col: u16 = 0;
     let mut cell_iter = cells.update(row)?;
@@ -616,11 +717,12 @@ fn paint_row<'alloc>(
         if col >= cols_total {
             break;
         }
-        emit_cell(out, cell, &mut emitted, selection, (row_index, col))?;
+        emit_cell(buf, cluster, cell, &mut state, selection, (row_index, col))?;
         // Every cell consumes one column, including a wide glyph's spacer
         // tail (which emits nothing).
         col = col.saturating_add(1);
     }
+    out.write_all(buf)?;
     // Reset per-row dirty bit after drawing, per the libghostty
     // contract.
     row.set_dirty(false)?;
@@ -628,30 +730,97 @@ fn paint_row<'alloc>(
 }
 
 /// Emit one cell at `at = (row, col)`: apply the copy-mode inversion, then
-/// hand the coalesced style and graphemes to [`emit_cell_glyphs`].
+/// hand the coalesced style and cluster to [`emit_cell_glyphs`].
 ///
 /// A wide glyph's `SpacerTail` column writes nothing at all.
+///
+/// Every value this needs costs a crossing into libghostty, so the reads are
+/// ordered to buy the cheapest verdict first and skip the rest:
+///
+/// * the cluster comes back through [`CellIteration::graphemes_utf8`], which
+///   encodes into the caller's buffer — `graphemes()` allocates a
+///   `Vec<char>` per call, and this runs 12 000 times on a full 200x60 frame;
+/// * `wide` is read only when it can change the outcome. A `SpacerTail` is
+///   written by libghostty as codepoint 0, so a cell that produced ANY text
+///   cannot be one; the two reads behind `raw_cell()?.wide()?` are therefore
+///   confined to blank cells, plus the copy-mode case where a selection has
+///   to know whether a wide glyph's tail column is covered;
+/// * the style trio is skipped outright for a tail, which emits nothing.
 fn emit_cell(
-    out: &mut impl Write,
+    out: &mut Vec<u8>,
+    cluster: &mut String,
     cell: &CellIteration<'_, '_>,
-    emitted: &mut Option<EmittedStyle>,
+    state: &mut RowState,
     selection: Option<SelectionRect>,
     at: (u16, u16),
 ) -> Result<(), RenderError> {
     let (row, col) = at;
-    let (graphemes, mut style) = (cell.graphemes()?, cell.style()?);
-    let (fg, bg) = (cell.fg_color()?, cell.bg_color()?);
-    let wide = cell.raw_cell()?.wide()?;
-    // Toggle inverse so selected cells differ from their normal state.
-    if selection_covers_cell(selection, row, col, wide) {
-        style.inverse = !style.inverse;
-    }
+    cluster.clear();
+    cell.graphemes_utf8(cluster)?;
+    let has_text = !cluster.is_empty();
+    let wide = read_wide(cell, state, has_text, selection)?;
+    state.prev_had_text = has_text;
     if matches!(wide, CellWide::SpacerTail) {
         // Account for the tail column, but emit no overwrite.
         return Ok(());
     }
-    emit_cell_glyphs(out, emitted, style, fg, bg, &graphemes)?;
+    let (mut style, fg, bg) = read_cell_pen(cell, state.styling, has_text)?;
+    // Toggle inverse so selected cells differ from their normal state.
+    if selection_covers_cell(selection, row, col, wide) {
+        style.inverse = !style.inverse;
+    }
+    emit_cell_glyphs(out, &mut state.emitted, style, fg, bg, cluster);
     Ok(())
+}
+
+/// The cell's `wide` classification, read only when it can change the outcome.
+///
+/// Two crossings into libghostty (`raw_cell` then `wide`) are a real cost at
+/// 12 000 cells a frame, and the answer is knowable without them in the common
+/// cases:
+///
+/// * a cell with TEXT is never a spacer tail — libghostty writes a tail as
+///   codepoint 0 (`printCell(0, .spacer_tail)`), so it has no text at all;
+/// * a wide glyph's tail is always the cell IMMEDIATELY after its base, and
+///   the base carries the glyph. A blank cell whose predecessor was also
+///   blank therefore cannot be a tail either, which collapses the read across
+///   a whole run of blanks to nothing.
+///
+/// A live copy-mode selection defeats both shortcuts: it has to know whether
+/// a wide glyph's tail column falls inside the rectangle, so it reads for
+/// real. `Narrow` is the honest answer everywhere else — nothing but the
+/// spacer-tail test and the selection consults this value.
+fn read_wide(
+    cell: &CellIteration<'_, '_>,
+    state: &RowState,
+    has_text: bool,
+    selection: Option<SelectionRect>,
+) -> Result<CellWide, RenderError> {
+    let could_be_tail = !has_text && state.prev_had_text;
+    if could_be_tail || selection.is_some() {
+        return Ok(cell.raw_cell()?.wide()?);
+    }
+    Ok(CellWide::Narrow)
+}
+
+/// The pen `(style, resolved fg, resolved bg)` a cell paints with.
+///
+/// On a [`RowStyling::Styled`] row this is the three reads it has always
+/// been. On an unstyled row libghostty's own resolution makes two of them
+/// constant — see [`RowStyling`] — and the third collapses too for a cell
+/// with text, whose content tag is a codepoint and whose background can then
+/// only come from a style the row does not have. That leaves an unstyled
+/// text cell costing a single crossing for its cluster and nothing else.
+fn read_cell_pen(
+    cell: &CellIteration<'_, '_>,
+    styling: RowStyling,
+    has_text: bool,
+) -> Result<(Style, Option<RgbColor>, Option<RgbColor>), RenderError> {
+    if matches!(styling, RowStyling::Styled) {
+        return Ok((cell.style()?, cell.fg_color()?, cell.bg_color()?));
+    }
+    let bg = if has_text { None } else { cell.bg_color()? };
+    Ok((Style::default(), None, bg))
 }
 
 /// Write one cell's style change (if any) followed by its glyphs.
@@ -662,34 +831,33 @@ fn emit_cell(
 /// `emitted` tracks the active state for this row (reset to default = `None`
 /// at row start).
 fn emit_cell_glyphs(
-    out: &mut impl Write,
+    out: &mut Vec<u8>,
     emitted: &mut Option<EmittedStyle>,
     style: Style,
     fg: Option<RgbColor>,
     bg: Option<RgbColor>,
-    graphemes: &[char],
-) -> io::Result<()> {
-    emit_sgr_if_changed(out, emitted, style, fg, bg)?;
-    if graphemes.is_empty() {
+    cluster: &str,
+) {
+    emit_sgr_if_changed(out, emitted, style, fg, bg);
+    if cluster.is_empty() {
         // A regular blank advances one column with a space.
-        return out.write_all(b" ");
+        out.push(b' ');
+        return;
     }
-    write_graphemes(out, graphemes)
-}
-
-/// Write a cell's grapheme cluster as UTF-8.
-///
-/// The scratch buffer is on the stack, so this per-cell path allocates nothing.
-fn write_graphemes(out: &mut impl Write, graphemes: &[char]) -> io::Result<()> {
-    let mut buf = [0u8; 4];
-    for ch in graphemes {
-        out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
-    }
-    Ok(())
+    // Already UTF-8: libghostty encoded the cluster straight into `cluster`.
+    out.extend_from_slice(cluster.as_bytes());
 }
 
 /// Close out a painted frame: reset SGR, place and cache the cursor, apply the
-/// cursor style, clear the global dirty bit, and flush.
+/// cursor style, and clear the global dirty bit.
+///
+/// It does NOT flush. A composite frame is one pane paint (or several) plus
+/// dividers, the sidebar strip and the status bar, and every one of those
+/// used to flush on its way out — several syscalls per frame, each one a
+/// chance for the outer terminal to composite a half-built screen. ADR-0029
+/// already names `paint::end_of_frame_cursor` the single cursor authority per
+/// frame; it is now the single FLUSH authority too, and the renderer leaves
+/// its bytes in the sink for it.
 fn emit_frame_epilogue(
     snapshot: &Snapshot<'_, '_>,
     out: &mut impl Write,
@@ -710,14 +878,13 @@ fn emit_frame_epilogue(
 
     // Clear the global dirty bit. Per-row bits were cleared inline.
     snapshot.set_dirty(Dirty::Clean)?;
-
-    out.flush()?;
     Ok(())
 }
 
 /// Project one row's cells into `frame`, clipped to `cols_total` columns.
 fn project_row_into_frame<'alloc>(
     frame: &mut RenderedFrame,
+    cluster: &mut String,
     cells: &mut CellIterator<'alloc>,
     row: &RowIteration<'alloc, '_>,
     row_index: u16,
@@ -733,6 +900,7 @@ fn project_row_into_frame<'alloc>(
         }
         project_cell_into_frame(
             frame,
+            cluster,
             cell,
             row_index.saturating_add(oy),
             col.saturating_add(ox),
@@ -746,35 +914,44 @@ fn project_row_into_frame<'alloc>(
 /// leaving the frame untouched when that coordinate is out of range.
 fn project_cell_into_frame(
     frame: &mut RenderedFrame,
+    cluster: &mut String,
     cell: &CellIteration<'_, '_>,
     row: u16,
     col: u16,
 ) -> Result<(), RenderError> {
-    let grapheme = frame_grapheme(cell)?;
+    read_frame_grapheme(cell, cluster)?;
     let style = to_cell_style(&cell.style()?, cell.fg_color()?, cell.bg_color()?);
     if let Some(dst) = frame.cell_mut(row, col) {
-        dst.grapheme = grapheme;
+        // Overwrite in place so the destination cell's `String` keeps its
+        // buffer across frames instead of being dropped and re-allocated.
+        dst.grapheme.clear();
+        dst.grapheme.push_str(cluster);
         dst.style = style;
     }
     Ok(())
 }
 
-/// The grapheme a cell contributes to a [`RenderedFrame`].
+/// Load into `out` the grapheme a cell contributes to a [`RenderedFrame`].
 ///
-/// A blank cell becomes a single space; everything else is the cell's own
-/// cluster.
-fn frame_grapheme(cell: &CellIteration<'_, '_>) -> Result<String, RenderError> {
-    let wide = cell.raw_cell()?.wide()?;
-    let graphemes = cell.graphemes()?;
-    if matches!(wide, CellWide::SpacerTail) {
-        // Right half of a wide glyph: the base cell already
-        // carries the cluster; emit no glyph so widths stay exact.
-        return Ok(String::new());
+/// A blank cell becomes a single space; a wide glyph's spacer tail becomes
+/// the empty string; everything else is the cell's own cluster. `out` is the
+/// renderer's scratch buffer, so this reads through
+/// [`CellIteration::graphemes_utf8`] rather than allocating a `Vec<char>`
+/// plus a `String` per cell.
+fn read_frame_grapheme(cell: &CellIteration<'_, '_>, out: &mut String) -> Result<(), RenderError> {
+    out.clear();
+    cell.graphemes_utf8(out)?;
+    if out.is_empty() {
+        // Only a cell with NO text can be a wide glyph's spacer tail, so the
+        // `wide` read is confined to this branch. A tail contributes nothing
+        // (the base cell already carries the cluster, and leaving the tail
+        // empty is what lets a consumer reconstruct exact widths); a real
+        // blank contributes one space.
+        if !matches!(cell.raw_cell()?.wide()?, CellWide::SpacerTail) {
+            out.push(' ');
+        }
     }
-    if graphemes.is_empty() {
-        return Ok(" ".to_owned());
-    }
-    Ok(graphemes.iter().collect())
+    Ok(())
 }
 
 /// The pane's cursor, shifted into frame-absolute coords, dropped when it sits
@@ -848,15 +1025,13 @@ fn render_clean_frame_cursor(
         return Ok(());
     }
 
+    // No flush here either: the frame's one flush belongs to
+    // `paint::end_of_frame_cursor` (see [`emit_frame_epilogue`]).
     if let Some((abs_y, abs_x)) = new_abs {
         write_cup(out, abs_y, abs_x)?;
         out.write_all(b"\x1b[?25h")?;
-        out.flush()?;
     } else if *last_cursor != new_abs {
         out.write_all(b"\x1b[?25l")?;
-        out.flush()?;
-    } else if emitted_kitty {
-        out.flush()?;
     }
     *last_cursor = new_abs;
     *last_cursor_local = new_local;
@@ -909,6 +1084,87 @@ fn cell_color(resolved: Option<RgbColor>, raw: StyleColor) -> CellColor {
             g: rgb.g,
             b: rgb.b,
         }),
+    }
+}
+
+/// DEC 2026 "begin synchronized update" — the outer terminal buffers
+/// everything until the matching end and presents it in one composite.
+pub(super) const SYNC_OUTPUT_BEGIN: &[u8] = b"\x1b[?2026h";
+/// DEC 2026 "end synchronized update".
+pub(super) const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+
+thread_local! {
+    /// How many [`SyncOutput`] guards are open on this thread.
+    ///
+    /// DEC 2026 is a MODE, not a counter: a nested `?2026l` ends the outer
+    /// terminal's transaction early, so a naive guard inside `render_at`
+    /// would break the frame-level block `paint_full_frame` opens around
+    /// several panes plus the chrome — the atomicity it exists for. Counting
+    /// the depth here makes the guard nestable: only the outermost one emits
+    /// the mode bytes.
+    ///
+    /// Thread-local rather than a field because the two nesting levels are
+    /// opened by different layers (the composite paint and the per-pane
+    /// renderer) that never see each other's state, and the client's paint
+    /// path is a single tokio current-thread runtime — every emit reaching
+    /// stdout comes from one thread. A guard on another thread simply nests
+    /// against its own counter, which is the correct answer for a separate
+    /// sink.
+    static SYNC_OUTPUT_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// An open DEC 2026 synchronized-output block.
+///
+/// Nestable: [`SyncOutput::begin`] emits `CSI ? 2026 h` only when no block is
+/// already open on this thread, and [`SyncOutput::end`] emits `CSI ? 2026 l`
+/// only when it closes the outermost one. That is what lets the frame-level
+/// block and the per-pane block land as independent changes without one
+/// truncating the other.
+///
+/// The counter is released in `Drop`, so an early return or a panic between
+/// `begin` and `end` cannot strand the depth (it can still leave the outer
+/// terminal inside a transaction — the driver's `SYNC_OUTPUT_WATCHDOG` is the
+/// backstop for that, exactly as it is for an application that omits its own
+/// `?2026l`). Closing is explicit rather than `Drop`-driven because the sink
+/// to write to is not something a guard can hold across the borrow of `out`
+/// the paint needs.
+#[derive(Debug)]
+#[must_use = "an opened synchronized-output block must be closed with `end`"]
+pub(super) struct SyncOutput {
+    /// Whether THIS guard emitted the begin bytes (i.e. it is the outermost).
+    outermost: bool,
+}
+
+impl SyncOutput {
+    /// Open a synchronized-output block around the emits that follow.
+    pub(super) fn begin(out: &mut impl Write) -> io::Result<Self> {
+        let outermost = SYNC_OUTPUT_DEPTH.with(|depth| {
+            let was = depth.get();
+            depth.set(was.saturating_add(1));
+            was == 0
+        });
+        // Bind the guard BEFORE the write so a failing sink drops it — and
+        // releases the depth it just took — instead of leaking a level that
+        // would silently suppress every later block on this thread.
+        let guard = Self { outermost };
+        if outermost {
+            out.write_all(SYNC_OUTPUT_BEGIN)?;
+        }
+        Ok(guard)
+    }
+
+    /// Close the block, emitting the end bytes only if this guard opened it.
+    pub(super) fn end(self, out: &mut impl Write) -> io::Result<()> {
+        if self.outermost {
+            out.write_all(SYNC_OUTPUT_END)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SyncOutput {
+    fn drop(&mut self) {
+        SYNC_OUTPUT_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 
@@ -1098,13 +1354,71 @@ fn emit_side_margin_bars(
     Ok(())
 }
 
-/// Write `n` blank (space) cells in one call — the margin-bar fill.
+/// A read-only run of spaces the blank-fill paths slice, so filling a margin
+/// bar costs no allocation. 256 is wider than any realistic terminal column
+/// count; [`write_blank_run`] loops for anything wider.
+const BLANK_RUN: [u8; 256] = [b' '; 256];
+
+/// Write `n` blank (space) cells — the margin-bar fill.
 fn write_blank_run(out: &mut impl Write, n: u16) -> io::Result<()> {
-    if n == 0 {
-        return Ok(());
+    let mut remaining = usize::from(n);
+    while remaining > 0 {
+        let chunk = remaining.min(BLANK_RUN.len());
+        out.write_all(&BLANK_RUN[..chunk])?;
+        remaining -= chunk;
     }
-    let blanks = vec![b' '; n as usize];
-    out.write_all(&blanks)
+    Ok(())
+}
+
+/// Whether a row holds any styled cell, decided once per row.
+///
+/// libghostty keeps a deliberately conservative `styled` flag per row: it is
+/// set the first time a styled cell is written to the row and never cleared
+/// again, because re-checking would cost more than it saves. So the flag can
+/// be a false POSITIVE, never a false negative — a styled cell in a row the
+/// flag calls unstyled is a page-integrity violation ghostty's own checker
+/// rejects (`UnmarkedStyleRow`).
+///
+/// That makes the flag safe to lead with: on an unstyled row every cell's
+/// `style()` resolves to the default and every cell's `fg_color()` to `None`,
+/// so both reads can be skipped for the whole row at the cost of reading one
+/// flag. On a full 200x60 frame that is 24 000 crossings into libghostty
+/// traded for 60.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowStyling {
+    /// No cell in this row carries a style entry.
+    Unstyled,
+    /// At least one cell may carry a style entry; read the pen per cell.
+    Styled,
+}
+
+impl RowStyling {
+    /// Read the row's flag.
+    fn of(row: &RowIteration<'_, '_>) -> Result<Self, RenderError> {
+        Ok(if row.raw_row()?.is_styled()? {
+            Self::Styled
+        } else {
+            Self::Unstyled
+        })
+    }
+}
+
+/// The state [`paint_row`] threads across one row's cells.
+#[derive(Debug)]
+struct RowState {
+    /// The style currently active on the outer terminal, for run coalescing.
+    /// `None` means the default style is active — true at row start, just
+    /// after the row-leading `\x1b[0m`.
+    emitted: Option<EmittedStyle>,
+    /// Whether the previous cell in this row carried any text. A wide glyph's
+    /// spacer tail only ever follows the base cell that carries the glyph, so
+    /// this is what lets [`read_wide`] skip the `wide` lookup across a run of
+    /// blanks. `false` at row start: column 0 has no predecessor, and the
+    /// base of a wide glyph is never off-row (a glyph that would not fit
+    /// wraps whole).
+    prev_had_text: bool,
+    /// How this row's cells resolve their pen.
+    styling: RowStyling,
 }
 
 /// The cell style currently active on the outer terminal, as a comparable
@@ -1133,29 +1447,28 @@ fn is_default_render(style: &Style, fg: Option<RgbColor>, bg: Option<RgbColor>) 
 /// are identical to the pre-coalescing per-cell emission (a `\x1b[0m` reset
 /// followed by the attribute/color set), so the rendered screen is unchanged.
 fn emit_sgr_if_changed(
-    out: &mut impl Write,
+    out: &mut Vec<u8>,
     emitted: &mut Option<EmittedStyle>,
     style: Style,
     fg: Option<RgbColor>,
     bg: Option<RgbColor>,
-) -> io::Result<()> {
+) {
     if is_default_render(&style, fg, bg) {
         // Returning to default mid-row needs an explicit reset; at row start
         // (`emitted == None`) the default is already active, so skip it.
         if emitted.is_some() {
-            out.write_all(b"\x1b[0m")?;
+            out.extend_from_slice(b"\x1b[0m");
             *emitted = None;
         }
-        return Ok(());
+        return;
     }
 
     let key = (style, fg, bg);
     if *emitted == Some(key) {
-        return Ok(());
+        return;
     }
-    emit_sgr_set(out, &style, fg, bg)?;
+    emit_sgr_set(out, &style, fg, bg);
     *emitted = Some(key);
-    Ok(())
 }
 
 fn selection_covers_cell(
@@ -1175,19 +1488,12 @@ fn selection_covers_cell(
 /// The leading reset clears any prior attributes so the resulting outer-
 /// terminal state is exactly `(style, fg, bg)` regardless of what preceded
 /// it; coalescing in [`emit_sgr_if_changed`] decides *when* this runs.
-fn emit_sgr_set(
-    out: &mut impl Write,
-    style: &Style,
-    fg: Option<RgbColor>,
-    bg: Option<RgbColor>,
-) -> io::Result<()> {
+fn emit_sgr_set(out: &mut Vec<u8>, style: &Style, fg: Option<RgbColor>, bg: Option<RgbColor>) {
     // Encode via the shared server/client SGR emitter (phux-protocol) so the
     // two ends cannot drift — they previously both dropped underline/overline.
-    // Build into a small scratch buffer (this runs once per coalesced style
-    // run, not per cell) then write it in one call.
-    let mut buf = Vec::with_capacity(32);
-    write_reset_and_sgr(&mut buf, style, fg, bg);
-    out.write_all(&buf)
+    // It appends straight to the row buffer, so a style run costs no scratch
+    // allocation of its own.
+    write_reset_and_sgr(out, style, fg, bg);
 }
 
 fn emit_cursor_style(
@@ -1453,6 +1759,10 @@ mod tests {
         );
     }
 
+    /// phux-l96p.2 updated the pinned prefix: a painted frame now OPENS with
+    /// the DEC 2026 begin (the paint is a transaction — see [`SyncOutput`])
+    /// and hides the cursor immediately inside it, and closes with the
+    /// matching end. The hide/show pair itself is unchanged.
     #[test]
     fn renderer_writes_cursor_hide_then_show_for_dirty_full() {
         let mut terminal = fresh(5, 2);
@@ -1462,11 +1772,138 @@ mod tests {
         let _ = renderer
             .render(ReplicaWalk::for_test(&terminal), &mut buf)
             .expect("render");
-        // Must start by hiding the cursor.
-        assert!(buf.starts_with(b"\x1b[?25l"));
+        // Opens the synchronized-output transaction, then hides the cursor.
+        let mut prefix = SYNC_OUTPUT_BEGIN.to_vec();
+        prefix.extend_from_slice(b"\x1b[?25l");
+        assert!(
+            buf.starts_with(&prefix),
+            "frame must open with sync-begin + cursor hide; got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+        assert!(
+            buf.ends_with(SYNC_OUTPUT_END),
+            "frame must close the transaction; got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
         // Should contain the literal characters "a" and "b" somewhere.
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains('a') && s.contains('b'));
+    }
+
+    /// The guard NESTS: an inner block emits nothing, so a `render_at`
+    /// inside a frame-level transaction (what `paint_full_frame` opens
+    /// around several panes plus the chrome) cannot end it early. This is
+    /// the invariant that lets the frame-level and per-pane blocks land as
+    /// independent changes.
+    #[test]
+    fn synchronized_output_blocks_nest() {
+        let mut outer: Vec<u8> = Vec::new();
+        let guard = SyncOutput::begin(&mut outer).expect("outer begin");
+        assert_eq!(outer, SYNC_OUTPUT_BEGIN);
+
+        let mut inner: Vec<u8> = Vec::new();
+        let nested = SyncOutput::begin(&mut inner).expect("inner begin");
+        nested.end(&mut inner).expect("inner end");
+        assert!(
+            inner.is_empty(),
+            "a nested block must emit nothing; got {inner:?}"
+        );
+
+        outer.clear();
+        guard.end(&mut outer).expect("outer end");
+        assert_eq!(outer, SYNC_OUTPUT_END);
+
+        // Depth is back to zero, so the next block is outermost again.
+        let mut again: Vec<u8> = Vec::new();
+        let guard = SyncOutput::begin(&mut again).expect("begin");
+        assert_eq!(again, SYNC_OUTPUT_BEGIN);
+        again.clear();
+        guard.end(&mut again).expect("end");
+        assert_eq!(again, SYNC_OUTPUT_END);
+    }
+
+    /// A sink that fails the begin write must not strand the nesting depth.
+    /// A leaked level would make every later block on this thread believe it
+    /// was nested and emit no mode bytes at all — every frame silently
+    /// un-synchronized, with nothing to notice it.
+    #[test]
+    fn failed_begin_releases_the_nesting_depth() {
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("sink closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(SyncOutput::begin(&mut FailingSink).is_err());
+
+        let mut after: Vec<u8> = Vec::new();
+        let guard = SyncOutput::begin(&mut after).expect("begin");
+        assert_eq!(
+            after, SYNC_OUTPUT_BEGIN,
+            "the next block must still be outermost"
+        );
+        after.clear();
+        guard.end(&mut after).expect("end");
+        assert_eq!(after, SYNC_OUTPUT_END);
+    }
+
+    /// A frame that painted nothing (no dirty rows, cursor unmoved) must
+    /// still emit ZERO bytes — the sync-output transaction opens only on the
+    /// dirty path, so an idle pane costs nothing per server frame.
+    #[test]
+    fn clean_frame_emits_no_transaction_bytes() {
+        let mut terminal = fresh(5, 2);
+        terminal.vt_write(b"ab");
+        let mut renderer = TerminalRenderer::new().expect("TerminalRenderer::new");
+        let mut buf = Vec::new();
+        let _ = renderer
+            .render(ReplicaWalk::for_test(&terminal), &mut buf)
+            .expect("first render");
+        buf.clear();
+        let _ = renderer
+            .render(ReplicaWalk::for_test(&terminal), &mut buf)
+            .expect("clean render");
+        assert!(buf.is_empty(), "clean frame emitted {buf:?}");
+    }
+
+    /// The renderer never flushes: ADR-0029's composite end-of-frame owns the
+    /// frame's single flush, so a pane paint leaves its bytes in the sink.
+    #[test]
+    fn pane_paint_does_not_flush() {
+        #[derive(Default)]
+        struct FlushCounter {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for FlushCounter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut terminal = fresh(5, 2);
+        terminal.vt_write(b"ab");
+        let mut renderer = TerminalRenderer::new().expect("TerminalRenderer::new");
+        let mut sink = FlushCounter::default();
+        let _ = renderer
+            .render(ReplicaWalk::for_test(&terminal), &mut sink)
+            .expect("dirty render");
+        // A pure cursor move on an otherwise clean frame must not flush either.
+        terminal.vt_write(b"\x1b[1;1H");
+        let _ = renderer
+            .render(ReplicaWalk::for_test(&terminal), &mut sink)
+            .expect("clean render");
+        assert_eq!(sink.flushes, 0, "renderer flushed {} times", sink.flushes);
+        assert!(!sink.bytes.is_empty(), "renderer emitted nothing at all");
     }
 
     /// phux-7ry0 regression: rendering a pane at a non-zero outer origin

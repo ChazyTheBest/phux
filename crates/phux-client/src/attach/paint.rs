@@ -21,8 +21,11 @@ use super::pane_state::{AttachKernel, PaneSlot, published_replica};
 use crate::layout::LayoutState;
 use crate::render::chrome::status_bar::{BarInset, Position, StatusBarPainter, make_context};
 
-const SYNC_OUTPUT_BEGIN: &[u8] = b"\x1b[?2026h";
-const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+// phux-l96p.2: the DEC 2026 constants and the nestable guard that owns them
+// moved to `super::render` so the per-pane paint can open its own block
+// without truncating the frame-level one opened here. `SyncOutput::begin`
+// emits the mode bytes only for the outermost block.
+use super::render::SyncOutput;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum StatusBarPaint {
@@ -198,7 +201,7 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
     let multi = super::multi_pane::compute_layout_in(layout_state, content, viewport_dims);
     // Component painters flush independently. Keep their intermediate states
     // hidden from the outer terminal while the destructive frame is rebuilt.
-    let _ = out.write_all(SYNC_OUTPUT_BEGIN);
+    let sync = SyncOutput::begin(out).ok();
     // ED2 (clear screen) + cursor home. Cheap and unambiguous.
     let _ = out.write_all(b"\x1b[2J\x1b[H");
     // Non-focused panes first; chrome (dividers + status bar) next; the
@@ -274,7 +277,7 @@ pub(super) fn paint_full_frame<W: super::RenderSink>(
         .and_then(|fid| multi.rects.get(fid).copied())
         .map(|r| (r.x, r.y));
     let cursor_published = end_of_frame_cursor(out, final_cursor, fallback_origin).is_ok();
-    let sync_ended = out.write_all(SYNC_OUTPUT_END).is_ok();
+    let sync_ended = sync.is_some_and(|sync| sync.end(out).is_ok());
     let frame_flushed = out.flush().is_ok();
     if cursor_published && sync_ended && frame_flushed {
         status_bar_painted
@@ -358,7 +361,7 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
         .map(|r| (r.x, r.y));
     // Sidebar/status painters flush independently. Publish their updates and
     // final cursor restoration as one outer-terminal transaction.
-    let _ = out.write_all(SYNC_OUTPUT_BEGIN);
+    let sync = SyncOutput::begin(out).ok();
     if let (Some(res), Some(painter)) = (sidebar, sidebar_painter) {
         let _ = painter.paint(out, sidebar_rect(viewport_dims, res));
     }
@@ -375,7 +378,7 @@ pub(super) fn paint_chrome_in_place<W: super::RenderSink>(
     // cursor sitting in the strip until the next pane render (never, for an
     // idle pane).
     let cursor_flushed = end_of_frame_cursor(out, restore, fallback).is_ok();
-    let sync_ended = out.write_all(SYNC_OUTPUT_END).is_ok();
+    let sync_ended = sync.is_some_and(|sync| sync.end(out).is_ok());
     let frame_flushed = out.flush().is_ok();
     if cursor_flushed && sync_ended && frame_flushed {
         status_bar_painted
@@ -435,6 +438,11 @@ pub(super) fn paint_bar_after_pane<W: Write>(
     bar_row_clobbered: bool,
 ) -> StatusBarPaint {
     let Some(painter) = status_bar else {
+        // phux-l96p.2: the pane renderer no longer flushes on its own (one
+        // flush per composite frame). With no bar there is no
+        // `end_of_frame_cursor` below to own it, so this early return is the
+        // frame's end and must publish what the pane painted.
+        let _ = out.flush();
         return StatusBarPaint::NotPublished;
     };
     let status_bar_painted = paint_bar_row(
@@ -686,6 +694,7 @@ pub(super) fn bar_inset(outer: (u16, u16), sidebar: Option<SidebarReservation>) 
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::attach::render::SYNC_OUTPUT_END;
     use crate::render::ChromeBreakpoints;
 
     fn published_kernel(
