@@ -44,6 +44,7 @@
     },
     "clients/cockpit": {
       "release-type": "simple",
+      "bootstrap-sha": "071e54cb2ca69f954ef5276db979d637deee7c78",
       "component": "cockpit",
       "include-component-in-tag": true,
       "include-v-in-tag": true,

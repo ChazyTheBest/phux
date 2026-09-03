@@ -55,7 +55,17 @@ jobs:
         env:
           BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
-        run: npx commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
+        run: |
+          set -euo pipefail
+          # Cockpit's one-time history import is intentionally reachable as a
+          # merge parent. Its 190 historical commits predate this repository's
+          # commitlint contract; exclude exactly that immutable ancestry while
+          # continuing to lint the import merge and every authored PR commit.
+          import_tip="$(< .github/cockpit-history-tip)"
+          mapfile -t commits < <(git rev-list --reverse "$BASE_SHA..$HEAD_SHA" --not "$import_tip")
+          for commit in "${commits[@]}"; do
+            git show -s --format=%B "$commit" | npx commitlint --verbose
+          done
 
       # The title is passed through the environment, not interpolated into
       # the script, so backticks/quotes in a title cannot inject shell.
