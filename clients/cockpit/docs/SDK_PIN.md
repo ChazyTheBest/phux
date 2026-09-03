@@ -29,8 +29,8 @@ would have.
 
 | Check | Where | Answers |
 |---|---|---|
-| Build against the pin | `.github/workflows/ci.yml`, every push and PR | Does Cockpit compile and pass against the SDK it claims to use? |
-| Build against the branch head | `.github/workflows/sdk-head.yml`, daily at 07:17 UTC and on dispatch | Has the fork moved somewhere Cockpit cannot follow? |
+| Build against the pin | root `.github/workflows/cockpit-ci.yml`, every relevant push and PR | Does Cockpit compile and pass against the SDK it claims to use? |
+| Build against the branch head | root `.github/workflows/cockpit-sdk-head.yml`, daily at 07:17 UTC and on dispatch | Has the fork moved somewhere Cockpit cannot follow? |
 | Pin documentation agrees | `scripts/check-sdk-pin.sh`, run first in CI | Does README describe the sha that is actually built? |
 | Glyph weight holds | `scripts/host-raster-check.sh --min-solid 4000`, in CI and SDK-head | Does the pinned host and the fork's branch head still ink text as thickly as they did? |
 
@@ -97,10 +97,7 @@ provider, because `-Dphux-enabled` defaults to false.
 ```sh
 zig build test -Dplatform=null --summary all
 
-zig build test -Dplatform=null -Dphux-enabled=true \
-  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
-  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release" \
-  --summary all
+zig build test -Dplatform=null -Dphux-enabled=true --summary all
 ```
 
 `zig build test` prints a line reading `failed command: .../test --listen=-` on
@@ -118,10 +115,7 @@ lands.
 ```sh
 zig build --summary all
 
-zig build -Dphux-enabled=true \
-  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
-  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release" \
-  --summary all
+zig build -Dphux-enabled=true --summary all
 ```
 
 **6. Update the documentation, and prove it.** Rewrite the pin paragraph under
@@ -146,13 +140,13 @@ The break originates in the fork, so the fork is where it should be caught: a
 job on `phall1/native`'s cockpit branches that checks out Cockpit and builds it.
 That job does not exist and cannot be added from here.
 
-Half of it is already in place. `sdk-head.yml` accepts a `workflow_dispatch`
+Half of it is already in place. `cockpit-sdk-head.yml` accepts a `workflow_dispatch`
 input naming any ref, so the fork's CI can ask Cockpit to build against the
 exact sha it is pushing, with a token holding `actions: write` on this repo:
 
 ```sh
-gh workflow run sdk-head.yml \
-  --repo no-phux/phux-cockpit \
+gh workflow run cockpit-sdk-head.yml \
+  --repo no-phux/phux \
   --field ref="$GITHUB_SHA"
 ```
 

@@ -271,8 +271,9 @@ Deriving command: `./scripts/host-raster-check.sh`
 
 ### The floor CI asserts, and how it was chosen
 
-`.github/workflows/ci.yml` runs the check on every push and pull request, and
-`.github/workflows/sdk-head.yml` runs it after repointing `build.zig.zon` at the
+the root `.github/workflows/cockpit-ci.yml` runs the check on every relevant
+push and pull request, and `.github/workflows/cockpit-sdk-head.yml` runs it after
+repointing `build.zig.zon` at the
 fork's branch head. In both jobs,
 `scripts/build-automation-cli.sh --checkout-only` materializes the SDK source
 declared by the current pin before the check runs:

@@ -626,14 +626,15 @@ APPLE_NOTARY_ISSUER_ID="ISSUER-UUID" \
 `MACOS_ENTITLEMENTS` may point to an entitlements plist when one is required.
 The packaging script validates the bundle identifier, display name, version,
 executable, arm64 architecture, and code signature before producing archives.
-Release Please maintains a draft version PR from conventional commits. Merging
-that PR creates the tag and a draft GitHub release; the release workflow builds,
-verifies, and attaches the macOS artifacts before publishing the release and
+The root Release Please workflow maintains Cockpit as an independent component
+inside the shared draft version PR. Merging that PR creates a
+`cockpit-vX.Y.Z` tag and draft GitHub release; the **Release Cockpit** workflow
+builds, verifies, and attaches the macOS artifacts before publishing the release and
 regenerating `Casks/phux-cockpit.rb` in
 [`phall1/homebrew-tap`](https://github.com/phall1/homebrew-tap). The tap's
 scheduled updater independently repairs a missed release update.
-A failed artifact pass can be resumed by manually dispatching the **Release**
-workflow against the existing draft tag.
+A failed artifact pass can be resumed by manually dispatching the **Release
+Cockpit** workflow against the existing draft tag.
 
 ## Limitations
 
@@ -669,7 +670,7 @@ workflow against the existing draft tag.
 
 ## Project background
 
-This repository began as a spike on 2026-07-27 asking whether phux could have
+Cockpit began as a standalone spike on 2026-07-27 asking whether phux could have
 several independent terminal panes beside ordinary native widgets in one GPU
 surface without making the native layer understand terminals.
 
@@ -690,16 +691,17 @@ pub fn feed(session: *Session, bytes: []const u8) void {
 
 The rendering spike is complete and closed out. All four steps of `FINDINGS.md`
 section 8 were finished, migrated here as PR #7, and developed further since;
-this repository is the shipping product, not a validation fixture. The spike
+Cockpit is the shipping product, not a validation fixture. Its standalone Git
+history was imported under `clients/cockpit` when it joined the Phux monorepo;
+the spike
 branch was removed on 2026-08-09 and its history preserved at the annotated tag
 `spike/first-party-terminal-grid` — `git show spike/first-party-terminal-grid`
 for the audit that established nothing was left behind.
 
-The section 7 `phux-client-ffi` sketch is historical, not the next API to
-implement. The current phux direction is a versioned libghostty checkpoint
-bootstrap and a shared `SessionKernel<NativeEngine>`; the eventual native host
-bridge should expose that kernel's effects, borrowed render views, and damage.
-Resume that integration here only after those protocol and kernel layers exist.
+The section 7 `phux-client-ffi` sketch is historical. The implemented stable C
+ABI now links Cockpit to `phux-client-core` without exposing Rust internals.
+Workspace snapshots, shared layout projection, and any thinner VT-byte handoff
+belong in explicit follow-up changes rather than the repository migration.
 
 ## License
 

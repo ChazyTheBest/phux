@@ -6,7 +6,7 @@
 [phall1/doodlestein_self_releaser](https://github.com/phall1/doodlestein_self_releaser))
 is an operator-invoked CLI tool for working around GitHub Actions billing and
 queue throttling. When hosted Actions is backed up or over budget, `dsr`
-replays a repo's existing `.github/workflows/release.yml` locally on the
+replays a repo's existing `.github/workflows/cockpit-release.yml` locally on the
 operator's machine, then uploads the resulting artifacts to the GitHub
 Release via `gh release upload`.
 
@@ -17,11 +17,11 @@ reasonable time.
 
 ## Registration lives outside this repo
 
-`dsr` is installed and configured on the operator's Mac already; nothing in
-this repo needs to change for it to work. The registration lives at
-`~/.config/dsr/repos.d/phux-cockpit.yaml` (machine-local, not part of this
-git repo), pointing at this repo's local checkout, `release.yml`, and the
-`darwin/arm64` target built natively on that same Mac. This app is
+`dsr` is installed on the operator's Mac, but the old standalone Cockpit
+registration is retired and no current machine registration exists. Any new
+machine-local registration must point at the Phux monorepo checkout,
+`.github/workflows/cockpit-release.yml`, and the `darwin/arm64` target built
+natively on that same Mac. This app is
 macOS-only per `app.zon`'s `platforms = ["macos"]`, and `act` cannot run
 macOS jobs at all, so there is no Linux/`act` leg to configure here — the
 native-build path is the only one that exists.
@@ -37,10 +37,10 @@ All commands are manual, run by an operator when `dsr check` (or direct
 observation of a stuck Actions run) indicates throttling:
 
 ```sh
-dsr check no-phux/phux-cockpit
+dsr check no-phux/phux
 dsr build phux-cockpit --targets darwin/arm64
-dsr release phux-cockpit --version vX.Y.Z
-dsr fallback phux-cockpit --version vX.Y.Z
+dsr release phux-cockpit --version cockpit-vX.Y.Z
+dsr fallback phux-cockpit --version cockpit-vX.Y.Z
 ```
 
 `dsr check` reports whether GitHub Actions currently looks throttled for
@@ -50,7 +50,7 @@ against an existing GitHub Release for the given tag.
 
 ## The signing caveat — read this before using the fallback for a real release
 
-`release.yml`'s single `macos` job conditionally imports Developer ID
+`cockpit-release.yml`'s single `macos` job conditionally imports Developer ID
 signing secrets (`MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`,
 `MACOS_SIGNING_IDENTITY`) and notarization secrets (`APPLE_NOTARY_KEY`,
 `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`). Both groups are declared
@@ -60,7 +60,7 @@ a partial set and it hard-fails.
 
 `dsr`'s local config for this repo **deliberately does not configure those
 secrets**. This is an explicit decision, not an oversight: `dsr` is
-build-only, and replaying `release.yml` locally without those secrets
+build-only, and replaying `cockpit-release.yml` locally without those secrets
 naturally falls through to the workflow's own existing ad-hoc-signed path —
 exactly the behavior the workflow already has for a normal hosted run with
 no signing secrets configured.
@@ -83,10 +83,10 @@ published, ad-hoc signed, when that's an acceptable tradeoff.
 ## The Homebrew tap caveat
 
 `HOMEBREW_TAP_DEPLOY_KEY` is `required: true` at the `workflow_call` level
-and gates a later step in `release.yml` that hard-fails if the secret is
+and gates a later step in `cockpit-release.yml` that hard-fails if the secret is
 unset. `dsr`'s local config does not configure this secret either.
 
-This means a full local replay of `release.yml` via `dsr` will get through
+This means a full local replay of `cockpit-release.yml` via `dsr` will get through
 build, asset upload, and ad-hoc-signature verification, but will fail at the
 Homebrew-tap-update gate. That failure is expected, not a sign that the
 fallback release is broken — the assets are already uploaded by the time it

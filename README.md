@@ -1,7 +1,7 @@
 <!--
 audience: humans, contributors, agents
 stability: stable
-last-reviewed: 2026-08-25
+last-reviewed: 2026-09-03
 -->
 
 <div align="center">
@@ -82,6 +82,11 @@ First-party, independently versioned host integrations are available for
 [OpenCode V2](./docs/consumers/opencode.md), [Pi](./docs/consumers/pi.md), and
 [Claude Code](./docs/consumers/claude.md). Their package, packed-artifact, and
 native host validation runs in the required CI gate.
+
+[Phux Cockpit](./clients/cockpit/README.md) is the independently versioned
+native macOS client. It keeps its own Zig build and `cockpit-vX.Y.Z` release
+cadence while compiling the stable `phux-client-ffi` C ABI from this same
+checkout. Use `just cockpit-build`, `just cockpit-test`, or `just cockpit-dev`.
 
 ```sh
 phux --skill=quick          # installed CLI operating guide
