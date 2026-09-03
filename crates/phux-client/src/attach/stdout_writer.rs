@@ -225,10 +225,14 @@ impl Write for StdoutSink {
                 q.chunks.clear();
                 q.bytes = 0;
                 self.needs_resync.store(true, Ordering::Release);
-                tracing::debug!(
-                    dropped_bytes = chunk.len(),
-                    "stdout backlog over cap; dropping queued diffs and resyncing",
-                );
+                crate::perf::STDOUT_DROPS.incr();
+                if let Some(suppressed) = crate::perf::STDOUT_DROP_WARN.admit() {
+                    tracing::warn!(
+                        dropped_bytes = chunk.len(),
+                        suppressed,
+                        "stdout backlog over cap; dropping queued diffs and resyncing (the outer terminal is not keeping up)",
+                    );
+                }
                 // The dropped chunk's allocation is still useful; keep it
                 // rather than freeing it on the very path where the sink is
                 // under the most pressure.
@@ -302,7 +306,12 @@ fn spawn_writer_into<W: Write + Send + 'static>(inner: W) -> (StdoutSink, Writer
     let writer_shared = Arc::clone(&shared);
     let join = std::thread::Builder::new()
         .name("phux-stdout".to_owned())
-        .spawn(move || writer_loop(&writer_shared, inner))
+        .spawn(move || {
+            // The glass is the end of the echo path; keep the thread that
+            // writes it in the interactive class with the loop that feeds it.
+            let _ = phux_perf::promote_current_thread();
+            writer_loop(&writer_shared, inner);
+        })
         .expect("spawn phux-stdout writer thread");
     let sink = StdoutSink {
         shared: Arc::clone(&shared),

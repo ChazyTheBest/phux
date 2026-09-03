@@ -308,6 +308,11 @@ fn launchd_policy_lines() -> Vec<String> {
         "  </dict>".to_owned(),
         "  <key>ThrottleInterval</key>".to_owned(),
         format!("  <integer>{RESTART_THROTTLE_SECS}</integer>"),
+        // Scheduling class (ADR-0096; ADR-0055 amendment). Owned here, not
+        // in the generator, so `phux service reconcile` moves an installed
+        // `Background` unit to `Interactive` instead of leaving it throttled.
+        "  <key>ProcessType</key>".to_owned(),
+        "  <string>Interactive</string>".to_owned(),
     ]
 }
 
@@ -346,8 +351,13 @@ const SYSTEMD_POLICY_KEYS: [&str; 4] = [
 ///
 /// `RunAtLoad` starts the server when the agent is bootstrapped (login, and
 /// boot when the host auto-logs-in); `KeepAlive` restarts it on any exit.
-/// `ProcessType` is `Background` so the scheduler does not treat a server
-/// with no attached client as an idle GUI app.
+/// `ProcessType` is `Interactive`: the server is the keystroke path between
+/// the user and every pane, so it belongs in the same scheduling class as
+/// the terminal emulator in front of it. It shipped as `Background` from
+/// ADR-0055 until 2026-09-02, which asked launchd to throttle exactly the
+/// process whose echo latency the user feels; under CPU contention from
+/// builds and agents that showed up as 15-60 ms keystroke tails with the
+/// server itself near idle (ADR-0096, ADR-0055 amendment).
 pub(crate) fn render_launchd_plist(plan: &ServicePlan) -> String {
     use std::fmt::Write as _;
 
@@ -381,7 +391,6 @@ pub(crate) fn render_launchd_plist(plan: &ServicePlan) -> String {
     for line in launchd_policy_lines() {
         let _ = writeln!(out, "{line}");
     }
-    out.push_str("  <key>ProcessType</key>\n  <string>Background</string>\n");
 
     let env = plan.environment();
     if !env.is_empty() {
@@ -604,13 +613,15 @@ fn reconcile_launchd(body: &str) -> Reconcile {
         let line = lines[index];
         let trimmed = line.trim();
         if depth == 1
-            && (trimmed == "<key>KeepAlive</key>" || trimmed == "<key>ThrottleInterval</key>")
+            && (trimmed == "<key>KeepAlive</key>"
+                || trimmed == "<key>ThrottleInterval</key>"
+                || trimmed == "<key>ProcessType</key>")
         {
             // The value element is balanced, so skipping it leaves `depth`
             // exactly where it was.
             let Some(end) = plist_value_end(&lines, index + 1) else {
                 return Reconcile::Unrecognized(
-                    "its KeepAlive/ThrottleInterval value is a shape this cannot rewrite safely",
+                    "its KeepAlive/ThrottleInterval/ProcessType value is a shape this cannot rewrite safely",
                 );
             };
             let _ = anchor.get_or_insert(kept.len());
@@ -3033,10 +3044,41 @@ WantedBy=default.target
             body.contains("<key>RunAtLoad</key>\n  <true/>"),
             "RunAtLoad's own <true/> was consumed:\n{body}"
         );
-        // Two lines out (the key and its value), seven in.
+        // Four lines out (KeepAlive and ProcessType, key and value each),
+        // the policy block in.
         assert_eq!(
             body.lines().count(),
-            LEGACY_PLIST.lines().count() - 2 + launchd_policy_lines().len()
+            LEGACY_PLIST.lines().count() - 4 + launchd_policy_lines().len()
+        );
+    }
+
+    /// A unit installed before 2026-09-02 declares `ProcessType Background`,
+    /// which throttles the server (ADR-0055 amendment). Reconciling must move
+    /// it to `Interactive` rather than leave the installed value in place.
+    #[test]
+    fn reconciling_a_background_launchd_plist_moves_it_to_interactive() {
+        assert!(
+            LEGACY_PLIST.contains("<string>Background</string>"),
+            "fixture lost its point"
+        );
+        let body = patched(reconcile_unit(Manager::Launchd, LEGACY_PLIST));
+        assert!(
+            !body.contains("Background"),
+            "the throttling ProcessType survived reconciliation:\n{body}"
+        );
+        assert_eq!(
+            body.matches("<key>ProcessType</key>").count(),
+            1,
+            "ProcessType must appear exactly once:\n{body}"
+        );
+        assert!(
+            body.contains("<key>ProcessType</key>\n  <string>Interactive</string>"),
+            "Interactive ProcessType missing:\n{body}"
+        );
+        // Reconciling the result again changes nothing.
+        assert!(
+            matches!(reconcile_unit(Manager::Launchd, &body), Reconcile::Current),
+            "a reconciled unit must reconcile to itself"
         );
     }
 

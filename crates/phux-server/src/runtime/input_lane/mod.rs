@@ -479,13 +479,14 @@ fn handoff_encoded(
     pane: phux_core::ids::TerminalId,
     handle: &TerminalHandle,
     bytes: Option<Vec<u8>>,
+    echo_probe: bool,
 ) -> Result<bool, CommandResult> {
     let Some(bytes) = bytes else {
         return Ok(true);
     };
     match handle
         .encoded_input
-        .try_send(EncodedInputRequest::legacy(bytes))
+        .try_send(EncodedInputRequest::legacy_probe(bytes, echo_probe))
     {
         Ok(()) => Ok(true),
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -536,7 +537,12 @@ fn process_attached(
             {
                 return Ok(false);
             }
-            handoff_encoded(current.pane, &current.handle, bytes)
+            handoff_encoded(
+                current.pane,
+                &current.handle,
+                bytes,
+                crate::terminal_actor::echo_probe_for(input),
+            )
         })
         .and_then(Result::ok)
         .unwrap_or(false);
@@ -573,7 +579,12 @@ fn process_headless(
         {
             return Ok(false);
         }
-        handoff_encoded(current.pane, &current.handle, bytes)
+        handoff_encoded(
+            current.pane,
+            &current.handle,
+            bytes,
+            crate::terminal_actor::echo_probe_for(&input),
+        )
     }) {
         Ok(Ok(_)) => CommandResult::Ok,
         Ok(Err(result)) | Err(result) => result,
@@ -823,6 +834,7 @@ fn spawn_input_lane_with_completion_timeout(
     let join = std::thread::Builder::new()
         .name("phux-input-lane".to_owned())
         .spawn(move || {
+            crate::perf::promote_helper_thread("phux-input-lane");
             let mut encoders = std::collections::HashMap::new();
             let mut tickets = TicketSource::default();
             // `blocking_recv` parks the thread with no tokio runtime on it.

@@ -216,6 +216,33 @@ pub async fn get_state_on(conn: &mut Connection) -> Result<StateView, AttachErro
     }
 }
 
+/// `GET_PERF` on an already-negotiated connection.
+///
+/// Returns the server's in-process performance telemetry as a
+/// [`phux_perf::PerfReport`]. `reset` zeroes the server's metrics after the
+/// snapshot so the next call reads as an interval. A server that predates
+/// the command answers with an error, surfaced as [`AttachError::Refused`].
+pub async fn get_perf_on(
+    conn: &mut Connection,
+    reset: bool,
+) -> Result<phux_perf::PerfReport, AttachError> {
+    const REQUEST_ID: u32 = 0;
+    let (result, _interleaved) = conn
+        .request(REQUEST_ID, Command::GetPerf { reset })
+        .await?
+        .into_parts();
+    match result {
+        CommandResult::OkWith(CommandValue::Json(json)) => phux_perf::PerfReport::from_json(&json)
+            .map_err(|err| {
+                AttachError::Protocol(format!("GET_PERF returned unparseable JSON: {err}"))
+            }),
+        CommandResult::Error { message, .. } => Err(AttachError::Refused(message)),
+        other => Err(AttachError::Protocol(crate::explain::explain_unexpected(
+            "GET_PERF", &other,
+        ))),
+    }
+}
+
 /// Send `HELLO` on `conn` and return the protocol version triple the server
 /// selected in `HELLO_OK`.
 ///
@@ -257,6 +284,35 @@ pub async fn probe_hello(conn: &mut Connection) -> Result<(u16, u16, u16), Attac
         FrameKind::Error { message, .. } => Err(AttachError::Refused(message)),
         // Neither HELLO_OK nor ERROR: the two binaries disagree about the
         // handshake itself, which is version skew, not a frame worth dumping.
+        _ => Err(AttachError::Protocol(crate::explain::unexpected_reply(
+            "HELLO",
+        ))),
+    }
+}
+
+/// Send `HELLO` on a raw connection and return the `ServerFeatureSet` the
+/// server advertised in `HELLO_OK`.
+///
+/// Lets a caller honour a "MUST observe the feature bit before sending"
+/// rule. `None` when the connection was already negotiated by the attach
+/// path, whose caller already holds the features.
+pub async fn probe_hello_features(
+    conn: &mut Connection,
+) -> Result<Option<phux_protocol::caps::ServerFeatureSet>, AttachError> {
+    if conn.negotiated_bootstrap().is_some() {
+        return Ok(None);
+    }
+    conn.send(&FrameKind::Hello {
+        client_name: format!("phux-cli/{}", env!("CARGO_PKG_VERSION")),
+        protocol_major: phux_protocol::PROTOCOL_VERSION.major,
+        protocol_minor: phux_protocol::PROTOCOL_VERSION.minor,
+        protocol_patch: phux_protocol::PROTOCOL_VERSION.patch,
+        client_caps: ClientCapabilities::default(),
+    })
+    .await?;
+    match conn.recv().await? {
+        FrameKind::HelloOk { server_caps, .. } => Ok(Some(server_caps.features)),
+        FrameKind::Error { message, .. } => Err(AttachError::Refused(message)),
         _ => Err(AttachError::Protocol(crate::explain::unexpected_reply(
             "HELLO",
         ))),
