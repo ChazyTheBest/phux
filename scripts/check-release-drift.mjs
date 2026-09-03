@@ -28,7 +28,32 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const repo = process.env.GITHUB_REPOSITORY ?? "phall1/phux";
+
+// In Actions, GITHUB_REPOSITORY is authoritative. Locally it is unset, and this
+// script's whole output is remediation commands carrying `--repo <slug>` — so a
+// hardcoded fallback does not merely mislabel, it hands the operator commands
+// aimed at the wrong repository. That is exactly what happened after the
+// phall1 -> no-phux move: the fallback kept naming an org that no longer owns
+// this repo, and only GitHub's redirect hid it. Derive it from the remote
+// instead, so it tracks a future move without another edit here.
+function detectRepo() {
+  if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
+  try {
+    const url = execFileSync("git", ["remote", "get-url", "origin"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    // Accept both git@host:owner/repo.git and https://host/owner/repo.git
+    const match = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
+    if (match) return match[1];
+  } catch {
+    // No git, no remote, or not a checkout — fall through to the default.
+  }
+  return "no-phux/phux";
+}
+
+const repo = detectRepo();
 const graceMinutes = Number(process.env.GRACE_MINUTES ?? 120);
 assert.ok(Number.isFinite(graceMinutes) && graceMinutes >= 0, "GRACE_MINUTES must be a non-negative number");
 
