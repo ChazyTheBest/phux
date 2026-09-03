@@ -68,6 +68,10 @@
             pkgs.chromedriver
             # Shell linting for scripts/ and examples/agents/ (just shellcheck).
             pkgs.shellcheck
+            # GitHub workflow syntax plus expression validation (`just
+            # workflow-check`). This is release infrastructure, so it belongs
+            # in the pinned shell rather than a developer's global tools.
+            pkgs.actionlint
             # JSON plumbing for the CI observability scripts (scripts/ci/,
             # ADR-0047) and `just trace-attach`'s slow-render peek. The
             # hosted runners ship jq, but the scripts must also run in the

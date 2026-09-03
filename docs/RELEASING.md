@@ -6,18 +6,11 @@ last-reviewed: 2026-08-15
 
 # Releasing
 
-**TL;DR.** Releases are cut by **release-please**, not by hand. Land
-conventional commits on the default branch; release-please keeps an open
-"release PR" that bumps the workspace version and regenerates `CHANGELOG.md`.
-Merging that PR tags `vX.Y.Z`, creates a draft GitHub release, and triggers
-`release.yml` to build and **attach** the `phux and phux-mcp artifacts`,
-publish the completed release, and then refresh the Homebrew tap. Publishing
-`phux-protocol` to crates.io stays a separate, deliberate human dispatch.
-OpenCode, Pi, and Claude Code integrations are independent Release Please
-components with their own `*-vX.Y.Z` tags and validated artifact workflows.
-`cargo install phux is unsupported`
-because the binary/internal crates are not publishable. Windows is not
-supported by this release lane.
+**TL;DR.** Release Please owns independent root, Cockpit, and host-integration
+versions in one manifest. Merging its reviewed PR creates component tags and
+private draft releases; dedicated workflows validate exact tagged trees,
+attach artifacts, publish only complete releases, and update Homebrew. The
+`phux-protocol` crate remains a separate human dispatch.
 
 ## Who owns what
 
@@ -36,6 +29,10 @@ same release.
 | `phux-protocol` on crates.io | a human, via `publish-crate.yml` |
 | Integration versions | release-please component PRs |
 | Integration validation, assets, and publication | `agent-integration-release.yml` |
+| Cockpit version and changelog | release-please, under `clients/cockpit` |
+| The `cockpit-vX.Y.Z` tag and draft release | release-please |
+| Cockpit ZIP, DMG, signature/notarization evidence, and publication | `cockpit-release.yml` |
+| `phux-cockpit` Homebrew cask | `cockpit-release.yml` |
 
 `release.yml` never creates a tag, release, or release body. It uploads assets
 onto the draft release-please made and only flips that draft to public after the
@@ -45,7 +42,7 @@ validates every push by re-resolving the release through the GitHub API, and a
 draft is invisible to it, so a formula pushed before publish is a guaranteed red
 tap build.
 
-## Release cockpit
+## Release control surface
 
 | You want to | Do this |
 |---|---|
@@ -56,6 +53,8 @@ tap build.
 | Publish `phux-protocol` to crates.io | Dispatch **Actions -> publish-crate** with `tag=vX.Y.Z`, `dry_run=false` |
 | Revalidate an integration tag without publishing | Dispatch **Actions -> Release agent integration** with its component tag and `dry_run=true` |
 | Finish an integration release that stalled in draft | Dispatch **Actions -> Release agent integration** with its component tag and `dry_run=false` |
+| Re-build or finish a Cockpit release | Dispatch **Actions -> Release Cockpit** with `tag=cockpit-vX.Y.Z` |
+| Check Cockpit locally before its release PR merges | `just cockpit-test`, then `clients/cockpit/scripts/package-macos.sh` after `just cockpit-ffi` |
 | Ask whether anything is stuck right now | `just release-drift` (needs an authenticated `gh`) |
 | Report a hand-recovered release to Linear | Dispatch **Actions -> linear-release** with the tag, `stage=building`, then again with `stage=released` |
 | Check a suspected install-doc drift | `bash scripts/check-install-surface.sh` |
@@ -65,22 +64,48 @@ tap build.
 | Flow | Trigger | What it does |
 |---|---|---|
 | Pull request CI | `pull_request` | Docs, Rust, OpenCode V2, Pi, and Claude package gates plus fast real-PTY e2e unless the change is docs-only. Draft PRs skip all of it until marked ready. |
-| Conventional-commit gate | `pull_request` | `commitlint` lints every PR commit and the PR title against `commitlint.config.mjs`; required by main's ruleset so nothing non-conventional reaches the release-please log. |
+| Cockpit CI | relevant pull request or `main` path | Builds the same-checkout FFI, tests both Cockpit graphs, and compiles the AppKit app on free arm64 `macos-26`. Draft PRs allocate no runner; ZIP/DMG packaging and the three-cycle soak run only on `main` or manual dispatch. |
+| Conventional-commit gate | `pull_request` | `commitlint` lints every PR commit and the PR title against `commitlint.config.mjs`. It must be required by main's ruleset; the 2026-09-03 audit found that live setting missing. |
 | Main CI | push to `main` | Same gates as PR CI and refreshes warm caches; a narrowly identified release-only merge skips the duplicate compile because its exact tree already passed required PR CI. |
 | release-please | push to `main` | Maintains the release PR; on merge, tags `vX.Y.Z`, creates a draft GitHub release, and calls `release.yml`. |
 | Release artifacts | called by release-please (or manual dispatch) | Requires all target builds, attaches tarballs + checksums, publishes the complete release, then updates Homebrew. |
+| Cockpit release | called by release-please, or manual dispatch | Re-tests the tagged tree, packages, signs and optionally notarizes, verifies downloaded ZIP/DMG assets, proves the Homebrew cask reached the tap, then publishes the draft. |
+| Cockpit SDK head | source-repository dispatch, manual, or Monday 07:17 UTC | Builds Cockpit against the exact SDK ref supplied by the fork; the weekly run catches missed dispatches. |
 | Crate publish | manual `publish-crate` workflow | `phux-protocol` package dry-run, then publish when `dry_run=false`. |
 | Agent integration release | component tag or manual dry run | Re-runs locked gates, creates one checksummed artifact, clean-installs npm artifacts, publishes npm with provenance where applicable, and publishes the component draft release. |
 | Stress lane | nightly, manual, or PR label `stress` | Heavy resize/output/lifecycle storms that are useful but too slow for every PR. |
 | Release drift | daily at 15:20 UTC, or manual | `scripts/check-release-drift.mjs`. Fails if a release is stuck. See "When a release goes quiet". |
 | Linear release report | called by release-please, or manual dispatch | `linear-release.yml`. `stage=building` at tag time, `stage=released` once artifacts are public. Dispatchable so a hand-recovered release can still be reported. |
 
+### Monorepo CI routing
+
+The root workflow always emits its required `check` and `test` contexts, but
+its classifier skips both jobs before runner allocation for a positively
+identified Cockpit-only diff. Unknown paths fail closed into the root lanes.
+
+| Change | Root Phux CI | Cockpit macOS CI |
+|---|---|---|
+| `clients/cockpit/**` only | skipped | full tests + app build |
+| Cockpit release metadata (`clients/cockpit/**` plus the shared release manifest) | skipped | full tests + app build |
+| Root/crate/integration only | full | not triggered |
+| `phux-client-core`, `phux-client-ffi`, `phux-perf`, `phux-protocol`, Cargo manifests/lockfile, Rust toolchain, or root Cockpit recipes | full | full tests + app build |
+| Draft PR | skipped until ready | skipped until ready |
+| Cockpit path on `main` | skipped | tests + app build + package + three-cycle soak |
+
+`scripts/ci/classify-changes.sh` owns the root decision and
+`scripts/ci/check-classify-changes.sh` locks its truth table. Keep Cockpit's
+workflow `paths` list aligned with the transitive in-repo dependency closure of
+`phux-client-ffi`; otherwise a shared ABI input can change without rebuilding
+the app that consumes it.
+
 Required secrets:
 
 | Secret | Used by | Required for | Set? |
 |---|---|---|---|
-| `HOMEBREW_TAP_DEPLOY_KEY` | `release.yml` | Automatic push to `phall1/homebrew-tap`. If absent, the release still publishes and the tap step warns/skips. | yes |
+| `HOMEBREW_TAP_DEPLOY_KEY` | `release.yml`, `cockpit-release.yml` | Automatic push to `phall1/homebrew-tap`. Root Phux may publish without it; Cockpit fails before asset publication because its cask update is part of the release contract. | yes |
 | `CARGO_REGISTRY_TOKEN` | `publish-crate.yml` | Publishing `phux-protocol` to crates.io. Not needed for binary/Homebrew-only releases. | yes |
+| `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGNING_IDENTITY` | `cockpit-release.yml` | Optional all-or-nothing Developer ID signing. With none, Cockpit is explicitly ad-hoc signed. | no |
+| `APPLE_NOTARY_KEY`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` | `cockpit-release.yml` | Optional all-or-nothing notarization; required whenever Developer ID signing is configured. | no |
 | _(none)_ | `agent-integration-release.yml` | Publishing `@phux/*` to npm — uses OIDC trusted publishing, not a secret. See below. | n/a |
 There is deliberately **no npm secret**. `agent-integration-release.yml` publishes
 through [npm trusted publishing](https://docs.npmjs.com/trusted-publishers), which
@@ -158,6 +183,7 @@ Linux x86_64, and Linux arm64.
 | `@phux/opencode` | npm + GitHub release | `opencode-plugin-vX.Y.Z`, [`agent-integration-release.yml`](../.github/workflows/agent-integration-release.yml) |
 | `@phux/pi` | npm + GitHub release | `pi-extension-vX.Y.Z`, [`agent-integration-release.yml`](../.github/workflows/agent-integration-release.yml) |
 | Claude Code plugin | repository marketplace + GitHub release | `claude-plugin-vX.Y.Z`, [`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json) |
+| Phux Cockpit | Homebrew cask + GitHub release | `cockpit-vX.Y.Z`, ZIP + DMG + `SHA256SUMS`, [`cockpit-release.yml`](../.github/workflows/cockpit-release.yml) |
 
 Every other crate (`phux`, `phux-core`, `phux-server`, `phux-client`,
 `phux-config`, `phux-mcp`) is `publish = false`: binary or internal-only.
@@ -198,10 +224,15 @@ The workspace shares one `version` in the root `Cargo.toml`
 `version.workspace = true`, and internal workspace dependencies use path-only
 requirements so release bumps do not require duplicate manifest edits.
 
-The three host integrations intentionally version independently under
-`integrations/{opencode,pi,claude}`. Their versions live in the Release Please
-manifest and package lockfiles; Claude's component also synchronizes its plugin
-manifest and repository marketplace entry. Run
+Cockpit and the three host integrations intentionally version independently.
+Cockpit's version lives in `clients/cockpit/version.txt`, `app.zon`, and
+`build.zig.zon`; the Release Please manifest records the latest released
+version and `clients/cockpit/scripts/check-release-version.sh` requires all four
+copies to agree. Its tags are `cockpit-vX.Y.Z`.
+
+Integration versions live under `integrations/{opencode,pi,claude}` in the
+Release Please manifest and package lockfiles; Claude's component also
+synchronizes its plugin manifest and repository marketplace entry. Run
 `node scripts/check-agent-integration-versions.mjs` after any version-bearing
 change. Host APIs and the phux CLI evolve on different schedules, so these
 components do not mirror the Rust workspace version.
@@ -346,6 +377,91 @@ native builds, so Linux artifacts may carry instructions specific to the
 runner generation and can `SIGILL` on older hardware. `aarch64-apple-darwin`
 has a uniform baseline and is unaffected. Pinning Linux CPU baselines through
 `libghostty-vt`'s build is future work.
+
+## Cutting a Cockpit release
+
+Cockpit is a Release Please component, not part of the Rust workspace version.
+A Cockpit conventional commit updates the shared draft release PR only under
+`clients/cockpit` plus the root release manifest. Mark that PR ready, wait for
+`cockpit-ci`, `check`, `test`, and `commitlint`, then merge it. Release Please
+creates `cockpit-vX.Y.Z` and a private draft; `cockpit-release.yml` re-tests the
+exact tag, creates the arm64 ZIP and DMG, verifies the downloaded copies and
+their `SHA256SUMS`, updates and remotely verifies `Casks/phux-cockpit.rb`,
+records signing status in the notes, and only then publishes the draft.
+
+Developer ID and notarization credentials are optional by policy, but never
+partial. No Apple secrets means an explicitly ad-hoc-signed release and a cask
+that removes quarantine with a caveat. Any Developer ID secret requires all
+three signing values and all three notarization values; otherwise the workflow
+fails before it uploads or publishes anything.
+
+Recovery is idempotent:
+
+```sh
+gh workflow run cockpit-release.yml \
+  --repo no-phux/phux \
+  -f tag=cockpit-vX.Y.Z
+```
+
+The job refuses unexpected assets on a draft and refuses any partial or
+unexpected asset set on an already-published release, so a replay cannot
+silently replace a public release with different bytes.
+
+## One-time Cockpit import cutover
+
+The imported branch contains a real two-parent merge whose second parent is
+Cockpit's rewritten 199-commit history. GitHub's enabled squash/rebase merge
+methods would discard that parent, while the required-linear-history rule
+rejects an ordinary merge commit. Therefore the migration is reviewed as a PR
+but landed once as a non-force fast-forward by an organization administrator
+using the ruleset bypass.
+
+1. Add `commitlint` to the live required checks beside `check` and `test` (the
+   2026-09-03 audit found it missing). Push the migration branch once and open
+   it ready for review; avoid draft and synchronization churn. Wait for all
+   root and Cockpit checks on that exact head.
+2. Fetch immediately before landing and prove `origin/main` is still the tested
+   PR base. If it moved, merge current `main` into the migration branch and
+   rerun CI; never rebase or squash the imported graph.
+3. With explicit authorization for this upstream operation, fast-forward
+   `main` without force:
+
+   ```sh
+   git fetch origin main
+   head="$(git rev-parse integration/cockpit-monorepo)"
+   test "$(git merge-base origin/main "$head")" = "$(git rev-parse origin/main)"
+   git push origin "$head:refs/heads/main"
+   git fetch origin main
+   git merge-base --is-ancestor "$(<.github/cockpit-history-tip)" origin/main
+   ```
+
+4. Confirm the canonical Cockpit workflows are visible, then disable the four
+   standalone scheduled/tag workflows so one change cannot consume two macOS
+   lanes:
+
+   ```sh
+   for workflow in ci.yml release-please.yml release.yml sdk-head.yml; do
+     gh workflow disable "$workflow" --repo no-phux/phux-cockpit
+   done
+   ```
+
+5. Do not archive the standalone repository yet. The first canonical
+   `cockpit-v*` release must prove the tag, notes, ZIP, DMG, checksums, signing
+   status, publication, and Homebrew cask. Then archive the old repository or
+   leave it read-only as the pre-monorepo release record.
+
+`release-please-config.json` carries a top-level `bootstrap-sha` at the final
+filtered standalone tip so the first Cockpit release includes only
+post-cutover work rather than relisting 199 historical commits. Release Please
+only accepts this setting at the top level. Remove it in the first follow-up
+after a successful canonical Cockpit release; the new `cockpit-v*` tag is the
+permanent baseline after that.
+
+There is no history-removing rollback. Before the fast-forward, stop and fix the
+branch. After it, fix forward or land an ordinary forward revert of the visible
+integration files; never reset `main`, delete the imported parent, or force-push
+the branch, because that would destroy the property this cutover exists to
+preserve.
 
 ## Publishing phux-protocol to crates.io
 

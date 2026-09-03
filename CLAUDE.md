@@ -20,7 +20,7 @@ phux-project-specific guidance: build, test, architecture, and conventions.
 ## Build & Test
 
 The dev shell is Nix-pinned (`flake.nix`): Rust 1.90, `zig_0_16` for
-libghostty-vt's build, plus `nextest`, `deny`, `watch`, `insta`,
+libghostty-vt's build, plus `nextest`, `deny`, `actionlint`, `watch`, `insta`,
 `mutants`, `just`.
 
 ```bash
@@ -40,34 +40,31 @@ is kept out of `just ci` deliberately (it spawns real PTY-backed servers, so a
 for that coverage. See CONTRIBUTING.md §"Bar for any change" for the
 gate-by-gate map.
 
-Note `commitlint` is a required check and lints **every commit in the PR**,
-not just the title — one malformed message fails the branch.
+`commitlint` lints **every commit in the PR**, not just the title. It is intended
+to be required; the 2026-09-03 live-ruleset audit found only `check` and `test`,
+so verify that `commitlint` has been added before relying on the merge gate.
 
 ## How work reaches `main`
 
-**A maintainer may push straight to `main`.** `main` carries two rulesets:
+`main` currently carries one active ruleset:
 
 | Ruleset | Rules | Bypass |
 |---|---|---|
-| `main safety rails` | `deletion`, `non_fast_forward` | **none** |
-| `main merge gate` | required checks `check` / `test` / `commitlint` | admin, always |
+| `main` | deletion, non-fast-forward, linear history, pull request, required `check` / `test` | organization admin and the release App, always |
 
-So a direct push is allowed, and `main` still cannot be force-pushed or
-deleted **by anyone, including an admin** — those two live in a separate
-ruleset with an empty bypass list precisely so that loosening the merge gate
-never loosens the safety rails.
+Ordinary maintainers cannot push directly. An organization administrator can
+use the bypass, including for the one-time Cockpit history import documented in
+`docs/RELEASING.md`; use a non-force fast-forward even when bypass is available.
+The live ruleset must also add `commitlint` before it can enforce the full
+documented conventional-commit contract.
 
-The gate that replaces the PR is therefore **local**: run `just ci-full`
-before pushing. Nothing else will catch you. A PR is still the right shape for
-anything you want reviewed, for anything from outside the maintainer set, and
-for release-please's own branch — pushing straight to `main` is a convenience
-for work you have already validated, not a licence to skip validating it.
+An administrator bypass never replaces validation: run `just ci-full` and use a
+PR for review and hosted checks before any exceptional fast-forward. Normal
+changes and Release Please branches use the ordinary PR path.
 
-The reason this is set up this way rather than routing everything through PR
-CI: a PR run costs several minutes of Actions time per branch, and for a
-maintainer who has already run the identical gates locally that is pure
-duplication. The release lanes still run the full suite, so the artifact that
-reaches users is never gated on a local run alone.
+Cockpit-only diffs are routed away from the Rust compile lanes while retaining
+the required root contexts; shared FFI/protocol/Cargo inputs run both surfaces.
+See `docs/RELEASING.md` for the routing matrix.
 
 ## Architecture Overview
 

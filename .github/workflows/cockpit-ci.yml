@@ -7,27 +7,32 @@ on:
       - "clients/cockpit/**"
       - "crates/phux-client-core/**"
       - "crates/phux-client-ffi/**"
+      - "crates/phux-perf/**"
       - "crates/phux-protocol/**"
+      - ".cargo/config.toml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "justfile"
       - ".github/workflows/cockpit-ci.yml"
       - ".github/workflows/cockpit-release.yml"
       - "release-please-config.json"
-      - ".release-please-manifest.json"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "clients/cockpit/**"
       - "crates/phux-client-core/**"
       - "crates/phux-client-ffi/**"
+      - "crates/phux-perf/**"
       - "crates/phux-protocol/**"
+      - ".cargo/config.toml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "justfile"
       - ".github/workflows/cockpit-ci.yml"
       - ".github/workflows/cockpit-release.yml"
       - "release-please-config.json"
-      - ".release-please-manifest.json"
   workflow_dispatch:
 
 permissions:
@@ -40,7 +45,10 @@ concurrency:
 jobs:
   test:
     name: Zig 0.16 macOS
-    runs-on: blacksmith-6vcpu-macos-26
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Standard macos-26 is arm64 and free for this public repository. The old
+    # Blacksmith six-vCPU lane charged for every synchronization of a PR.
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -61,6 +69,7 @@ jobs:
         working-directory: clients/cockpit
         run: |
           ./scripts/check-release-version.sh
+          ./scripts/check-release-fallback.sh
           ./scripts/check-sdk-pin.sh
           ./scripts/lib/zon_test.sh
           ./scripts/lib/measure_test.sh
@@ -88,7 +97,14 @@ jobs:
         working-directory: clients/cockpit
         run: ./scripts/zig-build.sh test -Dtypescript-spike=true -Dplatform=null --summary all
 
+      # The null-platform tests do not compile the AppKit executable. Keep one
+      # real production build on PRs while reserving archive/DMG work for main.
+      - name: Build the production macOS app
+        working-directory: clients/cockpit
+        run: ./scripts/zig-build.sh -Dphux-enabled=true --summary all
+
       - name: Package and verify the arm64 macOS app
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           VERSION="$(< clients/cockpit/version.txt)"

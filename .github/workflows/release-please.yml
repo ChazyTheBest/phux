@@ -25,15 +25,14 @@
 #
 # WHY AN APP TOKEN AND NOT GITHUB_TOKEN (this is load-bearing — do not "simplify"
 # it back):
-#   `main` carries an ACTIVE ruleset ("main automation guardrails") requiring the
-#   `check` and `test` status contexts, with `bypass_actors: []` and
-#   `current_user_can_bypass: never`. Those contexts are produced only by ci.yml's
-#   `pull_request` trigger. GitHub suppresses workflow runs for events raised by
-#   GITHUB_TOKEN — so a release PR opened with GITHUB_TOKEN would get NO CI run,
-#   `check`/`test` would never report, and the PR would be permanently unmergeable
-#   BY ANYONE, owner included. The same applies to the sync-lockfile push: it
-#   moves the PR head to a SHA with no check runs. Both jobs therefore authenticate
-#   as a GitHub App, whose events DO trigger workflows.
+#   `main` carries an active ruleset requiring the `check` and `test` status
+#   contexts for the ordinary merge path. Those contexts are produced only by
+#   ci.yml's `pull_request` trigger. GitHub suppresses workflow runs for events
+#   raised by GITHUB_TOKEN — so a release PR opened with GITHUB_TOKEN would get
+#   no CI run and require an administrator bypass. The same applies to the
+#   sync-lockfile push: it moves the PR head to a SHA with no check runs. Both
+#   jobs therefore authenticate as a GitHub App, whose events trigger workflows
+#   normally instead of making every release depend on bypass.
 #
 # ONE-TIME SETUP (without it, this workflow fails closed at the token step):
 #   1. Create a GitHub App with repo permissions `contents: write` +
@@ -73,11 +72,11 @@
 #   duplicated most of CHANGELOG.md and bumped the minor on the strength of
 #   long-released commits.
 #
-#   The manifest (.release-please-manifest.json) plus the vX.Y.Z tags are the
-#   real source of truth for "where the last release was", and both are now
-#   reliable — tag creation for draft releases was fixed in #417. If a release
-#   PR ever again proposes commits that are already in CHANGELOG.md, look here
-#   first.
+#   The manifest (.release-please-manifest.json) plus component tags are the
+#   real source of truth for "where the last release was". The top-level
+#   `bootstrap-sha` is a temporary exception for Cockpit's first monorepo
+#   release; remove it after that release lands. If a later release PR proposes
+#   commits that are already in a changelog, look here first.
 #
 # DO NOT REINTRODUCE `package-name` ON THE ROOT PACKAGE (this is the bug that
 # silently skipped v0.19.0):
@@ -135,8 +134,8 @@ jobs:
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
-      cockpit_release_created: ${{ steps.rp.outputs['clients--cockpit--release_created'] }}
-      cockpit_tag_name: ${{ steps.rp.outputs['clients--cockpit--tag_name'] }}
+      cockpit_release_created: ${{ steps.rp.outputs['clients/cockpit--release_created'] }}
+      cockpit_tag_name: ${{ steps.rp.outputs['clients/cockpit--tag_name'] }}
       prs_created: ${{ steps.rp.outputs.prs_created }}
       # `pr` is a JSON string of release-please's PullRequest object, and is
       # unset when no PR was touched — short-circuit so fromJSON never sees ''.
@@ -171,61 +170,9 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      # Create the tag ourselves, because a DRAFT release does not have one.
-      #
-      # GitHub defers tag creation for draft releases: the ref appears only
-      # when the draft is published. `release-please-config.json` sets
-      # `"draft": true` so users never see a release without binaries, which
-      # means the tag this job is documented to own does not actually exist
-      # when `release-artifacts` runs — and that job's first step requires it.
-      # v0.14.0 stuck exactly there: draft release created, no tag, artifact
-      # build refusing to start, release wedged with no way forward but a
-      # hand-pushed tag.
-      #
-      # Creating the ref here restores the documented ownership boundary
-      # (this job owns the TAG; release.yml owns assets and the draft ->
-      # published transition) without giving up the draft. Publishing the
-      # draft later is then a no-op for the ref, since it already points at
-      # this commit.
-      #
-      # Idempotent: a re-run against an existing tag is success, not a
-      # conflict, so replaying a failed release never wedges on the ref.
-      - name: Create the release tag for the draft
-        if: steps.rp.outputs.release_created == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ steps.rp.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            echo "tag ${TAG} already exists; nothing to do."
-            exit 0
-          fi
-          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${TAG}" \
-            -f "sha=${GITHUB_SHA}" >/dev/null
-          echo "created ${TAG} at ${GITHUB_SHA}"
-
-      - name: Create component tags for draft integration releases
-        if: steps.rp.outputs.paths_released != ''
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          RELEASE_OUTPUTS: ${{ toJSON(steps.rp.outputs) }}
-        run: |
-          set -euo pipefail
-          while IFS= read -r key; do
-            prefix="${key%--release_created}"
-            tag="$(jq -r --arg key "${prefix}--tag_name" '.[$key] // empty' <<<"$RELEASE_OUTPUTS")"
-            [[ -n "$tag" ]] || continue
-            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
-              echo "tag ${tag} already exists; nothing to do."
-              continue
-            fi
-            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f "ref=refs/tags/${tag}" \
-              -f "sha=${GITHUB_SHA}" >/dev/null
-            echo "created ${tag} at ${GITHUB_SHA}"
-          done < <(jq -r 'to_entries[] | select(.key | endswith("--release_created")) | select(.value == "true") | .key' <<<"$RELEASE_OUTPUTS")
+      # `force-tag-creation: true` makes release-please create refs immediately
+      # for draft releases. Do not recreate that behavior here: one owner keeps
+      # root, Cockpit, and integration component tags on the same code path.
 
   sync-lockfile:
     name: sync Cargo.lock on the release PR
@@ -261,21 +208,36 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release-please.outputs.pr_branch }}
+          fetch-depth: 0
           # MUST be the App token, not GITHUB_TOKEN. This job pushes a commit that
           # becomes the release PR's new head; with GITHUB_TOKEN that push raises
           # no `pull_request: synchronize` event, so ci.yml never runs against the
-          # new head SHA, `check`/`test` never report on it, and main's ruleset
-          # (bypass_actors: []) blocks the merge permanently. The App's push DOES
-          # trigger ci.yml — which is exactly what we want. This cannot recurse
+          # new head SHA, and `check`/`test` never report on it for the ordinary
+          # merge path. The App's push DOES trigger ci.yml — exactly what we want.
+          # This cannot recurse
           # into release-please.yml: that is `on: push: branches: [main]`, and this
           # pushes to the release PR branch.
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: true
 
+      - name: Detect a root workspace release
+        id: root-release
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          base="$(git merge-base HEAD origin/main)"
+          if git diff --quiet "$base" HEAD -- Cargo.toml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust toolchain
+        if: steps.root-release.outputs.changed == 'true'
         run: rustup toolchain install 1.90.0 --profile minimal
 
       - name: Re-resolve workspace member versions
+        if: steps.root-release.outputs.changed == 'true'
         run: cargo +1.90.0 update --workspace
 
       - name: Commit Cargo.lock

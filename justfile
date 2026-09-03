@@ -339,6 +339,13 @@ shellcheck:
       examples/agents/orchestrate-placed-fleet examples/agents/tests/*.sh \
       examples/plugins/*/scripts/*.sh
 
+# GitHub workflow syntax and the fail-closed CI path-routing truth table.
+workflow-check:
+    actionlint .github/workflows/*.yml
+    bash scripts/ci/check-classify-changes.sh
+    node scripts/check-release-orchestration.mjs
+    node scripts/check-release-drift-policy.mjs
+
 # Stable-cargo test for environments without nextest.
 test-cargo:
     {{AUTO_SPAWN_BACKSTOP}} cargo test --workspace --all-features
@@ -500,7 +507,7 @@ release-drift grace="120":
     GRACE_MINUTES={{ grace }} node scripts/check-release-drift.mjs
 
 # The inner-loop bar — every deterministic gate CI runs. Run before pushing.
-ci: fmt-check lint doc deny docs-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract agent-integrations-check test
+ci: fmt-check lint doc deny docs-check workflow-check formula-check font-check e2e-lane-check zig-pin-check install-surface-check skill-contract agent-integrations-check test
     @echo "ok"
 
 # The COMPLETE PR bar: `ci` plus the two lanes that spawn real processes.

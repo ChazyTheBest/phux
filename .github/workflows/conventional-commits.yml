@@ -9,9 +9,10 @@
 # changelog (docs/RELEASING.md), so a malformed message silently drops the
 # change from the release notes or skips a version bump.
 #
-# The `commitlint` context is required by main's ruleset ("main automation
-# guardrails"), alongside `check` and `test`. Release PRs opened by the
-# release App get this check like any other PR: App-raised events trigger
+# The `commitlint` context is intended to be required alongside `check` and
+# `test`. A 2026-09-03 live-ruleset audit found it missing, so the cutover
+# checklist requires correcting that repository setting. Release PRs opened by
+# the release App get this check like any other PR: App-raised events trigger
 # workflows normally (unlike GITHUB_TOKEN ones — see release-please.yml).
 #
 # `edited` is in the trigger list so fixing a bad PR title re-runs the gate
@@ -58,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           # Cockpit's one-time history import is intentionally reachable as a
-          # merge parent. Its 190 historical commits predate this repository's
+          # merge parent. Its 199 historical commits predate this repository's
           # commitlint contract; exclude exactly that immutable ancestry while
           # continuing to lint the import merge and every authored PR commit.
           import_tip="$(< .github/cockpit-history-tip)"

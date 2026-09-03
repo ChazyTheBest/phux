@@ -4,20 +4,23 @@
 set -Eeuo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COCKPIT_DIR="${PHUX_COCKPIT_DIR:-/Users/phall/workspace/phux-native-spike/cockpit}"
-NATIVE_APP="${PHUX_NATIVE_APP:-$COCKPIT_DIR/zig-out/bin/terminal}"
-NATIVE_CLI="${PHUX_NATIVE_CLI:-/Users/phall/workspace/phux-native-spike/ref/native-sdk/zig-out/bin/native}"
+COCKPIT_DIR="${PHUX_COCKPIT_DIR:-$REPO/clients/cockpit}"
+NATIVE_APP="${PHUX_NATIVE_APP:-$COCKPIT_DIR/zig-out/bin/phux-cockpit}"
+NATIVE_CLI="${PHUX_NATIVE_CLI:-$COCKPIT_DIR/.zig-cache/pinned-sdk/zig-out/bin/native}"
 PHUX_BIN="${PHUX_BIN:-$REPO/target/debug/phux}"
 ARTIFACT_ROOT="${PHUX_SMOKE_ARTIFACT_DIR:-$REPO/target/smoke-artifacts}"
 RUN_DIR="$ARTIFACT_ROOT/native-host-$$"
 AUTOMATION_DIR="$COCKPIT_DIR/.zig-cache/native-sdk-automation"
 PHUX_SOCK="/tmp/phux-native-host-smoke-$$.sock"
 SESSION="native-smoke"
+CONFIG="$RUN_DIR/config"
+STATE="$RUN_DIR/workspace.state"
 TRANSCRIPT="$RUN_DIR/transcript.txt"
 SERVER_PID="" APP_PID="" WATCHDOG_PID="" STEP=setup
 
 mkdir -p "$RUN_DIR" "$AUTOMATION_DIR"
 : >"$TRANSCRIPT"
+: >"$CONFIG"
 note() { printf '\n=== %s ===\n' "$*" | tee -a "$TRANSCRIPT"; }
 record_command() { printf '$' >>"$TRANSCRIPT"; printf ' %q' "$@" >>"$TRANSCRIPT"; printf '\n' >>"$TRANSCRIPT"; }
 fail() { printf 'FAIL [%s]: %s\n' "$STEP" "$*" | tee -a "$TRANSCRIPT" >&2; return 1; }
@@ -28,7 +31,7 @@ run_native() {
 }
 collect_artifacts() {
   local path
-  for path in snapshot.txt accessibility.txt windows.txt screenshot-terminal-canvas.png provenance.txt bridge-response.txt; do
+  for path in snapshot.txt accessibility.txt windows.txt screenshot-phux-cockpit-canvas.png provenance.txt bridge-response.txt; do
     [[ ! -e "$AUTOMATION_DIR/$path" ]] || cp "$AUTOMATION_DIR/$path" "$RUN_DIR/$path" 2>/dev/null || true
   done
   for path in "$AUTOMATION_DIR"/command*.txt; do
@@ -60,8 +63,11 @@ WATCHDOG_PID=$!
 
 [[ -x "$PHUX_BIN" ]] || fail "missing phux executable $PHUX_BIN"
 [[ -x "$NATIVE_APP" ]] || fail "missing automation-enabled cockpit $NATIVE_APP; build with -Dautomation=true -Dphux-enabled=true and the current FFI"
-[[ -x "$NATIVE_CLI" ]] || fail "missing native-sdk automation CLI $NATIVE_CLI"
+[[ -x "$NATIVE_CLI" ]] || fail "missing native-sdk automation CLI $NATIVE_CLI; run clients/cockpit/scripts/build-automation-cli.sh"
 command -v python3 >/dev/null || fail "python3 is required"
+if pgrep -x phux-cockpit >/dev/null 2>&1; then
+  fail "another phux-cockpit process is running; live-app automation must be serial"
+fi
 
 STEP=server-start
 note "start isolated real server"
@@ -87,50 +93,67 @@ run_phux send-keys --socket "$PHUX_SOCK" "$PANE_TWO" "printf 'NATIVE-PANE-TWO\\r
 run_phux wait --socket "$PHUX_SOCK" --until NATIVE-PANE-TWO --timeout 15 "$PANE_TWO"
 
 STEP=native-attach
-note "launch production cockpit and observe both rendered panes"
-rm -f "$AUTOMATION_DIR/snapshot.txt" "$AUTOMATION_DIR/accessibility.txt" "$AUTOMATION_DIR/windows.txt" "$AUTOMATION_DIR/screenshot-terminal-canvas.png" "$AUTOMATION_DIR"/command*.txt
-record_command "$NATIVE_APP" "unix://$PHUX_SOCK" "$SESSION" smoke
-(cd "$COCKPIT_DIR" && "$NATIVE_APP" "unix://$PHUX_SOCK" "$SESSION" smoke) >"$RUN_DIR/native-app.log" 2>&1 &
+note "launch production cockpit and observe the coordinator-selected terminal"
+rm -f "$AUTOMATION_DIR/snapshot.txt" "$AUTOMATION_DIR/accessibility.txt" "$AUTOMATION_DIR/windows.txt" "$AUTOMATION_DIR/screenshot-phux-cockpit-canvas.png" "$AUTOMATION_DIR"/command*.txt
+record_command env PHUX_SOCKET="$PHUX_SOCK" PHUX_SESSION="$SESSION" \
+  PHUX_COCKPIT_CONFIG="$CONFIG" PHUX_COCKPIT_STATE="$STATE" "$NATIVE_APP"
+(cd "$COCKPIT_DIR" && \
+  PHUX_SOCKET="$PHUX_SOCK" \
+  PHUX_SESSION="$SESSION" \
+  PHUX_COCKPIT_CONFIG="$CONFIG" \
+  PHUX_COCKPIT_STATE="$STATE" \
+  "$NATIVE_APP") >"$RUN_DIR/native-app.log" 2>&1 &
 APP_PID=$!
 run_native wait
-run_native assert --timeout-ms 30000 'ready=true' 'gpu_nonblank=true' 'view @w1/terminal-canvas' '1\* live' '2 live' 'NATIVE-PANE-ONE' 'NATIVE-PANE-TWO'
+run_native assert --timeout-ms 30000 \
+  'ready=true' \
+  'gpu_nonblank=true' \
+  'view @w1/phux-cockpit-canvas' \
+  'role=tab name="Phux, phux terminal, RUNNING' \
+  'tray #1 title="PX 2"'
 record_command "$NATIVE_CLI" automate snapshot
 (cd "$COCKPIT_DIR" && "$NATIVE_CLI" automate snapshot) >"$RUN_DIR/attached.snapshot.txt" 2>>"$TRANSCRIPT"
 
-widget_for_marker() {
-  python3 - "$RUN_DIR/attached.snapshot.txt" "$1" <<'PY'
+widget_for_remote_terminal() {
+  python3 - "$RUN_DIR/attached.snapshot.txt" <<'PY'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text()
-match = re.search(r"widget @w1/terminal-canvas#([0-9]+)[^\n]*" + re.escape(sys.argv[2]), text)
+match = re.search(r'widget @w1/phux-cockpit-canvas#([0-9]+)[^\n]*role=group name="[^"\n]*, phux terminal, RUNNING"', text)
 if not match:
-    raise SystemExit(f"no terminal-canvas widget contains {sys.argv[2]!r}")
+    raise SystemExit("no running Phux terminal widget")
 print(match.group(1))
 PY
 }
-PANE_ONE_WIDGET="$(widget_for_marker NATIVE-PANE-ONE)"
-PANE_TWO_WIDGET="$(widget_for_marker NATIVE-PANE-TWO)"
-printf 'pane_one_widget=%s\npane_two_widget=%s\n' "$PANE_ONE_WIDGET" "$PANE_TWO_WIDGET" >"$RUN_DIR/widget-ids.txt"
+REMOTE_WIDGET="$(widget_for_remote_terminal)"
+printf 'remote_widget=%s\n' "$REMOTE_WIDGET" >"$RUN_DIR/widget-ids.txt"
 
 STEP=native-input
-note "focus and type through both real native pane widgets"
-run_native widget-click terminal-canvas "$PANE_ONE_WIDGET"
-run_native widget-key terminal-canvas a "printf 'NATIVE-INPUT-PANE-ONE\\r\\n'"
-run_native widget-key terminal-canvas enter
-run_phux wait --socket "$PHUX_SOCK" --until NATIVE-INPUT-PANE-ONE --timeout 15 @1
-run_native widget-click terminal-canvas "$PANE_TWO_WIDGET"
-run_native widget-key terminal-canvas a "printf 'NATIVE-INPUT-PANE-TWO\\r\\n'"
-run_native widget-key terminal-canvas enter
-run_phux wait --socket "$PHUX_SOCK" --until NATIVE-INPUT-PANE-TWO --timeout 15 "$PANE_TWO"
-run_native assert --timeout-ms 15000 'NATIVE-INPUT-PANE-ONE' 'NATIVE-INPUT-PANE-TWO' '1 live' '2\* live'
+note "focus and type through the coordinator-owned native terminal"
+run_native widget-click phux-cockpit-canvas "$REMOTE_WIDGET"
+record_command osascript - "$APP_PID" "printf 'NATIVE-INPUT-SELECTED\\r\\n'"
+osascript - "$APP_PID" "printf 'NATIVE-INPUT-SELECTED\\r\\n'" <<'APPLESCRIPT' >>"$TRANSCRIPT" 2>&1
+on run argv
+  set targetPid to item 1 of argv as integer
+  set commandText to item 2 of argv
+  tell application "System Events"
+    set frontmost of first process whose unix id is targetPid to true
+    delay 0.2
+    keystroke commandText
+    key code 36
+  end tell
+end run
+APPLESCRIPT
+run_phux wait --socket "$PHUX_SOCK" --until NATIVE-INPUT-SELECTED --timeout 15 @1
+run_native assert --timeout-ms 15000 'role=tab name="Phux, phux terminal, RUNNING'
 
 STEP=native-resize
-note "resize real window and preserve exact two-pane presentation"
+note "resize real window and preserve the selected remote terminal"
 run_native resize 1240 720 1
-run_native assert --timeout-ms 15000 'gpu_nonblank=true' 'NATIVE-INPUT-PANE-ONE' 'NATIVE-INPUT-PANE-TWO' '1 live' '2\* live'
+run_native assert --timeout-ms 15000 'gpu_nonblank=true' 'role=tab name="Phux, phux terminal, RUNNING'
 record_command "$NATIVE_CLI" automate snapshot
 (cd "$COCKPIT_DIR" && "$NATIVE_CLI" automate snapshot) >"$RUN_DIR/final.snapshot.txt" 2>>"$TRANSCRIPT"
-run_native screenshot terminal-canvas
-[[ -s "$AUTOMATION_DIR/screenshot-terminal-canvas.png" ]] || fail "native-sdk produced no terminal screenshot"
+run_native screenshot phux-cockpit-canvas
+[[ -s "$AUTOMATION_DIR/screenshot-phux-cockpit-canvas.png" ]] || fail "native-sdk produced no terminal screenshot"
 
 STEP=server-projection
 note "assert input stayed on the focused canonical pane"
@@ -142,8 +165,8 @@ python3 - "$RUN_DIR/pane-one.json" "$RUN_DIR/pane-two.json" <<'PY'
 import json, pathlib, sys
 one = "\n".join(json.loads(pathlib.Path(sys.argv[1]).read_text())["lines"])
 two = "\n".join(json.loads(pathlib.Path(sys.argv[2]).read_text())["lines"])
-assert "NATIVE-INPUT-PANE-ONE" in one and "NATIVE-INPUT-PANE-TWO" not in one, one
-assert "NATIVE-INPUT-PANE-TWO" in two and "NATIVE-INPUT-PANE-ONE" not in two, two
+assert "NATIVE-INPUT-SELECTED" in one, one
+assert "NATIVE-INPUT-SELECTED" not in two, two
 PY
 
 STEP='done'

@@ -84,6 +84,12 @@
 # PR "Ready for review" runs everything — that event is in the trigger
 # types. Rationale and safety analysis on the `changes` job comment.
 #
+# Cockpit-only fast path: `clients/cockpit/**` and Cockpit's three dedicated
+# workflows are owned by cockpit-ci.yml. The required `check` and `test` jobs
+# remain in this workflow but are skipped before runner allocation, so their
+# required contexts resolve without compiling the Rust workspace. Any unknown
+# root path or shared FFI/protocol/Cargo input fails closed into full Phux CI.
+#
 # OBSERVABILITY (ADR-0082): each cargo phase runs under scripts/ci/timed.sh,
 # and a trailing `lane signal` step renders the phase timings, cache
 # effectiveness, and slowest tests into the job's step summary. That is the
@@ -117,8 +123,8 @@ permissions:
 
 jobs:
   # Cheap gate: decide whether the expensive compile lanes are needed.
-  # Fail-safe — every output defaults to false (run everything) unless the
-  # diff positively matches one of the narrow skip cases below.
+  # Fail-safe — empty/unknown diffs request full Phux CI unless the classifier
+  # positively identifies the narrow Cockpit-only skip case below.
   #
   # DRAFT PRs skip this job — and, through `needs`, the whole check/test
   # chain — so a draft never pays the nix + zig + workspace build. This is
@@ -126,16 +132,17 @@ jobs:
   # in release-please-config.json) free while they idle between releasable
   # commits: undraft the PR to run CI, merge to ship. GitHub counts skipped
   # required checks as satisfied, so drafts don't wedge; the merge is still
-  # safe because (a) draft PRs cannot be merged at all, and (b) the
-  # ruleset's strict up-to-date rule forces a branch update — and therefore
-  # a real CI run — before any merge once the base has moved.
+  # safe because a draft PR cannot be merged and ready_for_review triggers the
+  # real CI run before it becomes eligible.
   changes:
     name: classify changes
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Git diff and two shell classifiers need no paid build machine.
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
+      phux_needed: ${{ steps.detect.outputs.phux_needed }}
       release_only: ${{ steps.detect.outputs.release_only }}
     steps:
       - uses: actions/checkout@v7
@@ -144,7 +151,6 @@ jobs:
       - id: detect
         run: |
           set -euo pipefail
-          echo "docs_only=false" >> "$GITHUB_OUTPUT"
           echo "release_only=false" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "push" ]; then
@@ -152,7 +158,12 @@ jobs:
             # Its merge commit has the exact PR tree and changes only generated
             # release metadata, so compiling that tree again adds no coverage.
             # Keep this match intentionally narrow and fail closed.
-            files=$(git diff-tree --no-commit-id --name-only -r HEAD)
+            before='${{ github.event.before }}'
+            if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+              files=$(git diff-tree --no-commit-id --name-only -r HEAD)
+            else
+              files=$(git diff --name-only "$before" HEAD)
+            fi
             subject=$(git log -1 --pretty=%s)
             expected=$(printf '%s\n' \
               .release-please-manifest.json \
@@ -163,30 +174,17 @@ jobs:
                && [ "$(printf '%s\n' "$files" | sort)" = "$(printf '%s\n' "$expected" | sort)" ]; then
               echo "release_only=true" >> "$GITHUB_OUTPUT"
             fi
-            exit 0
-          fi
-
-          # A merge group may contain multiple PRs and has no base_ref. Run the
-          # complete required checks rather than applying a PR-only fast path.
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
-            exit 0
-          fi
-
-          git fetch --quiet origin "${{ github.base_ref }}"
-          base=$(git merge-base HEAD "origin/${{ github.base_ref }}")
-          files=$(git diff --name-only "$base" HEAD)
-          # Empty diff -> don't gamble, run in full.
-          if [ -z "$files" ]; then
-            exit 0
-          fi
-          # docs_only iff NO changed file falls outside docs/ ADR/ *.md.
-          # skills/*.md is executable input, so it deliberately forces CI.
-          if echo "$files" | grep -qE '^skills/' \
-             || echo "$files" | grep -qvE '(^docs/|^ADR/|\.md$)'; then
-            :
+          elif [ "${{ github.event_name }}" = "merge_group" ]; then
+            # A merge group may contain multiple PRs and has no base_ref. Empty
+            # input makes the classifier fail closed into complete root CI.
+            files=''
           else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            git fetch --quiet origin "${{ github.base_ref }}"
+            base=$(git merge-base HEAD "origin/${{ github.base_ref }}")
+            files=$(git diff --name-only "$base" HEAD)
           fi
+
+          printf '%s\n' "$files" | bash scripts/ci/classify-changes.sh >> "$GITHUB_OUTPUT"
 
   # Lint + docs + license lane. clippy and rustdoc each compile the workspace
   # (check / doc profiles); running them in one job — and one `nix develop` —
@@ -212,7 +210,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 30
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.release_only != 'true' && needs.changes.outputs.phux_needed == 'true'
     env:
       # sccache experiment (see the caching header): wrap rustc so unchanged
       # workspace crates hit the GHA cache across commits. `nix develop` is
@@ -314,6 +312,10 @@ jobs:
       # on the release path is a gate you discover during a release.
       - name: install-surface check
         run: nix develop -c bash scripts/check-install-surface.sh
+      # Workflow syntax and the path-router truth table are executable release
+      # infrastructure. Keep them in the always-on, compile-free guard set.
+      - name: workflow check
+        run: nix develop -c just workflow-check
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -354,7 +356,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     timeout-minutes: 30
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.release_only != 'true' && needs.changes.outputs.phux_needed == 'true'
     env:
       # sccache experiment — same rationale as the check job (see the
       # caching header). This is the lane where the 8m54s workspace

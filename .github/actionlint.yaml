@@ -9,7 +9,17 @@
 # v3.2.0. Drop these ignores once a newer actionlint ships a refreshed
 # snapshot (re-run `actionlint .github/workflows/*.yml` without them to
 # check).
+self-hosted-runner:
+  labels:
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404-arm
+
 paths:
+  .github/workflows/ci.yml:
+    ignore:
+      # The single quotes are intentional: $1 and $PATH belong to the inner
+      # bash launched by `nix develop`, not to the workflow shell.
+      - 'shellcheck reported issue in this script: SC2016:.+'
   .github/workflows/release-please.yml:
     ignore:
       - 'missing input "app-id" which is required by action "actions/create-github-app-token@v3"'

@@ -15,12 +15,12 @@ name: Cockpit SDK HEAD
 
 on:
   schedule:
-    # Daily. The fork's cockpit branch is rebased in bursts, so a weekly cadence
-    # would routinely report a week's worth of SDK commits as one failure with
-    # nothing to bisect. Minute 17 because GitHub delays scheduled runs that
-    # queue on the hour, and the fork is pushed from US hours, so 07:17 UTC
-    # reads the previous day's work.
-    - cron: "17 7 * * *"
+    # Weekly fallback. The preferred path is a repository dispatch from the SDK
+    # repository at the exact commit being changed; this catches missed dispatches
+    # without paying for a daily downstream rebuild.
+    - cron: "17 7 * * 1"
+  repository_dispatch:
+    types: [cockpit-sdk-head]
   workflow_dispatch:
     inputs:
       ref:
@@ -42,7 +42,7 @@ concurrency:
 jobs:
   build:
     name: Cockpit vs SDK branch head
-    runs-on: blacksmith-6vcpu-macos-26
+    runs-on: macos-26
     # 45 minutes, matching ci.yml. Measured against the run that is a superset
     # of every step below except packaging:
     # The standalone repository's measured cold job total was 12m23s:
@@ -69,7 +69,7 @@ jobs:
         working-directory: clients/cockpit
         run: ./scripts/repoint-sdk.sh --ref "${SDK_REF}"
         env:
-          SDK_REF: ${{ inputs.ref || 'auto' }}
+          SDK_REF: ${{ github.event.client_payload.ref || inputs.ref || 'auto' }}
       # Repointing rewrites build.zig.zon but does not create an SDK source
       # checkout. Materialize that newly-written pin through the same helper as
       # ci.yml, so host-raster-check.sh keeps enforcing its normal refusal to
