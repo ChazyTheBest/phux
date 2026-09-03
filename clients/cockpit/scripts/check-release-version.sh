@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "${ROOT}/../.." && pwd)"
 EXPECTED_TAG="${1:-}"
 
 IFS= read -r version < "${ROOT}/version.txt"
@@ -28,7 +29,7 @@ for file in app.zon build.zig.zon; do
     fi
 done
 
-manifest_version="$(jq -er '."."' "${ROOT}/.release-please-manifest.json")"
+manifest_version="$(jq -er '."clients/cockpit"' "${REPO_ROOT}/.release-please-manifest.json")"
 if [[ "${manifest_version}" != "${version}" ]]; then
     printf 'error: release manifest version %s does not match version.txt %s\n' \
         "${manifest_version}" "${version}" >&2
@@ -37,7 +38,7 @@ fi
 
 if [[ -n "${EXPECTED_TAG}" ]]; then
     tag="${EXPECTED_TAG#refs/tags/}"
-    if [[ "${tag}" != "v${version}" ]]; then
+    if [[ "${tag}" != "cockpit-v${version}" ]]; then
         printf 'error: release tag %s does not match version.txt %s\n' \
             "${tag}" "${version}" >&2
         exit 1

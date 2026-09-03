@@ -135,6 +135,8 @@ jobs:
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
+      cockpit_release_created: ${{ steps.rp.outputs['clients--cockpit--release_created'] }}
+      cockpit_tag_name: ${{ steps.rp.outputs['clients--cockpit--tag_name'] }}
       prs_created: ${{ steps.rp.outputs.prs_created }}
       # `pr` is a JSON string of release-please's PullRequest object, and is
       # unset when no PR was touched — short-circuit so fromJSON never sees ''.
@@ -302,6 +304,17 @@ jobs:
     secrets: inherit
     with:
       tag: ${{ needs.release-please.outputs.tag_name }}
+
+  cockpit-release-artifacts:
+    name: build + attach Cockpit app
+    needs: release-please
+    if: needs.release-please.outputs.cockpit_release_created == 'true'
+    uses: ./.github/workflows/cockpit-release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      tag: ${{ needs.release-please.outputs.cockpit_tag_name }}
 
   # Report the release to the Linear `phux` pipeline, which resolves the issues
   # a release carried from the Linear identifiers and PR references in its

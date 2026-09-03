@@ -28,6 +28,7 @@
       "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
       "exclude-paths": [
+        "clients/cockpit",
         "integrations/opencode",
         "integrations/pi",
         "integrations/claude",
@@ -39,6 +40,18 @@
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
         }
+      ]
+    },
+    "clients/cockpit": {
+      "release-type": "simple",
+      "component": "cockpit",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "tag-separator": "-",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        { "type": "generic", "path": "app.zon" },
+        { "type": "generic", "path": "build.zig.zon" }
       ]
     },
     "integrations/opencode": {

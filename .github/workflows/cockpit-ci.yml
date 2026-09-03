@@ -1,0 +1,99 @@
+name: cockpit-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clients/cockpit/**"
+      - "crates/phux-client-core/**"
+      - "crates/phux-client-ffi/**"
+      - "crates/phux-protocol/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "justfile"
+      - ".github/workflows/cockpit-ci.yml"
+      - ".github/workflows/cockpit-release.yml"
+      - "release-please-config.json"
+      - ".release-please-manifest.json"
+  pull_request:
+    paths:
+      - "clients/cockpit/**"
+      - "crates/phux-client-core/**"
+      - "crates/phux-client-ffi/**"
+      - "crates/phux-protocol/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "justfile"
+      - ".github/workflows/cockpit-ci.yml"
+      - ".github/workflows/cockpit-release.yml"
+      - "release-please-config.json"
+      - ".release-please-manifest.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cockpit-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Zig 0.16 macOS
+    runs-on: blacksmith-6vcpu-macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/cockpit/package-lock.json
+
+      - name: Check release, SDK, and measurement contracts
+        working-directory: clients/cockpit
+        run: |
+          ./scripts/check-release-version.sh
+          ./scripts/check-sdk-pin.sh
+          ./scripts/lib/zon_test.sh
+          ./scripts/lib/measure_test.sh
+          ./scripts/verify-phux-ffi.py --phux-tree ../..
+
+      - name: Materialize the pinned SDK source
+        working-directory: clients/cockpit
+        run: ./scripts/build-automation-cli.sh --checkout-only
+
+      - name: Check the host rasterizer's glyph weight
+        working-directory: clients/cockpit
+        run: |
+          defaults -currentHost read -g AppleFontSmoothing 2>/dev/null \
+            || echo 'AppleFontSmoothing: unset (the state the floor was derived on)'
+          ./scripts/host-raster-check.sh --min-solid 4179
+
+      - name: Build the same-checkout Phux client FFI
+        run: cargo build --locked --profile ffi-release -p phux-client-ffi
+
+      - name: Test the production provider graph
+        working-directory: clients/cockpit
+        run: ./scripts/zig-build.sh test -Dplatform=null -Dphux-enabled=true --summary all
+
+      - name: Test the TypeScript-core graph
+        working-directory: clients/cockpit
+        run: ./scripts/zig-build.sh test -Dtypescript-spike=true -Dplatform=null --summary all
+
+      - name: Package and verify the arm64 macOS app
+        run: |
+          set -euo pipefail
+          VERSION="$(< clients/cockpit/version.txt)"
+          VERSION="$VERSION" clients/cockpit/scripts/package-macos.sh
+          clients/cockpit/scripts/soak-macos-app.sh \
+            --app "clients/cockpit/zig-out/release/Phux Cockpit.app" \
+            --cycles 3 \
+            --artifacts clients/cockpit/zig-out/soak-ci

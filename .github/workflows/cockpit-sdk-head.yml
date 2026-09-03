@@ -11,7 +11,7 @@
 #
 # A failure here means the fork moved, not that Cockpit is broken. Cockpit's own
 # PRs stay green until someone runs scripts/repoint-sdk.sh. See docs/SDK_PIN.md.
-name: SDK HEAD
+name: Cockpit SDK HEAD
 
 on:
   schedule:
@@ -36,7 +36,7 @@ permissions:
 # result at all, which is indistinguishable from the failure this job exists to
 # catch.
 concurrency:
-  group: sdk-head
+  group: cockpit-sdk-head
   cancel-in-progress: false
 
 jobs:
@@ -45,8 +45,7 @@ jobs:
     runs-on: blacksmith-6vcpu-macos-26
     # 45 minutes, matching ci.yml. Measured against the run that is a superset
     # of every step below except packaging:
-    #   gh api repos/no-phux/phux-cockpit/actions/runs/31617082301/jobs \
-    #     --jq '.jobs[].steps[] | {name, started_at, completed_at}'
+    # The standalone repository's measured cold job total was 12m23s:
     # Cold job total 12m23s: setup 26s, phux-client-ffi 4m23s, null-platform
     # tests 2m28s, phux-provider tests 1m55s, package+soak 2m45s. This job drops
     # packaging and adds two exe builds, so it lands in the same band, and the
@@ -56,9 +55,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Load and check the pinned Phux client FFI provenance
-        id: phux
-        run: ./scripts/verify-phux-ffi.py --github-output "$GITHUB_OUTPUT"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
@@ -70,6 +66,7 @@ jobs:
       # to survive the failure it reports on. `inputs` is empty on a schedule
       # event; the script treats an empty ref as `auto` regardless.
       - name: Repoint the SDK dependency at the fork's branch head
+        working-directory: clients/cockpit
         run: ./scripts/repoint-sdk.sh --ref "${SDK_REF}"
         env:
           SDK_REF: ${{ inputs.ref || 'auto' }}
@@ -78,46 +75,39 @@ jobs:
       # ci.yml, so host-raster-check.sh keeps enforcing its normal refusal to
       # measure another commit or a checkout with local source changes.
       - name: Materialize the SDK branch head source
+        working-directory: clients/cockpit
         run: ./scripts/build-automation-cli.sh --checkout-only
       # Compile the branch head's real AppKit host into the headless CoreText
       # harness. This catches a glyph-weight regression while it is still the
       # SDK's change instead of waiting for Cockpit's next pin-bump PR.
       - name: Check the SDK branch head's glyph weight
+        working-directory: clients/cockpit
         run: |
           defaults -currentHost read -g AppleFontSmoothing 2>/dev/null \
             || echo 'AppleFontSmoothing: unset (the state the floor was derived on)'
           ./scripts/host-raster-check.sh --min-solid 4000
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: ${{ steps.phux.outputs.repository }}
-          ref: ${{ steps.phux.outputs.ref }}
-          path: .phux
-          persist-credentials: false
-      - name: Verify the pinned Phux client FFI checkout
-        run: ./scripts/verify-phux-ffi.py --phux-tree .phux
-      - name: Build the pinned Phux client FFI
-        working-directory: .phux
-        run: cargo build --locked --profile "${{ steps.phux.outputs.profile }}" -p phux-client-ffi
+      - name: Build the same-checkout Phux client FFI
+        run: cargo build --locked --profile ffi-release -p phux-client-ffi
       - name: Test with the null platform
+        working-directory: clients/cockpit
         run: zig build test -Dplatform=null --summary all
       - name: Test the production Phux provider
+        working-directory: clients/cockpit
         run: |
           zig build test \
             -Dplatform=null \
             -Dphux-enabled=true \
-            -Dphux-client-ffi-include-dir="$PWD/.phux/crates/phux-client-ffi/include" \
-            -Dphux-client-ffi-lib-dir="$PWD/.phux/target/ffi-release" \
             --summary all
       # `zig build test` compiles the test root, not the macOS executable, and
       # the platform layer is where an SDK signature change lands. Build the real
       # arm64 binary on both graphs so a break in AppKit-only code is caught here
       # rather than by the next person to run `zig build`.
       - name: Build the macOS executable, local terminal graph
+        working-directory: clients/cockpit
         run: zig build --summary all
       - name: Build the macOS executable, production Phux graph
+        working-directory: clients/cockpit
         run: |
           zig build \
             -Dphux-enabled=true \
-            -Dphux-client-ffi-include-dir="$PWD/.phux/crates/phux-client-ffi/include" \
-            -Dphux-client-ffi-lib-dir="$PWD/.phux/target/ffi-release" \
             --summary all

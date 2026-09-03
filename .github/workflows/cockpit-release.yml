@@ -1,6 +1,6 @@
 # Release Please owns tags, draft releases, and notes. This workflow owns only
 # verified artifacts, draft publication, and the Homebrew update.
-name: Release
+name: Release Cockpit
 
 on:
   workflow_call:
@@ -35,7 +35,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: cockpit-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -53,25 +53,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
-      - name: Load and check the pinned Phux client FFI provenance
-        id: phux
-        run: ./scripts/verify-phux-ffi.py --github-output "$GITHUB_OUTPUT"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: ${{ steps.phux.outputs.repository }}
-          ref: ${{ steps.phux.outputs.ref }}
-          path: .phux
-          persist-credentials: false
-      - name: Verify the pinned Phux client FFI checkout
-        run: ./scripts/verify-phux-ffi.py --phux-tree .phux
-
       - name: Validate release tag
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^cockpit-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
           git merge-base --is-ancestor HEAD origin/main
-          ./scripts/check-release-version.sh "$RELEASE_TAG"
+          clients/cockpit/scripts/check-release-version.sh "$RELEASE_TAG"
+          clients/cockpit/scripts/verify-phux-ffi.py --phux-tree "$GITHUB_WORKSPACE"
 
       - name: Require the Release Please release
         env:
@@ -83,8 +72,7 @@ jobs:
           version: 0.16.0
 
       - name: Build the pinned Phux client FFI
-        working-directory: .phux
-        run: cargo build --locked --profile "${{ steps.phux.outputs.profile }}" -p phux-client-ffi
+        run: cargo build --locked --profile ffi-release -p phux-client-ffi
 
       - name: Configure Developer ID signing when available
         env:
@@ -160,30 +148,29 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Test
+        working-directory: clients/cockpit
         run: |
           zig build test \
             -Dplatform=null \
             -Dphux-enabled=true \
-            -Dphux-client-ffi-include-dir="$PWD/.phux/crates/phux-client-ffi/include" \
-            -Dphux-client-ffi-lib-dir="$PWD/.phux/target/ffi-release" \
             --summary all
 
       - name: Build, sign, verify, and package
         id: package
         env:
-          PHUX_CLIENT_FFI_INCLUDE_DIR: ${{ github.workspace }}/.phux/crates/phux-client-ffi/include
-          PHUX_CLIENT_FFI_LIB_DIR: ${{ github.workspace }}/.phux/target/ffi-release
+          PHUX_CLIENT_FFI_INCLUDE_DIR: ${{ github.workspace }}/crates/phux-client-ffi/include
+          PHUX_CLIENT_FFI_LIB_DIR: ${{ github.workspace }}/target/ffi-release
         run: |
           set -euo pipefail
-          export VERSION="${RELEASE_TAG#v}"
-          ./scripts/package-macos.sh
+          export VERSION="${RELEASE_TAG#cockpit-v}"
+          clients/cockpit/scripts/package-macos.sh
 
       - name: Soak packaged application lifecycle
         run: |
-          ./scripts/soak-macos-app.sh \
-            --app "zig-out/release/Phux Cockpit.app" \
+          clients/cockpit/scripts/soak-macos-app.sh \
+            --app "clients/cockpit/zig-out/release/Phux Cockpit.app" \
             --cycles 10 \
-            --artifacts zig-out/soak-release
+            --artifacts clients/cockpit/zig-out/soak-release
 
       - name: Require Homebrew tap deploy key
         env:
@@ -201,7 +188,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          version="${RELEASE_TAG#v}"
+          version="${RELEASE_TAG#cockpit-v}"
           archive="phux-cockpit-${version}-macos-arm64.zip"
           image="phux-cockpit-${version}-macos-arm64.dmg"
           expected_assets="$(printf '%s\n' SHA256SUMS "${archive}" "${image}" | LC_ALL=C sort)"
@@ -219,9 +206,9 @@ jobs:
               fi
             done <<< "${existing_assets}"
             gh release upload "${RELEASE_TAG}" \
-              "zig-out/release/${archive}" \
-              "zig-out/release/${image}" \
-              zig-out/release/SHA256SUMS \
+              "clients/cockpit/zig-out/release/${archive}" \
+              "clients/cockpit/zig-out/release/${image}" \
+              clients/cockpit/zig-out/release/SHA256SUMS \
               --clobber
           elif [[ "${existing_assets}" != "${expected_assets}" ]]; then
             printf 'error: published release %s has a partial or unexpected asset set\n' "${RELEASE_TAG}" >&2
@@ -243,9 +230,9 @@ jobs:
             --pattern "${image}" \
             --pattern SHA256SUMS
           if [[ "${release_was_draft}" == "true" ]]; then
-            cmp "zig-out/release/${archive}" "${existing}/${archive}"
-            cmp "zig-out/release/${image}" "${existing}/${image}"
-            cmp zig-out/release/SHA256SUMS "${existing}/SHA256SUMS"
+            cmp "clients/cockpit/zig-out/release/${archive}" "${existing}/${archive}"
+            cmp "clients/cockpit/zig-out/release/${image}" "${existing}/${image}"
+            cmp clients/cockpit/zig-out/release/SHA256SUMS "${existing}/SHA256SUMS"
           fi
           (cd "${existing}" && shasum -a 256 -c SHA256SUMS)
           mkdir "${existing}/extracted"
@@ -262,7 +249,7 @@ jobs:
             printf 'error: release asset is Developer ID signed but not notarized\n' >&2
             exit 1
           fi
-          ./scripts/verify-macos-app.sh \
+          clients/cockpit/scripts/verify-macos-app.sh \
             --app "${existing_app}" \
             --version "${version}" \
             --signature-mode "${asset_signature}" \
@@ -281,7 +268,7 @@ jobs:
           hdiutil attach -quiet -readonly -nobrowse \
             -mountpoint "${dmg_mount}" "${existing}/${image}"
           dmg_attached=true
-          ./scripts/verify-macos-app.sh \
+          clients/cockpit/scripts/verify-macos-app.sh \
             --app "${dmg_mount}/Phux Cockpit.app" \
             --version "${version}" \
             --signature-mode "${asset_signature}" \
@@ -291,8 +278,8 @@ jobs:
           hdiutil detach -quiet "${dmg_mount}"
           dmg_attached=false
           trap - EXIT
-          rm -f -- zig-out/release/*.zip zig-out/release/*.dmg zig-out/release/SHA256SUMS
-          cp "${existing}/${archive}" "${existing}/${image}" "${existing}/SHA256SUMS" zig-out/release/
+          rm -f -- clients/cockpit/zig-out/release/*.zip clients/cockpit/zig-out/release/*.dmg clients/cockpit/zig-out/release/SHA256SUMS
+          cp "${existing}/${archive}" "${existing}/${image}" "${existing}/SHA256SUMS" clients/cockpit/zig-out/release/
           {
             echo "notarized=${asset_notarized}"
             echo "signature=${asset_signature}"
@@ -352,11 +339,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="$RELEASE_TAG"
-          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          [[ "$TAG" =~ ^cockpit-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
           version="${BASH_REMATCH[1]}"
           archive="phux-cockpit-$version-macos-arm64.zip"
-          expected="$(awk -v file="$archive" '$2 == file { print $1 }' zig-out/release/SHA256SUMS)"
-          actual="$(shasum -a 256 "zig-out/release/$archive" | cut -d ' ' -f 1)"
+          expected="$(awk -v file="$archive" '$2 == file { print $1 }' clients/cockpit/zig-out/release/SHA256SUMS)"
+          actual="$(shasum -a 256 "clients/cockpit/zig-out/release/$archive" | cut -d ' ' -f 1)"
           [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
           [[ "$actual" == "$expected" ]]
           cd tap
