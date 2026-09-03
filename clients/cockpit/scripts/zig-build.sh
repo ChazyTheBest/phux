@@ -193,10 +193,11 @@ esac
 # script would build.
 if [ "$ALLOW_FOREIGN_CWD" = 0 ]; then
     cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ -n "$cwd_root" ] && [ "$cwd_root" != "$ROOT" ]; then
+    expected_root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$cwd_root" ] && [ "$cwd_root" != "$expected_root" ]; then
         printf 'zig-build.sh: REFUSING to build a tree you are not standing in.\n' >&2
         printf '  your cwd is in:  %s\n' "$cwd_root" >&2
-        printf '  this script builds: %s\n' "$ROOT" >&2
+        printf '  this script builds from: %s\n' "$expected_root" >&2
         printf '  An exit code from the wrong tree is indistinguishable from a\n' >&2
         printf '  correct one. cd to the tree you mean, or pass --allow-foreign-cwd.\n' >&2
         exit 2

@@ -367,12 +367,12 @@ Zig 0.16-compatible checkpoint.
 
 ## Phux FFI provenance
 
-Production packages link [`no-phux/phux@0531189b`](https://github.com/no-phux/phux/commit/0531189bf77db5a93f98e897219d6d7ced2cd491)
-at workspace version `0.23.3`, with `PHUX_CLIENT_ABI_VERSION=1`, using Cargo
-profile `ffi-release`. [`phux-ffi.lock.json`](phux-ffi.lock.json) is the
-canonical source for those values; `./scripts/verify-phux-ffi.py` checks the
-hosted checkouts, documentation, license inventory, and packaged provenance
-against it.
+Production packages compile and statically link `phux-client-ffi` from the
+same Phux checkout that contains `clients/cockpit`. The C ABI remains the
+architectural seam; repository composition no longer requires a second clone
+or a cross-repository commit lock. `./scripts/verify-phux-ffi.py` derives the
+Git commit, workspace version, ABI version, and Cargo profile from that checkout
+and writes those exact values into the packaged provenance resource.
 
 ## Build and test
 
@@ -417,9 +417,11 @@ stderr is non-empty, whether or not the step failed. Those prints are now behind
 ------------------------------------------------------------------
 zig build test: PASS
   phux provider: COMPILED AND TESTED (transport, host, provider, pointer)
+  source root:   /Users/you/workspace/phux/clients/cockpit
+  phux provider: COMPILED AND TESTED (transport, host, provider, pointer, extension)
     ffi include: /Users/you/workspace/phux/crates/phux-client-ffi/include
     ffi lib:     /Users/you/workspace/phux/target/ffi-release
-    found via:   ../phux sibling checkout
+    found via:   Phux monorepo checkout
   app graph:     local terminal provider (-Dphux-enabled defaults to false)
 ------------------------------------------------------------------
 ```
@@ -433,12 +435,12 @@ hangs the build. See phux-cockpit-iwf and the comment on
 `phux_test_module_names` in `build.zig`.
 
 `src/providers/phux/` needs the phux client FFI, so `zig build test` looks for
-`phux/client.h` and `libphux_client_ffi.a` in four places, in order:
+`phux/client.h` and `libphux_client_ffi.a` in three places, in order:
 
 1. `-Dphux-client-ffi-include-dir` / `-Dphux-client-ffi-lib-dir`
 2. `$PHUX_CLIENT_FFI_INCLUDE_DIR` / `$PHUX_CLIENT_FFI_LIB_DIR`
-3. `./.phux/crates/phux-client-ffi/include` and `./.phux/target/ffi-release`
-4. `../phux/crates/phux-client-ffi/include` and `../phux/target/ffi-release`
+3. the enclosing Phux checkout: `../../crates/phux-client-ffi/include` and
+   `../../target/ffi-release`
 
 If it finds them, the provider is compiled and its tests run — regardless of
 `-Dphux-enabled`. If it does not, everything else still runs and passes, and the
@@ -458,20 +460,17 @@ test "every declaration in this module is compiled, not merely reachable" {
 
 which is what makes the verdict's "COMPILED" claim true.
 
-To build the FFI for a sibling checkout:
+From the Phux repository root, build the FFI and run the complete Cockpit gate:
 
 ```sh
-cargo build --locked --profile ffi-release -p phux-client-ffi \
-  --manifest-path ../phux/Cargo.toml
+just cockpit-test
 ```
 
 `-Dphux-enabled=true` adds the Phux provider to the **app** graph. It requires
 the FFI and fails loudly rather than building an app with no Phux path:
 
 ```sh
-zig build test -Dphux-enabled=true \
-  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
-  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release"
+zig build test -Dphux-enabled=true
 ```
 
 At launch, the Phux provider attaches the running server's current session. It
@@ -587,18 +586,15 @@ launches from the dev home.
 Create an arm64 app, ZIP, DMG, and `SHA256SUMS` under `zig-out/release`:
 
 ```sh
-cargo build --locked --profile ffi-release -p phux-client-ffi \
-  --manifest-path ../phux/Cargo.toml
-PHUX_CLIENT_FFI_INCLUDE_DIR="$PWD/../phux/crates/phux-client-ffi/include" \
-PHUX_CLIENT_FFI_LIB_DIR="$PWD/../phux/target/ffi-release" \
-  ./scripts/package-macos.sh
+cd ../..
+just cockpit-ffi
+clients/cockpit/scripts/package-macos.sh
 ```
 
 Release, CI, and local packaging all require the source and output paths to
-belong to the checkout named by `phux-ffi.lock.json`. The packaging script
-verifies that checkout, its header ABI, workspace version, Cargo profile, and
-artifact directories before building; it does not produce an unattested
-local-terminal-only package.
+belong to this same Phux checkout. The packaging script verifies the checkout,
+header ABI, workspace version, Cargo profile, and artifact directories before
+building; it does not produce an unattested local-terminal-only package.
 
 Verify a packaged or installed bundle and run a process-lifecycle soak with:
 

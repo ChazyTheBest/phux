@@ -160,9 +160,9 @@ Confirm `pwd` and `git rev-parse --show-toplevel` before treating any exit code
 as evidence.
 
 A verdict that says `PASS, INCOMPLETE` means `src/providers/phux/` was not
-compiled, because the phux client FFI was not found on this machine. The rest
-of the run is real; a change under `src/providers/phux/` is not verified by it.
-The verdict prints the four locations it searched and how to fix it. Do not
+compiled, because the phux client FFI has not been built in this checkout. The
+rest of the run is real; a change under `src/providers/phux/` is not verified by it.
+The verdict prints the three locations it searched and how to fix it. Do not
 report such a run as verifying a phux change.
 
 The full phux-inclusive invocation, when the FFI lives outside the four
@@ -170,10 +170,11 @@ searched locations:
 
 ```sh
 zig build test \
-  -Dphux-enabled=true \
-  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
-  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release"
+  -Dphux-enabled=true
 ```
+
+From the repository root, `just cockpit-test` builds the FFI from the same
+checkout and runs both Cockpit test graphs.
 
 `-Dphux-enabled=true` additionally swaps the *app* graph onto the phux
 provider. It is not needed just to compile and test `src/providers/phux/` —

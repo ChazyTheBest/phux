@@ -59,6 +59,27 @@ build:
 build-release:
     cargo build --locked --workspace --release
 
+# Build the stable C ABI and the native macOS Cockpit from this checkout.
+cockpit-build: cockpit-ffi
+    cd clients/cockpit && ./scripts/zig-build.sh -Dphux-enabled=true --summary all
+
+# Run both Cockpit graphs plus the repository and release contract checks.
+cockpit-test: cockpit-ffi
+    cd clients/cockpit && ./scripts/check-release-version.sh
+    cd clients/cockpit && ./scripts/check-sdk-pin.sh
+    cd clients/cockpit && ./scripts/lib/zon_test.sh
+    cd clients/cockpit && ./scripts/lib/measure_test.sh
+    cd clients/cockpit && ./scripts/zig-build.sh test -Dplatform=null -Dphux-enabled=true --summary all
+    cd clients/cockpit && ./scripts/zig-build.sh test -Dtypescript-spike=true -Dplatform=null --summary all
+
+# Build Cockpit's stable C ABI dependency from the enclosing Phux workspace.
+cockpit-ffi:
+    cargo build --locked --profile ffi-release -p phux-client-ffi
+
+# Run the isolated developer app with the Phux-backed production graph.
+cockpit-dev: cockpit-ffi
+    cd clients/cockpit && ./scripts/dev-run.sh --phux
+
 # Build the current checkout and atomically install its developer binaries.
 # The binaries live in Cargo's bin dir, matching normal source installs. Keep
 # that directory ahead of Homebrew in PATH so there is one developer binary.

@@ -139,7 +139,7 @@ const PhuxFfi = struct {
     include_dir: []const u8,
     lib_dir: []const u8,
     /// Human-readable provenance, printed in the test verdict so the reader
-    /// knows which of the four lookups won.
+    /// knows which lookup won.
     origin: []const u8,
 };
 
@@ -171,8 +171,7 @@ fn ffiComplete(b: *std.Build, include_dir: []const u8, lib_dir: []const u8) bool
 ///   1. -Dphux-client-ffi-include-dir / -Dphux-client-ffi-lib-dir
 ///   2. $PHUX_CLIENT_FFI_INCLUDE_DIR / $PHUX_CLIENT_FFI_LIB_DIR
 ///      (the pair scripts/package-macos.sh and both workflows already use)
-///   3. ./.phux/...        -- the CI checkout layout, .github/workflows/ci.yml
-///   4. ../phux/...        -- the sibling-checkout layout documented in README
+///   3. ../../...           -- the Phux monorepo root
 fn resolvePhuxFfi(
     b: *std.Build,
     opt_include: ?[]const u8,
@@ -199,8 +198,7 @@ fn resolvePhuxFfi(
     }
 
     const layouts = [_]struct { root: []const u8, origin: []const u8 }{
-        .{ .root = ".phux", .origin = "./.phux checkout" },
-        .{ .root = "../phux", .origin = "../phux sibling checkout" },
+        .{ .root = "../..", .origin = "Phux monorepo checkout" },
     };
     for (layouts) |layout| {
         const include_dir = rootPath(b, b.pathJoin(&.{ layout.root, "crates/phux-client-ffi/include" }));
@@ -573,9 +571,8 @@ fn buildVerdict(
             \\                   -Dphux-client-ffi-include-dir / -Dphux-client-ffi-lib-dir
             \\                   $PHUX_CLIENT_FFI_INCLUDE_DIR / $PHUX_CLIENT_FFI_LIB_DIR
             \\                   {s}
-            \\                   {s}
             \\  to include it: cargo build --locked --profile ffi-release \
-            \\                   -p phux-client-ffi --manifest-path ../phux/Cargo.toml
+            \\                   -p phux-client-ffi --manifest-path ../../Cargo.toml
             \\                 then re-run zig build test
             \\  app graph:     local terminal provider (-Dphux-enabled defaults to false)
             \\{s}
@@ -583,8 +580,7 @@ fn buildVerdict(
         rule,
         source_root,
         global_cache,
-        rootPath(b, ".phux"),
-        rootPath(b, "../phux"),
+        rootPath(b, "../.."),
         rule,
     });
 }
@@ -657,9 +653,9 @@ pub fn build(b: *std.Build) void {
             \\  <lib-dir>/libphux_client_ffi.a
             \\Pass -Dphux-client-ffi-include-dir=<dir> -Dphux-client-ffi-lib-dir=<dir>,
             \\or set PHUX_CLIENT_FFI_INCLUDE_DIR and PHUX_CLIENT_FFI_LIB_DIR,
-            \\or place the checkout at {s} or {s} and build it with:
+            \\or build the FFI from the Phux monorepo root at {s} with:
             \\  cargo build --locked --profile ffi-release -p phux-client-ffi
-        , .{ rootPath(b, ".phux"), rootPath(b, "../phux") });
+        , .{ rootPath(b, "../..") });
         std.process.exit(1);
     }
 

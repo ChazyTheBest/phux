@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "${ROOT}/../.." && pwd)"
 if [[ -z "${VERSION:-}" ]]; then
     IFS= read -r VERSION < "${ROOT}/version.txt"
 fi
@@ -67,8 +68,9 @@ for tool in zig codesign ditto hdiutil lipo plutil shasum unzip; do
     fi
 done
 
-: "${PHUX_CLIENT_FFI_INCLUDE_DIR:?set PHUX_CLIENT_FFI_INCLUDE_DIR to the directory containing phux/client.h}"
-: "${PHUX_CLIENT_FFI_LIB_DIR:?set PHUX_CLIENT_FFI_LIB_DIR to the directory containing libphux_client_ffi.a}"
+PHUX_SOURCE_DIR="${PHUX_SOURCE_DIR:-${REPO_ROOT}}"
+PHUX_CLIENT_FFI_INCLUDE_DIR="${PHUX_CLIENT_FFI_INCLUDE_DIR:-${REPO_ROOT}/crates/phux-client-ffi/include}"
+PHUX_CLIENT_FFI_LIB_DIR="${PHUX_CLIENT_FFI_LIB_DIR:-${REPO_ROOT}/target/ffi-release}"
 [[ -f "${PHUX_CLIENT_FFI_INCLUDE_DIR}/phux/client.h" ]] || {
     printf 'error: phux/client.h is missing from %s\n' "${PHUX_CLIENT_FFI_INCLUDE_DIR}" >&2
     exit 1
@@ -77,9 +79,6 @@ done
     printf 'error: libphux_client_ffi.a is missing from %s\n' "${PHUX_CLIENT_FFI_LIB_DIR}" >&2
     exit 1
 }
-if [[ -z "${PHUX_SOURCE_DIR:-}" ]]; then
-    PHUX_SOURCE_DIR="$(CDPATH='' cd -- "${PHUX_CLIENT_FFI_INCLUDE_DIR}/../../.." && pwd)"
-fi
 "${ROOT}/scripts/verify-phux-ffi.py" \
     --phux-tree "${PHUX_SOURCE_DIR}" \
     --ffi-include-dir "${PHUX_CLIENT_FFI_INCLUDE_DIR}" \

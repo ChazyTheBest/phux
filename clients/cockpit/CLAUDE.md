@@ -87,7 +87,7 @@ load-bearing:
   Confirm `pwd` and `git rev-parse --show-toplevel` before treating any exit
   code as evidence.
 - **`PASS, INCOMPLETE`** means `src/providers/phux/` was not in the build at
-  all, because the phux client FFI was not found. The rest of the run is real;
+  all, because the phux client FFI has not been built in this checkout. The rest of the run is real;
   a change under that directory is not verified by it.
 
 No verdict block at all means the run was not green, whatever else printed.
@@ -100,6 +100,8 @@ every invocation including the full phux one. `src/providers/phux/ref.zig` plus 
 `refAllDeclsRecursive` test in each rooted module is what forces the analysis.
 
 README.md, "Reading the result of `zig build test`", has the FFI search order.
+From the repository root, `just cockpit-test` builds the same-checkout FFI and
+runs both Cockpit test graphs.
 
 ### Running it
 
