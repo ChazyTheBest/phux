@@ -1,7 +1,7 @@
 .{
     .name = .phux_cockpit,
     .fingerprint = 0xa47a656ea288c810,
-    .version = "0.14.0", // x-release-please-version
+    .version = "0.16.1", // x-release-please-version
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Native v0.8.1 plus Cockpit's terminal fixes, plus the render work
@@ -151,9 +151,17 @@
         //   hands the engine to each instance as a module.
         // - Comptime markup diagnostics name the markup again instead of
         //   failing on Zig 0.16's refusal to discard an error value.
+        // - Split widgets carry an axis through layout, pointer drag, keyboard
+        //   steps, resize cursor, paint, and accessibility while preserving
+        //   horizontal as the source-compatible default.
+        // - The runtime's existing scoped display-list refresh batch is public.
+        //   Cockpit uses `beginCanvasWidgetDisplayListRefreshBatch`/`end...`
+        //   only around the installing main-canvas event: display-list work and
+        //   presentation stay synchronous, while AppKit accessibility
+        //   publication moves to the responding frame's post-present flush.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/7e783da8df366aa3a89de72287d2c6c81121355c.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQvwwsgLU5tfq3ymTRoyx9vSyB6vHqHRqeihyppxJ",
+            .url = "https://github.com/phall1/native/archive/df0c15cbd15fe30af923001468fb61f99ee22264.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQk1ysgKPZuZ_NZe_37dNOpfYCqlAj2qQ7atEav3o",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

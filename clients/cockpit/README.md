@@ -351,13 +351,13 @@ actually looking at.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is pinned to
-[`phall1/native@7e783da8`](https://github.com/phall1/native/commit/7e783da8df366aa3a89de72287d2c6c81121355c),
-the head of that fork's `cockpit/v0.9.5` branch: upstream v0.9.5 plus Cockpit's
-terminal interaction, viewport, and font seams, the packed `cell_grid` canvas
-command with its AppKit decoder and wire format v6, macOS glyph smoothing, the
-per-window `ChromeContext` on `build_window` and `web_panes`, `fx.openUrl`, and
-the `native_extension` hook that lets the TypeScript-core graph keep Cockpit's
-engine native.
+[`phall1/native@df0c15cb`](https://github.com/phall1/native/commit/df0c15cbd15fe30af923001468fb61f99ee22264),
+the fork's upstream-v0.9.5 Cockpit lineage: terminal interaction, viewport, and
+font seams, the packed `cell_grid` canvas command with its AppKit decoder and
+wire format v6, macOS glyph smoothing, per-window `ChromeContext` on
+`build_window` and `web_panes`, `fx.openUrl`, the `native_extension` hook that
+keeps the TypeScript-core graph's engine native, axis-aware native split
+dividers, and scoped post-present display-list refresh batching.
 The pin is a tarball SHA rather than a branch, so a push to the fork can never
 break a checkout of Cockpit — see [docs/SDK_PIN.md](docs/SDK_PIN.md) for how the
 fork and this repo stay in contract, and what to run before moving the pin.
@@ -512,7 +512,7 @@ The dev run differs in four ways, each closing a different hole:
 | process name | `phux-cockpit` | `phux-cockpit-dev` |
 | Dock and menu | Phux Cockpit | Phux Cockpit (dev) |
 | config | `~/.config/phux-cockpit/config` | `.dev-run/config` |
-| workspace layout | `~/Library/Application Support/…/workspace.state` | `.dev-run/workspace.state` |
+| workspace layout | `~/Library/Application Support/…/workspace.state` | `.dev-run/dev.phux.cockpit/workspace.state` |
 | automation dropbox | the CWD you launched from | `.dev-run/.zig-cache/…` |
 
 The process name is the one that matters to tooling rather than to you.

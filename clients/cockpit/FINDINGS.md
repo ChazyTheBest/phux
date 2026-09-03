@@ -430,12 +430,12 @@ freezes published panes until the replacement attach reaches its ATTACHED
 barrier.
 
 The production build is selected explicitly with `-Dphux-enabled=true` and
-requires the generated header plus the `ffi-release` static-library directory:
+requires the generated header plus the `ffi-release` static-library directory.
+From the current same-checkout layout, the root recipe builds both before
+running Cockpit's complete graphs:
 
 ```sh
-zig build test -Dplatform=null -Dphux-enabled=true \
-  -Dphux-client-ffi-include-dir=/Users/phall/workspace/phux/crates/phux-client-ffi/include \
-  -Dphux-client-ffi-lib-dir=/Users/phall/workspace/phux/target/ffi-release
+just cockpit-test
 ```
 
 ### The glyph budget: measured, and the answer is split

@@ -30,7 +30,7 @@ would have.
 | Check | Where | Answers |
 |---|---|---|
 | Build against the pin | root `.github/workflows/cockpit-ci.yml`, every relevant push and PR | Does Cockpit compile and pass against the SDK it claims to use? |
-| Build against the branch head | root `.github/workflows/cockpit-sdk-head.yml`, daily at 07:17 UTC and on dispatch | Has the fork moved somewhere Cockpit cannot follow? |
+| Build against the branch head | root `.github/workflows/cockpit-sdk-head.yml`, on source-repository dispatch, manual dispatch, and Mondays at 07:17 UTC | Has the fork moved somewhere Cockpit cannot follow? |
 | Pin documentation agrees | `scripts/check-sdk-pin.sh`, run first in CI | Does README describe the sha that is actually built? |
 | Glyph weight holds | `scripts/host-raster-check.sh --min-solid 4000`, in CI and SDK-head | Does the pinned host and the fork's branch head still ink text as thickly as they did? |
 
@@ -56,12 +56,13 @@ Notification is GitHub's default for scheduled workflows and nothing more: the
 account that created the workflow is emailed when a scheduled run fails, and
 that moves to whoever last changed the `cron` expression. There is no
 issue-filing automation and no chat integration. If that email is not being
-read, the check is not doing its job.
+read, the weekly fallback is not doing its job.
 
 ## Pre-pin checklist
 
 Run this before pushing a pin bump. It is the same sequence `sdk-head.yml` runs,
-so anything it catches, CI would have caught a day later.
+so anything it catches would otherwise wait for the next dispatch or weekly
+fallback.
 
 **1. See what would move.** `scripts/repoint-sdk.sh` resolves the ref, rewrites
 `build.zig.zon` through `zig fetch --save` (which touches only the `.url` and
@@ -134,20 +135,20 @@ that still names the old sha, before anything compiles.
 is this fork's changelog — it is where a future reader learns why the pin is
 where it is. Say what the new commits change for Cockpit.
 
-## The direction this repo cannot check
+## Dispatch from the SDK repository
 
-The break originates in the fork, so the fork is where it should be caught: a
-job on `phall1/native`'s cockpit branches that checks out Cockpit and builds it.
-That job does not exist and cannot be added from here.
-
-Half of it is already in place. `cockpit-sdk-head.yml` accepts a `workflow_dispatch`
-input naming any ref, so the fork's CI can ask Cockpit to build against the
-exact sha it is pushing, with a token holding `actions: write` on this repo:
+The break originates in the fork, so the preferred trigger is a job on
+`phall1/native`'s `cockpit/v*` branches. The canonical workflow accepts both a
+`repository_dispatch` payload and a manual `workflow_dispatch` input naming an
+exact SDK ref. A source-repository workflow can send:
 
 ```sh
-gh workflow run cockpit-sdk-head.yml \
-  --repo no-phux/phux \
-  --field ref="$GITHUB_SHA"
+gh api --method POST repos/no-phux/phux/dispatches \
+  -f event_type=cockpit-sdk-head \
+  -F 'client_payload[ref]'="$GITHUB_SHA"
 ```
 
-Until that exists, the daily run is the backstop, and it is a day late.
+The token needs permission to dispatch workflows in `no-phux/phux`; keep it in
+the SDK repository's secret store. Until that source-side job exists, use the
+manual dispatch after SDK branch pushes. The Monday schedule is only a backstop
+for a missed dispatch, not the primary signal.

@@ -28,7 +28,7 @@ beside this repo). Package name (`.terminal`), fingerprint
 are deliberately unchanged — the label is threaded through ~40 sites in
 `src/tests.zig`, and renaming the package would also force a new fingerprint.
 
-The reference clone at `/Users/phall/workspace/phux-native-spike/ref/native-sdk`
+The reference clone at `$HOME/workspace/phux-native-spike/ref/native-sdk`
 is READ-ONLY. Do not `git pull` it mid-spike: every line number the build plan
 cites was read at `a7509a7`.
 
@@ -48,7 +48,7 @@ gitignored, so no network fetch is needed.
 Tests:
 
 ```sh
-cd /Users/phall/workspace/phux-native-spike/cockpit && \
+cd "$HOME/workspace/phux-native-spike/cockpit" && \
   /nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig build test \
   -Dplatform=null --summary all
 ```
@@ -56,7 +56,7 @@ cd /Users/phall/workspace/phux-native-spike/cockpit && \
 Binary:
 
 ```sh
-cd /Users/phall/workspace/phux-native-spike/cockpit && \
+cd "$HOME/workspace/phux-native-spike/cockpit" && \
   /nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig build && \
   file zig-out/bin/terminal
 ```
@@ -116,7 +116,7 @@ is what `chrome.prefix_commands` now declares.
 54 (48 baseline + 6). The sixth is env-gated and skips unless `COCKPIT_SHOTS=1`:
 
 ```sh
-cd /Users/phall/workspace/phux-native-spike/cockpit && \
+cd "$HOME/workspace/phux-native-spike/cockpit" && \
   COCKPIT_SHOTS=1 /nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig \
   build test -Dplatform=null --summary all
 ```

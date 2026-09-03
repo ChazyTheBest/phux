@@ -379,6 +379,9 @@ pub const Palette = struct {
     /// what row 0 means on every keystroke, and an index into the unfiltered
     /// list would silently point at a row the user cannot see.
     cursor: usize = 0,
+    /// The stable identity carried by the row currently highlighted. `cursor`
+    /// is only navigation geometry; activation never resolves through it.
+    highlighted: ?PaletteDestination = null,
 
     pub fn needle(palette: *const Palette) []const u8 {
         return palette.query[0..palette.query_len];
@@ -388,6 +391,7 @@ pub const Palette = struct {
         palette.open = false;
         palette.query_len = 0;
         palette.cursor = 0;
+        palette.highlighted = null;
     }
 
     /// Append typed text, dropping anything past the buffer rather than
@@ -432,7 +436,8 @@ pub const Workspace = struct {
     selected_tab: usize = 0,
     /// The web surface owns the content area. Independent of `selected_tab`,
     /// so returning from Web restores the tab that was there. Only the MAIN
-    /// window can raise it: the webview is a scene-declared view of window 0.
+    /// window can raise it: its post-present WebView is parented to window 0's
+    /// canvas.
     web_selected: bool = false,
     /// The tab the pointer is over, or `no_hovered_tab`. Purely presentational
     /// — it decides whether that tab shows its close `x` — but it lives here
@@ -744,6 +749,17 @@ pub const Model = struct {
     tab_placement: TabPlacement = .top,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
+    /// The parked WebKit child exists. False through the first useful canvas
+    /// present so scene loading cannot put WebKit process startup in front of
+    /// the synchronous startup-frame flush; set only after createView lands.
+    webview_materialized: bool = false,
+    /// Number of weighted font companions installed through the late-font
+    /// seam. A count, rather than a bool, makes a partial registration failure
+    /// retry from the first face that did not land.
+    deferred_font_count: u8 = 0,
+    /// The automatic post-present resource attempt has run. Failures never
+    /// retry on the frame clock; an explicit Web-surface focus retries instead.
+    post_present_resources_attempted: bool = false,
     focused: bool = true,
     consumed_shortcut_keys_held: u64 = 0,
     held_terminal_keys: [max_held_terminal_keys]HeldTerminalKey = [_]HeldTerminalKey{.{}} ** max_held_terminal_keys,
