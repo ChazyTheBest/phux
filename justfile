@@ -494,12 +494,15 @@ milestone-check:
 agent-integrations-check:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Incidental install-time audits are off (npm's advisory endpoints have
+    # 503'd mid-lane and installs don't need them; npm stops project-config
+    # discovery at the nearest package.json, so env vars — not a root .npmrc
+    # — are what reach every spawned npm call). The explicit `npm audit`
+    # gates stay on, wrapped in scripts/npm-audit-gate.mjs for outage retry.
+    export npm_config_audit=false npm_config_fund=false
     node scripts/check-agent-integration-versions.mjs
     for package in integrations/opencode integrations/pi integrations/claude; do
-      # --no-audit: npm's advisory endpoint has 503'd mid-lane (2026-09-04);
-      # a transient registry outage must not fail the gate, and dependency
-      # hygiene is cargo-deny's contract, not npm audit's.
-      npm --prefix "$package" ci --no-audit --no-fund
+      npm --prefix "$package" ci
       npm --prefix "$package" run gates
     done
 
