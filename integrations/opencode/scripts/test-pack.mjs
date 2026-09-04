@@ -26,9 +26,12 @@ try {
 
   const tarball = join(temporaryRoot, manifest.filename);
   const consumerRoot = join(temporaryRoot, "consumer");
+  // --no-audit: the advisory bulk endpoint has returned 503s (observed
+  // 2026-09-04) and a transient registry audit outage must not fail a CI
+  // pack-verification lane. Dependency hygiene is cargo-deny's contract.
   execFileSync(
     "npm",
-    ["install", "--ignore-scripts", "--omit=dev", "--prefix", consumerRoot, tarball],
+    ["install", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund", "--prefix", consumerRoot, tarball],
     { stdio: "pipe" },
   );
 

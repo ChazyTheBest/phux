@@ -496,7 +496,10 @@ agent-integrations-check:
     set -euo pipefail
     node scripts/check-agent-integration-versions.mjs
     for package in integrations/opencode integrations/pi integrations/claude; do
-      npm --prefix "$package" ci
+      # --no-audit: npm's advisory endpoint has 503'd mid-lane (2026-09-04);
+      # a transient registry outage must not fail the gate, and dependency
+      # hygiene is cargo-deny's contract, not npm audit's.
+      npm --prefix "$package" ci --no-audit --no-fund
       npm --prefix "$package" run gates
     done
 
