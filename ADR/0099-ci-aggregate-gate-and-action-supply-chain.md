@@ -68,6 +68,15 @@ corresponding pass over the CI story, and the Blacksmith runner cutover
    rust-cache. Cache keys are profile-scoped (`check`, `test`) so the stress
    nightlies share main's warm `test` entries instead of maintaining a third
    copy. PR runs restore but never save.
+4b. **Workflow-only PRs never compile.** When every changed file is CI
+   infrastructure (workflows, composite manifests, actionlint.yaml), ci.yml
+   runs a compile-free `workflow-gate` job (actionlint, pin check, truth
+   tables, orchestration assertions) and skips the compile lanes; cockpit-ci
+   runs the same classifier and skips its macOS job when nothing but
+   workflow files changed. Dependabot's grouped action bumps — previously a
+   full 25-minute compile each — cost minutes. The classifier is truth-table
+   tested (`scripts/ci/check-classify-changes.sh`); unknown paths still fail
+   closed into full CI.
 5. **Cockpit caches like ci.yml.** FFI builds share a macOS `cockpit-ffi`
    rust-cache key across cockpit-ci, cockpit-release, and cockpit-sdk-head;
    Zig global + project caches are keyed on the checked-out build manifest

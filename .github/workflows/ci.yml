@@ -93,6 +93,13 @@
 # required contexts resolve without compiling the Rust workspace. Any unknown
 # root path or shared FFI/protocol/Cargo input fails closed into full Phux CI.
 #
+# Workflow-only fast path: a PR whose every changed file is CI infrastructure
+# (`.github/workflows/*.yml`, the composite action manifests, actionlint.yaml)
+# runs only the compile-free `workflow-gate` job. Dependabot's grouped action
+# bumps are exactly this shape — before this gate they paid the full compile
+# for a pin change. cockpit-ci.yml runs the same classifier so its macOS job
+# skips on the same PRs. See ADR-0099.
+#
 # OBSERVABILITY (ADR-0082): each cargo phase runs under scripts/ci/timed.sh,
 # and a trailing `lane signal` step renders the phase timings, cache
 # effectiveness, and slowest tests into the job's step summary. That is the
@@ -147,6 +154,8 @@ jobs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
       phux_needed: ${{ steps.detect.outputs.phux_needed }}
       release_only: ${{ steps.detect.outputs.release_only }}
+      workflow_only: ${{ steps.detect.outputs.workflow_only }}
+      cockpit_needed: ${{ steps.detect.outputs.cockpit_needed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -188,6 +197,34 @@ jobs:
           fi
 
           printf '%s\n' "$files" | bash scripts/ci/classify-changes.sh >> "$GITHUB_OUTPUT"
+
+  # Workflow-only fast path: actionlint, the SHA-pin check, the change
+  # classifier truth table, and the release-orchestration/drift assertions,
+  # on the pinned devshell — NO Rust compile, NO zig blob, NO rust-cache.
+  # Dependabot's grouped action bumps touch nothing but workflow files and
+  # used to pay for the full compile lanes before failing on an unrelated
+  # step; now they cost minutes instead of a quarter hour. The composite
+  # action manifests are deliberately in scope: a bumped action changes
+  # runtime steps, not compilation, and the next code PR exercises the lanes
+  # against it. Anything outside the workflow set fails closed into full CI.
+  workflow-gate:
+    name: workflow gate
+    needs: changes
+    if: needs.changes.outputs.workflow_only == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: phux
+          # Read-only: no auth token, so nothing here can push to Cachix even
+          # in principle — the gate only needs the devshell's actionlint,
+          # just, and node. Fork PRs therefore work identically.
+          pushFilter: '(-source$|nixpkgs\.tar\.gz$)'
+      - name: workflow checks
+        run: nix develop -c just workflow-check
 
   # Lint + docs + license lane. clippy and rustdoc each compile the workspace
   # (check / doc profiles); running them in one job — and one `nix develop` —
@@ -401,7 +438,7 @@ jobs:
   # would score the aggregate as skipped-green instead of red.
   ci:
     name: ci
-    needs: [changes, check, test]
+    needs: [changes, check, test, workflow-gate]
     # always(): a red lane must not skip this job into a green-by-skip. The
     # draft exclusion keeps drafts quiet without weakening the gate — a draft
     # cannot merge, and ready_for_review re-runs the full graph.

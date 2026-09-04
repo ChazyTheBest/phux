@@ -46,9 +46,47 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Cheap gate before the 45-minute macOS job. The trigger `paths` above stop
+  # unrelated PRs from starting this workflow at all; this classifier refines
+  # that: a run whose cockpit-relevant changes are ONLY workflow files
+  # (Dependabot's grouped action bumps match several of these paths) skips
+  # the build — the root ci.yml workflow gate verifies those. Fail-closed:
+  # unknown/empty diffs request the build.
+  changes:
+    name: classify changes
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      cockpit_needed: ${{ steps.detect.outputs.cockpit_needed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Mirror ci.yml's push classification: a release merge commit has
+            # an exact tree; a vanished `before` (branch reset) falls back to
+            # the merge commit's own files.
+            before='${{ github.event.before }}'
+            if [[ "$before" =~ ^0+$ ]] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+              files=$(git diff-tree --no-commit-id --name-only -r HEAD)
+            else
+              files=$(git diff --name-only "$before" HEAD)
+            fi
+          else
+            git fetch --quiet origin "${{ github.base_ref }}"
+            base=$(git merge-base HEAD "origin/${{ github.base_ref }}")
+            files=$(git diff --name-only "$base" HEAD)
+          fi
+          printf '%s\n' "$files" | bash scripts/ci/classify-changes.sh >> "$GITHUB_OUTPUT"
+
   test:
     name: Zig 0.16 macOS
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    if: needs.changes.outputs.cockpit_needed == 'true'
+    needs: changes
     # Blacksmith's macOS fleet is Apple-silicon-only and homogeneous, so the
     # caches below key on runner.os alone without a CPU fingerprint.
     runs-on: blacksmith-6vcpu-macos-26
