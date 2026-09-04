@@ -215,7 +215,9 @@ jobs:
           test_dir="$(mktemp -d)"
           cd "$test_dir"
           npm init --yes >/dev/null
-          npm install --ignore-scripts --package-lock=false "$GITHUB_WORKSPACE/release/$TARBALL"
+          # Temp dir outside the repo tree: no project .npmrc applies, so the
+          # flags are explicit here (see .npmrc for why audit is off).
+          npm install --ignore-scripts --no-audit --no-fund --package-lock=false "$GITHUB_WORKSPACE/release/$TARBALL"
           npm ls --depth=0 "${PACKAGE_NAME}@${VERSION}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
