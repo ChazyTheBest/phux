@@ -869,6 +869,71 @@ fn published_history_is_generation_bound_and_interleaves_without_advancing_live_
 }
 
 #[test]
+fn delayed_history_tombstone_for_an_advanced_cursor_is_ignored() {
+    let terminal_id = terminal(31);
+    let stream_id = stream(131);
+    let bootstrap_id = bootstrap(231);
+    let mut kernel = kernel(ReadyMode::ChunkFirst);
+    let mut effects = EffectBuffer::new();
+    publish_direct_with_history(
+        &mut kernel,
+        &terminal_id,
+        stream_id,
+        bootstrap_id,
+        40,
+        b"cursor-0",
+        &mut effects,
+    );
+    effects.clear();
+
+    kernel
+        .update(
+            KernelInput::HistoryPage {
+                terminal_id: &terminal_id,
+                stream_id,
+                bootstrap_id,
+                cursor: b"cursor-0",
+                next_cursor: Some(b"cursor-1"),
+                payload: b"history-one",
+                page_seq: 1,
+                rows: 0,
+            },
+            &mut effects,
+        )
+        .unwrap();
+    assert_eq!(
+        kernel.history_cache(&terminal_id).unwrap().status().state,
+        HistoryLoadState::Loading,
+        "the first page advances the outstanding request to cursor-1"
+    );
+    effects.clear();
+
+    let delayed = kernel.update(
+        KernelInput::HistoryTombstone {
+            terminal_id: &terminal_id,
+            stream_id,
+            bootstrap_id,
+            cursor: b"cursor-0",
+            reason: HistoryUnavailableReason::Expired,
+        },
+        &mut effects,
+    );
+    assert!(
+        delayed.is_ok(),
+        "a late tombstone for cursor-0 must not disconnect the live pane: {delayed:?}"
+    );
+    assert_eq!(
+        kernel.history_cache(&terminal_id).unwrap().status().state,
+        HistoryLoadState::Loading,
+        "the newer cursor remains usable"
+    );
+    assert!(
+        effects.as_slice().is_empty(),
+        "ignoring an obsolete cursor must not change visible history state"
+    );
+}
+
+#[test]
 fn retained_history_limit_and_prefetch_threshold_are_explicit() {
     let terminal_id = terminal(35);
     let stream_id = stream(135);

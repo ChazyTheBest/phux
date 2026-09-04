@@ -2093,7 +2093,13 @@ impl<E: EngineAdapter> SessionKernel<E> {
             | HistoryUnavailableReason::CodecFailure => HistoryLoadState::Tombstoned,
         };
         if !replica.history.invalidate_cursor(&cursor, state) {
-            return Err(KernelError::HistoryCache(HistoryCacheError::Gap));
+            // A cursor-scoped tombstone can race a page that advanced this
+            // replica to a newer cursor. It then names an already-resolved
+            // request rather than the one now outstanding. History is a
+            // recoverable, optional stream, so accepting that stale control
+            // frame as a fatal protocol gap would disconnect an otherwise
+            // healthy live pane.
+            return Ok(());
         }
         self.adapter.clear_document_state(&mut replica.engine);
         effects.push(KernelEffect::Status(KernelStatus::HistoryUnavailable {
