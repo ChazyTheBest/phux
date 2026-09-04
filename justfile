@@ -339,10 +339,12 @@ shellcheck:
       examples/agents/orchestrate-placed-fleet examples/agents/tests/*.sh \
       examples/plugins/*/scripts/*.sh
 
-# GitHub workflow syntax and the fail-closed CI path-routing truth table.
+# GitHub workflow + composite-action syntax, the fail-closed CI path-routing
+# truth table, and the SHA-pin policy for action references.
 workflow-check:
     actionlint .github/workflows/*.yml
     bash scripts/ci/check-classify-changes.sh
+    bash scripts/check-action-pins.sh
     node scripts/check-release-orchestration.mjs
     node scripts/check-release-drift-policy.mjs
 

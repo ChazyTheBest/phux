@@ -383,7 +383,7 @@ has a uniform baseline and is unaffected. Pinning Linux CPU baselines through
 Cockpit is a Release Please component, not part of the Rust workspace version.
 A Cockpit conventional commit updates the shared draft release PR only under
 `clients/cockpit` plus the root release manifest. Mark that PR ready, wait for
-`cockpit-ci`, `check`, `test`, and `commitlint`, then merge it. Release Please
+`cockpit-ci`, `ci` (the aggregate of `check`/`test`), and `commitlint`, then merge it. Release Please
 creates `cockpit-vX.Y.Z` and a private draft; `cockpit-release.yml` re-tests the
 exact tag, creates the arm64 ZIP and DMG, verifies the downloaded copies and
 their `SHA256SUMS`, updates and remotely verifies `Casks/phux-cockpit.rb`,
