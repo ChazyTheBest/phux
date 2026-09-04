@@ -79,7 +79,7 @@ require_fixed docs/INSTALL.md "| Linux aarch64 | Curl/tarball: yes. Homebrew: ye
 require_fixed docs/RELEASING.md "phux and phux-mcp artifacts"
 require_fixed docs/RELEASING.md "cargo install phux is unsupported"
 require_fixed docs/RELEASING.md "Windows is not supported"
-require_fixed docs/RELEASING.md "Release cockpit"
+require_fixed docs/RELEASING.md "Cutting a Cockpit release"
 require_fixed docs/RELEASING.md "just release-preflight vX.Y.Z"
 require_fixed docs/RELEASING.md "CARGO_REGISTRY_TOKEN"
 require_fixed docs/RELEASING.md "portable public release"
