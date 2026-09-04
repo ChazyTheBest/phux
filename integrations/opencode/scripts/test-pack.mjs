@@ -11,7 +11,11 @@ const temporaryRoot = await mkdtemp(join(tmpdir(), "phux-opencode-pack-"));
 try {
   const packed = JSON.parse(execFileSync(
     "npm",
-    ["pack", "--json", "--ignore-scripts", "--pack-destination", temporaryRoot],
+    // --no-audit: npm pack consults the live advisory endpoint; a transient
+    // 503 there must not fail pack verification (see .npmrc). The npm_config_*
+    // env set by `just agent-integrations-check` already covers this when
+    // driven through just; the flag keeps the script safe standalone.
+    ["pack", "--json", "--ignore-scripts", "--no-audit", "--pack-destination", temporaryRoot],
     { cwd: packageRoot, encoding: "utf8" },
   ));
   assert.equal(packed.length, 1);

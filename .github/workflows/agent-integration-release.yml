@@ -167,6 +167,13 @@ jobs:
 
       - name: Install and run component gates
         working-directory: ${{ needs.prepare.outputs.directory }}
+        env:
+          # npm stops project-config discovery at the nearest package.json, so
+          # the repo-root .npmrc is invisible from here; the env vars are the
+          # switch that reaches every npm call the gate scripts spawn (see
+          # .npmrc: the live audit endpoint 503s must not fail a release).
+          npm_config_audit: "false"
+          npm_config_fund: "false"
         run: |
           npm install --global npm@11.5.1
           npm ci
@@ -284,7 +291,7 @@ jobs:
         if: needs.prepare.outputs.publish_npm == 'true' && needs.prepare.outputs.dry_run == 'true'
         env:
           TARBALL: ${{ steps.artifact.outputs.tarball }}
-        run: npm publish --dry-run "$TARBALL"
+        run: npm publish --dry-run --no-audit "$TARBALL"
 
       - name: Publish exact npm artifact with provenance
         if: needs.prepare.outputs.publish_npm == 'true' && needs.prepare.outputs.dry_run == 'false'
@@ -307,7 +314,7 @@ jobs:
             fi
             echo "${PACKAGE_NAME}@${VERSION} already published with matching shasum; nothing to do."
           else
-            npm publish --provenance --access public "$TARBALL"
+            npm publish --provenance --access public --no-audit "$TARBALL"
           fi
 
       - name: Attach assets and publish component release
