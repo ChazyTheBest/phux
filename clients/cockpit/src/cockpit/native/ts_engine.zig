@@ -31,6 +31,9 @@ const view = @import("view.zig");
 const protocol = @import("ts_protocol.zig");
 const ts_snapshot = @import("ts_snapshot.zig");
 const theme_module = @import("../../config/theme.zig");
+const startup = @import("../startup.zig");
+const shell_words = @import("../shell_words.zig");
+const session_state = @import("../session_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -55,12 +58,25 @@ pub const NoShells = struct {
     pub fn writeClipboard(_: *const NoShells, _: anytype) void {}
     pub fn readClipboard(_: *const NoShells, _: anytype) void {}
     pub fn openUrl(_: *const NoShells, _: []const u8) void {}
+    pub fn toggleFullscreenWindow(_: *const NoShells, _: []const u8) void {}
+    pub fn minimizeWindow(_: *const NoShells, _: []const u8) void {}
 };
 
 /// Where a clipboard read is going once it lands, mirroring update.zig's
 /// `paste_target`: into the focused pane as a bracketed paste, or into the
 /// open search needle.
 const PasteTarget = enum { pane, search_needle };
+
+pub const PointerOutcome = enum { ignored, consumed, geometry_changed };
+
+const SplitDrag = struct {
+    window_id: platform.WindowId,
+    pointer_id: u64,
+    window_index: usize,
+    node: layout.NodeId,
+    orientation: layout.Orientation,
+    bounds: geometry.RectF,
+};
 
 /// Snapshot flag bit reserved for the engine: the last intent was refused
 /// because it named a revision the engine had already moved past (or could
@@ -92,6 +108,7 @@ pub const Engine = struct {
     last_down_ns: u64 = 0,
     last_down_point: geometry.PointF = .{},
     last_click_count: u8 = 0,
+    split_drag: ?SplitDrag = null,
 
     /// The model is multi-MB and lives on the heap for the process lifetime;
     /// `gpa` sizes the emulator sessions the provider mints, `io` is what the
@@ -108,10 +125,260 @@ pub const Engine = struct {
         return engine;
     }
 
+    /// The process composition root: the same config, persisted topology,
+    /// cwd restoration, and optional Phux provider bootstrap as the Zig app.
+    pub fn createConfigured(gpa: std.mem.Allocator, init: std.process.Init) !*Engine {
+        const initialized = try startup.initializeModel(gpa, init);
+        return createFromInitialized(initialized);
+    }
+
+    /// Explicit-input twin of createConfigured, used by isolated launch tests
+    /// and embedders that already resolved their environment. It still enters
+    /// through the same startup implementation and final-storage cwd fixup.
+    pub fn createResolvedConfigured(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        config: startup.Config,
+        config_path: ?[]const u8,
+        state_path: ?[]const u8,
+        tab_placement_override: ?[]const u8,
+    ) !*Engine {
+        const initialized = try startup.initializeResolvedModel(
+            gpa,
+            io,
+            config,
+            config_path,
+            state_path,
+            tab_placement_override,
+        );
+        return createFromInitialized(initialized);
+    }
+
+    fn createFromInitialized(initialized_value: startup.InitializedModel) !*Engine {
+        var initialized = initialized_value;
+        errdefer model_module.deinitModel(&initialized.model);
+        const model = try std.heap.page_allocator.create(Model);
+        errdefer std.heap.page_allocator.destroy(model);
+        model.* = initialized.model;
+        if (initialized.provenance == .restored) {
+            model_module.applyRestoredWorkingDirectories(model, &initialized.restored_snapshot);
+        }
+        const engine = try std.heap.page_allocator.create(Engine);
+        engine.* = .{ .model = model };
+        return engine;
+    }
+
     pub fn destroy(self: *Engine) void {
         model_module.deinitModel(self.model);
         std.heap.page_allocator.destroy(self.model);
         std.heap.page_allocator.destroy(self);
+    }
+
+    /// Start the configured provider's two native event sources. TypeScript
+    /// sees only the resulting ordered snapshot invalidations; sockets,
+    /// ChannelHandle values and pointer ownership stay native.
+    pub fn startProviderChannels(self: *Engine, fx: anytype, phux_event: anytype, pointer_event: anytype) void {
+        self.openPhuxChannel(fx, phux_event, false);
+        self.openPointerChannel(fx, pointer_event);
+    }
+
+    fn openPhuxChannel(self: *Engine, fx: anytype, on_event: anytype, reconnect: bool) void {
+        const remote = self.model.phux() orelse return;
+        const handle = fx.openChannel(.{
+            .key = support.phux_channel_key,
+            .on_event = on_event,
+            .max_pending = 1,
+        });
+        if (!handle.live()) {
+            self.model.phux_connection_unavailable = true;
+            return;
+        }
+        if (reconnect) {
+            remote.reconnect(handle) catch {
+                self.model.phux_connection_unavailable = true;
+                fx.closeChannel(support.phux_channel_key);
+            };
+        } else {
+            remote.open(handle) catch {
+                self.model.phux_connection_unavailable = true;
+                fx.closeChannel(support.phux_channel_key);
+            };
+        }
+    }
+
+    fn openPointerChannel(self: *Engine, fx: anytype, on_event: anytype) void {
+        if (comptime !support.phux_enabled) return;
+        const pointer_state = self.model.pointer_state orelse return;
+        if (pointer_state.monitor != null) return;
+        const handle = fx.openChannel(.{
+            .key = support.pointer_channel_key,
+            .on_event = on_event,
+            .max_pending = 1,
+        });
+        if (!handle.live()) return;
+        pointer_state.monitor = support.pointer_module.Monitor.start(
+            std.heap.page_allocator,
+            &pointer_state.queue,
+            handle,
+        ) catch {
+            fx.closeChannel(support.pointer_channel_key);
+            return;
+        };
+    }
+
+    /// Drain a provider wake and reconcile only stable provider terminal
+    /// identities into Cockpit topology. The bool says the snapshot-visible
+    /// model moved and therefore needs one ordered invalidation.
+    pub fn onPhuxChannel(self: *Engine, fx: anytype, event: native_sdk.EffectChannelEvent, on_event: anytype) bool {
+        if (event.key != support.phux_channel_key) return false;
+        const model = self.model;
+        const remote = model.phux() orelse return false;
+        var changed = false;
+        switch (event.kind) {
+            .data => {
+                const delta = remote.drainReadiness() catch {
+                    changed = !model.phux_connection_unavailable;
+                    model.phux_connection_unavailable = true;
+                    remote.stop();
+                    fx.closeChannel(support.phux_channel_key);
+                    return self.commitProviderChange(changed);
+                };
+                if (delta.detached) {
+                    changed = !model.phux_connection_unavailable;
+                    model.phux_connection_unavailable = true;
+                    remote.stop();
+                    fx.closeChannel(support.phux_channel_key);
+                    return self.commitProviderChange(changed);
+                }
+                if (delta.ready_published) {
+                    changed = model.phux_connection_unavailable;
+                    model.phux_connection_unavailable = false;
+                }
+                const terminal_set_changed = delta.ready_published or delta.added_count != 0 or delta.removed_count != 0;
+                if (terminal_set_changed) {
+                    model.reconcileRemoteTerminals();
+                    changed = true;
+                }
+                if (delta.ready_published and model.phux_admit_on_ready) {
+                    model.phux_admit_on_ready = false;
+                    changed = model.admitAndSelectCurrentRemoteTerminal() or changed;
+                }
+            },
+            .closed, .rejected => {
+                remote.stop();
+                if (model.phux_reconnect_after_close) {
+                    model.phux_reconnect_after_close = false;
+                    self.openPhuxChannel(fx, on_event, remote.state() != .new);
+                } else {
+                    changed = !model.phux_connection_unavailable;
+                    model.phux_connection_unavailable = true;
+                }
+            },
+        }
+        return self.commitProviderChange(changed);
+    }
+
+    pub fn onPointerChannel(self: *Engine, fx: anytype, event: native_sdk.EffectChannelEvent, on_event: anytype) void {
+        if (comptime !support.phux_enabled) return;
+        if (event.key != support.pointer_channel_key) return;
+        const pointer_state = self.model.pointer_state orelse return;
+        switch (event.kind) {
+            .data => pointer_input.drainPointerEvents(self.model),
+            .closed, .rejected => {
+                if (pointer_state.monitor) |*monitor| monitor.stop();
+                pointer_state.monitor = null;
+                pointer_state.queue.reset();
+                pointer_state.capture = null;
+                self.openPointerChannel(fx, on_event);
+            },
+        }
+    }
+
+    fn commitProviderChange(self: *Engine, changed: bool) bool {
+        if (!changed) return false;
+        self.sequence +%= 1;
+        self.revision +%= 1;
+        self.intent_refused = false;
+        return true;
+    }
+
+    pub fn stopProviderChannels(self: *Engine, fx: anytype) void {
+        if (self.model.phux()) |remote| remote.stop();
+        fx.closeChannel(support.phux_channel_key);
+        if (comptime support.phux_enabled) if (self.model.pointer_state) |pointer_state| {
+            if (pointer_state.monitor) |*monitor| monitor.stop();
+            pointer_state.monitor = null;
+            pointer_state.queue.reset();
+            pointer_state.capture = null;
+        };
+        fx.closeChannel(support.pointer_channel_key);
+    }
+
+    /// Edge-trigger the shipping topology persistence pipeline after any
+    /// native mutation. The model fingerprint is the complete list of state
+    /// transitions worth saving, so new intent kinds cannot forget to opt in.
+    pub fn noteTopologyChange(self: *Engine, fx: anytype, on_fire: anytype) void {
+        const state = &self.model.state;
+        const fingerprint = self.model.topologyFingerprint();
+        if (fingerprint == state.fingerprint) return;
+        state.fingerprint = fingerprint;
+        if (!state.enabled()) return;
+        state.pending = true;
+        state.retry_count = 0;
+        self.armTopologyPersist(fx, on_fire);
+    }
+
+    fn armTopologyPersist(_: *Engine, fx: anytype, on_fire: anytype) void {
+        fx.startTimer(.{
+            .key = update_module.topology_persist_timer_key,
+            .interval_ms = update_module.topology_persist_debounce_ms,
+            .mode = .one_shot,
+            .on_fire = on_fire,
+        });
+    }
+
+    /// The debounce fired (including a rejected timer): post one bounded
+    /// snapshot through the SDK's file seam unless an earlier write owns the
+    /// key. Its completion drives the same retry accounting as the Zig graph.
+    pub fn persistTopology(self: *Engine, fx: anytype, on_result: anytype) void {
+        const state = &self.model.state;
+        if (!state.enabled() or !state.pending or state.inflight) return;
+        var bytes: [session_state.max_state_bytes]u8 = undefined;
+        const topology_snapshot = self.model.topologySnapshot() catch return;
+        const encoded = session_state.serialize(&topology_snapshot, &bytes) catch return;
+        state.inflight = true;
+        state.inflight_fingerprint = state.fingerprint;
+        state.pending = false;
+        fx.writeFile(.{
+            .key = update_module.topology_state_file_key,
+            .path = state.path(),
+            .bytes = encoded,
+            .on_result = on_result,
+        });
+    }
+
+    pub fn topologyPersisted(self: *Engine, result: native_sdk.EffectFileResult, fx: anytype, on_fire: anytype) void {
+        const state = &self.model.state;
+        state.inflight = false;
+        if (state.inflight_fingerprint != state.fingerprint) {
+            state.pending = true;
+            self.armTopologyPersist(fx, on_fire);
+            return;
+        }
+        if (result.outcome == .ok) {
+            state.retry_count = 0;
+            state.write_failed = false;
+        } else {
+            state.pending = true;
+            if (state.retry_count < 3) {
+                state.retry_count += 1;
+                self.armTopologyPersist(fx, on_fire);
+            } else {
+                state.write_failed = true;
+            }
+            return;
+        }
+        if (state.pending) self.armTopologyPersist(fx, on_fire);
     }
 
     /// Apply one wire intent. Returns whether state changed. Sequence always
@@ -124,8 +391,14 @@ pub const Engine = struct {
         if (intent.expected_revision != self.revision) return self.refuse();
         // A tab intent means the window whose chrome sent it. Adopting it as
         // active first is what CockpitHost does with a routed event's window.
-        if (intent.window != 0 and !self.model.windowOpen(intent.window)) return self.refuse();
-        self.model.active_window = if (intent.window == 0) 0 else intent.window;
+        // 255 means "the platform event's already-adopted focused window".
+        // Markup intents carry an explicit 0..4 slot; native command mapping
+        // has no window field, so the extension adopts CommandEvent.window_id
+        // before the compiled core dispatches this intent.
+        if (intent.window != 255) {
+            if (intent.window != 0 and !self.model.windowOpen(intent.window)) return self.refuse();
+            self.model.active_window = intent.window;
+        }
         const changed = switch (intent.kind) {
             .select_tab => self.model.selectTab(intent.argument),
             .new_terminal => self.newTerminal(),
@@ -137,6 +410,7 @@ pub const Engine = struct {
             .new_window => self.newWindow(),
             .close_window => self.closeWindow(intent.window, fx),
             .focus_window => self.focusWindow(intent.window),
+            .native_command => self.nativeCommand(intent.argument, fx),
         };
         if (!changed) return self.refuse();
         self.intent_refused = false;
@@ -286,6 +560,145 @@ pub const Engine = struct {
         return true;
     }
 
+    /// Commands registered by the manifest remain native operations over the
+    /// same engine model. TypeScript maps names to this compact enum, but no
+    /// terminal bytes, pane nodes, or platform ids cross the seam.
+    fn nativeCommand(self: *Engine, raw: u8, fx: anytype) bool {
+        const command = protocol.decodeNativeCommand(raw) orelse return false;
+        const model = self.model;
+        switch (command) {
+            .previous_tab, .next_tab => {
+                const workspace = model.ws();
+                if (workspace.tab_count < 2) return false;
+                const delta: i32 = if (command == .next_tab) 1 else -1;
+                const count: i32 = @intCast(workspace.tab_count);
+                const selected: i32 = @intCast(workspace.selected_tab);
+                workspace.selected_tab = @intCast(@mod(selected + delta, count));
+            },
+            .close_focused_pane => return self.closeFocusedPane(fx),
+            .split_right => return self.splitFocusedPane(.horizontal),
+            .split_down => return self.splitFocusedPane(.vertical),
+            .previous_pane, .next_pane => {
+                const tree = model.selectedTree() orelse return false;
+                const next = tree.cycleFocus(if (command == .next_pane) 1 else -1) orelse return false;
+                if (next == tree.focus) return false;
+                tree.focus = next;
+            },
+            .move_tab_left, .move_tab_right => {
+                const workspace = model.wsConst();
+                const terminal = workspace.tabTerminal(workspace.selected_tab) orelse return false;
+                if (!model.moveTerminal(terminal, if (command == .move_tab_right) 1 else -1)) return false;
+            },
+            .select_all => {
+                const pane = self.focusedPane() orelse return false;
+                if (!pane.session.selectAllHistory()) return false;
+                pane.selecting = false;
+            },
+            .copy => {
+                const pane = self.focusedPane() orelse return false;
+                if (!pane.selecting and !pane.session.selectionActive()) return false;
+                self.copySelection(fx, pane);
+            },
+            .paste => {
+                const pane = self.focusedPane() orelse return false;
+                self.requestPaste(fx, pane, .pane);
+            },
+            .clear => {
+                const pane = self.focusedPane() orelse return false;
+                pane.selecting = false;
+                pane.session.clearSelection();
+                terminal_runtime.feedOutput(pane, fx, "\x1b[H\x1b[2J\x1b[3J");
+                pane.session.scrollToBottom();
+                pane.session.refreshScreenText();
+                terminal_runtime.moveResponsesToOutbound(pane, fx);
+            },
+            .find => {
+                const pane = self.focusedPane() orelse return false;
+                if (pane.selecting) {
+                    pane.selecting = false;
+                    pane.session.clearSelection();
+                }
+                pane.session.searchOpen();
+            },
+            .find_next, .find_previous => {
+                const pane = self.focusedPane() orelse return false;
+                _ = pane.session.searchStep(command == .find_next);
+            },
+            .font_larger => return model.stepFontSize(1),
+            .font_smaller => return model.stepFontSize(-1),
+            .font_reset => return model.resetFontSize(),
+            .focus_left, .focus_right, .focus_up, .focus_down => {
+                const tree = model.selectedTree() orelse return false;
+                const workspace = model.wsConst();
+                const chrome = projection.workspaceChromeIn(model, workspace, workspace.surface_size);
+                const direction: layout.Direction = switch (command) {
+                    .focus_left => .left,
+                    .focus_right => .right,
+                    .focus_up => .up,
+                    .focus_down => .down,
+                    else => unreachable,
+                };
+                const next = tree.focusDirection(
+                    chrome.content,
+                    projection.split_divider_width,
+                    projection.split_pane_min_width,
+                    projection.split_pane_min_height,
+                    direction,
+                ) orelse return false;
+                if (next == tree.focus) return false;
+                tree.focus = next;
+            },
+            .fullscreen => fx.toggleFullscreenWindow(scene.windowLabelFor(model.active_window)),
+            .minimize => fx.minimizeWindow(scene.windowLabelFor(model.active_window)),
+        }
+        pointer_input.endAllCaptures(model, fx);
+        return true;
+    }
+
+    fn splitFocusedPane(self: *Engine, orientation: layout.Orientation) bool {
+        const model = self.model;
+        const tree = model.selectedTree() orelse return false;
+        const target = tree.focus;
+        if (target == layout.none or tree.node(target).kind != .leaf) return false;
+        const origin = tree.focusedTerminal();
+        const pane = model.provider.createTerminal() catch {
+            model.terminal_limit_refused = true;
+            return false;
+        };
+        if (model.config.inherit_working_directory) {
+            if (origin) |source_ref| if (model.provider.terminalConst(source_ref)) |source| {
+                const cwd = source.pwd();
+                if (cwd.len > 0) if (model.provider.slotIndex(pane.id)) |slot| {
+                    pane.argv = local.paneArgvIn(cwd, &model.cwd_argv[slot]);
+                };
+            };
+        }
+        _ = tree.split(target, orientation, pane.id) catch {
+            _ = model.provider.destroyTerminal(pane.id);
+            return false;
+        };
+        model.terminal_limit_refused = false;
+        return true;
+    }
+
+    fn closeFocusedPane(self: *Engine, fx: anytype) bool {
+        const model = self.model;
+        const workspace = model.ws();
+        const tree = workspace.selectedTree() orelse return false;
+        const terminal = tree.focusedTerminal() orelse return false;
+        const pane = model.provider.terminal(terminal) orelse return false;
+        const pty_key = pane.pty_key;
+        const had_live_pty = pane.phase == .starting or pane.phase == .live;
+        _ = tree.closeTerminal(terminal) orelse return false;
+        _ = model.provider.destroyTerminal(terminal);
+        if (had_live_pty) fx.ptyKill(pty_key);
+        if (tree.isEmpty()) workspace.dropTab(workspace.selected_tab);
+        model.terminal_limit_refused = false;
+        workspace.tab_limit_refused = false;
+        pointer_input.endAllCaptures(model, fx);
+        return true;
+    }
+
     /// The window index a canvas label names, by the shipping scene's own
     /// table: the spike declares the same labels, so per-window painting,
     /// frames and input resolve through one function.
@@ -304,6 +717,18 @@ pub const Engine = struct {
             if (model.windowOpen(index)) model.active_window = index;
             return;
         }
+    }
+
+    /// A platform event may adopt a window before the core handles it. Native
+    /// commands already advance the ordered seam inside that same dispatch;
+    /// core-only commands (the switcher) do not, so finish the adoption here
+    /// exactly once after the inner app has run.
+    pub fn commitWindowAdoption(self: *Engine, before_window: usize, before_sequence: u64) bool {
+        if (self.model.active_window == before_window or self.sequence != before_sequence) return false;
+        self.sequence +%= 1;
+        self.revision +%= 1;
+        self.intent_refused = false;
+        return true;
     }
 
     // ------------------------------------------------------------ shells
@@ -326,12 +751,27 @@ pub const Engine = struct {
         }
     }
 
-    /// One pty event, applied the way `update.zig`'s `.shell` arm applies it
-    /// minus the bell, pointer-protocol and selection bookkeeping that belong
-    /// to chrome this graph does not paint natively yet. `event.bytes` is
-    /// drain scratch: the emulator is fed inside this call.
-    pub fn onShellEvent(self: *Engine, fx: anytype, event: native_sdk.EffectPtyEvent) void {
-        const pane = terminal_runtime.paneForKey(self.model, event.key) orelse return;
+    fn paneChromeFingerprint(self: *const Engine, pane: *const model_module.Pane) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, pane.phase);
+        std.hash.autoHash(&hasher, pane.exit_code);
+        std.hash.autoHash(&hasher, pane.exit_signal);
+        std.hash.autoHash(&hasher, pane.exit_reason);
+        var title_room: [ts_snapshot.max_title_bytes]u8 = undefined;
+        const title = projection.terminalTitleInto(self.model, pane.id, &title_room);
+        hasher.update(title);
+        hasher.update(pane.pwd());
+        std.hash.autoHash(&hasher, projection.terminalNeedsAttention(self.model, pane.id));
+        return hasher.final();
+    }
+
+    /// One pty event, applied the way `update.zig`'s `.shell` arm applies it.
+    /// The return is edge-triggered only for state represented in the core's
+    /// snapshot (phase/title/cwd/attention); ordinary terminal output still
+    /// wakes native painting without forcing a snapshot on every byte batch.
+    pub fn onShellEvent(self: *Engine, fx: anytype, event: native_sdk.EffectPtyEvent) bool {
+        const pane = terminal_runtime.paneForKey(self.model, event.key) orelse return false;
+        const chrome_before = self.paneChromeFingerprint(pane);
         switch (event.kind) {
             .output => {
                 pane.phase = .live;
@@ -363,6 +803,11 @@ pub const Engine = struct {
             // the shipping app marks the arm unreachable for the same reason.
             .write => {},
         }
+        if (chrome_before == self.paneChromeFingerprint(pane)) return false;
+        self.sequence +%= 1;
+        self.revision +%= 1;
+        self.intent_refused = false;
+        return true;
     }
 
     // ------------------------------------------------------------- input
@@ -552,7 +997,7 @@ pub const Engine = struct {
     /// the pointer went, a hover or wheel goes to the pane under the point.
     /// Returns whether a terminal took it; chrome is never under a pane's
     /// frame, and the caller keeps overlays out.
-    pub fn onPointer(self: *Engine, fx: anytype, raw: platform.GpuSurfaceInputEvent) bool {
+    pub fn onPointer(self: *Engine, fx: anytype, raw: platform.GpuSurfaceInputEvent) PointerOutcome {
         const model = self.model;
         const phase: canvas.WidgetPointerPhase = switch (raw.kind) {
             .pointer_down => .down,
@@ -561,9 +1006,12 @@ pub const Engine = struct {
             .pointer_move => .hover,
             .pointer_drag => .move,
             .scroll => .wheel,
-            else => return false,
+            else => return .ignored,
         };
         const point = geometry.PointF.init(raw.x, raw.y);
+        if (self.routeSplitDrag(raw, point)) |changed| {
+            return if (changed) .geometry_changed else .consumed;
+        }
         if (phase == .down) {
             if (pointer_input.pointerCaptureFor(model, raw.window_id, raw.pointer_id)) |previous| {
                 pointer_input.handleTerminalPointer(model, fx, .{
@@ -591,12 +1039,12 @@ pub const Engine = struct {
             generation = owned.generation;
             frame = pointer_input.paneFrameForTerminal(model, support.localRef(owned.terminal_id)) orelse owned.frame;
         } else {
-            if (phase == .move or phase == .up or phase == .cancel) return false;
-            const ref = pointer_input.terminalRefAtPoint(model, raw.x, raw.y) orelse return false;
-            const pane = model.provider.terminal(ref) orelse return false;
-            terminal_id = provider_contract.localId(ref) orelse return false;
+            if (phase == .move or phase == .up or phase == .cancel) return .ignored;
+            const ref = pointer_input.terminalRefAtPoint(model, raw.x, raw.y) orelse return .ignored;
+            const pane = model.provider.terminal(ref) orelse return .ignored;
+            terminal_id = provider_contract.localId(ref) orelse return .ignored;
             generation = pane.session_generation;
-            frame = pointer_input.paneFrameForTerminal(model, ref) orelse return false;
+            frame = pointer_input.paneFrameForTerminal(model, ref) orelse return .ignored;
         }
         pointer_input.handleTerminalPointer(model, fx, .{
             .window_id = raw.window_id,
@@ -616,7 +1064,108 @@ pub const Engine = struct {
                 .super = raw.modifiers.command,
             },
         });
+        return .consumed;
+    }
+
+    /// Divider identity and pointer capture stay native. The interaction tree
+    /// and painter both consume the same branch fractions, while a drag never
+    /// exports a layout.NodeId or platform window id through the TS seam.
+    fn routeSplitDrag(self: *Engine, raw: platform.GpuSurfaceInputEvent, point: geometry.PointF) ?bool {
+        if (self.split_drag) |drag| {
+            if (drag.window_id != raw.window_id or drag.pointer_id != raw.pointer_id) return null;
+            switch (raw.kind) {
+                .pointer_drag, .pointer_move => {
+                    const available = switch (drag.orientation) {
+                        .horizontal => @max(1, drag.bounds.width - projection.split_divider_width),
+                        .vertical => @max(1, drag.bounds.height - projection.split_divider_width),
+                    };
+                    const offset = switch (drag.orientation) {
+                        .horizontal => point.x - drag.bounds.x,
+                        .vertical => point.y - drag.bounds.y,
+                    };
+                    const workspace = self.model.wsAt(drag.window_index) orelse {
+                        self.split_drag = null;
+                        return false;
+                    };
+                    const tree = workspace.selectedTree() orelse {
+                        self.split_drag = null;
+                        return false;
+                    };
+                    const before = tree.node(drag.node).fraction;
+                    tree.setFraction(drag.node, offset / available);
+                    const changed = tree.node(drag.node).fraction != before;
+                    if (changed) {
+                        self.sequence +%= 1;
+                        self.revision +%= 1;
+                        self.intent_refused = false;
+                    }
+                    return changed;
+                },
+                .pointer_up, .pointer_cancel => {
+                    self.split_drag = null;
+                    return false;
+                },
+                else => return false,
+            }
+        }
+        if (raw.kind != .pointer_down) return null;
+        const window_index = windowIndexForCanvas(raw.label) orelse return null;
+        const workspace = self.model.wsAt(window_index) orelse return null;
+        const tree = workspace.selectedTree() orelse return null;
+        const chrome = projection.workspaceChromeIn(self.model, workspace, workspace.surface_size);
+        var dividers: [layout.max_panes - 1]layout.Divider = undefined;
+        const count = tree.dividers(
+            chrome.content,
+            projection.split_divider_width,
+            projection.split_pane_min_width,
+            projection.split_pane_min_height,
+            &dividers,
+        );
+        for (dividers[0..count]) |divider| {
+            if (point.x < divider.rect.x or point.x > divider.rect.x + divider.rect.width or
+                point.y < divider.rect.y or point.y > divider.rect.y + divider.rect.height) continue;
+            self.model.active_window = window_index;
+            self.split_drag = .{
+                .window_id = raw.window_id,
+                .pointer_id = raw.pointer_id,
+                .window_index = window_index,
+                .node = divider.node,
+                .orientation = divider.orientation,
+                .bounds = divider.bounds,
+            };
+            return false;
+        }
+        return null;
+    }
+
+    /// Finder drops stay wholly native: quote the selected paths, resolve the
+    /// pane under the drop point, and use the same bracketed-paste path as
+    /// cmd+V. Paths and pane identities never enter the compiled core.
+    pub fn onDrop(self: *Engine, fx: anytype, drop: platform.FileDropEvent) bool {
+        if (drop.paths.len == 0) return false;
+        const model = self.model;
+        if (windowIndexForCanvas(drop.view_label)) |window_index| {
+            if (model.windowOpen(window_index)) model.active_window = window_index;
+        }
+        const terminal = if (drop.point) |point|
+            pointer_input.terminalRefAtPoint(model, point.x, point.y) orelse model.focusedTerminalRef() orelse return false
+        else
+            model.focusedTerminalRef() orelse return false;
+        const pane = model.provider.terminal(terminal) orelse return false;
+        if (!pane.acceptsInput()) return false;
+        var quoted: [shell_words.max_quoted_bytes]u8 = undefined;
+        const text = shell_words.quotePaths(drop.paths, &quoted) orelse return false;
+        if (model.selectedTree()) |tree| _ = tree.focusTerminal(terminal);
+        update_module.pasteClipboardText(model, pane, fx, text);
         return true;
+    }
+
+    pub fn selectionAutoscrollActive(self: *const Engine) bool {
+        return pointer_input.modelHasSelectionAutoscroll(self.model);
+    }
+
+    pub fn selectionAutoscroll(self: *Engine, fx: anytype) void {
+        pointer_input.handleSelectionAutoscroll(self.model, fx);
     }
 
     const double_click_window_ns: u64 = 400 * std.time.ns_per_ms;

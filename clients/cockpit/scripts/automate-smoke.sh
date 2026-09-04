@@ -8,6 +8,7 @@
 #   ./scripts/automate-smoke.sh --profile       # ...and a 4-pane scheduler profile
 #   ./scripts/automate-smoke.sh --churn         # split/close churn profile
 #   ./scripts/automate-smoke.sh --churn --churn-actions 160
+#   ./scripts/automate-smoke.sh --typescript-candidate
 #   ./scripts/automate-smoke.sh --keep          # leave the app running to poke at
 #
 # It builds the CLI from the PINNED SDK (see build-automation-cli.sh — the
@@ -58,6 +59,7 @@ PROFILE_PIPELINE_STAGES=(rebuild layout reconcile emit a11y plan patch encode pr
 PROFILE_REQUIRED_STAGES=("${PROFILE_PIPELINE_STAGES[@]}" interval)
 CHURN_REQUIRED_STAGES=(rebuild layout reconcile emit a11y plan patch encode)
 KEEP=0
+APP_GRAPH=shipping
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile) PROFILE=1; shift ;;
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
             CHURN_ACTIONS="$2"; shift 2
             ;;
         --keep) KEEP=1; shift ;;
+        --typescript-candidate) APP_GRAPH=typescript-candidate; shift ;;
         -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -131,7 +134,7 @@ else
     printf 'command = /bin/sh %s\nfont-size = 13\n' "${WORK}/repaint.sh" >"${WORK}/config"
 fi
 
-measure_launch_isolated "$WORK" "${WORK}/config" "${WORK}/app.log"
+measure_launch_isolated "$WORK" "${WORK}/config" "${WORK}/app.log" "$APP_GRAPH"
 APP_PID="$MEASURE_APP_PID"
 
 "$NATIVE" automate wait >/dev/null
@@ -382,6 +385,30 @@ if [[ "$CHURN" == "1" ]]; then
     measure_print_frame_profile split_close_churn \
         "${CHURN_ACTIONS} alternating cmd+d/cmd+w actions, each pane transition asserted; required full 128-sample rolling populations for ${CHURN_REQUIRED_STAGES[*]}; paced continuous repaint" \
         "./scripts/automate-smoke.sh --churn --churn-actions ${CHURN_ACTIONS}" "$profile_snapshot"
+fi
+
+if [[ "$APP_GRAPH" == "typescript-candidate" ]]; then
+    printf 'verifying focused secondary-window overlays...\n'
+    expect_change 'cmd+n opens a secondary window' 'window @w2' \
+        "$NATIVE" automate widget-key phux-cockpit-canvas cmd+n
+    "$NATIVE" automate assert --absent 'role=textbox name="Find terminal"' >/dev/null
+    "$NATIVE" automate widget-key phux-cockpit-canvas-1 cmd+shift+p >/dev/null
+    deadline=$((SECONDS + 5))
+    while :; do
+        snapshot="$(app_instance_snapshot)"
+        switcher_count="$(grep -c 'role=textbox name="Find terminal"' <<<"$snapshot" || true)"
+        if [[ "$switcher_count" == 1 ]] \
+            && grep -q '@w2/phux-cockpit-canvas-1.*role=textbox name="Find terminal"' <<<"$snapshot"; then
+            break
+        fi
+        if [[ "$SECONDS" -ge "$deadline" ]]; then
+            printf 'FAILED: focused secondary switcher appeared %s times or in the wrong window.\n' "$switcher_count" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    app_instance_assert
+    printf '  ok: secondary switcher appears once, in focused window @w2\n'
 fi
 
 printf '\nsmoke: ok\n'

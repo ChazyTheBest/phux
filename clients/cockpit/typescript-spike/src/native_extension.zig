@@ -57,11 +57,43 @@ const EngineFx = struct {
     pub fn openUrl(self: EngineFx, url: []const u8) void {
         self.effects.openUrl(url);
     }
+    pub fn toggleFullscreenWindow(self: EngineFx, label: []const u8) void {
+        self.effects.toggleFullscreenWindow(label);
+    }
+    pub fn minimizeWindow(self: EngineFx, label: []const u8) void {
+        self.effects.minimizeWindow(label);
+    }
     pub fn writeClipboard(self: EngineFx, options: struct { key: u64, text: []const u8 }) void {
         self.effects.writeClipboard(.{ .key = options.key, .text = options.text, .on_result = clipboardWritten });
     }
     pub fn readClipboard(self: EngineFx, options: struct { key: u64 }) void {
         self.effects.readClipboard(.{ .key = options.key, .on_result = clipboardRead });
+    }
+    pub fn startTimer(self: EngineFx, options: anytype) void {
+        self.effects.startTimer(.{
+            .key = options.key,
+            .interval_ms = options.interval_ms,
+            .mode = options.mode,
+            .on_fire = options.on_fire,
+        });
+    }
+    pub fn writeFile(self: EngineFx, options: anytype) void {
+        self.effects.writeFile(.{
+            .key = options.key,
+            .path = options.path,
+            .bytes = options.bytes,
+            .on_result = options.on_result,
+        });
+    }
+    pub fn openChannel(self: EngineFx, options: anytype) native_sdk.ChannelHandle {
+        return self.effects.openChannel(.{
+            .key = options.key,
+            .on_event = options.on_event,
+            .max_pending = options.max_pending,
+        });
+    }
+    pub fn closeChannel(self: EngineFx, key: u64) void {
+        self.effects.closeChannel(key);
     }
 };
 
@@ -117,6 +149,7 @@ const Bridge = struct {
         if (engineFx()) |fx| {
             _ = engine.applyIntent(payload, fx);
             self.spawnShells(engine, fx);
+            engine.noteTopologyChange(fx, topologyTimer);
         } else {
             _ = engine.applyIntent(payload, &cockpit.NoShells{});
         }
@@ -208,7 +241,24 @@ var bridge = Bridge{};
 /// the compiled core.
 fn shellEvent(event: native_sdk.EffectPtyEvent) core.Msg {
     if (bridge.engine) |engine| {
-        if (engineFx()) |fx| engine.onShellEvent(fx, event);
+        if (engineFx()) |fx| {
+            if (engine.onShellEvent(fx, event)) bridge.announce(engine);
+            engine.noteTopologyChange(fx, topologyTimer);
+        }
+    }
+    return .engine_wake;
+}
+
+fn topologyTimer(_: native_sdk.EffectTimer) core.Msg {
+    if (bridge.engine) |engine| {
+        if (engineFx()) |fx| engine.persistTopology(fx, topologyWritten);
+    }
+    return .engine_wake;
+}
+
+fn topologyWritten(result: native_sdk.EffectFileResult) core.Msg {
+    if (bridge.engine) |engine| {
+        if (engineFx()) |fx| engine.topologyPersisted(result, fx, topologyTimer);
     }
     return .engine_wake;
 }
@@ -225,15 +275,37 @@ fn clipboardRead(event: native_sdk.EffectClipboardResult) core.Msg {
     return .engine_wake;
 }
 
+fn phuxChannel(event: native_sdk.EffectChannelEvent) core.Msg {
+    if (bridge.engine) |engine| {
+        if (engineFx()) |fx| {
+            if (engine.onPhuxChannel(fx, event, phuxChannel)) bridge.announce(engine);
+            engine.noteTopologyChange(fx, topologyTimer);
+        }
+    }
+    return .engine_wake;
+}
+
+fn pointerChannel(event: native_sdk.EffectChannelEvent) core.Msg {
+    if (bridge.engine) |engine| {
+        if (engineFx()) |fx| engine.onPointerChannel(fx, event, pointerChannel);
+    }
+    return .engine_wake;
+}
+
 /// The app's activation is the terminal's focus: a bell that rings while
 /// deactivated notifies, and deactivation strands every capture.
 fn onLifecycle(event: native_sdk.LifecycleEvent) ?core.Msg {
     const engine = bridge.engine orelse return null;
     const fx = engineFx() orelse return null;
     switch (event) {
+        .start => engine.startProviderChannels(fx, phuxChannel, pointerChannel),
         .activate => engine.setFocused(fx, true),
         .deactivate => engine.setFocused(fx, false),
-        else => {},
+        .stop => {
+            engine.model.writeWorkspaceState(engine.model.provider.io);
+            engine.stopProviderChannels(fx);
+        },
+        .frame => {},
     }
     return null;
 }
@@ -256,8 +328,31 @@ fn overlayKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
     return null;
 }
 
+/// `native automate widget-key` enters through the canvas fallback rather
+/// than the platform shortcut registrar. Map the product chords to the same
+/// core messages as menus/real shortcuts so the driven and physical paths are
+/// indistinguishable after this boundary.
+fn primaryChord(event: canvas.WidgetKeyboardEvent) ?core.Msg {
+    if (event.phase == .key_up or !event.modifiers.hasCommandModifier()) return null;
+    const key = event.key;
+    const shift = event.modifiers.shift;
+    const control = event.modifiers.control;
+    const alt = event.modifiers.alt;
+    if (!control and !alt and !shift and std.ascii.eqlIgnoreCase(key, "t")) return core.commandMsg("terminal.new");
+    if (!control and !alt and !shift and std.ascii.eqlIgnoreCase(key, "n")) return core.commandMsg("window.new");
+    if (!control and !alt and !shift and std.ascii.eqlIgnoreCase(key, "w")) return core.commandMsg("terminal.close");
+    if (!control and !alt and !shift and std.ascii.eqlIgnoreCase(key, "d")) return core.commandMsg("pane.split-right");
+    if (!control and !alt and shift and std.ascii.eqlIgnoreCase(key, "d")) return core.commandMsg("pane.split-down");
+    if (!control and !alt and !shift and std.ascii.eqlIgnoreCase(key, "f")) return core.commandMsg("terminal.find");
+    if (!control and !alt and !shift and std.mem.eql(u8, key, ",")) return core.commandMsg("settings.open");
+    if (!control and !alt and shift and std.ascii.eqlIgnoreCase(key, "p")) return core.commandMsg("tabs.palette");
+    if (control and !alt and !shift and std.ascii.eqlIgnoreCase(key, "f")) return core.commandMsg("window.fullscreen");
+    return null;
+}
+
 fn onKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
     if (overlay_open) return overlayKey(event);
+    if (primaryChord(event)) |msg| return msg;
     const engine = bridge.engine orelse return null;
     const fx = engineFx() orelse return null;
     engine.onKey(fx, event);
@@ -270,6 +365,115 @@ fn onText(event: canvas.WidgetKeyboardEvent) ?core.Msg {
     const fx = engineFx() orelse return null;
     engine.onText(fx, event);
     return null;
+}
+
+fn emptyInteraction(ui: *Adapter.Ui) Adapter.Ui.Node {
+    return ui.el(.stack, .{ .grow = 1, .semantics = .{ .hidden = true } }, .{});
+}
+
+fn paneInteraction(
+    ui: *Adapter.Ui,
+    engine: *const Engine,
+    workspace: anytype,
+    node: cockpit.layout.NodeId,
+) Adapter.Ui.Node {
+    const current = workspace.selectedTreeConst() orelse return emptyInteraction(ui);
+    const entry = current.node(node);
+    switch (entry.kind) {
+        .free => return emptyInteraction(ui),
+        .leaf => {
+            const terminal = entry.terminal orelse return emptyInteraction(ui);
+            var title_room: [cockpit.snapshot.max_title_bytes]u8 = undefined;
+            const title = cockpit.projection.terminalTitleInto(engine.model, terminal, &title_room);
+            const screen = if (engine.model.provider.terminalConst(terminal)) |pane|
+                pane.session.screenText()
+            else if (engine.model.remotePresentation(terminal)) |presentation|
+                presentation.grid.screen_text
+            else
+                "";
+            return ui.el(.stack, .{
+                .grow = 1,
+                .min_width = cockpit.projection.split_pane_min_width,
+                .min_height = cockpit.projection.split_pane_min_height,
+                .opacity = 0,
+                .text = screen,
+                .semantics = .{
+                    .role = .textbox,
+                    .label = ui.fmt("{s}", .{title}),
+                    .focusable = true,
+                },
+            }, .{});
+        },
+        .branch => {
+            const first = paneInteraction(ui, engine, workspace, entry.first);
+            const second = paneInteraction(ui, engine, workspace, entry.second);
+            return ui.split(.{
+                .grow = 1,
+                .min_width = cockpit.projection.split_pane_min_width,
+                .min_height = cockpit.projection.split_pane_min_height,
+                .gap = cockpit.projection.split_divider_width,
+                .split_axis = switch (entry.orientation) {
+                    .horizontal => .horizontal,
+                    .vertical => .vertical,
+                },
+                .value = entry.fraction,
+                .opacity = 0,
+                .semantics = .{ .label = "Terminal split" },
+            }, .{ first, second });
+        },
+    }
+}
+
+/// Transparent native interaction leaves occupy exactly the rectangles the
+/// authoritative projection gives the grid painter. Compiled `.native`
+/// markup owns all visible chrome; this layer contributes pane semantics and
+/// split topology over the app-owned libghostty surfaces beneath it.
+fn terminalInteraction(ui: *Adapter.Ui, engine: *const Engine, window_index: usize) Adapter.Ui.Node {
+    const workspace = engine.model.wsAtConst(window_index) orelse return emptyInteraction(ui);
+    const chrome = cockpit.projection.workspaceChromeIn(engine.model, workspace, workspace.surface_size);
+    const panes = if (workspace.selectedTreeConst()) |tree|
+        paneInteraction(ui, engine, workspace, tree.root)
+    else
+        emptyInteraction(ui);
+    const content = ui.row(.{ .height = chrome.content.height }, .{
+        ui.el(.stack, .{ .width = chrome.content.x, .semantics = .{ .hidden = true } }, .{}),
+        ui.el(.stack, .{ .width = chrome.content.width, .height = chrome.content.height }, .{panes}),
+        ui.el(.stack, .{ .grow = 1, .semantics = .{ .hidden = true } }, .{}),
+    });
+    const search = if (chrome.search.height > 0)
+        ui.el(.stack, .{
+            .height = chrome.search.height,
+            .opacity = 0,
+            .semantics = .{ .role = .group, .label = "Scrollback search" },
+        }, .{})
+    else
+        ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
+    return ui.column(.{ .grow = 1 }, .{
+        ui.el(.stack, .{ .height = chrome.search.y, .semantics = .{ .hidden = true } }, .{}),
+        search,
+        content,
+        ui.el(.stack, .{ .grow = 1, .semantics = .{ .hidden = true } }, .{}),
+    });
+}
+
+fn composeView(ui: *Adapter.Ui, model: *const core.Model, markup: Adapter.Ui.Node, window_index: usize) Adapter.Ui.Node {
+    const engine = bridge.engine orelse return markup;
+    if (model.paletteOpen or model.settingsOpen) return markup;
+    return ui.el(.stack, .{ .grow = 1 }, .{
+        terminalInteraction(ui, engine, window_index),
+        markup,
+    });
+}
+
+fn mainView(ui: *Adapter.Ui, model: *const core.Model) Adapter.Ui.Node {
+    return composeView(ui, model, CompiledChrome.build(ui, model), 0);
+}
+
+fn windowView(ui: *Adapter.Ui, model: *const core.Model, label: []const u8) Adapter.Ui.Node {
+    if (std.mem.eql(u8, label, "phux-window-1")) return composeView(ui, model, WindowView1.build(ui, model), 1);
+    if (std.mem.eql(u8, label, "phux-window-2")) return composeView(ui, model, WindowView2.build(ui, model), 2);
+    if (std.mem.eql(u8, label, "phux-window-3")) return composeView(ui, model, WindowView3.build(ui, model), 3);
+    return composeView(ui, model, WindowView4.build(ui, model), 4);
 }
 
 /// Set by the paint pass, which sees the committed core model: the only
@@ -315,10 +519,15 @@ fn installEngine(options: *Adapter.CoreOptions, gpa: std.mem.Allocator, io: std.
 }
 
 pub fn configureCoreOptions(options: *Adapter.CoreOptions, init: std.process.Init) void {
-    installEngine(options, std.heap.page_allocator, init.io);
+    bridge = .{};
+    bridge.engine = Engine.createConfigured(std.heap.page_allocator, init) catch null;
+    options.host_calls = bridge.binding();
 }
 
 fn configureOptionsValue(options: *Adapter.Options) void {
+    options.view = mainView;
+    options.markup = null;
+    options.window_view = windowView;
     options.chrome = .{
         .prefix_commands = cockpit.projection.chrome_command_envelope,
         .variable_prefix = true,
@@ -332,8 +541,9 @@ fn configureOptionsValue(options: *Adapter.Options) void {
     options.on_lifecycle = onLifecycle;
 }
 
-pub fn configureOptions(options: *Adapter.Options, _: std.process.Init) void {
+pub fn configureOptions(options: *Adapter.Options, init: std.process.Init) void {
     configureOptionsValue(options);
+    options.fragment_watch = .{ .fragments = &compiled_fragments, .io = init.io };
 }
 
 /// Wraps the adapter's app to see the raw surface input before it: the
@@ -344,6 +554,7 @@ pub fn configureOptions(options: *Adapter.Options, _: std.process.Init) void {
 /// inner app afterwards.
 const PointerHost = struct {
     inner: native_sdk.App = undefined,
+    selection_autoscroll_timer_active: bool = false,
 
     fn wrap(self: *PointerHost, inner: native_sdk.App) native_sdk.App {
         self.inner = inner;
@@ -373,23 +584,47 @@ const PointerHost = struct {
     }
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, value: native_sdk.Event) anyerror!void {
         const self: *PointerHost = @ptrCast(@alignCast(context));
-        routePointer(value);
+        defer self.syncSelectionAutoscrollTimer(runtime) catch {};
+        const engine = bridge.engine;
+        const before_window = if (engine) |current| current.model.active_window else 0;
+        const before_sequence = if (engine) |current| current.sequence else 0;
+        routeNativeInput(value);
         try self.inner.event(runtime, value);
+        if (engine) |current| {
+            if (current.commitWindowAdoption(before_window, before_sequence)) bridge.announce(current);
+        }
     }
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *PointerHost = @ptrCast(@alignCast(context));
+        if (self.selection_autoscroll_timer_active) {
+            runtime.cancelTimer(cockpit.selection_autoscroll_timer_id) catch {};
+            self.selection_autoscroll_timer_active = false;
+        }
         try self.inner.stop(runtime);
     }
     fn replay(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
         const self: *PointerHost = @ptrCast(@alignCast(context));
         try self.inner.replayControl(control);
     }
+
+    fn syncSelectionAutoscrollTimer(self: *PointerHost, runtime: *native_sdk.Runtime) !void {
+        const engine = bridge.engine orelse return;
+        const needed = engine.selectionAutoscrollActive();
+        if (needed == self.selection_autoscroll_timer_active) return;
+        if (needed) {
+            try runtime.startTimer(cockpit.selection_autoscroll_timer_id, cockpit.selection_autoscroll_interval_ns, true);
+        } else {
+            try runtime.cancelTimer(cockpit.selection_autoscroll_timer_id);
+        }
+        self.selection_autoscroll_timer_active = needed;
+    }
 };
 
-fn routePointer(value: native_sdk.Event) void {
+fn routeNativeInput(value: native_sdk.Event) void {
     const engine = bridge.engine orelse return;
     const fx = engineFx() orelse return;
     switch (value) {
+        .command => |command| engine.adoptFocusedWindow(command.window_id),
         // A routed key names the window it was typed in: adopt it before the
         // key fallback resolves the focused pane, as CockpitHost adopts a
         // routed event's window. The raw echo is left to the pointer kinds.
@@ -409,7 +644,12 @@ fn routePointer(value: native_sdk.Event) void {
             // before the pane under it is resolved, as CockpitHost adopts
             // the routed event's window.
             engine.model.active_window = index;
-            _ = engine.onPointer(fx, raw);
+            if (engine.onPointer(fx, raw) == .geometry_changed) bridge.announce(engine);
+            engine.noteTopologyChange(fx, topologyTimer);
+        },
+        .files_dropped => |drop| _ = engine.onDrop(fx, drop),
+        .timer => |timer| if (timer.id == cockpit.selection_autoscroll_timer_id) {
+            engine.selectionAutoscroll(fx);
         },
         else => {},
     }
@@ -464,9 +704,26 @@ const Rig = struct {
     frame_index: u64 = 1,
 
     fn start() !Rig {
+        return startWithPhux(false);
+    }
+
+    fn startWithPhux(want_phux: bool) !Rig {
         var core_options: Adapter.CoreOptions = .{};
         installEngine(&core_options, std.testing.allocator, std.testing.io);
         try std.testing.expect(bridge.engine != null);
+        if (want_phux) {
+            if (comptime !cockpit.phux_enabled) return error.SkipZigTest;
+            var config = cockpit.startup.resolvePhuxConfig(.{}, .{
+                .socket = "/tmp/phux-typescript-lifecycle-test.sock",
+                .session = "configured-session",
+            });
+            const remote = (try cockpit.startup.createPhuxProviderFromConfig(
+                std.testing.allocator,
+                std.testing.io,
+                &config,
+            )) orelse return error.TestExpectedPhuxProvider;
+            cockpit.attachPhuxProvider(bridge.engine.?.model, remote);
+        }
         bridge.shells = false;
         var options: Adapter.Options = .{
             .name = "phux-cockpit-typescript-spike",
@@ -511,8 +768,8 @@ const Rig = struct {
     }
 
     fn stop(self: *Rig) void {
-        self.harness.destroy(std.testing.allocator);
         self.app_state.destroy();
+        self.harness.destroy(std.testing.allocator);
         if (bridge.engine) |engine| engine.destroy();
         bridge = .{};
     }
@@ -612,6 +869,96 @@ test "the core boots from the engine's snapshot, not from its own defaults" {
     try std.testing.expectEqual(@as(i64, 1), model.engineRevision.lo);
 }
 
+// GUARD: ts-phux-provider-lifecycle
+test "configured Phux attachment starts native provider lifecycle without replacing the ephemeral local terminal" {
+    if (comptime !cockpit.phux_enabled) return error.SkipZigTest;
+    var rig = try Rig.startWithPhux(true);
+    defer rig.stop();
+    const engine = bridge.engine.?;
+
+    try std.testing.expect(engine.model.phux() != null);
+    try std.testing.expect(engine.model.pointer_state != null);
+    // The test executor may refuse the socket worker; either a live channel or
+    // the engine's explicit unavailable state proves startup attempted the
+    // native source instead of leaving an attached provider inert.
+    try std.testing.expect(
+        rig.app_state.effects.channelHandle(cockpit.phux_channel_key) != null or
+            engine.model.phux_connection_unavailable or
+            engine.model.phux().?.state() != .new,
+    );
+    // Installing the global pointer monitor may be refused by the test host's
+    // process permissions; its model state still exists and the production
+    // start path attempts the native channel without exposing it to TS.
+    // Attaching durable Phux work is discovery, not implicit focus or an
+    // attempt to make the direct local PTY durable. Until ATTACH_READY admits
+    // a remote identity, the initial terminal remains the local provider's.
+    try std.testing.expectEqual(.local, engine.model.focusedTerminalRef().?.provider_id);
+    try std.testing.expectEqual(@as(usize, 1), engine.model.provider.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), engine.model.remote_inventory_count);
+}
+
+// GUARD: ts-configured-startup
+test "TypeScript engine startup restores topology and cwd while applying config and tab precedence" {
+    const root = ".zig-cache/ts-configured-startup-test";
+    const state_path = root ++ "/workspace.state";
+    const config_path = root ++ "/config";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(std.testing.io, root) catch {};
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root);
+
+    const seed = try Engine.create(std.testing.allocator, std.testing.io);
+    seed.model.state.setPath(state_path);
+    const split = protocol.encodeIntent(.{
+        .kind = .native_command,
+        .expected_revision = 1,
+        .argument = 4,
+        .window = 0,
+    });
+    try std.testing.expect(seed.applyIntent(&split, &cockpit.NoShells{}));
+    seed.model.tab_placement = .side;
+    const cwd_pane = seed.model.provider.terminal(seed.model.focusedTerminalRef().?).?;
+    cwd_pane.session.feed("\x1b]7;file://host/tmp/restored-right\x1b\\");
+    seed.model.writeWorkspaceState(std.testing.io);
+    seed.destroy();
+
+    const config = cockpit.startup.parseConfig(
+        "command = tmux attach\n" ++
+            "scrollback-limit = 1048576\n" ++
+            "tab-placement = top\n",
+    );
+    const restored = try Engine.createResolvedConfigured(
+        std.testing.allocator,
+        std.testing.io,
+        config,
+        config_path,
+        state_path,
+        null,
+    );
+    defer restored.destroy();
+    try std.testing.expectEqual(@as(usize, 2), restored.model.provider.activeCount());
+    // Persisted placement beats config when no debug override exists.
+    try std.testing.expectEqual(.side, restored.model.tab_placement);
+    try std.testing.expectEqual(@as(usize, 1048576), restored.model.provider.max_scrollback_bytes);
+    try std.testing.expectEqualStrings(config_path, restored.model.config_file.path());
+    const plain = restored.model.provider.slot(0).argv;
+    try std.testing.expectEqualStrings("exec tmux attach", plain[plain.len - 1]);
+    const with_cwd = restored.model.provider.slot(1).argv;
+    try std.testing.expect(std.mem.indexOf(u8, with_cwd[with_cwd.len - 1], "/tmp/restored-right") != null);
+
+    const overridden = try Engine.createResolvedConfigured(
+        std.testing.allocator,
+        std.testing.io,
+        config,
+        config_path,
+        state_path,
+        "top",
+    );
+    defer overridden.destroy();
+    // PHUX_COCKPIT_TABS is the final debug precedence edge.
+    try std.testing.expectEqual(.top, overridden.model.tab_placement);
+}
+
 // GUARD: ts-engine-intent
 test "an intent moves the engine and the core resyncs to the new revision" {
     var rig = try Rig.start();
@@ -631,6 +978,115 @@ test "an intent moves the engine and the core resyncs to the new revision" {
     try std.testing.expectEqual(@as(i64, 1), model.selectedTab);
     try std.testing.expectEqual(@as(i64, 2), model.engineRevision.lo);
     try std.testing.expect(model.tabs[0].id != model.tabs[1].id);
+}
+
+// GUARD: ts-native-command-parity
+test "native menu commands split and close the focused pane through the engine seam" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+
+    try std.testing.expect(core.commandMsg("terminal.new") != null);
+    try std.testing.expect(core.commandMsg("terminal.find") != null);
+    try std.testing.expect(core.commandMsg("window.fullscreen") != null);
+
+    try rig.dispatch(core.commandMsg("pane.split-right").?);
+    try rig.settle(1, "READY");
+    try std.testing.expectEqual(@as(usize, 2), engine.model.provider.activeCount());
+
+    try rig.dispatch(core.commandMsg("terminal.close").?);
+    try rig.settle(2, "READY");
+    try std.testing.expectEqual(@as(usize, 1), engine.model.provider.activeCount());
+}
+
+// GUARD: ts-topology-persistence
+test "TypeScript topology changes use the shipping debounce and file effect" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+    const executor = rig.app_state.effects.executor;
+    defer rig.app_state.effects.executor = executor;
+    engine.model.state.setPath("/tmp/phux-cockpit-tests/ts-workspace.state");
+    defer engine.model.state.setPath(null);
+
+    rig.app_state.effects.executor = .fake;
+    try rig.dispatch(.new_terminal);
+    rig.app_state.effects.executor = executor;
+    try rig.settle(1, "READY");
+    try std.testing.expect(engine.model.state.pending);
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.effects.pendingTimerCount());
+    const timer = rig.app_state.effects.pendingTimerAt(0).?;
+    try std.testing.expectEqual(cockpit.topology_persist_timer_key, timer.key);
+    try std.testing.expectEqual(cockpit.topology_persist_debounce_ms, timer.interval_ms);
+
+    try rig.app_state.effects.fireTimer(cockpit.topology_persist_timer_key);
+    rig.app_state.effects.executor = .fake;
+    try rig.app_state.drainEffects(&rig.harness.runtime);
+    rig.app_state.effects.executor = executor;
+    try std.testing.expect(engine.model.state.inflight);
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.effects.pendingFileCount());
+    const write = rig.app_state.effects.pendingFileAt(0).?;
+    try std.testing.expectEqual(cockpit.topology_state_file_key, write.key);
+    try std.testing.expectEqualStrings(engine.model.state.path(), write.path);
+    try std.testing.expect(write.bytes.len > 0);
+
+    try rig.app_state.effects.feedFileResult(cockpit.topology_state_file_key, .ok, "");
+    try rig.app_state.drainEffects(&rig.harness.runtime);
+    try std.testing.expect(!engine.model.state.inflight);
+    try std.testing.expect(!engine.model.state.pending);
+}
+
+// GUARD: ts-native-divider-drag
+test "native divider drag updates engine geometry without crossing the TypeScript seam" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+
+    try rig.dispatch(core.commandMsg("pane.split-right").?);
+    try rig.settle(1, "READY");
+    const workspace = engine.model.ws();
+    const tree = workspace.selectedTree().?;
+    const chrome = cockpit.projection.workspaceChromeIn(engine.model, workspace, workspace.surface_size);
+    var dividers: [cockpit.layout.max_panes - 1]cockpit.layout.Divider = undefined;
+    const count = tree.dividers(
+        chrome.content,
+        cockpit.projection.split_divider_width,
+        cockpit.projection.split_pane_min_width,
+        cockpit.projection.split_pane_min_height,
+        &dividers,
+    );
+    try std.testing.expectEqual(@as(usize, 1), count);
+    const divider = dividers[0];
+    const y = divider.rect.y + divider.rect.height / 2;
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .pointer_id = 7,
+        .x = divider.rect.x + divider.rect.width / 2,
+        .y = y,
+    } });
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_drag,
+        .pointer_id = 7,
+        .x = divider.bounds.x + (divider.bounds.width - cockpit.projection.split_divider_width) * 0.7,
+        .y = y,
+    } });
+    try rig.settle(2, "READY");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), tree.node(divider.node).fraction, 0.001);
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_up,
+        .pointer_id = 7,
+        .x = divider.rect.x,
+        .y = y,
+    } });
 }
 
 // GUARD: ts-engine-fence
@@ -718,6 +1174,8 @@ test "every registered pane gets exactly one shell request and a closed tab kill
         pub fn writeClipboard(_: *@This(), _: anytype) void {}
         pub fn readClipboard(_: *@This(), _: anytype) void {}
         pub fn openUrl(_: *@This(), _: []const u8) void {}
+        pub fn toggleFullscreenWindow(_: *@This(), _: []const u8) void {}
+        pub fn minimizeWindow(_: *@This(), _: []const u8) void {}
         pub fn ptySpawn(self: *@This(), _: anytype) void {
             self.spawned += 1;
         }
@@ -751,6 +1209,14 @@ test "every registered pane gets exactly one shell request and a closed tab kill
     try std.testing.expectEqual(second_key, fx.last_killed);
     engine.spawnShells(&fx, shellEvent);
     try std.testing.expectEqual(@as(usize, 2), fx.spawned);
+
+    // A split creates a real provider pane, not only a visual branch. The
+    // next idempotent spawn pass must start exactly that pane's PTY.
+    const split = protocol.encodeIntent(.{ .kind = .native_command, .expected_revision = 3, .argument = 4, .window = 0 });
+    try std.testing.expect(engine.applyIntent(&split, &fx));
+    engine.spawnShells(&fx, shellEvent);
+    try std.testing.expectEqual(@as(usize, 3), fx.spawned);
+    try std.testing.expectEqual(@as(usize, 2), engine.model.provider.activeCount());
 }
 
 // MEASURED: the cost of the route docs/DECISIONS.md chose by reuse. A full
@@ -808,9 +1274,17 @@ test "MEASURED: the chrome-prefix paint of a full grid on the engine model" {
 // same toolkit audit the Zig ladder answers to. A finding is a real defect
 // (overlap, a target under the WCAG floor, a widget off its grid), printed
 // the way the Zig audit prints it. The engine's grids are painted beneath
-// this tree and are not widgets; their geometry is the shipping painter's.
+// the composite tree; its transparent pane leaves carry accessibility and
+// consume the exact geometry the shipping painter uses.
 
 const CompiledChrome = canvas.CompiledMarkupView(core.Model, core.Msg, @embedFile("app.native"));
+const compiled_fragments = [_]canvas.MarkupFragment{
+    CompiledChrome.fragment("src/app.native"),
+    WindowView1.fragment("src/windows/phux-window-1.native"),
+    WindowView2.fragment("src/windows/phux-window-2.native"),
+    WindowView3.fragment("src/windows/phux-window-3.native"),
+    WindowView4.fragment("src/windows/phux-window-4.native"),
+};
 
 const parity_sizes = [_]native_sdk.geometry.SizeF{
     native_sdk.geometry.SizeF.init(900, 420),
@@ -844,7 +1318,7 @@ fn auditChromeAt(model: *const core.Model, size: native_sdk.geometry.SizeF, dens
 
     var tokens = cockpit.projection.cockpitTokens(bridge.engine.?.model);
     tokens.density = density;
-    const node = CompiledChrome.build(&ui, model);
+    const node = mainView(&ui, model);
     const tree = try ui.finalizeWithTokens(node, tokens);
 
     const nodes = try std.testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
@@ -914,6 +1388,30 @@ test "the switcher filters the engine's tabs by position or title and selects th
     try rig.settle(before + 1, "READY");
     try std.testing.expectEqual(@as(usize, 2), engine.model.wsConst().selected_tab);
     try std.testing.expectEqual(@as(i64, 2), rig.app_state.model.selectedTab);
+}
+
+// GUARD: ts-cwd-invalidation
+test "the switcher receives the focused split pane's cwd without polling terminal bytes" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+
+    try rig.dispatch(core.commandMsg("pane.split-right").?);
+    try rig.settle(1, "READY");
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    const wake = shellEvent(.{
+        .key = pane.pty_key,
+        .kind = .output,
+        .bytes = "\x1b]7;file://host/tmp/right-pane\x1b\\",
+    });
+    try rig.dispatch(wake);
+    try rig.settle(2, "READY");
+    try std.testing.expectEqualStrings("/tmp/right-pane", rig.app_state.model.tabs[0].cwd);
+
+    try rig.dispatch(.palette_open);
+    try rig.dispatch(.{ .palette_edit = .{ .insert_text = "right-pane" } });
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.model.paletteRows.len);
 }
 
 // GUARD: ts-overlay-settings
@@ -991,10 +1489,10 @@ test "a bell while the app is deactivated notifies once, on its rising edge" {
     const key = pane.pty_key;
 
     engine.setFocused(&fx, false);
-    engine.onShellEvent(&fx, .{ .key = key, .kind = .output, .bytes = "more\x07" });
+    _ = engine.onShellEvent(&fx, .{ .key = key, .kind = .output, .bytes = "more\x07" });
     try std.testing.expectEqual(@as(usize, 1), fx.notifications);
     // A standing bell does not ring again until it is acknowledged.
-    engine.onShellEvent(&fx, .{ .key = key, .kind = .output, .bytes = "\x07" });
+    _ = engine.onShellEvent(&fx, .{ .key = key, .kind = .output, .bytes = "\x07" });
     try std.testing.expectEqual(@as(usize, 1), fx.notifications);
 
     // A focused app hears its own bell and is not notified.
@@ -1003,7 +1501,7 @@ test "a bell while the app is deactivated notifies once, on its rising edge" {
     var quiet = Recorder{};
     const front = attended.model.provider.terminal(attended.model.focusedTerminalRef().?).?;
     attended.setFocused(&quiet, true);
-    attended.onShellEvent(&quiet, .{ .key = front.pty_key, .kind = .output, .bytes = "\x07" });
+    _ = attended.onShellEvent(&quiet, .{ .key = front.pty_key, .kind = .output, .bytes = "\x07" });
     try std.testing.expectEqual(@as(usize, 0), quiet.notifications);
 }
 
@@ -1060,6 +1558,82 @@ test "a drag across the grid through the raw surface input selects text" {
     try std.testing.expect(pane.session.selectionActive());
 }
 
+// GUARD: ts-finder-drop
+test "Finder drops stay native and enter the focused pane as bracketed paste" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    pane.session.feed("\x1b[?2004h");
+    try std.testing.expectEqual(@as(usize, 0), pane.outbound_len);
+
+    routeNativeInput(.{ .files_dropped = .{
+        .view_label = canvas_label,
+        .paths = &.{ "/tmp/a b.txt", "/tmp/second" },
+    } });
+
+    const queued = pane.outbound_buffer[0..pane.outbound_len];
+    try std.testing.expect(std.mem.startsWith(u8, queued, "\x1b[200~"));
+    try std.testing.expect(std.mem.indexOf(u8, queued, "'/tmp/a b.txt' '/tmp/second' ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, queued, "\x1b[201~"));
+}
+
+// GUARD: ts-selection-autoscroll
+test "selection edge drag autoscrolls through the TypeScript host timer" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    pane.session.reset();
+    var lines: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&lines);
+    for (0..80) |index| try writer.print("row {d}\r\n", .{index});
+    pane.session.feed(writer.buffered());
+    pane.session.refreshScreenText();
+    try rig.resize(native_sdk.geometry.SizeF.init(1100, 640));
+    const frame = cockpit.engine.pointerFrame(engine) orelse return error.TestExpectedFrame;
+    const start = native_sdk.geometry.PointF.init(frame.x + 24, frame.y + 24);
+    const above = native_sdk.geometry.PointF.init(start.x, frame.y - 8);
+
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .x = start.x,
+        .y = start.y,
+        .timestamp_ns = 1,
+    } });
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_drag,
+        .x = above.x,
+        .y = above.y,
+        .timestamp_ns = 2,
+    } });
+    try std.testing.expect(pointer_host.selection_autoscroll_timer_active);
+    const timer = rig.harness.null_platform.startedTimer(cockpit.selection_autoscroll_timer_id) orelse return error.TestExpectedTimer;
+    try std.testing.expect(timer.active and timer.repeats);
+    try std.testing.expectEqual(cockpit.selection_autoscroll_interval_ns, timer.interval_ns);
+    const before = pane.session.scrollbar().offset;
+    const fired = rig.harness.null_platform.fireTimer(cockpit.selection_autoscroll_timer_id, 20 * std.time.ns_per_ms) orelse return error.TestExpectedTimer;
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, fired);
+    try std.testing.expect(before > 0);
+    try std.testing.expectEqual(before - 1, pane.session.scrollbar().offset);
+
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_up,
+        .x = above.x,
+        .y = above.y,
+        .timestamp_ns = 3,
+    } });
+    try std.testing.expect(!pointer_host.selection_autoscroll_timer_active);
+}
+
 // GUARD: ts-engine-windows
 test "a new window opens a second workspace with its own shell and closes whole through the seam" {
     var rig = try Rig.start();
@@ -1093,4 +1667,74 @@ test "a new window opens a second workspace with its own shell and closes whole 
     try std.testing.expect(!engine.model.windowOpen(1));
     try std.testing.expect(!rig.app_state.model.window1Open);
     try std.testing.expectEqual(@as(usize, 0), rig.app_state.model.windows(frame).len);
+}
+
+fn compiledViewHasLabel(model: *const core.Model, window_index: usize, label: []const u8) !bool {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ui = Adapter.Ui.init(arena.allocator());
+    const node = if (window_index == 0)
+        mainView(&ui, model)
+    else
+        windowView(&ui, model, "phux-window-1");
+    const tree = try ui.finalizeWithTokens(node, cockpit.projection.cockpitTokens(bridge.engine.?.model));
+    const nodes = try arena.allocator().alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
+    const layout_tree = try canvas.layoutWidgetTreeWithTokens(
+        tree.root,
+        native_sdk.geometry.RectF.init(0, 0, 1100, 640),
+        cockpit.projection.cockpitTokens(bridge.engine.?.model),
+        nodes,
+    );
+    for (layout_tree.nodes) |entry| {
+        if (std.mem.eql(u8, entry.widget.semantics.label, label)) return true;
+    }
+    return false;
+}
+
+// GUARD: ts-secondary-snapshot-primary
+test "a focused secondary snapshot keeps main and secondary projections distinct" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+
+    // Open the second window, then make a main-window mutation so both the
+    // engine and core agree that main is active before the platform command.
+    try rig.dispatch(.new_window);
+    try rig.settle(1, "READY");
+    try rig.dispatch(.new_terminal);
+    try rig.settle(2, "READY");
+    try std.testing.expectEqual(@as(usize, 0), engine.model.active_window);
+    try std.testing.expectEqual(@as(i64, 0), rig.app_state.model.activeWindow);
+
+    // This is the stable process-local window id the native host records; it
+    // never enters TypeScript. The command's projection slot does.
+    engine.model.wsAt(1).?.window_id = 42;
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .native_command = .{
+        .name = "tabs.palette",
+        .window_id = 42,
+    } });
+    try rig.settle(3, "READY");
+
+    try std.testing.expectEqual(@as(usize, 1), engine.model.active_window);
+    try std.testing.expectEqual(@as(i64, 1), rig.app_state.model.activeWindow);
+    try std.testing.expectEqual(@as(usize, 2), rig.app_state.model.tabs.len);
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.model.window1Tabs.len);
+}
+
+// GUARD: ts-secondary-overlay-scope
+test "a secondary-window switcher is scoped to the focused window" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    try rig.dispatch(.new_window);
+    try rig.settle(1, "READY");
+    try std.testing.expectEqual(@as(i64, 1), rig.app_state.model.activeWindow);
+
+    try rig.dispatch(.palette_open);
+    try std.testing.expect(rig.app_state.model.paletteOpen);
+    try std.testing.expect(!rig.app_state.model.mainPaletteOpen);
+    try std.testing.expect(rig.app_state.model.window1PaletteOpen);
+    try std.testing.expect(!try compiledViewHasLabel(&rig.app_state.model, 0, "Find terminal"));
+    try std.testing.expect(try compiledViewHasLabel(&rig.app_state.model, 1, "Find terminal"));
 }

@@ -16,6 +16,7 @@ export interface Tab {
   readonly index: number;
   readonly slot: number;
   readonly title: Uint8Array;
+  readonly cwd: Uint8Array;
   readonly selected: boolean;
   readonly attention: boolean;
 }
@@ -67,13 +68,18 @@ export interface Model {
   readonly overflowLabel: Uint8Array;
   readonly selectedTab: number;
   readonly tabPlacement: TabPlacement;
+  /// Native projection slot for the platform window that owns modal chrome.
+  /// Platform ids never cross the seam; the snapshot carries only 0..4.
+  readonly activeWindow: number;
   readonly paletteOpen: boolean;
+  readonly mainPaletteOpen: boolean;
   readonly paletteQuery: Uint8Array;
   readonly paletteAnchor: number;
   readonly paletteFocus: number;
   readonly paletteRows: readonly SwitcherRow[];
   readonly paletteCursor: number;
   readonly settingsOpen: boolean;
+  readonly mainSettingsOpen: boolean;
   readonly themes: readonly ThemeRow[];
   readonly settingsCursor: number;
   readonly configExists: boolean;
@@ -85,21 +91,29 @@ export interface Model {
   readonly window1TabWidth: number;
   readonly window1HasOverflow: boolean;
   readonly window1OverflowLabel: Uint8Array;
+  readonly window1PaletteOpen: boolean;
+  readonly window1SettingsOpen: boolean;
   readonly window2Open: boolean;
   readonly window2Tabs: readonly Tab[];
   readonly window2TabWidth: number;
   readonly window2HasOverflow: boolean;
   readonly window2OverflowLabel: Uint8Array;
+  readonly window2PaletteOpen: boolean;
+  readonly window2SettingsOpen: boolean;
   readonly window3Open: boolean;
   readonly window3Tabs: readonly Tab[];
   readonly window3TabWidth: number;
   readonly window3HasOverflow: boolean;
   readonly window3OverflowLabel: Uint8Array;
+  readonly window3PaletteOpen: boolean;
+  readonly window3SettingsOpen: boolean;
   readonly window4Open: boolean;
   readonly window4Tabs: readonly Tab[];
   readonly window4TabWidth: number;
   readonly window4HasOverflow: boolean;
   readonly window4OverflowLabel: Uint8Array;
+  readonly window4PaletteOpen: boolean;
+  readonly window4SettingsOpen: boolean;
   readonly engineConnected: boolean;
   readonly engineSequence: WireU64;
   readonly engineRevision: WireU64;
@@ -108,6 +122,7 @@ export interface Model {
 
 export type Msg =
   | { readonly kind: "select_tab"; readonly index: number }
+  | { readonly kind: "select_active_tab"; readonly index: number }
   | { readonly kind: "select_slot"; readonly slot: number }
   | { readonly kind: "new_terminal" }
   | { readonly kind: "new_window" }
@@ -126,6 +141,7 @@ export type Msg =
   | { readonly kind: "settings_pick"; readonly index: number }
   | { readonly kind: "settings_commit" }
   | { readonly kind: "settings_reveal" }
+  | { readonly kind: "native_command"; readonly command: number }
   // Posted by the native engine for every shell event it consumed: no bytes
   // ride along, the core only learns that the grids beneath it moved.
   | { readonly kind: "engine_wake" }
@@ -142,6 +158,10 @@ export type Msg =
 
 export const viewUnbound = [
   "selectedTab",
+  "activeWindow",
+  "paletteOpen",
+  "settingsOpen",
+  "select_active_tab",
   "window_closed",
   "paletteAnchor",
   "paletteFocus",
@@ -156,6 +176,7 @@ export const viewUnbound = [
   "engine_wake",
   "snapshot_loaded",
   "snapshot_failed",
+  "native_command",
 ] as const;
 
 const ZERO_U64: WireU64 = { hi: 0, lo: 0 };
@@ -243,17 +264,17 @@ const NO_ROWS: readonly SwitcherRow[] = [];
 const NO_TABS: readonly Tab[] = [];
 const NO_THEMES: readonly ThemeRow[] = [];
 
-/// The switcher rows for a needle: every tab whose strip position or title
-/// contains it, the shipping palette's rule minus the working directory,
-/// which the snapshot does not carry yet. The cursor is clamped into the
-/// filtered list so an Enter always lands on a row that is showing.
+/// The switcher rows for a needle: every tab whose strip position, title or
+/// working directory contains it, matching the shipping palette's rule. The
+/// cursor is clamped into the filtered list so Enter always lands on a row
+/// that is showing.
 function switcherRows(tabs: readonly Tab[], needle: Uint8Array, cursor: number): readonly SwitcherRow[] {
   const rows: SwitcherRow[] = [];
   for (let index = 0; index < tabs.length; index += 1) {
     if (!(index >= 0 && index <= 255)) break;
     const tab = tabs[index];
     const position = positionBytes(index);
-    if (!containsIgnoreCase(position, needle) && !containsIgnoreCase(tab.title, needle)) continue;
+    if (!containsIgnoreCase(position, needle) && !containsIgnoreCase(tab.title, needle) && !containsIgnoreCase(tab.cwd, needle)) continue;
     rows.push({ id: tab.id, index, label: joinBytes(position, TWO_SPACES, tab.title), highlighted: false });
   }
   if (rows.length === 0) return rows;
@@ -277,6 +298,26 @@ function withSwitcher(model: Model, query: Uint8Array, anchor: number, focus: nu
   const rows = switcherRows(model.tabs, query, cursor);
   const clamped = rows.length === 0 ? 0 : cursor >= 0 && cursor < rows.length && cursor <= 255 ? Math.trunc(cursor) : 0;
   return { ...model, paletteQuery: query, paletteAnchor: a, paletteFocus: f, paletteRows: rows, paletteCursor: clamped };
+}
+
+/// Only the active native window presents the global core-owned modal. The
+/// booleans are flattened because `.native` template arguments bind fields,
+/// not comparisons; `paletteOpen`/`settingsOpen` remain the keyboard gate.
+function scopeOverlays(model: Model): Model {
+  const active = model.activeWindow >= 0 && model.activeWindow <= 4 ? Math.trunc(model.activeWindow) : 0;
+  return {
+    ...model,
+    mainPaletteOpen: model.paletteOpen && active === 0,
+    mainSettingsOpen: model.settingsOpen && active === 0,
+    window1PaletteOpen: model.paletteOpen && active === 1,
+    window1SettingsOpen: model.settingsOpen && active === 1,
+    window2PaletteOpen: model.paletteOpen && active === 2,
+    window2SettingsOpen: model.settingsOpen && active === 2,
+    window3PaletteOpen: model.paletteOpen && active === 3,
+    window3SettingsOpen: model.settingsOpen && active === 3,
+    window4PaletteOpen: model.paletteOpen && active === 4,
+    window4SettingsOpen: model.settingsOpen && active === 4,
+  };
 }
 
 const IN_EFFECT = asciiBytes("  (in effect)");
@@ -316,7 +357,7 @@ function configNotice(enabled: boolean, probed: boolean, exists: boolean, writab
   return joinBytes(asciiBytes("Active configuration file: "), path, NO_BYTES);
 }
 
-function stampSlots(tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly selected: boolean; readonly attention: boolean }[], window: number): readonly Tab[] {
+function stampSlots(tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly cwd: Uint8Array; readonly selected: boolean; readonly attention: boolean }[], window: number): readonly Tab[] {
   const out: Tab[] = [];
   const w = window >= 0 && window <= 4 ? Math.trunc(window) : 0;
   for (let i = 0; i < tabs.length; i += 1) {
@@ -326,7 +367,7 @@ function stampSlots(tabs: readonly { readonly id: number; readonly index: number
     if (!(rawIndex >= 0 && rawIndex <= 31) || !(rawId >= 1 && rawId <= 4294967295)) continue;
     const index = Math.trunc(rawIndex);
     const id = Math.trunc(rawId);
-    out.push({ id, index, slot: w * 32 + index, title: t.title, selected: t.selected, attention: t.attention });
+    out.push({ id, index, slot: w * 32 + index, title: t.title, cwd: t.cwd, selected: t.selected, attention: t.attention });
   }
   return out;
 }
@@ -347,7 +388,7 @@ function closedWindow(index: number): WindowState {
   return { ...CLOSED_WINDOW, index: at };
 }
 
-function windowState(index: number, section: { readonly selectedTab: number; readonly runStart: number; readonly runCount: number; readonly tabWidth: number; readonly tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly selected: boolean; readonly attention: boolean }[] } | null): WindowState {
+function windowState(index: number, section: { readonly selectedTab: number; readonly runStart: number; readonly runCount: number; readonly tabWidth: number; readonly tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly cwd: Uint8Array; readonly selected: boolean; readonly attention: boolean }[] } | null): WindowState {
   if (section === null) return closedWindow(index);
   const at = index >= 0 && index <= 4 ? Math.trunc(index) : 0;
   const tabs = stampSlots(section.tabs, at);
@@ -463,10 +504,45 @@ export function commandMsg(name: string): Msg | null {
   if (name === "cockpit.window.closed.2") return { kind: "window_closed", window: 2 };
   if (name === "cockpit.window.closed.3") return { kind: "window_closed", window: 3 };
   if (name === "cockpit.window.closed.4") return { kind: "window_closed", window: 4 };
+  if (name === "surface.1") return { kind: "select_active_tab", index: 0 };
+  if (name === "surface.2") return { kind: "select_active_tab", index: 1 };
+  if (name === "surface.3") return { kind: "select_active_tab", index: 2 };
+  if (name === "surface.4") return { kind: "select_active_tab", index: 3 };
+  if (name === "surface.5") return { kind: "select_active_tab", index: 4 };
+  if (name === "terminal.new") return { kind: "new_terminal" };
+  if (name === "window.new") return { kind: "new_window" };
+  if (name === "tabs.palette") return { kind: "palette_open" };
+  if (name === "settings.open") return { kind: "settings_open" };
+  if (name === "tabs.toggle-placement") return { kind: "toggle_tab_placement" };
+  if (name === "tab.previous") return { kind: "native_command", command: 1 };
+  if (name === "tab.next") return { kind: "native_command", command: 2 };
+  if (name === "terminal.close") return { kind: "native_command", command: 3 };
+  if (name === "pane.split-right") return { kind: "native_command", command: 4 };
+  if (name === "pane.split-down") return { kind: "native_command", command: 5 };
+  if (name === "pane.previous") return { kind: "native_command", command: 6 };
+  if (name === "pane.next") return { kind: "native_command", command: 7 };
+  if (name === "tab.move-left") return { kind: "native_command", command: 8 };
+  if (name === "tab.move-right") return { kind: "native_command", command: 9 };
+  if (name === "terminal.select-all") return { kind: "native_command", command: 10 };
+  if (name === "terminal.copy") return { kind: "native_command", command: 11 };
+  if (name === "terminal.paste") return { kind: "native_command", command: 12 };
+  if (name === "terminal.clear") return { kind: "native_command", command: 13 };
+  if (name === "terminal.find") return { kind: "native_command", command: 14 };
+  if (name === "terminal.find-next") return { kind: "native_command", command: 15 };
+  if (name === "terminal.find-previous") return { kind: "native_command", command: 16 };
+  if (name === "view.font-larger") return { kind: "native_command", command: 17 };
+  if (name === "view.font-smaller") return { kind: "native_command", command: 18 };
+  if (name === "view.font-reset") return { kind: "native_command", command: 19 };
+  if (name === "pane.focus-left") return { kind: "native_command", command: 20 };
+  if (name === "pane.focus-right") return { kind: "native_command", command: 21 };
+  if (name === "pane.focus-up") return { kind: "native_command", command: 22 };
+  if (name === "pane.focus-down") return { kind: "native_command", command: 23 };
+  if (name === "window.fullscreen") return { kind: "native_command", command: 24 };
+  if (name === "window.minimize") return { kind: "native_command", command: 25 };
   return null;
 }
 
-function findSection(sections: readonly { readonly index: number; readonly selectedTab: number; readonly runStart: number; readonly runCount: number; readonly tabWidth: number; readonly tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly selected: boolean; readonly attention: boolean }[] }[], index: number) {
+function findSection(sections: readonly { readonly index: number; readonly selectedTab: number; readonly runStart: number; readonly runCount: number; readonly tabWidth: number; readonly tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly cwd: Uint8Array; readonly selected: boolean; readonly attention: boolean }[] }[], index: number) {
   for (let i = 0; i < sections.length; i += 1) {
     if (sections[i].index === index) return sections[i];
   }
@@ -487,20 +563,23 @@ function sliceRun(tabs: readonly Tab[], runStart: number, runCount: number): rea
 export function initialModel(): [Model, Cmd<Msg>] {
   return [
     {
-      tabs: [{ id: 1, index: 0, slot: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
-      visibleTabs: [{ id: 1, index: 0, slot: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
+      tabs: [{ id: 1, index: 0, slot: 0, title: asciiBytes("Terminal 1"), cwd: new Uint8Array(0), selected: true, attention: false }],
+      visibleTabs: [{ id: 1, index: 0, slot: 0, title: asciiBytes("Terminal 1"), cwd: new Uint8Array(0), selected: true, attention: false }],
       tabWidth: 168,
       hasOverflow: false,
       overflowLabel: new Uint8Array(0),
       selectedTab: 0,
       tabPlacement: "top",
+      activeWindow: 0,
       paletteOpen: false,
+      mainPaletteOpen: false,
       paletteQuery: new Uint8Array(0),
       paletteAnchor: 0,
       paletteFocus: 0,
       paletteRows: NO_ROWS,
       paletteCursor: 0,
       settingsOpen: false,
+      mainSettingsOpen: false,
       themes: NO_THEMES,
       settingsCursor: 0,
       configExists: false,
@@ -510,21 +589,29 @@ export function initialModel(): [Model, Cmd<Msg>] {
       window1TabWidth: 168,
       window1HasOverflow: false,
       window1OverflowLabel: new Uint8Array(0),
+      window1PaletteOpen: false,
+      window1SettingsOpen: false,
       window2Open: false,
       window2Tabs: NO_TABS,
       window2TabWidth: 168,
       window2HasOverflow: false,
       window2OverflowLabel: new Uint8Array(0),
+      window2PaletteOpen: false,
+      window2SettingsOpen: false,
       window3Open: false,
       window3Tabs: NO_TABS,
       window3TabWidth: 168,
       window3HasOverflow: false,
       window3OverflowLabel: new Uint8Array(0),
+      window3PaletteOpen: false,
+      window3SettingsOpen: false,
       window4Open: false,
       window4Tabs: NO_TABS,
       window4TabWidth: 168,
       window4HasOverflow: false,
       window4OverflowLabel: new Uint8Array(0),
+      window4PaletteOpen: false,
+      window4SettingsOpen: false,
       engineConnected: false,
       engineSequence: ZERO_U64,
       engineRevision: ZERO_U64,
@@ -557,6 +644,8 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
         },
         Cmd.host("cockpit.intent", intent(1, model.engineRevision, msg.index, 0)),
       ];
+    case "select_active_tab":
+      return [model, Cmd.host("cockpit.intent", intent(1, model.engineRevision, msg.index, 255))];
     case "select_slot": {
       // A tab pressed in a secondary window's chrome: the intent names that
       // window so it cannot land on whichever window is active.
@@ -592,9 +681,9 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       // Two modal surfaces cannot both own the keyboard; the one just asked
       // for wins. Opening is idempotent so a repeat never clears a needle.
       if (model.paletteOpen) return model;
-      return withSwitcher({ ...model, paletteOpen: true, settingsOpen: false }, new Uint8Array(0), 0, 0, 0);
+      return scopeOverlays(withSwitcher({ ...model, paletteOpen: true, settingsOpen: false }, new Uint8Array(0), 0, 0, 0));
     case "palette_close":
-      return { ...model, paletteOpen: false, paletteQuery: new Uint8Array(0), paletteRows: NO_ROWS, paletteCursor: 0 };
+      return scopeOverlays({ ...model, paletteOpen: false, paletteQuery: new Uint8Array(0), paletteRows: NO_ROWS, paletteCursor: 0 });
     case "palette_edit": {
       if (!model.paletteOpen) return model;
       const next = applyTextInputEvent(paletteState(model), msg.edit, 96);
@@ -610,7 +699,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
     }
     case "palette_submit": {
       if (!model.paletteOpen) return model;
-      const closed: Model = { ...model, paletteOpen: false, paletteQuery: new Uint8Array(0), paletteRows: NO_ROWS, paletteCursor: 0 };
+      const closed: Model = scopeOverlays({ ...model, paletteOpen: false, paletteQuery: new Uint8Array(0), paletteRows: NO_ROWS, paletteCursor: 0 });
       // A commit with nothing matching still dismisses: an Enter that found
       // nothing and left the switcher up reads as a stuck keyboard.
       if (model.paletteRows.length === 0) return closed;
@@ -624,7 +713,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       const index = msg.index;
       if (!(index >= 0 && index < model.tabs.length)) return model;
       const picked = Math.trunc(index);
-      const chosen: Model = {
+      const chosen: Model = scopeOverlays({
         ...model,
         paletteOpen: false,
         paletteQuery: new Uint8Array(0),
@@ -633,7 +722,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
         tabs: selectTab(model.tabs, picked),
         visibleTabs: selectTab(model.visibleTabs, picked),
         selectedTab: picked,
-      };
+      });
       return [chosen, Cmd.host("cockpit.intent", intent(1, model.engineRevision, picked, 0))];
     }
     case "settings_open": {
@@ -641,12 +730,12 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       // The probe is the engine's, once per opening, exactly as the shipping
       // app asks the disk once when the panel opens and never per frame.
       return [
-        { ...model, settingsOpen: true, paletteOpen: false },
+        scopeOverlays({ ...model, settingsOpen: true, paletteOpen: false }),
         Cmd.host("cockpit.intent", intent(7, model.engineRevision, 0, 0)),
       ];
     }
     case "settings_close":
-      return { ...model, settingsOpen: false };
+      return scopeOverlays({ ...model, settingsOpen: false });
     case "settings_move": {
       if (!model.settingsOpen || model.themes.length === 0) return model;
       const step = msg.delta >= 0 ? 1 : -1;
@@ -665,13 +754,15 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
     case "settings_commit": {
       if (!model.settingsOpen) return model;
       return [
-        { ...model, settingsOpen: false },
+        scopeOverlays({ ...model, settingsOpen: false }),
         Cmd.host("cockpit.intent", intent(5, model.engineRevision, model.settingsCursor, 0)),
       ];
     }
     case "settings_reveal":
       if (!model.settingsOpen || !model.configExists) return model;
       return [model, Cmd.host("cockpit.intent", intent(6, model.engineRevision, 0, 0))];
+    case "native_command":
+      return [model, Cmd.host("cockpit.intent", intent(11, model.engineRevision, msg.command, 255))];
     case "engine_wake":
       return { ...model };
     case "snapshot_loaded": {
@@ -709,6 +800,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       const width4 = w4.tabWidth >= 0 && w4.tabWidth <= 65535 ? Math.trunc(w4.tabWidth) : 168;
       const synced: Model = {
         ...model,
+        activeWindow: projected.activeWindow >= 0 && projected.activeWindow <= 4 ? Math.trunc(projected.activeWindow) : 0,
         window1Open: w1.open,
         window1Tabs: w1.visibleTabs,
         window1TabWidth: width1,
@@ -745,9 +837,10 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
         engineRevision: projected.revision,
         status: refusedMask === 0 ? asciiBytes("READY") : asciiBytes("ACTION REFUSED"),
       };
-      return model.paletteOpen
+      const switched = model.paletteOpen
         ? withSwitcher(synced, model.paletteQuery, model.paletteAnchor, model.paletteFocus, model.paletteCursor)
         : synced;
+      return scopeOverlays(switched);
     }
     case "snapshot_failed":
       return { ...model, engineConnected: false, status: asciiBytes("ENGINE UNAVAILABLE") };
