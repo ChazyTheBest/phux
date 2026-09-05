@@ -1547,6 +1547,32 @@ async fn wheel_in_mouse_tracking_pane_forwards_input_mouse() {
     }
 }
 
+/// Ctrl-left drag is the explicit host-selection escape hatch for a TUI that
+/// enabled mouse tracking. Ordinary clicks still belong to the TUI; the
+/// modifier makes it possible to copy long Codex output through scrollback.
+#[tokio::test]
+async fn ctrl_left_press_in_mouse_tracking_pane_starts_host_copy() {
+    use phux_protocol::input::key::ModSet;
+
+    let mut press = mev(MouseAction::Press, MouseButton::Left, 70.0, 5.0);
+    press.mods = ModSet::CTRL;
+    let mut overlays = OverlayState::new();
+    let (received, _, focused, _, _) = dispatch_mouse_two_pane_into(
+        &mut overlays,
+        vec![InputEvent::Mouse(press)],
+        &[],
+        &[(
+            tid(2),
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
+        )],
+        (1, 1),
+    )
+    .await;
+    assert_eq!(focused, Some(tid(2)));
+    assert!(received.is_empty(), "Ctrl drag must not reach the TUI");
+    assert!(overlays.is_active(), "Ctrl drag must enter copy mode");
+}
+
 // ---------- phux-wrnm: right-click context menus (ADR-0058) ----------
 
 /// A right press over a pane whose app has NOT asked for the mouse

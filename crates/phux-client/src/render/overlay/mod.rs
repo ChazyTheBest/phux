@@ -47,7 +47,9 @@ pub use select_list::{SelectItem, SelectList};
 // owner; both the selection UX (`copy_mode`) and the renderer (`attach::render`)
 // import these types from here, so the highlight geometry and the copy path
 // cannot disagree about what a selection covers.
-pub use selection::{CopyRequest, SelectionGrab, SelectionMode, SelectionRect};
+pub use selection::{
+    CopyRequest, ScreenSelectionPoint, SelectionGrab, SelectionMode, SelectionRect,
+};
 pub use toast::ToastOverlay;
 pub use which_key::WhichKeyOverlay;
 

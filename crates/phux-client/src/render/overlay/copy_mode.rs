@@ -16,7 +16,8 @@ use ratatui::layout::Rect;
 
 use super::HardcodedBinding;
 use super::{
-    CopyRequest, OverlayCommand, RenderOverlay, SelectionGrab, SelectionMode, SelectionRect,
+    CopyRequest, OverlayCommand, RenderOverlay, ScreenSelectionPoint, SelectionGrab, SelectionMode,
+    SelectionRect,
 };
 
 const WHEEL_SCROLL_LINES: isize = 3;
@@ -135,6 +136,16 @@ pub struct CopyModeOverlay {
     pub pane_rows: u16,
     /// Whether a left-button drag is actively extending the selection.
     selecting_with_mouse: bool,
+    /// The first clicked cell in full-screen coordinates. This is supplied by
+    /// the dispatcher, which has access to the focused terminal engine.
+    mouse_anchor_screen: Option<ScreenSelectionPoint>,
+    /// Where the stable mouse anchor currently appears in the viewport.
+    ///
+    /// This deliberately is signed and may be outside the visible pane. While
+    /// wheel-scrolling a drag, the first cell can leave the viewport; clamping
+    /// only when painting keeps the visible end of the highlight at the pane
+    /// edge rather than making the selection appear to travel with the text.
+    mouse_anchor_viewport_row: Option<i32>,
 }
 
 impl CopyModeOverlay {
@@ -155,7 +166,15 @@ impl CopyModeOverlay {
             pane_cols,
             pane_rows,
             selecting_with_mouse: false,
+            mouse_anchor_screen: None,
+            mouse_anchor_viewport_row: None,
         }
+    }
+
+    /// Record the stable terminal cell under a mouse press.
+    pub fn set_mouse_anchor_screen(&mut self, anchor: ScreenSelectionPoint) {
+        self.mouse_anchor_screen = Some(anchor);
+        self.mouse_anchor_viewport_row = Some(i32::from(self.anchor_row));
     }
 
     /// The current selection mode.
@@ -199,6 +218,36 @@ impl CopyModeOverlay {
         )
     }
 
+    /// The portion of a mouse selection that is visible in the current
+    /// viewport. The copy request still carries the unmodified full-screen
+    /// press point, so this is presentation-only.
+    fn visible_selection_range(&self) -> CellRange {
+        let anchor_row = self
+            .mouse_anchor_viewport_row
+            .map_or(self.anchor_row, |row| {
+                row.clamp(0, i32::from(self.pane_rows.saturating_sub(1))) as u16
+            });
+        CellRange::from_points(
+            anchor_row,
+            self.anchor_col,
+            self.cursor_row,
+            self.cursor_col,
+        )
+    }
+
+    fn apply_selection_mode(&self, range: CellRange) -> CellRange {
+        if self.mode == SelectionMode::Line {
+            CellRange {
+                start_row: range.start_row,
+                start_col: 0,
+                end_row: range.end_row,
+                end_col: self.pane_cols.saturating_sub(1),
+            }
+        } else {
+            range
+        }
+    }
+
     /// The selection range adjusted for the active [`SelectionMode`].
     ///
     /// `Char` and `Rect` use the raw two-corner range as-is (the linear-vs-block
@@ -212,17 +261,30 @@ impl CopyModeOverlay {
     ///
     /// [`copy_selection`]: RenderOverlay::copy_selection
     fn effective_range(&self) -> CellRange {
-        let range = self.selection_range();
-        if self.mode == SelectionMode::Line {
-            CellRange {
-                start_row: range.start_row,
-                start_col: 0,
-                end_row: range.end_row,
-                end_col: self.pane_cols.saturating_sub(1),
-            }
-        } else {
-            range
+        self.apply_selection_mode(self.selection_range())
+    }
+
+    /// The range used only to paint the viewport-local highlight.
+    fn visible_effective_range(&self) -> CellRange {
+        self.apply_selection_mode(self.visible_selection_range())
+    }
+
+    /// Keep the painted mouse anchor attached to its terminal cell when the
+    /// viewport moves. A negative viewport delta exposes older history and
+    /// pushes the already-clicked cell down on screen, hence `-delta`.
+    fn scroll_mouse_anchor(&mut self, delta: isize) {
+        if !self.selecting_with_mouse {
+            return;
         }
+        let Some(row) = self.mouse_anchor_viewport_row.as_mut() else {
+            return;
+        };
+        let delta = i32::try_from(delta).unwrap_or(if delta.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        });
+        *row = row.saturating_sub(delta);
     }
 
     /// Move cursor by a delta, clamping to pane bounds.
@@ -286,6 +348,7 @@ impl CopyModeOverlay {
             start_col: range.start_col,
             end_row: range.end_row,
             end_col: range.end_col,
+            mouse_anchor_screen: self.mouse_anchor_screen,
             rectangle: self.mode == SelectionMode::Rect,
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
@@ -341,7 +404,7 @@ impl RenderOverlay for CopyModeOverlay {
         // `from_range` sets the block/linear flag from the mode, so the renderer
         // highlights exactly what a copy of the current mode would extract
         // (ADR-0045).
-        let range = self.effective_range();
+        let range = self.visible_effective_range();
         Some(SelectionRect::from_range(
             range.start_row,
             range.start_col,
@@ -443,15 +506,20 @@ impl RenderOverlay for CopyModeOverlay {
     fn handle_mouse(&mut self, mouse: &MouseEvent) -> OverlayCommand {
         match (mouse.action, mouse.button) {
             (MouseAction::Press, MouseButton::Four) => {
+                self.scroll_mouse_anchor(-WHEEL_SCROLL_LINES);
                 OverlayCommand::ScrollViewport(-WHEEL_SCROLL_LINES)
             }
             (MouseAction::Press, MouseButton::Five) => {
+                self.scroll_mouse_anchor(WHEEL_SCROLL_LINES);
                 OverlayCommand::ScrollViewport(WHEEL_SCROLL_LINES)
             }
             (MouseAction::Press, MouseButton::Left) => {
                 self.set_cursor_from_mouse(mouse);
                 self.anchor_row = self.cursor_row;
                 self.anchor_col = self.cursor_col;
+                if self.mouse_anchor_screen.is_some() {
+                    self.mouse_anchor_viewport_row = Some(i32::from(self.anchor_row));
+                }
                 self.selecting_with_mouse = true;
                 OverlayCommand::Stay
             }
@@ -718,6 +786,59 @@ mod tests {
             overlay.handle_mouse(&mouse_wheel(MouseButton::Five)),
             OverlayCommand::ScrollViewport(WHEEL_SCROLL_LINES)
         );
+    }
+
+    #[test]
+    fn mouse_drag_highlight_stays_with_the_clicked_cell_while_scrolling() {
+        let mut overlay = CopyModeOverlay::new(6, 5, 80, 24);
+        overlay.set_mouse_anchor_screen(ScreenSelectionPoint { col: 5, row: 106 });
+        overlay.handle_mouse(&mouse_event(
+            MouseAction::Press,
+            MouseButton::Left,
+            5.0,
+            6.0,
+        ));
+
+        // Scrolling up reveals older rows: the clicked terminal cell moves
+        // three viewport rows downward while the mouse remains at row 6.
+        assert_eq!(
+            overlay.handle_mouse(&mouse_wheel(MouseButton::Four)),
+            OverlayCommand::ScrollViewport(-WHEEL_SCROLL_LINES)
+        );
+        let selection = overlay.copy_selection().expect("selection");
+        assert_eq!((selection.start_row, selection.end_row), (6, 9));
+
+        // The full-screen press point, rather than this display-only range,
+        // remains the value the eventual copy bridge resolves.
+        assert_eq!(overlay.copy_request().mouse_anchor_screen.unwrap().row, 106);
+    }
+
+    #[test]
+    fn mouse_copy_request_carries_the_stable_press_point() {
+        let mut overlay = CopyModeOverlay::new(0, 0, 80, 24);
+        let anchor = ScreenSelectionPoint { col: 7, row: 123 };
+        overlay.set_mouse_anchor_screen(anchor);
+        overlay.handle_mouse(&mouse_event(
+            MouseAction::Press,
+            MouseButton::Left,
+            7.0,
+            4.0,
+        ));
+        overlay.handle_mouse(&mouse_event(
+            MouseAction::Motion,
+            MouseButton::Left,
+            9.0,
+            11.0,
+        ));
+        let OverlayCommand::Copy(request) = overlay.handle_mouse(&mouse_event(
+            MouseAction::Release,
+            MouseButton::Left,
+            9.0,
+            11.0,
+        )) else {
+            panic!("a dragged release must copy");
+        };
+        assert_eq!(request.mouse_anchor_screen, Some(anchor));
     }
 
     #[test]
