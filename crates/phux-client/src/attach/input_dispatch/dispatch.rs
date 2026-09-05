@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use libghostty_vt::terminal::{Mode, ScrollViewport};
+use libghostty_vt::terminal::{Mode, Point, PointCoordinate, PointSpace, ScrollViewport};
 use phux_protocol::TerminalId;
 use phux_protocol::input::InputEvent;
 use phux_protocol::input::key::{ModSet, PhysicalKey};
@@ -32,7 +32,7 @@ use crate::attach::pane_state::{
 use crate::layout::Workspace;
 use crate::layout_ops::{DEFAULT_LAYOUT_GROUP_ID as DEFAULT_GROUP_ID, layout_key};
 use crate::predict::{Overlay, PredictionState};
-use crate::render::overlay::{ContextMenu, OverlayOutcome, OverlayState};
+use crate::render::overlay::{ContextMenu, OverlayOutcome, OverlayState, ScreenSelectionPoint};
 
 use super::ctx::{DispatchCtx, DragGrab};
 use super::effects::encode_layout_or_log;
@@ -939,22 +939,45 @@ impl<W: crate::attach::RenderSink> EventEnv<'_, '_, W> {
 
     /// Drag-to-copy (tmux convention): a left press on a pane
     /// whose app has NOT enabled mouse tracking starts a
-    /// copy-mode selection anchored at the click. Motion and
-    /// release then route through the overlay stage above —
-    /// release copies to the host clipboard (OSC 52) and
-    /// dismisses; a click without drag just dismisses. Apps
-    /// that DO track the mouse (vim, htop) keep receiving
-    /// their events untouched.
+    /// copy-mode selection anchored at the click. Holding Ctrl
+    /// explicitly overrides an app's mouse tracking, matching the
+    /// conventional terminal escape hatch for selecting output from a TUI.
+    /// Motion and release then route through the overlay stage above —
+    /// release copies to the host clipboard (OSC 52) and dismisses; a click
+    /// without drag just dismisses. Without Ctrl, apps that DO track the
+    /// mouse (vim, htop, Codex) keep receiving their events untouched.
     fn begin_drag_to_copy(&mut self, routed: &MouseEvent, target: &TerminalId) -> bool {
-        if !is_left_press(routed) || !pane_ignores_mouse(self.ctx.engine_kernel, target) {
+        let force_copy = routed.mods.contains(ModSet::CTRL);
+        if !is_left_press(routed)
+            || (!force_copy && !pane_ignores_mouse(self.ctx.engine_kernel, target))
+        {
             return false;
         }
         let rect = focused_pane_rect(self.ctx, self.focused_pane.as_ref());
-        self.ctx
-            .overlays
-            .push(Box::new(crate::render::overlay::CopyModeOverlay::new(
-                0, 0, rect.w, rect.h,
-            )));
+        let mouse_col = quantize_cell(routed.x).min(rect.w.saturating_sub(1));
+        let mouse_row = quantize_cell(routed.y).min(rect.h.saturating_sub(1));
+        let anchor = published_terminal(self.ctx.engine_kernel, target)
+            .and_then(|terminal| {
+                let cell = terminal
+                    .grid_ref(Point::Viewport(PointCoordinate {
+                        x: mouse_col,
+                        y: u32::from(mouse_row),
+                    }))
+                    .ok()?;
+                terminal
+                    .point_from_grid_ref(&cell, PointSpace::Screen)
+                    .ok()?
+            })
+            .map(|point| ScreenSelectionPoint {
+                col: point.x,
+                row: point.y,
+            });
+        let mut overlay =
+            crate::render::overlay::CopyModeOverlay::new(mouse_row, mouse_col, rect.w, rect.h);
+        if let Some(anchor) = anchor {
+            overlay.set_mouse_anchor_screen(anchor);
+        }
+        self.ctx.overlays.push(Box::new(overlay));
         // Seed anchor + cursor from the (pane-local) press.
         let _ = self.ctx.overlays.handle_mouse(routed);
         true

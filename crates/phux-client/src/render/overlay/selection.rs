@@ -157,6 +157,20 @@ pub enum SelectionGrab {
     Output,
 }
 
+/// A cell in the terminal's full primary-screen coordinate space.
+///
+/// Unlike viewport coordinates, this stays attached to the same terminal
+/// cell while the user scrolls through history. It is intentionally a plain
+/// value: the engine resolves it only at copy time, so the overlay remains
+/// independent of libghostty handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenSelectionPoint {
+    /// Column, zero-based.
+    pub col: u16,
+    /// Row in the full screen (history plus active area), zero-based.
+    pub row: u32,
+}
+
 /// A client-local copy request ([ADR-0045]).
 ///
 /// The overlay's normalized, inclusive viewport selection rectangle, handed to
@@ -180,6 +194,10 @@ pub struct CopyRequest {
     pub end_row: u16,
     /// Right column of the selection (inclusive).
     pub end_col: u16,
+    /// Stable press point for a mouse drag, when it was resolved by the
+    /// dispatcher. Keyboard copy-mode keeps this `None` and remains purely
+    /// viewport-relative.
+    pub mouse_anchor_screen: Option<ScreenSelectionPoint>,
     /// Block (rectangular) selection when `true`; linear when `false`. Only
     /// consulted for [`SelectionGrab::Rect`].
     pub rectangle: bool,

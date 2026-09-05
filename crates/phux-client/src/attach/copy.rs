@@ -20,7 +20,7 @@ use libghostty_vt::{
     terminal::{Point, PointCoordinate},
 };
 
-use crate::render::overlay::{CopyRequest, SelectionGrab};
+use crate::render::overlay::{CopyRequest, ScreenSelectionPoint, SelectionGrab};
 
 /// Base64 alphabet (RFC 4648 §4, standard, with `+`/`/` and `=` padding).
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -76,7 +76,7 @@ fn resolve_selection<'t>(
     req: CopyRequest,
 ) -> Option<Selection<'t>> {
     match req.grab {
-        SelectionGrab::Rect => select_viewport_rect(terminal, req),
+        SelectionGrab::Rect => select_drag_rect(terminal, req),
         SelectionGrab::All => terminal.select_all().ok().flatten(),
         SelectionGrab::Word => select_word_at_cursor(terminal, req),
         SelectionGrab::Line | SelectionGrab::LineSemantic => select_line_at_cursor(terminal, req),
@@ -87,16 +87,33 @@ fn resolve_selection<'t>(
 /// Map the overlay's inclusive `(row, col)` viewport rectangle onto two
 /// [`Point::Viewport`] grid references and build the two-corner [`Selection`]
 /// (rectangular when `req.rectangle`).
-fn select_viewport_rect<'t>(
+fn select_drag_rect<'t>(
     terminal: &'t GhosttyTerminal<'_, '_>,
     req: CopyRequest,
 ) -> Option<Selection<'t>> {
     // Endpoints are inclusive (see `Selection::new`); the overlay's
     // CellRange is already normalized so start <= end and both ends
     // name real cells.
-    let start = viewport_grid_ref(terminal, req.start_col, req.start_row)?;
+    let start = req.mouse_anchor_screen.map_or_else(
+        || viewport_grid_ref(terminal, req.start_col, req.start_row),
+        |point| screen_grid_ref(terminal, point),
+    )?;
     let end = viewport_grid_ref(terminal, req.end_col, req.end_row)?;
     Some(Selection::new(start, end, req.rectangle))
+}
+
+/// Resolve a stored mouse press point against the full primary screen. This
+/// is valid for both scrollback and active rows, unlike `Point::History`.
+fn screen_grid_ref<'t>(
+    terminal: &'t GhosttyTerminal<'_, '_>,
+    point: ScreenSelectionPoint,
+) -> Option<GridRef<'t>> {
+    terminal
+        .grid_ref(Point::Screen(PointCoordinate {
+            x: point.col,
+            y: point.row,
+        }))
+        .ok()
 }
 
 /// libghostty's own word selection at the overlay cursor.
@@ -249,7 +266,10 @@ fn base64_encode(input: &[u8]) -> String {
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
-    use libghostty_vt::{Terminal as GhosttyTerminal, TerminalOptions};
+    use libghostty_vt::{
+        Terminal as GhosttyTerminal, TerminalOptions,
+        terminal::{PointSpace, ScrollViewport},
+    };
 
     fn fresh(cols: u16, rows: u16) -> GhosttyTerminal<'static, 'static> {
         GhosttyTerminal::new(TerminalOptions {
@@ -268,6 +288,7 @@ mod tests {
             start_col,
             end_row,
             end_col,
+            mouse_anchor_screen: None,
             rectangle: false,
             cursor_row: end_row,
             cursor_col: end_col,
@@ -284,6 +305,7 @@ mod tests {
             start_col: col,
             end_row: row,
             end_col: col,
+            mouse_anchor_screen: None,
             rectangle: false,
             cursor_row: row,
             cursor_col: col,
@@ -329,6 +351,38 @@ mod tests {
         // "hello" occupies viewport row 0, cols 0..=4 (inclusive).
         let req = rect_req(0, 0, 0, 4);
         assert_eq!(extract_selection_text(&t, req).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn mouse_drag_copy_keeps_its_first_cell_after_scrolling() {
+        let mut t = fresh(12, 3);
+        for n in 0..8 {
+            let suffix = if n == 7 { "" } else { "\r\n" };
+            t.vt_write(format!("line{n:02}{suffix}").as_bytes());
+        }
+
+        // The first click lands on an older visible row, then the user
+        // scrolls back to the live end before releasing on line07.
+        t.scroll_viewport(ScrollViewport::Delta(-3));
+        let first = t
+            .grid_ref(Point::Viewport(PointCoordinate { x: 0, y: 0 }))
+            .expect("first visible cell");
+        let anchor = t
+            .point_from_grid_ref(&first, PointSpace::Screen)
+            .expect("screen conversion")
+            .expect("screen point");
+        t.scroll_viewport(ScrollViewport::Bottom);
+
+        let mut req = rect_req(0, 0, 2, 5);
+        req.mouse_anchor_screen = Some(ScreenSelectionPoint {
+            col: anchor.x,
+            row: anchor.y,
+        });
+        assert_eq!(
+            extract_selection_text(&t, req).as_deref(),
+            Some("line02\nline03\nline04\nline05\nline06\nline07"),
+            "copy must span the original press point, not the same viewport row after scrolling"
+        );
     }
 
     /// A two-corner request that is rectangular (block) rather than linear.
