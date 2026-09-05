@@ -12,7 +12,7 @@ use phux_protocol::wire::frame::{FrameKind, ViewportInfo};
 
 use crate::attach::connection::Connection;
 use crate::attach::outcome::AttachError;
-use crate::layout::Workspace;
+use crate::layout::{LayoutState, Workspace};
 
 /// The per-leaf rect map of the zoom- and sidebar-honoring view, used as the
 /// pre-toggle snapshot for the reflow handshake. Returns an empty map when
@@ -48,9 +48,7 @@ pub(super) fn view_rects(
 /// path so each PTY's winsize tracks the on-screen geometry. Sent before
 /// repainting, mirroring the other reflow sites.
 ///
-/// Called on a pane-zoom or sidebar toggle with the pre-toggle rects, and once
-/// at attach with an empty map — which `compute_reflow` reads as "every leaf is
-/// new", seeding each PTY at the rect it is painted into (phux-e9fd).
+/// Called on a pane-zoom or sidebar toggle with the pre-toggle rects.
 pub(super) async fn emit_view_reflow(
     conn: &mut Connection,
     workspace: &Workspace,
@@ -61,10 +59,36 @@ pub(super) async fn emit_view_reflow(
     let Some(ls) = workspace.render_window(zoomed) else {
         return Ok(());
     };
-    if ls.tree.is_none() {
-        return Ok(());
+    emit_layout_reflow(conn, ls.as_ref(), prev_rects, content).await
+}
+
+/// Seed every window in a restored workspace before its first full paint.
+///
+/// The initial `ATTACHED` frame contains only a single-pane fallback; the
+/// persisted workspace arrives later through the layout metadata reply. At
+/// that point every PTY already exists and still has the outer-terminal size.
+/// Reflowing it before the reply's full paint lets a later window switch be an
+/// ordinary paint rather than a corrective resize.
+pub(super) async fn emit_bootstrap_workspace_reflow(
+    conn: &mut Connection,
+    workspace: &Workspace,
+    content: crate::layout::Rect,
+) -> Result<(), AttachError> {
+    let no_previous_rects = HashMap::new();
+    for window in &workspace.windows {
+        emit_layout_reflow(conn, &window.state, &no_previous_rects, content).await?;
     }
-    let diff = crate::attach::reflow::compute_reflow(ls.as_ref(), prev_rects, content);
+    Ok(())
+}
+
+/// Emit the resize diff for one concrete window layout.
+async fn emit_layout_reflow(
+    conn: &mut Connection,
+    layout: &LayoutState,
+    prev_rects: &HashMap<TerminalId, crate::layout::Rect>,
+    content: crate::layout::Rect,
+) -> Result<(), AttachError> {
+    let diff = crate::attach::reflow::compute_reflow(layout, prev_rects, content);
     for (terminal_id, new_rect) in &diff.changed {
         conn.send(&FrameKind::TerminalResize {
             terminal_id: terminal_id.clone(),
@@ -153,6 +177,56 @@ pub(super) fn current_viewport() -> Result<ViewportInfo, AttachError> {
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use tokio::net::UnixStream;
+
+    /// A restored workspace reflow must include off-screen windows. They are
+    /// not painted yet, but their first ordinary paint must not depend on a
+    /// later window switch doing a corrective resize.
+    #[tokio::test]
+    async fn restored_workspace_reflow_sizes_panes_in_every_window() {
+        let first = TerminalId::local(1);
+        let second = TerminalId::local(2);
+        let mut workspace = Workspace::single(first);
+        workspace.add_window("2".to_owned(), second.clone());
+        workspace.select(0);
+
+        let viewport = (100, 30);
+        let content = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: viewport.0,
+            h: viewport.1,
+        };
+        let (client_stream, server_stream) = UnixStream::pair().expect("pair");
+        let mut client = Connection::from_stream(client_stream);
+        let mut server = Connection::from_stream(server_stream);
+        let (sent, received) = tokio::join!(
+            emit_bootstrap_workspace_reflow(&mut client, &workspace, content),
+            async {
+                [
+                    server.recv().await.expect("first resize frame"),
+                    server.recv().await.expect("second resize frame"),
+                ]
+            },
+        );
+
+        sent.expect("bootstrap reflow sends");
+        let resized: std::collections::HashSet<_> = received
+            .into_iter()
+            .map(|frame| match frame {
+                FrameKind::TerminalResize {
+                    terminal_id,
+                    cols: 100,
+                    rows: 30,
+                } => terminal_id,
+                other => panic!("expected 100x30 resize, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            resized,
+            [TerminalId::local(1), second].into_iter().collect()
+        );
+    }
 
     /// The factored builder produces a `ViewportResize` frame carrying
     /// the supplied viewport unchanged. Lets us assert the encoder-

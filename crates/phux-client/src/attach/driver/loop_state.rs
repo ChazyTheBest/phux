@@ -85,8 +85,9 @@ use super::terminal::{
     desired_mouse_capture, sync_hover_tracking, sync_mouse_capture, terminal_reset_on_signal,
 };
 use super::viewport::{
-    HOST_CELL_PX_FALLBACK, current_viewport, current_viewport_or_default, emit_view_reflow,
-    host_cell_px, view_rects, viewport_resize_frame,
+    HOST_CELL_PX_FALLBACK, current_viewport, current_viewport_or_default,
+    emit_bootstrap_workspace_reflow, emit_view_reflow, host_cell_px, view_rects,
+    viewport_resize_frame,
 };
 
 /// Window before a parser-pending bare ESC is interpreted as the Escape
@@ -1126,8 +1127,8 @@ impl SessionLoop {
         Ok(None)
     }
 
-    /// phux-e9fd: size every bootstrap pane's PTY to the rect this client will
-    /// actually paint it into, before anything else runs.
+    /// Size the initial bootstrap pane's PTY to the rectangle this client will
+    /// paint it into.
     ///
     /// The server sizes each pane from the ATTACH viewport
     /// (`apply_attach_viewport`), which is the client's OUTER terminal —
@@ -1141,8 +1142,9 @@ impl SessionLoop {
     /// The server side already defers the off-by-one here in as many words
     /// ("the client's concern via the post-attach `TERMINAL_RESIZE` reflow
     /// path"); this is that path, and until now nothing called it. An empty
-    /// `prev_rects` makes `compute_reflow` report every leaf as changed — its
-    /// documented first-attach rule — so each pane is sized exactly once.
+    /// The persisted multi-window layout arrives later through its metadata
+    /// reply; that adoption path reflows every restored window before its
+    /// first full paint.
     async fn size_bootstrap_panes(
         &self,
         conn: &mut Connection,
@@ -1747,9 +1749,10 @@ impl SessionLoop {
                 sidebar_enabled: self.sidebar_enabled,
             }));
         }
-        // Zoom and sidebar toggles both change pane geometry. Resize
-        // every affected PTY before repainting so applications reflow
-        // to the same rectangle the client is about to render.
+        // Window changes still repaint to show the newly active window, but
+        // bootstrap has already seeded every known window's PTY geometry. A
+        // resize is needed here only when client-local geometry genuinely
+        // changes (zoom or sidebar).
         if self.zoomed != prev_zoomed || sidebar != prev_sidebar {
             emit_view_reflow(
                 conn,
@@ -2429,7 +2432,15 @@ impl SessionLoop {
         if outcome.emit_set_metadata {
             self.broadcast_layout(conn).await?;
         }
-        if outcome.reflow_panes
+        // `ATTACHED` initially exposes a one-pane fallback. The persisted
+        // multi-window layout lands later as this correlated metadata reply.
+        // Reflow every restored window here, before `settle_frame_view`
+        // schedules its full paint. Doing it earlier can only see the fallback;
+        // doing it on first window selection turns that selection into a
+        // corrective resize instead of an ordinary paint.
+        if outcome.layout_get_answered {
+            emit_bootstrap_workspace_reflow(conn, &self.workspace, self.content(sidebar)).await?;
+        } else if outcome.reflow_panes
             && let Some(prev_rects) = prev_rects
         {
             self.emit_reflow_resizes(conn, prev_rects, sidebar).await?;
