@@ -61,7 +61,7 @@ pub(crate) const WS_REJECTION_WARN_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// This mirrors `phux-relay`'s `PREAMBLE_DEADLINE`: a legitimate client starts
 /// its handshake immediately, so the bound only fires on stalled peers.
-const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Read side of a client connection: yields one complete encoded frame (length
 /// prefix included) per call, or `None` at end-of-stream.
@@ -891,6 +891,14 @@ mod tests {
             .and_then(|inner| inner.downcast_ref::<WsPeerRejection>())
             .expect("timeout is reported as a typed peer rejection");
         assert_eq!(rejection.stage, WsAcceptStage::Upgrade);
+
+        // Paused time makes the silent-peer deadline deterministic, but it is
+        // hostile to the real socket I/O below: while the kernel is briefly
+        // pending, Tokio can auto-advance straight to the next timer and make
+        // a healthy upgrade lose to the ten-second virtual deadline. Resume
+        // real time before proving recovery so this half tests the listener,
+        // not the paused-clock scheduler.
+        tokio::time::resume();
 
         // The listener is still live: a well-behaved client connecting after
         // the stall is served normally.
